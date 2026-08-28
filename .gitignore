@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 output/
 .tmt_key
+activatevenv.exe
