@@ -3,7 +3,7 @@
 import json
 from agent_config import MODEL, MUTATING_ACTIONS, Panel, console
 from agent_config import REQUIRED_KEYS
-from agent_actions import batch_summary, build_result_message, execute_action, trim_messages
+from agent_actions import authorizes_push, batch_summary, build_result_message, execute_action, trim_messages
 from agent_actions import READ_ONLY_ACTIONS, ACTION_LABELS, MAX_TURNS
 from agent_model import ask_model
 from agent_ui import LiveUI, render_response
@@ -58,6 +58,9 @@ def main():
             break
         if not task:
             continue
+        # Authority to push comes from this task's wording alone, decided once
+        # here so nothing the model later writes can widen it.
+        context = {"push_authorized": authorizes_push(task)}
         messages = [{"role": "system", "content": get_system_prompt()}, {"role": "user", "content": task}]
         last_raw, identical_count = "", 0
         live_ui = LiveUI()
@@ -103,7 +106,7 @@ def main():
                             results.append(f"INVALID: {error}")
                             break
                         sub_action = sub_obj["action"]
-                        result = execute_action(sub_obj)
+                        result = execute_action(sub_obj, context)
                         if sub_action in MUTATING_ACTIONS:
                             invalidate_prompt()
                         if sub_action in ("done", "respond"):
@@ -122,7 +125,7 @@ def main():
                     messages.extend([{"role": "assistant", "content": raw}, {"role": "user", "content": f"INVALID: {error}. Output a corrected action JSON."}])
                     continue
                 action = obj["action"]
-                result = execute_action(obj)
+                result = execute_action(obj, context)
                 if action in ("done", "respond"):
                     finish_response(live_ui, relay, result)
                 else:

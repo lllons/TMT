@@ -132,6 +132,22 @@ open_app - keys: app. Optional: path.
   {"action":"open_app","app":"notepad","path":"notes.txt"}
   {"action":"open_app","app":"explorer","path":"src/hello.py"}
 
+git_status - keys: none. The branch, how many files are staged, unstaged and untracked, and the repository path.
+  {"action":"git_status"}
+  {"actions":[{"action":"git_status"},{"action":"respond","message":"The repository is on main with two modified files and one untracked file."}]}
+
+git_identity - keys: none. The identity TMT commits under. Use it when a commit fails because that identity is not set.
+  {"action":"git_identity"}
+  {"actions":[{"action":"git_identity"},{"action":"respond","message":"TMT commits as TMT code, using the address configured in .tmt_git."}]}
+
+git_commit - keys: message. Optional: paths (repo-relative files to stage), all (bool, stage every change).
+  {"action":"git_commit","message":"Add the report generator","paths":["src/report.py"]}
+  {"action":"git_commit","message":"Save the current work","all":true}
+
+git_push - keys: none. Optional: branch, remote. Sends existing commits to the remote. Never pushes on its own initiative.
+  {"action":"git_push"}
+  {"actions":[{"action":"git_commit","message":"Fix the timeout handling","paths":["src/net.py"]},{"action":"git_push"},{"action":"respond","message":"Committed the timeout fix and pushed it to the remote."}]}
+
 respond - keys: message. The only text the user ever sees. Ends the task.
   {"action":"respond","message":"I created notes.txt with your shopping list."}
   {"action":"respond","message":"hello.py ran and printed: Hello, world"}"""
@@ -155,6 +171,15 @@ WORKFLOW_RULES = r"""=== BEHAVIOUR ===
 - Only perform file actions the user actually asked for. Never create, edit, delete or rename anything unprompted, and never touch a file outside the task.
 - Never run shell commands. Never leave the workspace root. Only the permitted apps listed above may be opened."""
 
+GIT_RULES = r"""=== GIT ===
+- TMT commits under its own git identity, never the user's. The user does not configure git for TMT; when the identity is missing, git_identity reports exactly what to set.
+- git_commit and git_push are separate actions. Committing never implies pushing.
+- Only push when the user asked for a push in this task. Editing or committing files is not permission to push. When in doubt, commit, then tell the user what is ready and ask.
+- If a push comes back BLOCKED, the user did not ask for one. Do not retry it. Say what is committed and ask them to confirm.
+- Never invent a branch or a remote. Leave "branch" and "remote" out so the current branch and its upstream are used, and never create a branch.
+- Stage only what the task changed by listing those files in "paths". Use "all": true only when the user asked to commit everything.
+- Report a failed push as a failed push, and say the commit still exists locally. Never rewrite history to get a push through."""
+
 def get_system_prompt():
     global _cached_prompt, _prompt_dirty
     if not _prompt_dirty and _cached_prompt is not None:
@@ -172,6 +197,7 @@ def get_system_prompt():
         f"Permitted apps for open_app: {apps}",
         PREFERENCE_RULES,
         WORKFLOW_RULES,
+        GIT_RULES,
         f"Workspace root: {ROOT_DIR}",
         f"=== CURRENT WORKSPACE FILES AND CONTENTS ===\n{snapshot}",
         "Reminder: reply with one JSON object only. Start with { and end with }.",

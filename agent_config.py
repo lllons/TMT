@@ -114,6 +114,39 @@ def save_api_key(key):
     return OPENROUTER_API_KEY
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "") or read_saved_key()
+
+# The git identity lives beside the modules in its own git-ignored file, for
+# the same reason as the key: a fresh checkout starts with no identity rather
+# than inheriting the identity of whoever cloned it.
+GIT_IDENTITY_FILE = Path(__file__).resolve().parent / ".tmt_git"
+
+def read_saved_git_identity():
+    """The name and email stored in .tmt_git, or {} when there is no file.
+
+    The file is key=value lines ("name=", "email="); blank lines, comments and
+    lines without a separator are ignored so a hand-edited file still loads.
+    """
+    values = {}
+    try:
+        contents = GIT_IDENTITY_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return values
+    for line in contents.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        values[key.strip().lower()] = value.strip()
+    return values
+
+_saved_git_identity = read_saved_git_identity()
+TMT_GIT_NAME = os.environ.get("TMT_GIT_NAME", "") or _saved_git_identity.get("name", "") or "TMT code"
+# Deliberately no fallback: an unset email must fail loudly rather than let TMT
+# commit as the human whose git config happens to be on the machine.
+TMT_GIT_EMAIL = os.environ.get("TMT_GIT_EMAIL", "") or _saved_git_identity.get("email", "")
+# Overrides repository discovery when TMT must work outside the folder it lives in.
+TMT_GIT_ROOT = os.environ.get("TMT_GIT_ROOT", "")
+
 MODEL = os.environ.get("OPENROUTER_MODEL", "minimax/minimax-m3:free")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 APP_TITLE = "Local File AI"
@@ -157,4 +190,6 @@ REQUIRED_KEYS = {
     "read_lines": ["path"], "replace_lines": ["path", "start", "end", "content"],
     "copy_file": ["path"], "delete_folder": ["path"], "respond": ["message"],
     "done": [],
+    "git_status": [], "git_identity": [],
+    "git_commit": ["message"], "git_push": [],
 }
