@@ -2,6 +2,7 @@
 
 import os
 import random
+import re
 import shutil
 import sys
 import threading
@@ -74,14 +75,114 @@ def fit_to_width(text, columns):
     return "".join(kept)
 
 
-def activity_glyph(now=None):
+# Grapheme-ish clustering: keeps combining marks, variation selectors, ZWJ
+# sequences and flag pairs attached to their base character.
+_MARKS = "[̀-ͯ᪰-᫿᷀-᷿⃐-⃿︀-️︠-︯]"
+_GRAPHEME_RE = re.compile(
+    "\r\n|[\U0001F1E6-\U0001F1FF]{2}|"
+    "(?:.%s*(?:%s.%s*)*)" % (_MARKS, _ZWJ, _MARKS),
+    re.DOTALL,
+)
+
+
+def iter_graphemes(text):
+    """Split text into user-perceived characters without breaking Unicode."""
+    return [match.group() for match in _GRAPHEME_RE.finditer(text)] if text else []
+
+
+def pad_to_width(text, columns):
+    return text + " " * max(0, columns - display_width(text))
+
+
+def clip_to_width(text, columns):
+    """Return (head, rest) where head fits within `columns` columns."""
+    used, index = 0, 0
+    for grapheme in iter_graphemes(text):
+        size = display_width(grapheme)
+        if used + size > columns:
+            break
+        used += size
+        index += len(grapheme)
+    if index == 0 and text:
+        index = len(iter_graphemes(text)[0])
+    return text[:index], text[index:]
+
+
+def wrap_lines(text, columns):
+    lines = []
+    for raw in text.split("\n"):
+        raw = raw.replace("\t", "    ").replace("\r", "")
+        while display_width(raw) > columns:
+            head, raw = clip_to_width(raw, columns)
+            lines.append(head)
+        lines.append(raw)
+    return lines
+
+
+def activity_glyph(now=None, plain=False):
     """The glyph standing in for a spinner, advanced by the wall clock."""
+    if plain:
+        return "*"
     now = time.monotonic() if now is None else now
     return ACTIVITY_GLYPHS[int(now / ACTIVITY_TICK) % len(ACTIVITY_GLYPHS)]
 
 
+def thinking_styles(stream):
+    """The THINKING styles this stream can actually draw.
+
+    Most are decorative Unicode. Plain "THINKING" always survives the filter,
+    so the animation degrades instead of emptying.
+    """
+    return [style for style in _THINKING_STYLES if encodable(stream, style)] or ["THINKING"]
+
+
 def _supports_color(stream) -> bool:
     return bool(getattr(stream, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
+
+
+def encodable(stream, text) -> bool:
+    """Whether the stream's encoding can carry every character in text."""
+    encoding = getattr(stream, "encoding", None) or ""
+    if not encoding:
+        # No declared encoding means this is not a byte sink -- an in-memory
+        # buffer, say -- so nothing can fail to encode on the way out.
+        return True
+    try:
+        text.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
+# Every decorative glyph the interface draws, asked once. A stream that cannot
+# carry them gets a deliberate ASCII interface rather than a row of
+# replacement marks -- or, before this was checked at all, a crash.
+DECORATION = "█░✳✻✽…·↓┌┐└┘│─『』"
+
+
+def plain_output(stream) -> bool:
+    """Whether this stream needs the ASCII fallbacks."""
+    return not encodable(stream, DECORATION)
+
+
+def safe_write(stream, text) -> bool:
+    """Write text, degrading only the characters the stream cannot encode.
+
+    A terminal that cannot represent a glyph must not end the run: the task
+    matters more than its decoration. Returns False when the stream is gone,
+    so a caller can stop drawing to it.
+    """
+    try:
+        stream.write(text)
+        stream.flush()
+        return True
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "ascii"
+        stream.write(text.encode(encoding, "replace").decode(encoding, "replace"))
+        stream.flush()
+        return True
+    except (ValueError, OSError):
+        return False
 
 
 def _gradient(progress: int):
@@ -241,8 +342,10 @@ class LiveUI:
                 return ""
             started_at, tokens = self._started_at, self._token_total()
         elapsed = max(0, round(time.monotonic() - started_at))
-        detail = f"{elapsed}s" if not tokens else f"{elapsed}s · ↓ {tokens} tokens"
-        return f"{activity_glyph()} thinking… ({detail})"
+        plain = plain_output(self.stream)
+        separator, arrow, trail = ("-", "", "...") if plain else ("·", "↓ ", "…")
+        detail = f"{elapsed}s" if not tokens else f"{elapsed}s {separator} {arrow}{tokens} tokens"
+        return f"{activity_glyph(plain=plain)} thinking{trail} ({detail})"
 
     def _paint_activity(self, text):
         """Glyph and word ride the shared cycle; the detail stays dim."""
@@ -262,6 +365,7 @@ class LiveUI:
         often, so the colour never settles.
         """
         tick = min(self.interval, GRADIENT_TICK)
+        styles = thinking_styles(self.stream)
         word = "THINKING"
         next_word = time.monotonic() + self.interval
         while not self._stop.wait(tick):
@@ -273,7 +377,7 @@ class LiveUI:
                 self._render_progress(label, estimate)
                 continue
             if time.monotonic() >= next_word:
-                word = random.choice(_THINKING_STYLES)
+                word = random.choice(styles)
                 next_word = time.monotonic() + self.interval
             self._render(word, painter=self._paint_cycle)
 
@@ -306,13 +410,24 @@ class LiveUI:
         self._render_progress("FINALIZING", estimate="completing...")
 
     def complete(self):
+        # The animation stops before the final line is drawn, not after: while
+        # it runs it repaints the same finished row a moment later, which
+        # doubles it on any stream without a real cursor to overwrite.
         with self._lock:
             if not self._active:
                 return
             self._progress = 100
+        self._halt_animation()
         self._render_progress("Complete!", estimate=None)
         time.sleep(0.05)
         self.stop(clear=True)
+
+    def _halt_animation(self):
+        """Stop the animation thread, leaving the line it drew on screen."""
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=1)
 
     def stop(self, clear=True):
         with self._lock:
@@ -359,8 +474,7 @@ class LiveUI:
         if self._sink is not None:
             self._sink(painted)
             return
-        self.stream.write("\r\033[2K" + painted)
-        self.stream.flush()
+        safe_write(self.stream, "\r\033[2K" + painted)
 
     def _render_progress(self, label, estimate="calculating..."):
         with self._lock:
@@ -369,7 +483,10 @@ class LiveUI:
             progress = self._progress
             self._label, self._estimate = label, estimate
         width = min(12, max(4, shutil.get_terminal_size((80, 24)).columns // 8))
-        bar = "█" * round(width * progress / 100) + "░" * (width - round(width * progress / 100))
+        plain = plain_output(self.stream)
+        full, empty = ("#", "-") if plain else ("█", "░")
+        filled = round(width * progress / 100)
+        bar = full * filled + empty * (width - filled)
         line = f"{bar} {progress:>3}% {label}"
         detail = ""
         if estimate and progress < 100:
@@ -378,7 +495,7 @@ class LiveUI:
             detail = f" | Estimated finish: {estimate_text}"
 
         def paint(text, bar_width=len(bar)):
-            return cycle_bar(progress, self.stream, width=bar_width) + text[bar_width:]
+            return cycle_bar(progress, self.stream, width=bar_width, plain=plain) + text[bar_width:]
 
         self._render(line, painter=paint, optional=detail)
 
@@ -386,24 +503,30 @@ class LiveUI:
         if self._sink is not None:
             self._sink("")
             return
-        self.stream.write("\r\033[2K")
-        self.stream.flush()
+        safe_write(self.stream, "\r\033[2K")
 
 
 def render_response(response: str, stream=None):
+    """Draw the finished reply in a box sized to the terminal.
+
+    Wrapped and padded by display width rather than character count, so a
+    reply carrying wide or combining characters cannot push a row past the
+    edge and wrap it onto a second line. One column is left spare because
+    terminals disagree about what a row filled to the last column does.
+    """
     stream = stream or sys.stdout
     width = max(20, shutil.get_terminal_size((80, 24)).columns)
-    inner = max(10, width - 4)
-    lines = []
-    for raw in str(response).splitlines() or [""]:
-        while len(raw) > inner:
-            lines.append(raw[:inner])
-            raw = raw[inner:]
-        lines.append(raw)
-    border = "┌" + "─" * (inner + 2) + "┐"
-    bottom = "└" + "─" * (inner + 2) + "┘"
-    stream.write(cycle_text(border, stream) + "\n")
-    for line in lines:
-        stream.write(cycle_text("│", stream) + " " + line.ljust(inner) + " " + cycle_text("│", stream) + "\n")
-    stream.write(cycle_text(bottom, stream, phase=gradient_phase() + 0.5) + "\n")
-    stream.flush()
+    plain = plain_output(stream)
+    edge, rule = ("|", "-") if plain else ("│", "─")
+    inner = max(10, width - 5)
+    lines = wrap_lines(str(response), inner) or [""]
+    fill = rule * (inner + 2)
+    if plain:
+        border = bottom = "+" + fill + "+"
+    else:
+        border, bottom = "┌" + fill + "┐", "└" + fill + "┘"
+    out = [cycle_text(border, stream)]
+    left = right = cycle_text(edge, stream)
+    out.extend(f"{left} {pad_to_width(line, inner)} {right}" for line in lines)
+    out.append(cycle_text(bottom, stream, phase=gradient_phase() + 0.5))
+    safe_write(stream, "\n".join(out) + "\n")

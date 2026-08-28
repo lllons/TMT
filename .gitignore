@@ -4,3 +4,4 @@ output/
 .tmt_key
 .tmt_git.local
 activatevenv.exe
+logs/

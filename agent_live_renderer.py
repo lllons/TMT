@@ -13,7 +13,11 @@ import threading
 import time
 from collections import deque
 
-from agent_ui import GRADIENT_TICK, cycle_text, display_width, gradient_phase
+from agent_ui import (
+    GRADIENT_TICK, clip_to_width, cycle_text, display_width, encodable,
+    gradient_phase, iter_graphemes, pad_to_width, plain_output, safe_write,
+    wrap_lines,
+)
 
 SYMBOL_POOL = (
     "↖", "↗", "↘", "↙", "↑", "↓", "↔", "↕", "↩", "↪", "↰", "↱", "↲", "↳", "↺", "↻",
@@ -39,8 +43,12 @@ SYMBOL_POOL = (
 
 ASCII_SYMBOL_POOL = ("+", "-", "*", "#", "@", "%", "&", "^", "~", "=", "<", ">", "/", "\\", "|", "?")
 
-BODY_LEFT = "『"                # frame edges: both are two columns wide
-BODY_RIGHT = "』"
+FRAME = {"left": "『", "right": "』", "top": "┌", "top_end": "┐",
+         "bottom": "└", "bottom_end": "┘", "rule": "─"}
+ASCII_FRAME = {"left": "|", "right": "|", "top": "+", "top_end": "+",
+               "bottom": "+", "bottom_end": "+", "rule": "-"}
+BODY_LEFT = FRAME["left"]          # the default edges are two columns wide
+BODY_RIGHT = FRAME["right"]
 
 GLITCH_REVEAL_DURATION = 0.025   # seconds a character spends as a symbol
 REVEAL_TICK = 0.012              # renderer refresh period
@@ -50,64 +58,7 @@ FINALIZE_TIMEOUT = 2.0           # hard cap on waiting for the reveal queue
 LIVE_BODY_LINES = 10             # visible lines of the live response area
 _TAIL_CHARS = 4000               # text kept for redraw of the visible tail
 
-# Grapheme-ish clustering: keeps combining marks, variation selectors, ZWJ
-# sequences and flag pairs attached to their base character.
-_MARKS = "[̀-ͯ᪰-᫿᷀-᷿⃐-⃿︀-️︠-︯]"
-_ZWJ = "‍"
-_VARIATION_SELECTOR_16 = "️"
-_GRAPHEME_RE = re.compile(
-    "\r\n|[\U0001F1E6-\U0001F1FF]{2}|"
-    "(?:.%s*(?:%s.%s*)*)" % (_MARKS, _ZWJ, _MARKS),
-    re.DOTALL,
-)
-
 _WHITESPACE = {" ", "\n", "\r", "\t", "\r\n", "\v", "\f"}
-
-
-def iter_graphemes(text):
-    """Split text into user-perceived characters without breaking Unicode."""
-    return [match.group() for match in _GRAPHEME_RE.finditer(text)] if text else []
-
-
-def pad_to_width(text, width):
-    return text + " " * max(0, width - display_width(text))
-
-
-def clip_to_width(text, width):
-    """Return (head, rest) where head fits within width columns."""
-    used, index = 0, 0
-    for grapheme in iter_graphemes(text):
-        size = display_width(grapheme)
-        if used + size > width:
-            break
-        used += size
-        index += len(grapheme)
-    if index == 0 and text:
-        index = len(iter_graphemes(text)[0])
-    return text[:index], text[index:]
-
-
-def wrap_lines(text, width):
-    lines = []
-    for raw in text.split("\n"):
-        raw = raw.replace("\t", "    ").replace("\r", "")
-        while display_width(raw) > width:
-            head, raw = clip_to_width(raw, width)
-            lines.append(head)
-        lines.append(raw)
-    return lines
-
-
-def encodable(stream, text):
-    """Whether the stream's encoding can carry every character in text."""
-    encoding = getattr(stream, "encoding", None) or ""
-    if not encoding:
-        return False
-    try:
-        text.encode(encoding)
-    except (UnicodeEncodeError, LookupError):
-        return False
-    return True
 
 
 def symbols_supported(stream):
@@ -268,13 +219,7 @@ class LiveRegion:
             self._write("".join(parts))
 
     def _write(self, text):
-        try:
-            self.stream.write(text)
-            self.stream.flush()
-        except UnicodeEncodeError:
-            self.stream.write(text.encode("ascii", "replace").decode("ascii"))
-            self.stream.flush()
-        except (ValueError, OSError):
+        if not safe_write(self.stream, text):
             self.ansi = False
 
 
@@ -371,19 +316,20 @@ class LiveRelay:
         # wrapped row silently costs a second screen line, which the cursor
         # moves in LiveRegion.paint do not count, so every repaint would land
         # too high and march the frame down the screen.
-        chrome = display_width(BODY_LEFT) + display_width(BODY_RIGHT) + 2
+        frame = ASCII_FRAME if plain_output(self.region.stream) else FRAME
+        chrome = display_width(frame["left"]) + display_width(frame["right"]) + 2
         inner = max(10, width - chrome - 1)
         # Keep the whole region on screen: a region taller than the terminal
         # would scroll away from the cursor moves that repaint it.
         visible = max(1, min(self.body_lines, size.lines - 4))
         wrapped = wrap_lines(body, inner)[-visible:]
         stream, phase = self.region.stream, gradient_phase()
-        rule = "─" * (inner + chrome - 2)
-        lines.append(cycle_text("┌" + rule + "┐", stream, phase))
-        left = cycle_text(BODY_LEFT, stream, phase)
-        right = cycle_text(BODY_RIGHT, stream, phase + 0.5)
+        rule = frame["rule"] * (inner + chrome - 2)
+        lines.append(cycle_text(frame["top"] + rule + frame["top_end"], stream, phase))
+        left = cycle_text(frame["left"], stream, phase)
+        right = cycle_text(frame["right"], stream, phase + 0.5)
         lines.extend(f"{left} {pad_to_width(line, inner)} {right}" for line in wrapped)
-        lines.append(cycle_text("└" + rule + "┘", stream, phase + 0.5))
+        lines.append(cycle_text(frame["bottom"] + rule + frame["bottom_end"], stream, phase + 0.5))
         return lines
 
     def wait_for_reveal(self, timeout=FINALIZE_TIMEOUT):

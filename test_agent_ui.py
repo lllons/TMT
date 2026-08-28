@@ -178,3 +178,126 @@ def test_fit_to_width_measures_columns_not_characters():
     assert fit_to_width("abc", 10) == "abc"
     assert display_width(fit_to_width(FULL_WIDTH, 5)) <= 5
     assert display_width(fit_to_width("hello world", 5)) == 5
+
+
+class NarrowStream(io.TextIOBase):
+    """A stream that genuinely cannot encode the decorative glyphs.
+
+    Writing through a pipe on Windows produces exactly this: stdout falls back
+    to cp1252, and every box-drawing or block character raises on the way out.
+    """
+
+    encoding = "cp1252"
+
+    def __init__(self):
+        self.chunks = []
+
+    def write(self, text):
+        text.encode(self.encoding)          # raises just as the console does
+        self.chunks.append(text)
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def getvalue(self):
+        return "".join(self.chunks)
+
+
+def test_a_stream_that_cannot_encode_the_glyphs_does_not_end_the_run():
+    """Decoration must never cost the task.
+
+    The progress bar wrote block characters straight to stdout with no
+    fallback, so a cp1252 stream raised UnicodeEncodeError out of the render
+    and killed TMT after the work was already done.
+    """
+    original = with_columns(100)
+    out = NarrowStream()
+    try:
+        assert agent_ui.plain_output(out) is True
+        ui = LiveUI(stream=out, interval=0.01)
+        ui.start()
+        ui.meaningful_output()
+        ui.add_output(800)
+        ui._render_progress("Git Push")
+        ui.final_event()
+        ui.complete()
+        # The reply is the model's, so it carries whatever Unicode it likes
+        # no matter which glyphs the interface picked for itself.
+        render_response("Committed a841564 ✓ pushed 🚀 to main.", out)
+        text = out.getvalue()
+        assert "100% Complete!" in text
+        assert "Committed a841564" in text and "to main." in text
+        # The interface chose ASCII rather than emitting replacement marks.
+        assert "#" in text and "█" not in text
+    finally:
+        agent_ui.shutil.get_terminal_size = original
+
+
+def test_the_completion_line_is_drawn_exactly_once():
+    """The animation thread used to repaint the finished row after complete()
+    had already drawn it, doubling it wherever no cursor could overwrite."""
+    original = with_columns(100)
+    out = NarrowStream()
+    try:
+        ui = LiveUI(stream=out, interval=0.01)
+        ui.start()
+        ui.meaningful_output()
+        time.sleep(0.05)                    # let the animation run a few ticks
+        ui.complete()
+        time.sleep(0.05)                    # and prove it does not come back
+        assert out.getvalue().count("100% Complete!") == 1
+    finally:
+        agent_ui.shutil.get_terminal_size = original
+
+
+def test_the_response_box_is_sized_by_columns_not_characters():
+    """A reply containing wide characters used to overflow the row and wrap,
+    because the box was wrapped with len() but drawn with box characters."""
+    for columns in (40, 60, 100):
+        original = with_columns(columns)
+        try:
+            buffer = io.StringIO()
+            render_response("wide: \u4f60\u597d\u4e16\u754c and plain text " * 4, buffer)
+            rows = [row for row in buffer.getvalue().split("\n") if row]
+            widths = {display_width(row) for row in rows}
+            assert len(widths) == 1, (columns, sorted(widths))
+            assert widths.pop() < columns, columns
+        finally:
+            agent_ui.shutil.get_terminal_size = original
+
+
+def test_the_response_box_survives_a_reply_with_no_content():
+    original = with_columns(80)
+    try:
+        buffer = io.StringIO()
+        render_response("", buffer)
+        rows = [row for row in buffer.getvalue().split("\n") if row]
+        assert len(rows) == 3                # top, one empty body row, bottom
+        assert len({display_width(row) for row in rows}) == 1
+    finally:
+        agent_ui.shutil.get_terminal_size = original
+
+
+def test_an_undeclared_encoding_counts_as_capable():
+    """An in-memory buffer holds str, so nothing can fail to encode into it.
+    Treating a missing encoding as incapable made every test stream ASCII."""
+    assert agent_ui.encodable(io.StringIO(), agent_ui.DECORATION) is True
+    assert agent_ui.plain_output(io.StringIO()) is False
+    assert agent_ui.plain_output(NarrowStream()) is True
+
+
+def test_safe_write_reports_a_dead_stream_instead_of_raising():
+    class Closed(io.TextIOBase):
+        encoding = "utf-8"
+        def write(self, text):
+            raise ValueError("I/O operation on closed file")
+
+    assert agent_ui.safe_write(Closed(), "anything") is False
+    assert agent_ui.safe_write(io.StringIO(), "fine") is True
+
+    # Content the stream cannot encode is degraded, never raised: this is the
+    # guard that keeps a model reply full of emoji from ending the run.
+    narrow = NarrowStream()
+    assert agent_ui.safe_write(narrow, "rocket 🚀 done") is True
+    assert "rocket" in narrow.getvalue() and "done" in narrow.getvalue()

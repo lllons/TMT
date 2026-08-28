@@ -3,6 +3,7 @@
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import agent_config
@@ -21,6 +22,49 @@ PLACEHOLDER_MARKER = "replace_with"
 # inside git's own error text, so it is removed from everything that leaves
 # this module for the user or the model.
 _URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)[^/@\s]*@")
+
+# Git work is the only thing TMT does that reaches past this machine, so every
+# command, exit code and failure is written down where it can be read after the
+# fact. The directory is git-ignored: this is diagnostics, not source.
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOGGING = os.environ.get("TMT_GIT_LOG", "1").lower() not in {"0", "false", "no", "off"}
+_log_file = None
+
+
+def log_path():
+    """This process's log file, created on the first git operation."""
+    global _log_file
+    if _log_file is None:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        _log_file = LOG_DIR / f"tmt-git-{stamp}-{os.getpid()}.log"
+        _write(f"# TMT git log, started {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    return _log_file
+
+
+def _write(line):
+    try:
+        with _log_file.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass                                # a log must never break the work
+
+
+def log(event, detail=""):
+    """Append one scrubbed line.
+
+    Everything written here passes through _scrub first, so a remote URL
+    carrying credentials cannot reach the log any more than it can reach the
+    user or the model.
+    """
+    if not LOGGING:
+        return
+    log_path()
+    line = f"{time.strftime('%H:%M:%S')} {event:<9}"
+    if detail:
+        line += " " + _scrub(str(detail)).replace("\n", " / ").strip()
+    _write(line.rstrip())
+
 
 SETUP_HINT = (
     "TMT commits under its own git identity and never under yours, so it needs "
@@ -84,19 +128,30 @@ def _clip(text, limit):
 def _git(args, cwd, env=None, timeout=GIT_TIMEOUT, check=True):
     """Run one git command. Never a shell, never inheriting a cwd by accident."""
     cmd = ["git"] + [str(a) for a in args]
+    log("run", " ".join(cmd) + f"   (in {cwd})")
+    started = time.monotonic()
     try:
         result = subprocess.run(
             cmd, cwd=str(cwd), env=env, shell=False, capture_output=True,
             text=True, encoding="utf-8", errors="replace", timeout=timeout,
         )
     except FileNotFoundError:
+        log("error", "git was not found on PATH")
         raise GitError("git was not found on PATH.")
     except subprocess.TimeoutExpired:
+        log("error", f"git {args[0]} timed out after {timeout}s")
         raise GitError(f"git {args[0]} timed out after {timeout} seconds.")
     except OSError as error:
+        log("error", f"could not run git: {error}")
         raise GitError(f"Could not run git: {error}")
+    log("exit", f"code {result.returncode} after {time.monotonic() - started:.2f}s")
+    if result.stdout.strip():
+        log("stdout", _clip(_scrub(result.stdout), MAX_DETAIL_CHARS))
+    if result.stderr.strip():
+        log("stderr", _clip(_scrub(result.stderr), MAX_DETAIL_CHARS))
     if check and result.returncode != 0:
         detail = _clip(_scrub(result.stderr) or _scrub(result.stdout), MAX_DETAIL_CHARS)
+        log("failed", f"git {args[0]}: {detail or 'no output'}")
         raise GitError(f"git {args[0]} failed: {detail or 'no output'}")
     return result
 
@@ -372,9 +427,16 @@ class TMTGit:
         staged, or when git fails. `stage_all` is the explicit
         commit-everything path; without it only `paths` are staged."""
         identity = self.identity
+        log("commit", f"requested in {self.root} | paths={paths} | all={stage_all}")
         # Checked before anything is staged: an unusable identity must leave the
         # repository exactly as it was found.
-        identity.validate()
+        try:
+            identity.validate()
+        except GitError as error:
+            log("refused", f"identity unusable, nothing staged: {error}")
+            raise
+        log("identity", f"{identity.signature()} (name from {identity.name_source}, "
+                        f"email from {identity.email_source})")
         text = (message or "").strip()
         if not text:
             raise GitError("A commit message is required.")
@@ -383,7 +445,9 @@ class TMTGit:
         elif paths:
             self.stage(paths)
         staged = self._staged_paths()
+        log("staged", ", ".join(staged) if staged else "nothing")
         if not staged:
+            log("refused", "nothing staged, no commit created")
             raise GitError(
                 "Nothing is staged, so there is nothing to commit. Name the "
                 "paths to commit, or ask to commit everything."
@@ -400,7 +464,11 @@ class TMTGit:
             author_name != identity.name or author_email != identity.email
             or committer_name != identity.name or committer_email != identity.email
         )
+        log("created", f"{short} on {self._branch_label()}")
+        log("verified", f"author {author_name} <{author_email}> | "
+                        f"committer {committer_name} <{committer_email}>")
         if mismatched:
+            log("failed", "recorded identity is not TMT's; commit left untouched")
             # Better to stop loudly than to leave the user believing a commit
             # carries TMT's identity when it carries someone else's.
             raise GitError(
@@ -426,7 +494,9 @@ class TMTGit:
         {'remote','branch','remote_url_host','summary'}; raises GitError
         carrying a classified, human-readable reason."""
         name = (branch or "").strip() or self.current_branch()
+        log("push", f"requested | branch={name} | remote={remote or 'default'}")
         if not self.branch_exists(name):
+            log("refused", f"no local branch named {name}; TMT does not create one")
             raise GitError(
                 f"There is no local branch named '{name}'. TMT does not create "
                 "branches; push a branch that already exists."
@@ -435,6 +505,7 @@ class TMTGit:
         if target not in self.remotes():
             raise GitError(f"There is no remote named '{target}'.")
         host = _url_host(self.remote_url(target))
+        log("target", f"{target}/{name} at {host}")
         env = dict(os.environ)
         # An interactive credential prompt would hang the subprocess until the
         # timeout; fail fast and report it as an authentication problem instead.
@@ -446,11 +517,13 @@ class TMTGit:
         if result.returncode != 0:
             reason = classify_push_failure(output)
             detail = _clip(output, MAX_DETAIL_CHARS)
+            log("failed", f"push rejected: {reason} | commit kept locally")
             raise GitError(
                 f"Push of {name} to {target} ({host}) failed. {reason}\n"
                 f"git said: {detail or 'nothing'}\n"
                 "The commit is still in the local repository; nothing was changed."
             )
+        log("pushed", f"{name} to {target} ({host}) | {_clip(output, 200) or 'no output'}")
         return {
             "remote": target,
             "branch": name,
