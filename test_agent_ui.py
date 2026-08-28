@@ -101,13 +101,32 @@ def test_readout_is_dropped_whole_when_the_row_is_too_narrow():
 def test_token_count_accumulates_then_resets_with_the_next_task():
     ui = LiveUI(stream=io.StringIO())
     ui.start()
+    ui.meaningful_output()
     for _ in range(363):
         ui.add_tokens()
     assert "363 tokens" in ui._activity()
     ui.stop()
     ui.start()                                # a new task starts from zero
+    ui.meaningful_output()
     assert "tokens" not in ui._activity()
     ui.stop()
+
+
+def test_readout_appears_with_the_progress_bar_and_not_before():
+    original = with_columns(100)
+    ui = LiveUI(stream=io.StringIO())
+    try:
+        ui.start()
+        ui.add_tokens(363)
+        assert ui._activity() == ""            # THINKING owns the row alone
+        assert "thinking\u2026" not in ui._last_render
+        assert "363" not in ui._last_render
+        ui.meaningful_output()                 # the bar takes the row
+        assert "thinking\u2026" in ui._activity()
+        assert "363 tokens" in ui._last_render
+    finally:
+        agent_ui.shutil.get_terminal_size = original
+        ui.stop()
 
 
 def test_finished_row_drops_the_in_flight_readout():

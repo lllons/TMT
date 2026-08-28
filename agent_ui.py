@@ -205,11 +205,16 @@ class LiveUI:
         return cycle_text(text, self.stream)
 
     def _activity(self):
-        """The right-hand readout: turning glyph, elapsed time, tokens seen."""
+        """The right-hand readout: turning glyph, elapsed time, tokens seen.
+
+        Empty until the progress bar takes the row, and empty again once the
+        row is finished. It is the bar's counterpart, so it keeps the bar's
+        company: beside the THINKING animation it would only say twice, in
+        two places, what that word already says.
+        """
         with self._lock:
             started_at, tokens = self._started_at, self._tokens
-            # An in-flight indicator has no place on a finished row.
-            if self._progress >= 100:
+            if not self._progress_started or self._progress >= 100:
                 return ""
         elapsed = max(0, round(time.monotonic() - started_at))
         detail = f"{elapsed}s" if not tokens else f"{elapsed}s · ↓ {tokens} tokens"
