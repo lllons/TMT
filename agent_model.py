@@ -2,8 +2,9 @@
 
 import json
 import re
+import agent_config
 from agent_config import (
-    APP_TITLE, APP_URL, OPENROUTER_API_KEY, OPENROUTER_URL, STREAM_ENABLED,
+    APP_TITLE, APP_URL, OPENROUTER_URL, STREAM_ENABLED,
     VERIFY_SSL, MODEL, _json_mode_ok, _session, console, requests,
 )
 
@@ -14,7 +15,8 @@ def clean_model_json(raw):
 
 def _headers(stream=False):
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        # Read at call time: first-launch setup can supply the key after import.
+        "Authorization": f"Bearer {agent_config.OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": APP_URL,
         "X-Title": APP_TITLE,

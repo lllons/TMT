@@ -14,6 +14,8 @@ import time
 import unicodedata
 from collections import deque
 
+from agent_ui import GRADIENT_TICK, cycle_text, gradient_phase
+
 SYMBOL_POOL = (
     "↖", "↗", "↘", "↙", "↑", "↓", "↔", "↕", "↩", "↪", "↰", "↱", "↲", "↳", "↺", "↻",
     "⇦", "⇧", "⇨", "⇩",
@@ -107,16 +109,21 @@ def wrap_lines(text, width):
     return lines
 
 
-def symbols_supported(stream):
-    """Whether the stream's encoding can carry the full symbol pool."""
+def encodable(stream, text):
+    """Whether the stream's encoding can carry every character in text."""
     encoding = getattr(stream, "encoding", None) or ""
     if not encoding:
         return False
     try:
-        "".join(SYMBOL_POOL).encode(encoding)
+        text.encode(encoding)
     except (UnicodeEncodeError, LookupError):
         return False
     return True
+
+
+def symbols_supported(stream):
+    """Whether the stream's encoding can carry the full symbol pool."""
+    return encodable(stream, "".join(SYMBOL_POOL))
 
 
 class _Cell:
@@ -332,12 +339,17 @@ class LiveRelay:
         self.start()
 
     def _loop(self):
+        last_paint = 0.0
         while not self._stop.wait(REVEAL_TICK):
             with self._lock:
                 changed = self.glitch.tick()
                 pending = self.glitch.pending_count()
-            if changed or self._dirty.is_set():
+            now = time.monotonic()
+            # Repaint on new text, on a status change, and otherwise often
+            # enough that the border keeps riding the shared colour cycle.
+            if changed or self._dirty.is_set() or now - last_paint >= GRADIENT_TICK:
                 self._dirty.clear()
+                last_paint = now
                 self._repaint()
             if not pending:
                 self._idle.set()
@@ -361,9 +373,11 @@ class LiveRelay:
         # would scroll away from the cursor moves that repaint it.
         visible = max(1, min(self.body_lines, size.lines - 4))
         wrapped = wrap_lines(body, inner)[-visible:]
-        lines.append("┌" + "─" * (inner + 2) + "┐")
-        lines.extend("『 " + pad_to_width(line, inner) + " 』" for line in wrapped)
-        lines.append("└" + "─" * (inner + 2) + "┘")
+        stream, phase = self.region.stream, gradient_phase()
+        lines.append(cycle_text("┌" + "─" * (inner + 2) + "┐", stream, phase))
+        left, right = cycle_text("『", stream, phase), cycle_text("』", stream, phase + 0.5)
+        lines.extend(f"{left} {pad_to_width(line, inner)} {right}" for line in wrapped)
+        lines.append(cycle_text("└" + "─" * (inner + 2) + "┘", stream, phase + 0.5))
         return lines
 
     def wait_for_reveal(self, timeout=FINALIZE_TIMEOUT):

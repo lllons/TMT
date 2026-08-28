@@ -1,13 +1,14 @@
 """Command-line entry point for the local file AI agent."""
 
 import json
-from agent_config import MODEL, OPENROUTER_API_KEY, MUTATING_ACTIONS, Panel, console
+from agent_config import MODEL, MUTATING_ACTIONS, Panel, console
 from agent_config import REQUIRED_KEYS
 from agent_actions import batch_summary, build_result_message, execute_action, trim_messages
 from agent_actions import READ_ONLY_ACTIONS, ACTION_LABELS, MAX_TURNS
 from agent_model import ask_model
 from agent_ui import LiveUI, render_response
 from agent_live_renderer import LiveRelay
+from agent_setup import ensure_api_key
 from agent_prompt import get_system_prompt, invalidate_prompt, validate_action
 from agent_execution import APP_REGISTRY, RUNNERS, open_app, run_file, run_python
 from agent_file_ops import (
@@ -37,9 +38,7 @@ def stream_handler(live_ui, relay, state):
     return handle
 
 def main():
-    if not OPENROUTER_API_KEY:
-        console.print("[bold red]ERROR:[/bold red] OPENROUTER_API_KEY is not set.\n"
-                      "Export it before running:  [bold]set OPENROUTER_API_KEY=sk-or-v1-...[/bold]")
+    if not ensure_api_key():
         return
     console.print(Panel.fit(f"[bold green]Local File AI[/bold green] (OpenRouter / {MODEL})"))
     while True:

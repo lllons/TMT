@@ -91,7 +91,29 @@ console = Console()
 ROOT_DIR = (Path(__file__).resolve().parent / "output").resolve()
 ROOT_DIR.mkdir(parents=True, exist_ok=True)
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+# The key lives beside the modules in a git-ignored file, so a checkout on
+# another machine simply starts empty and runs first-launch setup.
+KEY_FILE = Path(__file__).resolve().parent / ".tmt_key"
+
+def read_saved_key():
+    """The API key stored by first-launch setup, or "" when there is none."""
+    try:
+        return KEY_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+def save_api_key(key):
+    """Store the key for future launches and make it live for this one."""
+    global OPENROUTER_API_KEY
+    OPENROUTER_API_KEY = key.strip()
+    KEY_FILE.write_text(OPENROUTER_API_KEY + "\n", encoding="utf-8")
+    try:
+        os.chmod(KEY_FILE, 0o600)
+    except OSError:
+        pass
+    return OPENROUTER_API_KEY
+
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "") or read_saved_key()
 MODEL = os.environ.get("OPENROUTER_MODEL", "minimax/minimax-m3:free")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 APP_TITLE = "Local File AI"
