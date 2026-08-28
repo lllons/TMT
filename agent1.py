@@ -6,6 +6,7 @@ from agent_config import REQUIRED_KEYS
 from agent_actions import batch_summary, build_result_message, execute_action, trim_messages
 from agent_actions import READ_ONLY_ACTIONS, ACTION_LABELS, MAX_TURNS
 from agent_model import ask_model
+from agent_ui import LiveUI, render_response
 from agent_prompt import get_system_prompt, invalidate_prompt, validate_action
 from agent_execution import APP_REGISTRY, RUNNERS, open_app, run_file, run_python
 from agent_file_ops import (
@@ -34,11 +35,14 @@ def main():
             continue
         messages = [{"role": "system", "content": get_system_prompt()}, {"role": "user", "content": task}]
         last_raw, identical_count = "", 0
+        live_ui = LiveUI()
+        live_ui.start()
         try:
             for _ in range(35):
                 messages[0]["content"] = get_system_prompt()
                 messages = trim_messages(messages)
                 raw = ask_model(messages)
+                live_ui.meaningful_output()
                 identical_count = identical_count + 1 if raw == last_raw else 0
                 last_raw = raw
                 if identical_count >= 3:
@@ -54,7 +58,7 @@ def main():
                     if not isinstance(batch, list) or not batch:
                         messages.extend([{"role": "assistant", "content": raw}, {"role": "user", "content": "INVALID: 'actions' must be a non-empty list. Try again."}])
                         continue
-                    console.print(f"[dim]{batch_summary(batch)}[/dim]")
+                    live_ui.intermediate_event("Processing...")
                     results = []
                     for sub_obj in batch:
                         error = validate_action(sub_obj)
@@ -66,7 +70,9 @@ def main():
                         if sub_action in MUTATING_ACTIONS:
                             invalidate_prompt()
                         if sub_action in ("done", "respond"):
-                            console.print(Panel(str(result), border_style="green"))
+                            live_ui.final_event()
+                            live_ui.complete()
+                            render_response(str(result))
                             break
                         results.append(f"{sub_action}: {result}")
                     else:
@@ -80,14 +86,25 @@ def main():
                     continue
                 action = obj["action"]
                 result = execute_action(obj)
-                console.print(Panel(str(result), border_style="green"))
+                if action in ("done", "respond"):
+                    live_ui.final_event()
+                    live_ui.complete()
+                    render_response(str(result))
+                else:
+                    live_ui.intermediate_event(ACTION_LABELS.get(action, "Processing..."))
                 if action in MUTATING_ACTIONS:
                     invalidate_prompt()
                 if action in ("done", "respond"):
                     break
                 messages.extend([{"role": "assistant", "content": raw}, {"role": "user", "content": build_result_message(action, result)}])
         except KeyboardInterrupt:
+            live_ui.stop()
             console.print("\n[yellow]Task cancelled. Returning to prompt.[/yellow]")
+        except Exception:
+            live_ui.stop()
+            raise
+        else:
+            live_ui.stop()
 
 if __name__ == "__main__":
     main()
