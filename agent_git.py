@@ -13,7 +13,10 @@ PUSH_TIMEOUT = 120
 MAX_DIFF_CHARS = 20000
 MAX_DETAIL_CHARS = 500
 
-_EMAIL_PATTERN = re.compile(r"^[^@\s,;<>]+@[^@\s,;<>]+\.[^@\s,;<>]+$")
+# The token the shipped .tmt_git carries in place of a real address. An email
+# nobody has verified on a GitHub account is attributed to nobody, so it is
+# treated as no identity at all rather than as a usable one.
+PLACEHOLDER_MARKER = "replace_with"
 # Userinfo in a remote URL is a credential. It appears in remote listings and
 # inside git's own error text, so it is removed from everything that leaves
 # this module for the user or the model.
@@ -22,10 +25,24 @@ _URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)[^/@\s]*@")
 SETUP_HINT = (
     "TMT commits under its own git identity and never under yours, so it needs "
     "an address of its own.\n"
-    "Set the TMT_GIT_EMAIL environment variable, or put a line "
-    "'email=tmt-code@example.invalid' in the .tmt_git file beside the TMT "
-    "modules. TMT_GIT_NAME sets the display name (default 'TMT code').\n"
+    "Put a line 'TMT_GIT_EMAIL=tmt-code@example.invalid' in the tracked .tmt_git "
+    "file beside the TMT modules to set it for every clone, or in .tmt_git.local "
+    "to set it on this machine only, or set the TMT_GIT_EMAIL environment "
+    "variable. TMT_GIT_NAME sets the display name (default 'TMT code').\n"
+    "The address is public commit metadata, not a credential: never put tokens, "
+    "passwords or keys in either file.\n"
     "Your own git configuration is not read and not changed."
+)
+
+PLACEHOLDER_HINT = (
+    "The TMT git email is still the placeholder the project ships with, so it "
+    "identifies nobody and GitHub cannot attribute a commit to it.\n"
+    "Replace it with a real address that is verified on the GitHub account "
+    "representing TMT: edit the TMT_GIT_EMAIL line in the tracked .tmt_git file "
+    "beside the TMT modules, or override it for this machine alone in "
+    ".tmt_git.local, or set the TMT_GIT_EMAIL environment variable.\n"
+    "Until then TMT refuses to commit rather than author commits under an "
+    "address that belongs to no one."
 )
 
 
@@ -40,6 +57,14 @@ def _config(name, default=""):
     if value is None or value == "":
         return default
     return str(value).strip()
+
+
+def _local_identity_file():
+    """The per-machine override's path, for the diagnostic only."""
+    try:
+        return agent_config.local_git_identity_path()
+    except Exception:
+        return ".tmt_git.local"
 
 
 def _scrub(text):
@@ -85,22 +110,51 @@ class TMTGitIdentity:
 
     DEFAULT_NAME = "TMT code"
 
-    def __init__(self, name, email):
+    def __init__(self, name, email, name_source="", email_source=""):
         self.name = (name or self.DEFAULT_NAME).strip() or self.DEFAULT_NAME
         self.email = (email or "").strip()
+        self.name_source = name_source or "unknown"
+        self.email_source = email_source or ("unknown" if self.email else "not set")
 
     @classmethod
     def resolve(cls):
-        """Name from TMT_GIT_NAME (default 'TMT code'); email from TMT_GIT_EMAIL
-        or the .tmt_git file. Email is never inferred from git config."""
-        return cls(_config("TMT_GIT_NAME", cls.DEFAULT_NAME), _config("TMT_GIT_EMAIL"))
+        """The identity to commit under, read from agent_config at call time.
+
+        Precedence, highest first: the TMT_GIT_* environment variables, the
+        git-ignored .tmt_git.local, the tracked .tmt_git, then the built-in
+        name. The email is never inferred from git config, and there is no
+        default for it.
+        """
+        values = agent_config.resolve_git_identity()
+        return cls(
+            values.get("name", cls.DEFAULT_NAME), values.get("email", ""),
+            values.get("name_source", ""), values.get("email_source", ""),
+        )
+
+    def is_placeholder(self):
+        """Whether the email is still the address the project ships with."""
+        return PLACEHOLDER_MARKER in self.email.lower()
 
     def validate(self):
-        """Raise GitError with the setup instructions when the email is missing
-        or malformed."""
+        """Raise GitError with the setup instructions when the email is unusable.
+
+        Unusable means empty, without an "@", carrying whitespace or angle
+        brackets, or still holding the shipped placeholder. Every one of those
+        would produce a commit GitHub can attribute to no one, which is worse
+        than no commit at all.
+        """
         if not self.email:
             raise GitError("No TMT git identity is configured.\n" + SETUP_HINT)
-        if not _EMAIL_PATTERN.match(self.email):
+        if self.is_placeholder():
+            raise GitError(
+                f"The TMT git email is unusable: {self.email}\n" + PLACEHOLDER_HINT
+            )
+        unusable = (
+            "@" not in self.email
+            or any(character.isspace() for character in self.email)
+            or "<" in self.email or ">" in self.email
+        )
+        if unusable:
             raise GitError(
                 f"The configured TMT git email is not a valid address: {self.email}\n"
                 + SETUP_HINT
@@ -122,31 +176,33 @@ class TMTGitIdentity:
         return f"{self.name} <{self.email}>"
 
     def describe(self):
-        """Multi-line diagnostic. Must never print credentials."""
-        if os.environ.get("TMT_GIT_NAME", "").strip():
-            name_source = "TMT_GIT_NAME environment variable"
-        elif self.name != self.DEFAULT_NAME:
-            name_source = "the .tmt_git file"
-        else:
-            name_source = "built-in default"
-        if os.environ.get("TMT_GIT_EMAIL", "").strip():
-            email_source = "TMT_GIT_EMAIL environment variable"
-        elif self.email:
-            email_source = "the .tmt_git file"
-        else:
-            email_source = "not set"
+        """Multi-line diagnostic naming the winning source for each half.
+
+        Reports an address and a display name only: there is no credential in
+        this identity to print.
+        """
         lines = [
             "TMT git identity",
-            f"  name:  {self.name}  (from {name_source})",
-            f"  email: {self.email or '(not set)'}  (from {email_source})",
-            f"  identity file: {_config('GIT_IDENTITY_FILE', '.tmt_git')}",
+            f"  name:  {self.name}  (from {self.name_source})",
+            f"  email: {self.email or '(not set)'}  (from {self.email_source})",
+            f"  tracked identity file: {_config('GIT_IDENTITY_FILE', '.tmt_git')}",
+            f"  per-machine override:  {_local_identity_file()}",
+            "  precedence: TMT_GIT_* environment variables, then .tmt_git.local, "
+            "then .tmt_git",
         ]
         try:
             self.validate()
             lines.append("  status: usable")
-        except GitError:
-            lines.append("  status: not usable — commits are refused until this is set")
-            lines.append(SETUP_HINT)
+        except GitError as error:
+            if self.is_placeholder():
+                lines.append(
+                    "  status: placeholder, not a real address - commits are refused"
+                )
+            else:
+                lines.append(
+                    "  status: not usable - commits are refused until this is set"
+                )
+            lines.append(str(error).split("\n", 1)[-1])
         return "\n".join(lines)
 
 

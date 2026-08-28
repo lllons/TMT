@@ -115,20 +115,43 @@ def save_api_key(key):
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "") or read_saved_key()
 
-# The git identity lives beside the modules in its own git-ignored file, for
-# the same reason as the key: a fresh checkout starts with no identity rather
-# than inheriting the identity of whoever cloned it.
+# TMT's git identity lives in two files beside the modules. The tracked one
+# ships with the project, so every clone commits under the same TMT identity
+# instead of each user inventing an address; the ".local" one is git-ignored
+# and overrides it on a single machine. A commit email is public metadata
+# printed in every commit, not a credential, which is why the shipped file can
+# be tracked. Credentials belong in neither file.
 GIT_IDENTITY_FILE = Path(__file__).resolve().parent / ".tmt_git"
+GIT_IDENTITY_LOCAL_FILE = Path(__file__).resolve().parent / ".tmt_git.local"
+_DEFAULT_GIT_IDENTITY_FILE = GIT_IDENTITY_FILE
+_DEFAULT_GIT_IDENTITY_LOCAL_FILE = GIT_IDENTITY_LOCAL_FILE
 
-def read_saved_git_identity():
-    """The name and email stored in .tmt_git, or {} when there is no file.
+GIT_NAME_DEFAULT = "TMT code"
 
-    The file is key=value lines ("name=", "email="); blank lines, comments and
-    lines without a separator are ignored so a hand-edited file still loads.
+# The names the git_identity diagnostic reports a value's origin by.
+GIT_SOURCE_ENV = "environment"
+GIT_SOURCE_LOCAL_FILE = ".tmt_git.local"
+GIT_SOURCE_TRACKED_FILE = ".tmt_git"
+GIT_SOURCE_DEFAULT = "built-in default"
+GIT_SOURCE_UNSET = "not set"
+
+# Both spellings are accepted so a file written for either convention loads.
+_GIT_IDENTITY_KEYS = {
+    "name": "name", "tmt_git_name": "name",
+    "email": "email", "tmt_git_email": "email",
+}
+
+def read_git_identity_file(path):
+    """The name and email in one identity file, or {} when it is absent.
+
+    key=value lines, keys matched case-insensitively in either the
+    TMT_GIT_NAME/TMT_GIT_EMAIL or the shorter name/email spelling. Blank lines,
+    "#" comments and unrecognised lines are ignored so a hand-edited file still
+    loads.
     """
     values = {}
     try:
-        contents = GIT_IDENTITY_FILE.read_text(encoding="utf-8")
+        contents = Path(path).read_text(encoding="utf-8")
     except OSError:
         return values
     for line in contents.splitlines():
@@ -136,14 +159,66 @@ def read_saved_git_identity():
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        values[key.strip().lower()] = value.strip()
+        field = _GIT_IDENTITY_KEYS.get(key.strip().lower())
+        if field:
+            values[field] = value.strip()
     return values
 
-_saved_git_identity = read_saved_git_identity()
-TMT_GIT_NAME = os.environ.get("TMT_GIT_NAME", "") or _saved_git_identity.get("name", "") or "TMT code"
-# Deliberately no fallback: an unset email must fail loudly rather than let TMT
-# commit as the human whose git config happens to be on the machine.
-TMT_GIT_EMAIL = os.environ.get("TMT_GIT_EMAIL", "") or _saved_git_identity.get("email", "")
+def local_git_identity_path():
+    """Where the per-machine override lives.
+
+    It follows a redirected GIT_IDENTITY_FILE, so pointing the tracked file at
+    a temporary directory cannot leave a real .tmt_git.local on the machine
+    still deciding the answer.
+    """
+    local = Path(GIT_IDENTITY_LOCAL_FILE)
+    if local != Path(_DEFAULT_GIT_IDENTITY_LOCAL_FILE):
+        return local
+    tracked = Path(GIT_IDENTITY_FILE)
+    if tracked != Path(_DEFAULT_GIT_IDENTITY_FILE):
+        return tracked.with_name(tracked.name + ".local")
+    return local
+
+def read_saved_git_identity():
+    """The name and email from the tracked .tmt_git file, or {}."""
+    return read_git_identity_file(GIT_IDENTITY_FILE)
+
+def resolve_git_identity():
+    """The identity TMT commits under and where each half of it came from.
+
+    Returns {"name", "name_source", "email", "email_source"}, read at call time
+    so a value changed after import is honoured. Precedence, highest first: the
+    TMT_GIT_* environment variables, the git-ignored .tmt_git.local, the
+    tracked .tmt_git, then a built-in default name.
+
+    There is deliberately no default email. An unset email must fail loudly
+    rather than let TMT commit as the human whose git config happens to be on
+    the machine.
+    """
+    local = read_git_identity_file(local_git_identity_path())
+    tracked = read_git_identity_file(GIT_IDENTITY_FILE)
+    layers = (
+        (GIT_SOURCE_ENV,
+         os.environ.get("TMT_GIT_NAME", ""), os.environ.get("TMT_GIT_EMAIL", "")),
+        (GIT_SOURCE_LOCAL_FILE, local.get("name", ""), local.get("email", "")),
+        (GIT_SOURCE_TRACKED_FILE, tracked.get("name", ""), tracked.get("email", "")),
+    )
+    name, name_source = GIT_NAME_DEFAULT, GIT_SOURCE_DEFAULT
+    email, email_source = "", GIT_SOURCE_UNSET
+    for source, candidate, _ in layers:
+        if candidate and candidate.strip():
+            name, name_source = candidate.strip(), source
+            break
+    for source, _, candidate in layers:
+        if candidate and candidate.strip():
+            email, email_source = candidate.strip(), source
+            break
+    return {"name": name, "name_source": name_source,
+            "email": email, "email_source": email_source}
+
+_saved_git_identity = resolve_git_identity()
+TMT_GIT_NAME = _saved_git_identity["name"]
+TMT_GIT_EMAIL = _saved_git_identity["email"]
 # Overrides repository discovery when TMT must work outside the folder it lives in.
 TMT_GIT_ROOT = os.environ.get("TMT_GIT_ROOT", "")
 
@@ -190,6 +265,6 @@ REQUIRED_KEYS = {
     "read_lines": ["path"], "replace_lines": ["path", "start", "end", "content"],
     "copy_file": ["path"], "delete_folder": ["path"], "respond": ["message"],
     "done": [],
-    "git_status": [], "git_identity": [],
+    "git_status": [], "git_identity": [], "git_diff": [],
     "git_commit": ["message"], "git_push": [],
 }

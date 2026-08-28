@@ -10,7 +10,7 @@ Needs Python 3.8+.
 git clone https://github.com/lllons/TMT.git
 cd TMT
 pip install requests rich      # optional: adds live streaming + colour
-python agent1.py               # Windows: py agent1.py   macOS/Linux: python3 agent1.py
+python TMT.py                  # Windows: py TMT.py      macOS/Linux: python3 TMT.py
 ```
 
 First launch asks for an [OpenRouter key](https://openrouter.ai/keys) and saves it to `.tmt_key` (git-ignored). Set `OPENROUTER_API_KEY` in your environment to skip that.
@@ -27,20 +27,32 @@ identity rather than yours.
 
 ### Configuration
 
-- `TMT_GIT_NAME` — defaults to `TMT code`.
-- `TMT_GIT_EMAIL` — required, no default. TMT never reads your git config's email
-  and never commits as you.
+TMT's identity comes from the first of these that supplies a value, highest first:
 
-Set both as environment variables, or in a git-ignored `.tmt_git` file next to the
-code:
+1. The `TMT_GIT_NAME` / `TMT_GIT_EMAIL` environment variables.
+2. `.tmt_git.local` beside the code — git-ignored, per machine.
+3. `.tmt_git` beside the code — tracked in the repo, so every clone has the same
+   TMT identity without anyone inventing an address for it.
+4. A built-in default for the name only, `TMT code`. There is no default email.
+
+Both files are `key=value` lines; blank lines and `#` comments are ignored:
 
 ```
-name=TMT code
-email=tmt-code@example.invalid
+TMT_GIT_NAME=TMT code
+TMT_GIT_EMAIL=tmt-code@example.invalid
 ```
 
-Without `TMT_GIT_EMAIL` set, any commit action fails with a setup error instead of
-falling back to your identity.
+The older `name=` / `email=` spelling still loads.
+
+`.tmt_git` is tracked on purpose: a commit email is public metadata, not a
+credential — it is printed in every commit of every public repo. Tokens, passwords
+and keys never go in it. Use `.tmt_git.local` or the environment for anything you
+do not want committed.
+
+The tracked file ships a placeholder address, not a real one. TMT detects it and
+refuses to commit rather than authoring commits under an address GitHub cannot
+attribute to anyone. Without a usable email, every commit action fails with a setup
+error instead of falling back to your identity.
 
 ### Git identity vs. GitHub attribution vs. GitHub auth
 
@@ -56,6 +68,10 @@ These are three separate things and TMT only controls one of them:
 - **GitHub authentication** — who is allowed to push at all. This is unchanged and
   stays yours: your SSH key, credential manager, or `gh` login. TMT stores no
   credentials and does not implement login.
+
+No attribution happens at all while `.tmt_git` still holds the shipped placeholder.
+It only starts once that line is replaced with an address verified on the GitHub
+account that represents TMT.
 
 Your own git identity (global or repo-local `user.name`/`user.email`) is never
 touched, so your own commits are unaffected.
@@ -73,6 +89,6 @@ force-pushes.
 ### Setting up the TMT GitHub account
 
 To have commits show up as made by "TMT" on GitHub: create a dedicated GitHub
-account for it, add the address from `TMT_GIT_EMAIL` to that account, and verify it.
-Only then will GitHub attribute the commits to it. This is a manual, one-time step
-outside TMT.
+account for it, add an address to that account and verify it, then put that address
+in `.tmt_git` in place of the placeholder. Only then will GitHub attribute the
+commits to it. This is a manual, one-time step outside TMT.

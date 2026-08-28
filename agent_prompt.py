@@ -136,6 +136,10 @@ git_status - keys: none. The branch, how many files are staged, unstaged and unt
   {"action":"git_status"}
   {"actions":[{"action":"git_status"},{"action":"respond","message":"The repository is on main with two modified files and one untracked file."}]}
 
+git_diff - keys: none. Optional: paths (repo-relative files to limit the diff to). The staged and unstaged changes as a unified diff. Read-only. A long diff comes back truncated, with a note saying so.
+  {"action":"git_diff","paths":["src/net.py"]}
+  {"actions":[{"action":"git_diff"},{"action":"respond","message":"The only change is a longer socket timeout in src/net.py."}]}
+
 git_identity - keys: none. The identity TMT commits under. Use it when a commit fails because that identity is not set.
   {"action":"git_identity"}
   {"actions":[{"action":"git_identity"},{"action":"respond","message":"TMT commits as TMT code, using the address configured in .tmt_git."}]}
@@ -178,6 +182,7 @@ GIT_RULES = r"""=== GIT ===
 - If a push comes back BLOCKED, the user did not ask for one. Do not retry it. Say what is committed and ask them to confirm.
 - Never invent a branch or a remote. Leave "branch" and "remote" out so the current branch and its upstream are used, and never create a branch.
 - Stage only what the task changed by listing those files in "paths". Use "all": true only when the user asked to commit everything.
+- When you are not certain what changed, run git_diff first and commit only the paths it shows. Narrow it with "paths" rather than reading a whole repository's diff.
 - Report a failed push as a failed push, and say the commit still exists locally. Never rewrite history to get a push through."""
 
 def get_system_prompt():

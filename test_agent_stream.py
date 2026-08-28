@@ -5,7 +5,7 @@ import json
 import threading
 
 import agent_model
-from agent1 import stream_handler
+from TMT import stream_handler
 from agent_live_renderer import LiveRelay
 from agent_model import StreamingActionParser, StreamError, ask_model
 from agent_ui import LiveUI

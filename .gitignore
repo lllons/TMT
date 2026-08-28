@@ -2,5 +2,5 @@ __pycache__/
 *.pyc
 output/
 .tmt_key
-.tmt_git
+.tmt_git.local
 activatevenv.exe

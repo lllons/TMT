@@ -83,6 +83,33 @@ def _git_status(agent_git):
         )
     return f"Repository: {state.get('root') or repo.root}\nBranch: {state.get('branch', 'unknown')}\n{changes}"
 
+# A diff of a large change would otherwise arrive whole: it goes into the
+# model's context and is relayed live to the user at the same time, so one
+# refactor could crowd out the rest of the task on both. The engine already
+# caps a diff far higher; this is the size a reply is still built from.
+MAX_DIFF_RESULT_CHARS = 6000
+
+def _clip_diff(diff):
+    """Cap a diff at MAX_DIFF_RESULT_CHARS, cutting on a line boundary.
+
+    The note says how much was dropped, so the model can tell a partial diff
+    from a complete one and narrow the next one with "paths" instead of
+    reasoning about changes it never saw.
+    """
+    if len(diff) <= MAX_DIFF_RESULT_CHARS:
+        return diff
+    shown = diff[:MAX_DIFF_RESULT_CHARS].rsplit("\n", 1)[0]
+    omitted = diff[len(shown):].count("\n")
+    return (
+        f"{shown}\n"
+        f"... diff truncated: {len(shown)} of {len(diff)} characters shown, "
+        f"{omitted} further lines omitted. Re-run git_diff with \"paths\" set to "
+        "the files you need in order to see the rest."
+    )
+
+def _git_diff(agent_git, obj):
+    return _clip_diff(agent_git.TMTGit.discover().diff(paths=obj.get("paths")))
+
 def _git_commit(agent_git, obj):
     result = agent_git.TMTGit.discover().commit(
         obj["message"], paths=obj.get("paths"), stage_all=bool(obj.get("all", False))
@@ -131,6 +158,7 @@ def execute_action(obj, context=None):
     if action in ("run_python", "run_file"): return run_file(obj["path"])
     if action == "open_app": return open_app(obj["app"], file_path=obj.get("path"), url=obj.get("url"))
     if action == "git_status": return _run_git(_git_status)
+    if action == "git_diff": return _run_git(lambda agent_git: _git_diff(agent_git, obj))
     if action == "git_identity": return _run_git(lambda agent_git: agent_git.TMTGitIdentity.resolve().describe())
     if action == "git_commit": return _run_git(lambda agent_git: _git_commit(agent_git, obj))
     if action == "git_push":
@@ -142,7 +170,7 @@ def execute_action(obj, context=None):
     if action in ("respond", "done"): return obj.get("message", "done")
     return f"Unknown action: {action}"
 
-READ_ONLY_ACTIONS = ("list_files", "read_file", "search_files", "read_lines")
+READ_ONLY_ACTIONS = ("list_files", "read_file", "search_files", "read_lines", "git_diff")
 
 def build_result_message(action, result):
     result_str = str(result)
@@ -162,7 +190,7 @@ ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     "write_file", "append_file", "write_files", "patch_file", "delete_file", "read_file",
     "list_files", "search_files", "read_lines", "replace_lines", "copy_file",
     "delete_folder", "rename_file", "create_folder", "run_python", "run_file",
-    "open_app", "git_status", "git_identity", "git_commit", "git_push",
+    "open_app", "git_status", "git_diff", "git_identity", "git_commit", "git_push",
     "respond", "done",
 )}
 
