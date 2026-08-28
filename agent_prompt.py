@@ -183,7 +183,32 @@ GIT_RULES = r"""=== GIT ===
 - Never invent a branch or a remote. Leave "branch" and "remote" out so the current branch and its upstream are used, and never create a branch.
 - Stage only what the task changed by listing those files in "paths". Use "all": true only when the user asked to commit everything.
 - When you are not certain what changed, run git_diff first and commit only the paths it shows. Narrow it with "paths" rather than reading a whole repository's diff.
-- Report a failed push as a failed push, and say the commit still exists locally. Never rewrite history to get a push through."""
+- Report a failed push as a failed push, and say the commit still exists locally. Never rewrite history to get a push through.
+- The git actions work on the repository named above, not on the workspace. A file missing from the workspace listing may still exist in the repository, so use git_status to find out instead of concluding it is absent.
+- git_status names the files it found. Commit those names; never invent a path and never guess at one you were not shown.
+- Never tell the user to run git config, and never ask them for a token, password, SSH key or any credential. TMT already has its own identity, and pushing uses the git authentication already set up on the machine. Neither is ever the user's job mid-task.
+- Never state anything about TMT's identity from files you can see. Call git_identity and report what it says."""
+
+# Machinery, not work. A checkout inside the workspace otherwise contributes
+# its whole .git directory to the snapshot: hook samples, refs, and a config
+# naming a remote TMT does not act on. Shown that, the model reasons about the
+# wrong repository entirely.
+SNAPSHOT_SKIP = {".git", "__pycache__", ".venv", "venv", "node_modules", ".mypy_cache"}
+
+
+def repository_root():
+    """The repository the git actions address, or "" if there is not one.
+
+    Worth stating in the prompt because it is usually not the workspace: the
+    model cannot infer it from the files it can see, and guessing produces
+    confident advice about the wrong remote.
+    """
+    try:
+        import agent_git
+        return str(agent_git.TMTGit.discover().root)
+    except Exception:
+        return ""
+
 
 def get_system_prompt():
     global _cached_prompt, _prompt_dirty
@@ -191,8 +216,11 @@ def get_system_prompt():
         return _cached_prompt
     snapshot = ""
     for path in sorted(ROOT_DIR.rglob("*")):
+        relative = path.relative_to(ROOT_DIR)
+        if any(part in SNAPSHOT_SKIP for part in relative.parts):
+            continue
         if path.is_file() and path.stat().st_size < 8000:
-            snapshot += f"\n--- {path.relative_to(ROOT_DIR)} ---\n{path.read_text(encoding='utf-8', errors='replace')}\n"
+            snapshot += f"\n--- {relative} ---\n{path.read_text(encoding='utf-8', errors='replace')}\n"
     snapshot = snapshot or "(empty workspace)"
     apps = ", ".join(f"{key} ({value['description']})" for key, value in APP_REGISTRY.items()) or "none"
     _cached_prompt = "\n\n".join([
@@ -204,11 +232,24 @@ def get_system_prompt():
         WORKFLOW_RULES,
         GIT_RULES,
         f"Workspace root: {ROOT_DIR}",
+        _repository_line(),
         f"=== CURRENT WORKSPACE FILES AND CONTENTS ===\n{snapshot}",
         "Reminder: reply with one JSON object only. Start with { and end with }.",
     ]).strip()
     _prompt_dirty = False
     return _cached_prompt
+
+def _repository_line():
+    root = repository_root()
+    if not root:
+        return "Git repository: none found. The git actions will report why if asked."
+    return (
+        f"Git repository: {root}\n"
+        "This is what every git action works on. It is a different place from the "
+        "workspace above, and paths in git_commit are relative to it, not to the "
+        "workspace. Files you cannot see in the workspace can still be committed."
+    )
+
 
 def validate_action(obj):
     action = obj.get("action")

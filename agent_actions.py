@@ -71,17 +71,34 @@ def _run_git(operation):
             return f"Git error: {error}"
         raise
 
+MAX_STATUS_PATHS = 40
+
 def _git_status(agent_git):
+    """Report the changed paths by name.
+
+    Counts alone are useless to the model: it cannot commit "one untracked
+    item", and an untracked file appears in no diff, so a name reported here is
+    the only way it can ever learn one.
+    """
     repo = agent_git.TMTGit.discover()
     state = repo.status()
+    lines = [
+        f"Repository: {state.get('root') or repo.root}",
+        f"Branch: {state.get('branch', 'unknown')}",
+    ]
     if state.get("clean"):
-        changes = "Working tree clean"
-    else:
-        changes = ", ".join(
-            f"{len(state.get(key) or [])} {label}"
-            for key, label in (("staged", "staged"), ("unstaged", "unstaged"), ("untracked", "untracked"))
-        )
-    return f"Repository: {state.get('root') or repo.root}\nBranch: {state.get('branch', 'unknown')}\n{changes}"
+        lines.append("Working tree clean; there is nothing to commit.")
+        return "\n".join(lines)
+    for key, label in (("staged", "Staged"), ("unstaged", "Modified"), ("untracked", "Untracked")):
+        paths = state.get(key) or []
+        if not paths:
+            continue
+        shown = paths[:MAX_STATUS_PATHS]
+        listed = ", ".join(shown)
+        if len(paths) > len(shown):
+            listed += f", and {len(paths) - len(shown)} more"
+        lines.append(f"{label} ({len(paths)}): {listed}")
+    return "\n".join(lines)
 
 # A diff of a large change would otherwise arrive whole: it goes into the
 # model's context and is relayed live to the user at the same time, so one

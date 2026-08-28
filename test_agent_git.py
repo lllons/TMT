@@ -1171,3 +1171,68 @@ def test_git_diff_returns_the_changed_content_and_needs_no_push_authorization():
         assert "respond" in follow_up, follow_up
     finally:
         sandbox.close()
+
+
+def test_the_workspace_snapshot_never_carries_a_nested_git_directory():
+    """A checkout inside the workspace must not put its .git in the prompt.
+
+    It once did, and the model read the nested config, took that remote for the
+    one it acts on, and reported a push as impossible against a repository it
+    was never pointed at. The hook samples alone tripled the prompt.
+    """
+    if not ready("agent_prompt", "agent_config"):
+        return
+    planted = Path(agent_config.ROOT_DIR) / "nested_repo_probe" / ".git"
+    try:
+        planted.mkdir(parents=True, exist_ok=True)
+        (planted / "config").write_text(
+            '[remote "origin"]\n\turl = https://example.invalid/other.git\n',
+            encoding="utf-8")
+        (planted / "HEAD").write_text("ref: refs/heads/probe\n", encoding="utf-8")
+        agent_prompt.invalidate_prompt()
+        prompt = agent_prompt.get_system_prompt()
+        assert "example.invalid/other.git" not in prompt
+        assert "refs/heads/probe" not in prompt
+        listed = re.findall(r"^--- (.+?) ---$", prompt, re.M)
+        leaked = [n for n in listed if ".git" in n.replace("\\", "/").split("/")]
+        assert not leaked, leaked
+    finally:
+        for leftover in sorted(planted.rglob("*"), reverse=True):
+            leftover.unlink()
+        planted.rmdir()
+        planted.parent.rmdir()
+        agent_prompt.invalidate_prompt()
+
+
+def test_the_prompt_states_which_repository_the_git_actions_use():
+    """The workspace and the repository are different directories here, and the
+    model cannot work that out from the files it is shown."""
+    if not ready("agent_prompt", "agent_config"):
+        return
+    agent_prompt.invalidate_prompt()
+    prompt = agent_prompt.get_system_prompt()
+    assert "Git repository:" in prompt
+    assert "not to the workspace" in prompt
+    # And it must never be told to repair git itself or to ask for secrets.
+    assert "Never tell the user to run git config" in prompt
+    assert "never ask them for a token" in prompt
+
+
+def test_git_status_names_the_paths_it_found():
+    """Counts cannot be committed. An untracked file appears in no diff, so the
+    name reported here is the only way the model can ever learn it."""
+    if not ready("agent_actions", "agent_git", "agent_config"):
+        return
+    box = Sandbox()
+    try:
+        box.write("tracked.txt", "one\n")
+        box.git(["add", "tracked.txt"])
+        box.git(["commit", "-m", "seed"])
+        box.write("tracked.txt", "changed\n")
+        box.write("brand_new.txt", "untracked\n")
+        report = str(agent_actions.execute_action({"action": "git_status"}))
+        assert "tracked.txt" in report, report
+        assert "brand_new.txt" in report, report
+        assert "Untracked" in report and "Modified" in report, report
+    finally:
+        box.close()
