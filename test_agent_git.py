@@ -1236,3 +1236,22 @@ def test_git_status_names_the_paths_it_found():
         assert "Untracked" in report and "Modified" in report, report
     finally:
         box.close()
+
+
+def test_every_module_imports_and_is_clean_utf8_text():
+    """A corrupted module degrades quietly rather than loudly.
+
+    agent_actions catches an agent_git import failure and turns it into an
+    action result, which is right for a missing dependency but means a broken
+    source file looks like a git problem to everyone downstream. A stray NUL
+    byte, which Python refuses to parse at all, once reached a module this way.
+    """
+    import importlib
+    root = Path(__file__).resolve().parent
+    for source in sorted(root.glob("*.py")):
+        raw = source.read_bytes()
+        assert b"\x00" not in raw, f"{source.name} contains a NUL byte"
+        raw.decode("utf-8")                       # raises if not valid UTF-8
+        if source.name.startswith("test_") or source.name == "run_tests.py":
+            continue
+        importlib.import_module(source.stem)      # raises if it cannot load

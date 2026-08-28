@@ -61,6 +61,9 @@ def log(event, detail=""):
         return
     log_path()
     line = f"{time.strftime('%H:%M:%S')} {event:<9}"
+    # git -z output carries NUL separators, which make the whole log read as a
+    # binary file to grep and every other text tool that would inspect it.
+    detail = str(detail).replace("\x00", " ")
     if detail:
         line += " " + _scrub(str(detail)).replace("\n", " / ").strip()
     _write(line.rstrip())
