@@ -118,7 +118,12 @@ MODEL = os.environ.get("OPENROUTER_MODEL", "minimax/minimax-m3:free")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 APP_TITLE = "Local File AI"
 APP_URL = "http://localhost"
-USE_JSON_MODE = False
+# Ask the provider to constrain the reply to a syntactically valid JSON
+# object: no prose, no markdown fences, no stray text around it. This is a
+# grammar constraint only -- our action schema is enforced by the system
+# prompt and validate_action. Models that reject response_format fall back
+# automatically (see JSON_MODE_REJECTIONS in agent_model).
+USE_JSON_MODE = True
 _json_mode_ok = USE_JSON_MODE
 # Live relay: stream model output as it is generated. Requires the real
 # requests package (the urllib fallback shim above cannot stream responses).
