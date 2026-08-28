@@ -47,11 +47,25 @@ def _post_chat(payload, spinner=True):
 class StreamError(RuntimeError):
     """The model stream failed, was rejected, or closed unexpectedly."""
 
-def stream_chat(payload):
+def _completion_tokens(data):
+    """The provider's own count of the tokens it generated, if it reports one.
+
+    Exact, and covers the whole reply rather than the part shown to the user,
+    so it supersedes any estimate once it arrives.
+    """
+    usage = (data or {}).get("usage") or {}
+    for key in ("completion_tokens", "output_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int) and value >= 0:
+            return value
+    return None
+
+def stream_chat(payload, on_usage=None):
     """Yield content fragments from the provider's server-sent event stream.
 
-    Only generated content is yielded: SSE comments, keep-alives, role deltas
-    and usage metadata never reach the caller.
+    Only generated content is yielded: SSE comments, keep-alives and role
+    deltas never reach the caller. A usage record, when the provider sends
+    one, goes to ``on_usage`` instead of the content stream.
     """
     response = _session.post(
         OPENROUTER_URL, headers=_headers(stream=True), json=payload,
@@ -84,6 +98,9 @@ def stream_chat(payload):
             if event.get("error"):
                 error = event["error"]
                 raise StreamError(error.get("message", str(error)) if isinstance(error, dict) else str(error))
+            tokens = _completion_tokens(event)
+            if tokens is not None and on_usage:
+                on_usage(tokens)
             for choice in event.get("choices") or []:
                 content = (choice.get("delta") or {}).get("content")
                 if content:
@@ -286,15 +303,16 @@ def _ask_model_streaming(messages, on_event):
         parser = StreamingActionParser()
         seen_content = False
         try:
-            for content in stream_chat(payload):
+            usage_sink = lambda tokens: on_event(("usage", tokens))
+            for content in stream_chat(payload, on_usage=usage_sink):
                 if not content:
                     continue
                 if not seen_content:
                     seen_content = True
                     on_event(("first_content", ""))
-                # Providers emit one delta per token, so counting deltas gives
-                # a live figure without waiting for the final usage record.
-                on_event(("tokens", 1))
+                # Every character generated, action plumbing and file contents
+                # included -- not only the part relayed to the user.
+                on_event(("output", len(content)))
                 for event in parser.feed(content):
                     on_event(event)
         except StreamError as error:
@@ -326,7 +344,7 @@ def ask_model(messages, on_event=None):
     With ``on_event`` supplied and streaming available, the reply is consumed
     from the provider's stream and events are reported as they arrive:
     ("first_content", ""), ("text", str), ("action", str), ("object", str),
-    ("tokens", int) and ("error", str). Without it — or when the provider or transport cannot
+    ("output", int), ("usage", int) and ("error", str). Without it — or when the provider or transport cannot
     stream — a single blocking request is used instead.
     """
     global _json_mode_ok
@@ -352,4 +370,11 @@ def ask_model(messages, on_event=None):
         full = data["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError, TypeError):
         return json.dumps({"action": "done", "message": f"Unexpected response shape: {str(data)[:300]}"})
+    if on_event:
+        # A blocking reply is generated output too, and it always carries the
+        # provider's own usage record, so it needs no estimating.
+        on_event(("output", len(full)))
+        tokens = _completion_tokens(data)
+        if tokens is not None:
+            on_event(("usage", tokens))
     return _extract_json(full)

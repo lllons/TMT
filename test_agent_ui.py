@@ -68,7 +68,7 @@ def test_activity_readout_sits_against_the_right_edge():
     try:
         ui.start()
         ui.meaningful_output()
-        ui.add_tokens(363)
+        ui.add_output(363 * 4)
         ui._render_progress("Respond")
         row = ui._last_render
         assert "thinking" in row and "363 tokens" in row
@@ -88,7 +88,7 @@ def test_readout_is_dropped_whole_when_the_row_is_too_narrow():
     try:
         ui.start()
         ui.meaningful_output()
-        ui.add_tokens(363)
+        ui.add_output(363 * 4)
         ui._render_progress("A label long enough to crowd the row")
         row = ui._last_render
         assert "thinking" not in row          # dropped whole, never half-drawn
@@ -103,7 +103,7 @@ def test_token_count_accumulates_then_resets_with_the_next_task():
     ui.start()
     ui.meaningful_output()
     for _ in range(363):
-        ui.add_tokens()
+        ui.add_output(4)
     assert "363 tokens" in ui._activity()
     ui.stop()
     ui.start()                                # a new task starts from zero
@@ -117,7 +117,7 @@ def test_readout_appears_with_the_progress_bar_and_not_before():
     ui = LiveUI(stream=io.StringIO())
     try:
         ui.start()
-        ui.add_tokens(363)
+        ui.add_output(363 * 4)
         assert ui._activity() == ""            # THINKING owns the row alone
         assert "thinking\u2026" not in ui._last_render
         assert "363" not in ui._last_render
@@ -135,7 +135,7 @@ def test_finished_row_drops_the_in_flight_readout():
         ui = LiveUI(stream=io.StringIO())
         ui.start()
         ui.meaningful_output()
-        ui.add_tokens(363)
+        ui.add_output(363 * 4)
         ui.complete()
         assert ui._activity() == ""
         assert "thinking" not in ui._last_render
@@ -165,7 +165,7 @@ def test_painted_row_carries_no_more_columns_than_the_plain_one():
     try:
         ui.start()
         ui.meaningful_output()
-        ui.add_tokens(42)
+        ui.add_output(42 * 4)
         ui._render_progress("Respond")
         painted = ui.stream.getvalue().rsplit("\r", 1)[-1]
         assert display_width(visible(painted).lstrip("\033[2K")) <= 79

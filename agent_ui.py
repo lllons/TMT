@@ -35,6 +35,7 @@ RESET = "\033[0m"
 ACTIVITY_GLYPHS = ("✳", "✻", "✽", "✻")
 ACTIVITY_TICK = 0.4      # seconds each glyph is held
 ACTIVITY_GAP = 2         # minimum blank columns kept between the two halves
+CHARS_PER_TOKEN = 4      # token size assumed until the provider reports its own
 
 _ZWJ = "‍"
 _VARIATION_SELECTOR_16 = "️"
@@ -167,7 +168,8 @@ class LiveUI:
         self._last_render = ""
         self._label = "Just Started!"
         self._estimate = "calculating..."
-        self._tokens = 0
+        self._settled_tokens = 0
+        self._pending_chars = 0
         self._sink = None
 
     def attach_sink(self, sink):
@@ -175,15 +177,36 @@ class LiveUI:
         of writing it directly, so both share one terminal region."""
         self._sink = sink
 
-    def add_tokens(self, count=1):
-        """Add to the running token count shown in the activity readout.
+    def add_output(self, characters):
+        """Add generated characters to the running total.
 
-        Counted across the whole task rather than per request, so the figure
-        keeps climbing through the agent loop instead of resetting on each
+        Everything the model produces counts: the JSON that carries an action,
+        the paths and file contents inside it, and the reply the user reads.
+        Totals run across the whole task rather than per request, so the figure
+        keeps climbing through the agent loop instead of restarting on each
         call. The animation thread repaints often enough to show it.
         """
         with self._lock:
-            self._tokens += count
+            self._pending_chars += characters
+
+    def settle_tokens(self, tokens):
+        """Replace the estimate for the request that just finished with the
+        provider's own count, which is exact.
+
+        Earlier requests keep their settled figures, so a task mixing replies
+        that report usage with replies that do not stays correct rather than
+        being rebased on the last number to arrive.
+        """
+        with self._lock:
+            self._settled_tokens += tokens
+            self._pending_chars = 0
+
+    def _token_total(self):
+        """Settled counts plus an estimate for output not yet accounted for.
+
+        The caller holds the lock.
+        """
+        return self._settled_tokens + round(self._pending_chars / CHARS_PER_TOKEN)
 
     @property
     def progress_started(self):
@@ -195,7 +218,8 @@ class LiveUI:
             self._progress_started = False
             self._progress = 0
             self._events = 0
-            self._tokens = 0
+            self._settled_tokens = 0
+            self._pending_chars = 0
             self._started_at = time.monotonic()
         self._render("THINKING", painter=self._paint_cycle)
         self._thread = threading.Thread(target=self._animate, name="tmt-thinking", daemon=True)
@@ -213,9 +237,9 @@ class LiveUI:
         two places, what that word already says.
         """
         with self._lock:
-            started_at, tokens = self._started_at, self._tokens
             if not self._progress_started or self._progress >= 100:
                 return ""
+            started_at, tokens = self._started_at, self._token_total()
         elapsed = max(0, round(time.monotonic() - started_at))
         detail = f"{elapsed}s" if not tokens else f"{elapsed}s · ↓ {tokens} tokens"
         return f"{activity_glyph()} thinking… ({detail})"

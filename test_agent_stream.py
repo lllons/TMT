@@ -19,7 +19,7 @@ def chunk_text(text, size):
 
 def fake_stream(chunks):
     """Replace the transport with a scripted sequence of content fragments."""
-    def stream_chat(payload):
+    def stream_chat(payload, on_usage=None):
         for chunk in chunks:
             if isinstance(chunk, BaseException):
                 raise chunk
@@ -244,3 +244,88 @@ def test_keyboard_interrupt_leaves_no_live_workers():
     assert interrupted
     remaining = {thread.name for thread in threading.enumerate()} - before
     assert not remaining, remaining
+
+
+def total_counted(events):
+    """The token figure a LiveUI would show for this run of events."""
+    ui = LiveUI(stream=io.StringIO())
+    ui.start()
+    ui.meaningful_output()
+    for kind, value in events:
+        if kind == "output":
+            ui.add_output(value)
+        elif kind == "usage":
+            ui.settle_tokens(value)
+    with ui._lock:
+        total = ui._token_total()
+    ui.stop()
+    return total
+
+
+def test_counter_includes_the_json_plumbing_not_just_the_message():
+    """A write_file reply is mostly path and file content. All of it counts."""
+    reply = ('{"action":"write_file","path":"notes.txt",'
+             '"content":"line one\\nline two\\nline three","message":"ok"}')
+    _, events = collect(chunk_text(reply, 5))
+    counted = sum(value for kind, value in events if kind == "output")
+    assert counted == len(reply)
+    relayed = sum(len(value) for kind, value in events if kind == "text")
+    # The user-facing text is a small fraction of what the model generated.
+    assert relayed < counted / 3
+
+
+def test_every_generated_character_is_counted_once():
+    _, events = collect(chunk_text(RESPOND, 3))
+    assert sum(value for kind, value in events if kind == "output") == len(RESPOND)
+
+
+def test_provider_usage_supersedes_the_character_estimate():
+    """An exact count replaces the estimate rather than adding to it."""
+    events = [("output", 4000), ("usage", 137)]
+    assert total_counted(events) == 137
+
+
+def test_requests_that_report_usage_and_requests_that_do_not_both_count():
+    """First request settles exactly, the second is still being estimated."""
+    events = [("output", 400), ("usage", 90), ("output", 40)]
+    assert total_counted(events) == 90 + 10
+
+
+def test_the_blocking_transport_counts_its_output_too():
+    """A reply that never streamed still reaches the counter, exactly."""
+    reply = '{"action":"respond","message":"no streaming here"}'
+    original_stream, original_post = agent_model.stream_chat, agent_model._post_chat
+    agent_model.stream_chat = fake_stream([StreamError("HTTP 400: no streaming")])
+    agent_model._post_chat = lambda payload, spinner=True: (
+        {"choices": [{"message": {"content": reply}}],
+         "usage": {"completion_tokens": 11}}, None)
+    events = []
+    try:
+        raw = ask_model([{"role": "user", "content": "hi"}], on_event=events.append)
+    finally:
+        agent_model.stream_chat, agent_model._post_chat = original_stream, original_post
+    assert json.loads(raw)["action"] == "respond"
+    assert ("output", len(reply)) in events
+    assert ("usage", 11) in events
+    assert total_counted(events) == 11
+
+
+def test_a_usage_record_in_the_stream_is_not_relayed_as_content():
+    """The usage chunk must reach the counter without polluting the reply."""
+    original = agent_model.stream_chat
+
+    def stream_with_usage(payload, on_usage=None):
+        for piece in chunk_text(RESPOND, 6):
+            yield piece
+        if on_usage:
+            on_usage(29)
+
+    agent_model.stream_chat = stream_with_usage
+    events = []
+    try:
+        raw = ask_model([{"role": "user", "content": "hi"}], on_event=events.append)
+    finally:
+        agent_model.stream_chat = original
+    assert json.loads(raw) == json.loads(RESPOND)
+    assert ("usage", 29) in events
+    assert total_counted(events) == 29

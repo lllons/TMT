@@ -22,8 +22,8 @@ def stream_handler(live_ui, relay, state):
 
     Only real generated content moves the UI on: the first content event
     replaces THINKING with the progress bar, user-facing text goes to the live
-    relay, token events feed the activity readout, and structured action
-    events drive progress. Text never advances progress, so a long reply
+    relay, output and usage events feed the activity readout, and structured
+    action events drive progress. Text never advances progress, so a long reply
     cannot produce one step per token.
     """
     def handle(event):
@@ -32,8 +32,10 @@ def stream_handler(live_ui, relay, state):
             live_ui.meaningful_output()
         elif kind == "text":
             relay.feed(value)
-        elif kind == "tokens":
-            live_ui.add_tokens(value)
+        elif kind == "output":
+            live_ui.add_output(value)
+        elif kind == "usage":
+            live_ui.settle_tokens(value)
         elif kind == "action":
             live_ui.intermediate_event(ACTION_LABELS.get(value, "Processing..."))
         elif kind == "error":
