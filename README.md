@@ -1,94 +1,156 @@
 # TMT
 
-"To Many Tools" CLI coding agent.
+"Too Many Tools" — a CLI coding agent. It edits files in a sandboxed workspace, runs
+code in a dozen languages, and commits and pushes under its own git identity.
 
-## Quick start
+## Install
 
 Needs Python 3.8+.
 
 ```bash
 git clone https://github.com/lllons/TMT.git
 cd TMT
-pip install requests rich      # optional: adds live streaming + colour
-python TMT.py                  # Windows: py TMT.py      macOS/Linux: python3 TMT.py
+pip install requests rich      # optional: adds live streaming and colour
+python TMT.py                  # Windows: py TMT.py   macOS/Linux: python3 TMT.py
 ```
 
-First launch asks for an [OpenRouter key](https://openrouter.ai/keys) and saves it to `.tmt_key` (git-ignored). Set `OPENROUTER_API_KEY` in your environment to skip that.
+First launch asks for an [OpenRouter key](https://openrouter.ai/keys) and saves it to
+`.tmt_key` (git-ignored). Set `OPENROUTER_API_KEY` to skip that.
 
-Type a task at the `Task>` prompt; `quit` to exit. The agent only touches the `output/` folder, created beside the code on first launch.
+Type a task at the `Task>` prompt. `quit` or `exit` to leave. Ctrl-C cancels the
+current task without closing TMT.
 
-Run the tests with `python run_tests.py`.
+## Workspace
 
-## TMT Git Identity & Autonomous Push
+TMT only touches `output/`, created beside the code on first launch. Paths outside it
+are refused. Files under 8 KB are shown to the model automatically; larger ones are
+read on demand.
 
-Ask TMT things like "commit this", "commit and push to main", or "push this to git"
-and it will run the corresponding git commands itself, committing under its own
-identity rather than yours.
+## What you can ask for
 
-### Configuration
+Plain English. TMT picks the actions itself.
 
-TMT's identity comes from the first of these that supplies a value, highest first:
+```
+Task> write a python script that fetches a URL and prints the status code
+Task> what does report.py do?
+Task> find every TODO in src and list them
+Task> change the timeout in net.py from 5 to 30 seconds
+Task> run hello.py
+Task> open notes.txt in notepad
+Task> commit the changes and push to main
+```
 
-1. The `TMT_GIT_NAME` / `TMT_GIT_EMAIL` environment variables.
-2. `.tmt_git.local` beside the code — git-ignored, per machine.
-3. `.tmt_git` beside the code — tracked in the repo, so every clone has the same
-   TMT identity without anyone inventing an address for it.
-4. A built-in default for the name only, `TMT code`. There is no default email.
+### Files
 
-Both files are `key=value` lines; blank lines and `#` comments are ignored:
+| Action | Purpose |
+|---|---|
+| `write_file` / `write_files` | Create a file, or several at once |
+| `patch_file` | Search-and-replace — the default for edits |
+| `replace_lines` | Replace an exact line range |
+| `append_file` | Add to the end of a file |
+| `read_file` / `read_lines` | Read a whole file, or a line range |
+| `search_files` | Plain or regex search, optionally scoped to a folder |
+| `copy_file` / `rename_file` / `delete_file` | Move, rename, remove |
+| `create_folder` / `delete_folder` | Folders (recursive delete is opt-in) |
+| `list_files` | List the workspace |
+
+Editing an existing file uses `patch_file`, not a rewrite, so untouched lines stay
+untouched. Python files are syntax-checked before they are written; a broken edit is
+rejected rather than saved.
+
+### Running code
+
+`run_file` executes and returns the output. Python, JavaScript, TypeScript, Ruby,
+PHP, Lua, Perl, R, Go, C, C++, Java. 10-second timeout. The toolchain has to be on
+your PATH.
+
+### Apps
+
+`open_app` launches Notepad, or Explorer with a file selected. Nothing else — TMT
+never runs shell commands.
+
+## Git
+
+TMT commits under its own identity, not yours.
+
+```
+Task> commit this                        commits, does not push
+Task> commit these changes and push       commits and pushes
+Task> push this to main                   targets main
+Task> fix the bug                         edits only, no commit, no push
+```
+
+Commit and push are separate. TMT pushes only when your own words asked for one —
+"fix the bug" never triggers a push, and neither does finishing an edit.
+
+Actions: `git_status`, `git_diff`, `git_identity`, `git_commit`, `git_push`.
+
+It stages only the files it changed, so your unrelated work stays uncommitted. It
+never creates a branch, never invents a remote, and never force-pushes. If a push
+fails, the commit stays local and you get the real error.
+
+### Identity
 
 ```
 TMT_GIT_NAME=TMT code
-TMT_GIT_EMAIL=tmt-code@example.invalid
+TMT_GIT_EMAIL=someone@example.com
 ```
 
-The older `name=` / `email=` spelling still loads.
+Read in this order: `TMT_GIT_*` environment variables, then `.tmt_git.local`
+(git-ignored, per machine), then `.tmt_git` (tracked, ships with the project). The
+name defaults to `TMT code`. The email has no default and is never taken from your
+git config.
 
 `.tmt_git` is tracked on purpose: a commit email is public metadata, not a
-credential — it is printed in every commit of every public repo. Tokens, passwords
-and keys never go in it. Use `.tmt_git.local` or the environment for anything you
-do not want committed.
+credential, so every clone gets the same TMT identity without setup. Put no tokens,
+passwords or keys in it.
 
-The tracked file ships a placeholder address, not a real one. TMT detects it and
-refuses to commit rather than authoring commits under an address GitHub cannot
-attribute to anyone. Without a usable email, every commit action fails with a setup
-error instead of falling back to your identity.
+Run `git_identity` to see which source won.
 
-### Git identity vs. GitHub attribution vs. GitHub auth
+### Setting up GitHub attribution
 
-These are three separate things and TMT only controls one of them:
+`.tmt_git` ships with a placeholder, and TMT refuses to commit while it is there —
+an invented address identifies nobody. To make commits attribute to TMT:
 
-- **Git commit identity** — the author/committer name and email written into the
-  commit. TMT fully controls this, via `TMT_GIT_NAME`/`TMT_GIT_EMAIL`.
-- **GitHub contributor attribution** — whether GitHub shows the commit as made by
-  an account, with its avatar. GitHub decides this itself by matching the commit
-  email to an account's verified emails. TMT cannot force it. Setting a name alone
-  does nothing for this; it only works once the configured email has been added to
-  a GitHub account.
-- **GitHub authentication** — who is allowed to push at all. This is unchanged and
-  stays yours: your SSH key, credential manager, or `gh` login. TMT stores no
-  credentials and does not implement login.
+1. Create a GitHub account for TMT.
+2. Add and verify an address on it.
+3. Put that address in `.tmt_git` and commit it once.
 
-No attribution happens at all while `.tmt_git` still holds the shipped placeholder.
-It only starts once that line is replaced with an address verified on the GitHub
-account that represents TMT.
+Three separate things, only the first of which TMT controls:
 
-Your own git identity (global or repo-local `user.name`/`user.email`) is never
-touched, so your own commits are unaffected.
+- **Commit identity** — the author and committer written into the commit. TMT sets
+  this, for one git subprocess at a time. Your own `user.name` and `user.email` are
+  never read or modified, globally or per repo.
+- **GitHub attribution** — GitHub matches the commit email to a verified account. A
+  name alone does nothing.
+- **Authentication** — who may push. Stays yours: your SSH key, credential manager,
+  or `gh` login. TMT stores no credentials and implements no login.
 
-### Commit and push are separate
+## Interface
 
-Committing never implies pushing. TMT only pushes when your task actually asked for
-one ("push", "push to main", "commit and push", "send it to github", ...). If it
-didn't, the commit is made locally and TMT tells you it's ready to push, without
-sending anything to the remote.
+While a task runs: a THINKING animation until the first output, then a progress bar,
+elapsed time and a live token count. Model text is revealed character by character as
+it streams. The final answer is boxed.
 
-If a push fails, the commit stays local, TMT reports the real error, and it never
-force-pushes.
+Set `TMT_STREAM=0` to disable streaming.
 
-### Setting up the TMT GitHub account
+## Configuration
 
-To have commits show up as made by "TMT" on GitHub: create a dedicated GitHub
-account for it, add an address to that account and verify it, then put that address
-in `.tmt_git` in place of the placeholder. Only then will GitHub attribute the
-commits to it. This is a manual, one-time step outside TMT.
+| Variable | Default |
+|---|---|
+| `OPENROUTER_API_KEY` | from `.tmt_key` |
+| `OPENROUTER_MODEL` | `minimax/minimax-m3:free` |
+| `TMT_STREAM` | `1` |
+| `TMT_GIT_NAME` | `TMT code` |
+| `TMT_GIT_EMAIL` | none — required for commits |
+| `TMT_GIT_ROOT` | the repository containing the workspace |
+
+## Tests
+
+```bash
+python run_tests.py
+```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
