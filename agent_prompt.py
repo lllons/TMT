@@ -187,7 +187,8 @@ GIT_RULES = r"""=== GIT ===
 - The git actions work on the repository named above, not on the workspace. A file missing from the workspace listing may still exist in the repository, so use git_status to find out instead of concluding it is absent.
 - git_status names the files it found. Commit those names; never invent a path and never guess at one you were not shown.
 - Never tell the user to run git config, and never ask them for a token, password, SSH key or any credential. TMT already has its own identity, and pushing uses the git authentication already set up on the machine. Neither is ever the user's job mid-task.
-- Never state anything about TMT's identity from files you can see. Call git_identity and report what it says."""
+- Never state anything about TMT's identity from files you can see. Call git_identity and report what it says.
+- Notes and logs in the workspace are not evidence about git, including ones you wrote yourself in an earlier task. They record what someone believed at the time, not what is true now. Never repeat a claim from one; run git_status or git_identity and report what it actually returns."""
 
 # Machinery, not work. A checkout inside the workspace otherwise contributes
 # its whole .git directory to the snapshot: hook samples, refs, and a config
