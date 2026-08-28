@@ -1,9 +1,9 @@
-# TMT
+<p align="center">
+  <img src="assets/Recording%202026-08-29%20103658.gif" width="600">
+</p>
 
-"Too Many Tools" — a CLI coding agent. It edits files in a sandboxed workspace, runs
-code in a dozen languages, and commits and pushes under its own git identity.
 
-## Install
+## "Too Many Tools" — a CLI coding agent. It edits files in a sandboxed workspace, runs code in a dozen languages, and commits and pushes under its own git identity.
 
 Needs Python 3.8+.
 
