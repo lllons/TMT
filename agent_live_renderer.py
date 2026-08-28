@@ -40,6 +40,9 @@ SYMBOL_POOL = (
 
 ASCII_SYMBOL_POOL = ("+", "-", "*", "#", "@", "%", "&", "^", "~", "=", "<", ">", "/", "\\", "|", "?")
 
+BODY_LEFT = "『"                # frame edges: both are two columns wide
+BODY_RIGHT = "』"
+
 GLITCH_REVEAL_DURATION = 0.025   # seconds a character spends as a symbol
 REVEAL_TICK = 0.012              # renderer refresh period
 BACKLOG_ACCELERATE_AT = 48       # queued characters before the reveal speeds up
@@ -242,8 +245,15 @@ class LiveRegion:
         self.ansi = ansi
         self._drawn = 0
         self._last = None
+        # The relay worker and the status sink can both reach paint():
+        # one interleaved cursor-move sequence would corrupt the region.
+        self._paint_lock = threading.RLock()
 
     def paint(self, lines):
+        with self._paint_lock:
+            self._paint(lines)
+
+    def _paint(self, lines):
         if not self.ansi or lines == self._last:
             return
         self._last = list(lines)
@@ -261,14 +271,15 @@ class LiveRegion:
         self._write("".join(parts))
 
     def clear(self):
-        if not self.ansi or not self._drawn:
+        with self._paint_lock:
+            if not self.ansi or not self._drawn:
+                self._drawn, self._last = 0, None
+                return
+            parts = ["\033[%dA" % self._drawn]
+            parts.extend("\r\033[2K\n" for _ in range(self._drawn))
+            parts.append("\033[%dA" % self._drawn)
             self._drawn, self._last = 0, None
-            return
-        parts = ["\033[%dA" % self._drawn]
-        parts.extend("\r\033[2K\n" for _ in range(self._drawn))
-        parts.append("\033[%dA" % self._drawn)
-        self._drawn, self._last = 0, None
-        self._write("".join(parts))
+            self._write("".join(parts))
 
     def _write(self, text):
         try:
@@ -368,16 +379,25 @@ class LiveRelay:
         lines = [status] if status else []
         if not body:
             return lines
-        inner = max(10, width - 4)
+        # BODY_LEFT and BODY_RIGHT are East Asian wide: two columns each, not
+        # one. Measure the chrome instead of assuming it, and leave a spare
+        # column so a full row never reaches the terminal's auto-wrap. A
+        # wrapped row silently costs a second screen line, which the cursor
+        # moves in LiveRegion.paint do not count, so every repaint would land
+        # too high and march the frame down the screen.
+        chrome = display_width(BODY_LEFT) + display_width(BODY_RIGHT) + 2
+        inner = max(10, width - chrome - 1)
         # Keep the whole region on screen: a region taller than the terminal
         # would scroll away from the cursor moves that repaint it.
         visible = max(1, min(self.body_lines, size.lines - 4))
         wrapped = wrap_lines(body, inner)[-visible:]
         stream, phase = self.region.stream, gradient_phase()
-        lines.append(cycle_text("┌" + "─" * (inner + 2) + "┐", stream, phase))
-        left, right = cycle_text("『", stream, phase), cycle_text("』", stream, phase + 0.5)
+        rule = "─" * (inner + chrome - 2)
+        lines.append(cycle_text("┌" + rule + "┐", stream, phase))
+        left = cycle_text(BODY_LEFT, stream, phase)
+        right = cycle_text(BODY_RIGHT, stream, phase + 0.5)
         lines.extend(f"{left} {pad_to_width(line, inner)} {right}" for line in wrapped)
-        lines.append(cycle_text("└" + "─" * (inner + 2) + "┘", stream, phase + 0.5))
+        lines.append(cycle_text("└" + rule + "┘", stream, phase + 0.5))
         return lines
 
     def wait_for_reveal(self, timeout=FINALIZE_TIMEOUT):

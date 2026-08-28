@@ -1,6 +1,7 @@
 """Tests for the character-by-character reveal used by the live relay."""
 
 import io
+import re
 import threading
 import time
 
@@ -8,6 +9,8 @@ from agent_live_renderer import (
     ASCII_SYMBOL_POOL, GLITCH_REVEAL_DURATION, GlitchStream, LiveRegion,
     LiveRelay, SYMBOL_POOL, display_width, iter_graphemes, wrap_lines,
 )
+
+ANSI_RE = re.compile("\033\[[0-9;]*m")
 
 
 def drain(glitch, limit=5.0):
@@ -228,3 +231,49 @@ def test_wrapping_and_width_handle_wide_characters():
     assert wrap_lines("abcdef", 3) == ["abc", "def"]
     assert wrap_lines("a\nbb", 4) == ["a", "bb"]
     assert all(display_width(line) <= 4 for line in wrap_lines("你好你好", 4))
+
+
+def visible_width(line):
+    """Columns a painted line really occupies, ignoring colour escapes."""
+    return display_width(ANSI_RE.sub("", line))
+
+
+def test_every_painted_row_fits_inside_the_terminal(monkeypatch=None):
+    """The frame edges are two columns wide each, so a row budgeting only four
+    columns of chrome overflows, wraps, and desyncs LiveRegion's cursor moves.
+    """
+    import shutil as _shutil
+    import agent_live_renderer as renderer
+
+    original = renderer.shutil.get_terminal_size
+    try:
+        for columns in (24, 40, 80, 100, 120, 200):
+            renderer.shutil.get_terminal_size = (
+                lambda default=None, c=columns: _shutil.os.terminal_size((c, 24))
+            )
+            relay = LiveRelay(stream=io.StringIO(), ansi=True)
+            relay.streamed = True
+            body = "A response long enough to wrap several times. " * 6
+            painted = relay._compose("███░░░ 23% Respond", body)
+            widths = {visible_width(line) for line in painted[1:]}
+            assert max(widths) < columns, (columns, sorted(widths))
+            # One box: every row of the frame is the same width.
+            assert len(widths) == 1, (columns, sorted(widths))
+    finally:
+        renderer.shutil.get_terminal_size = original
+
+
+def test_a_repaint_never_grows_the_region_it_replaces():
+    """Two frames of equal line count must repaint in place, not stack up."""
+    output = io.StringIO()
+    relay = LiveRelay(stream=output, ansi=True)
+    relay.set_status("███░░░ 23% Respond")
+    relay.feed("first chunk of the reply")
+    relay.glitch.reveal_all()
+    relay._repaint()
+    drawn = relay.region._drawn
+    relay.set_status("████░░ 31% Respond")
+    relay._repaint()
+    assert relay.region._drawn == drawn
+    assert output.getvalue().count("[%dA" % drawn) >= 1
+    relay.abort()
