@@ -2,8 +2,9 @@
 # metadata, not a credential, so every clone gets the same TMT identity.
 # Never put tokens, passwords or keys in this file.
 #
-# Replace the address below with one verified on the GitHub account that
-# represents TMT. Until then TMT refuses to commit rather than authoring
-# commits under an address GitHub cannot attribute to anyone.
+# This address belongs to the GitHub account that represents TMT:
+# https://github.com/TMT-git
+# GitHub attributes a commit to that account by matching this address
+# against the addresses verified on it.
 TMT_GIT_NAME=TMT code
-TMT_GIT_EMAIL=REPLACE_WITH_TMT_GITHUB_ACCOUNT_EMAIL
+TMT_GIT_EMAIL=tmt.tmt@gmail.com
