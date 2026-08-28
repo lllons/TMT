@@ -79,7 +79,9 @@ def test_whitespace_is_never_disguised():
 def test_spaces_inside_text_stay_spaces():
     glitch = GlitchStream()
     glitch.feed("Hello world")
-    assert glitch.display_text()[5] == " "
+    # By grapheme, not by string index: a symbol standing in for one character
+    # can itself be several code points, which shifts every later index.
+    assert iter_graphemes(glitch.display_text())[5] == " "
 
 
 def test_text_is_exact_at_every_moment():

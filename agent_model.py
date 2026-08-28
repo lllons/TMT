@@ -292,6 +292,9 @@ def _ask_model_streaming(messages, on_event):
                 if not seen_content:
                     seen_content = True
                     on_event(("first_content", ""))
+                # Providers emit one delta per token, so counting deltas gives
+                # a live figure without waiting for the final usage record.
+                on_event(("tokens", 1))
                 for event in parser.feed(content):
                     on_event(event)
         except StreamError as error:
@@ -322,8 +325,8 @@ def ask_model(messages, on_event=None):
 
     With ``on_event`` supplied and streaming available, the reply is consumed
     from the provider's stream and events are reported as they arrive:
-    ("first_content", ""), ("text", str), ("action", str), ("object", str) and
-    ("error", str). Without it — or when the provider or transport cannot
+    ("first_content", ""), ("text", str), ("action", str), ("object", str),
+    ("tokens", int) and ("error", str). Without it — or when the provider or transport cannot
     stream — a single blocking request is used instead.
     """
     global _json_mode_ok

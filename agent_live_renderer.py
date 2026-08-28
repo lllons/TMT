@@ -11,10 +11,9 @@ import shutil
 import sys
 import threading
 import time
-import unicodedata
 from collections import deque
 
-from agent_ui import GRADIENT_TICK, cycle_text, gradient_phase
+from agent_ui import GRADIENT_TICK, cycle_text, display_width, gradient_phase
 
 SYMBOL_POOL = (
     "↖", "↗", "↘", "↙", "↑", "↓", "↔", "↕", "↩", "↪", "↰", "↱", "↲", "↳", "↺", "↻",
@@ -68,19 +67,6 @@ _WHITESPACE = {" ", "\n", "\r", "\t", "\r\n", "\v", "\f"}
 def iter_graphemes(text):
     """Split text into user-perceived characters without breaking Unicode."""
     return [match.group() for match in _GRAPHEME_RE.finditer(text)] if text else []
-
-
-def display_width(text):
-    """Terminal columns occupied by text, treating wide characters as two."""
-    width = 0
-    for char in text:
-        if unicodedata.combining(char) or char == _ZWJ:
-            continue
-        if char == _VARIATION_SELECTOR_16:
-            width += 1
-            continue
-        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
-    return width
 
 
 def pad_to_width(text, width):

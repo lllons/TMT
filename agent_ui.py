@@ -6,6 +6,7 @@ import shutil
 import sys
 import threading
 import time
+import unicodedata
 from typing import Optional
 
 
@@ -28,6 +29,54 @@ GRADIENT_CYCLE = 2.4     # seconds for one full there-and-back pass
 GRADIENT_TICK = 0.08     # repaint period while a surface is animating
 DIM = "\033[38;2;88;88;88m"
 RESET = "\033[0m"
+
+# The activity readout drawn hard against the right edge of the status row,
+# opposite the progress bar: a turning glyph, elapsed time and token count.
+ACTIVITY_GLYPHS = ("✳", "✻", "✽", "✻")
+ACTIVITY_TICK = 0.4      # seconds each glyph is held
+ACTIVITY_GAP = 2         # minimum blank columns kept between the two halves
+
+_ZWJ = "‍"
+_VARIATION_SELECTOR_16 = "️"
+
+
+def display_width(text):
+    """Terminal columns occupied by text, treating wide characters as two."""
+    width = 0
+    for char in text:
+        if unicodedata.combining(char) or char == _ZWJ:
+            continue
+        if char == _VARIATION_SELECTOR_16:
+            width += 1
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+    return width
+
+
+def fit_to_width(text, columns):
+    """Trim text to at most `columns` terminal columns.
+
+    Measured rather than counted, so a full-width or combining style cannot
+    overflow the row and wrap onto a second screen line.
+    """
+    if display_width(text) <= columns:
+        return text
+    kept, used = [], 0
+    for char in text:
+        size = display_width(char)
+        # Zero-width marks never reach the break, so they stay attached to the
+        # base character rather than being orphaned onto a space.
+        if used + size > columns:
+            break
+        kept.append(char)
+        used += size
+    return "".join(kept)
+
+
+def activity_glyph(now=None):
+    """The glyph standing in for a spinner, advanced by the wall clock."""
+    now = time.monotonic() if now is None else now
+    return ACTIVITY_GLYPHS[int(now / ACTIVITY_TICK) % len(ACTIVITY_GLYPHS)]
 
 
 def _supports_color(stream) -> bool:
@@ -118,12 +167,23 @@ class LiveUI:
         self._last_render = ""
         self._label = "Just Started!"
         self._estimate = "calculating..."
+        self._tokens = 0
         self._sink = None
 
     def attach_sink(self, sink):
         """Route the status line through a renderer (the live relay) instead
         of writing it directly, so both share one terminal region."""
         self._sink = sink
+
+    def add_tokens(self, count=1):
+        """Add to the running token count shown in the activity readout.
+
+        Counted across the whole task rather than per request, so the figure
+        keeps climbing through the agent loop instead of resetting on each
+        call. The animation thread repaints often enough to show it.
+        """
+        with self._lock:
+            self._tokens += count
 
     @property
     def progress_started(self):
@@ -135,6 +195,7 @@ class LiveUI:
             self._progress_started = False
             self._progress = 0
             self._events = 0
+            self._tokens = 0
             self._started_at = time.monotonic()
         self._render("THINKING", painter=self._paint_cycle)
         self._thread = threading.Thread(target=self._animate, name="tmt-thinking", daemon=True)
@@ -142,6 +203,27 @@ class LiveUI:
 
     def _paint_cycle(self, text):
         return cycle_text(text, self.stream)
+
+    def _activity(self):
+        """The right-hand readout: turning glyph, elapsed time, tokens seen."""
+        with self._lock:
+            started_at, tokens = self._started_at, self._tokens
+            # An in-flight indicator has no place on a finished row.
+            if self._progress >= 100:
+                return ""
+        elapsed = max(0, round(time.monotonic() - started_at))
+        detail = f"{elapsed}s" if not tokens else f"{elapsed}s · ↓ {tokens} tokens"
+        return f"{activity_glyph()} thinking… ({detail})"
+
+    def _paint_activity(self, text):
+        """Glyph and word ride the shared cycle; the detail stays dim."""
+        head, separator, tail = text.partition(" (")
+        if not separator:
+            return cycle_text(text, self.stream)
+        detail = separator + tail
+        if not _supports_color(self.stream):
+            return head + detail
+        return cycle_text(head, self.stream) + DIM + detail + RESET
 
     def _animate(self):
         """Keep the colour cycle turning for as long as the line is on screen.
@@ -212,19 +294,39 @@ class LiveUI:
         if clear:
             self._clear()
 
-    def _render(self, text, painter=None):
-        """Render one plain line, optionally painted after truncation.
+    def _render(self, text, painter=None, optional=""):
+        """Render one status row: `text` on the left, the activity readout
+        against the right edge.
 
-        Truncation happens before painting so an escape sequence can never be
-        cut in half, and `_last_render` stays readable text.
+        `optional` is a lower-priority tail of the left half — the finish
+        estimate — which is given up first when the row cannot hold
+        everything, because the readout already carries the elapsed time.
+        Only if the row still will not fit is the readout dropped, and then
+        whole rather than truncated to a fragment.
+
+        Both halves are trimmed and measured in terminal columns before they
+        are painted, so an escape sequence is never cut in half, the row can
+        never overflow onto a second screen line, and `_last_render` stays
+        readable text.
         """
         with self._lock:
             if not self._active:
                 return
-        width = shutil.get_terminal_size((80, 24)).columns
-        text = text[:max(1, width - 1)]
-        self._last_render = text
-        painted = painter(text) if painter else text
+        budget = max(1, shutil.get_terminal_size((80, 24)).columns - 1)
+        right = self._activity()
+        for left in ((text + optional, text) if optional else (text,)):
+            left = fit_to_width(left, budget)
+            gap = budget - display_width(left) - display_width(right)
+            if right and gap >= ACTIVITY_GAP:
+                self._last_render = left + " " * gap + right
+                self._write_row((painter(left) if painter else left)
+                                + " " * gap + self._paint_activity(right))
+                return
+        left = fit_to_width(text + optional, budget)
+        self._last_render = left
+        self._write_row(painter(left) if painter else left)
+
+    def _write_row(self, painted):
         if self._sink is not None:
             self._sink(painted)
             return
@@ -240,15 +342,16 @@ class LiveUI:
         width = min(12, max(4, shutil.get_terminal_size((80, 24)).columns // 8))
         bar = "█" * round(width * progress / 100) + "░" * (width - round(width * progress / 100))
         line = f"{bar} {progress:>3}% {label}"
+        detail = ""
         if estimate and progress < 100:
             elapsed = max(0.01, time.monotonic() - self._started_at)
             estimate_text = estimate if progress >= 95 else f"~{max(1, round(elapsed * (100 - progress) / max(1, progress)))} seconds"
-            line += f" | Estimated finish: {estimate_text}"
+            detail = f" | Estimated finish: {estimate_text}"
 
         def paint(text, bar_width=len(bar)):
             return cycle_bar(progress, self.stream, width=bar_width) + text[bar_width:]
 
-        self._render(line, painter=paint)
+        self._render(line, painter=paint, optional=detail)
 
     def _clear(self):
         if self._sink is not None:
