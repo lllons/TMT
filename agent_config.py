@@ -10,7 +10,9 @@ from pathlib import Path
 
 try:
     import requests
+    HAS_REQUESTS = True
 except ModuleNotFoundError:
+    HAS_REQUESTS = False
     class _Response:
         def __init__(self, response):
             self._response = response
@@ -84,7 +86,9 @@ except ModuleNotFoundError:
 
 json_module = json
 console = Console()
-ROOT_DIR = Path(r"C:\Coding\chat\dist").resolve()
+# Workspace the agent is allowed to touch: an "output" folder beside this
+# module, created on first launch.
+ROOT_DIR = (Path(__file__).resolve().parent / "output").resolve()
 ROOT_DIR.mkdir(parents=True, exist_ok=True)
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -94,6 +98,9 @@ APP_TITLE = "Local File AI"
 APP_URL = "http://localhost"
 USE_JSON_MODE = False
 _json_mode_ok = USE_JSON_MODE
+# Live relay: stream model output as it is generated. Requires the real
+# requests package (the urllib fallback shim above cannot stream responses).
+STREAM_ENABLED = HAS_REQUESTS and os.environ.get("TMT_STREAM", "1").lower() not in {"0", "false", "no", "off"}
 FORCE_IPV4 = True
 VERIFY_SSL = True
 

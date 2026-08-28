@@ -59,6 +59,12 @@ class LiveUI:
         self._events = 0
         self._started_at = 0.0
         self._last_render = ""
+        self._sink = None
+
+    def attach_sink(self, sink):
+        """Route the status line through a renderer (the live relay) instead
+        of writing it directly, so both share one terminal region."""
+        self._sink = sink
 
     @property
     def progress_started(self):
@@ -134,9 +140,12 @@ class LiveUI:
                 return
         width = shutil.get_terminal_size((80, 24)).columns
         text = text[:max(1, width - 1)]
+        self._last_render = text
+        if self._sink is not None:
+            self._sink(text)
+            return
         self.stream.write("\r\033[2K" + text)
         self.stream.flush()
-        self._last_render = text
 
     def _render_progress(self, label, estimate="calculating..."):
         with self._lock:
@@ -154,6 +163,9 @@ class LiveUI:
         self._render(line)
 
     def _clear(self):
+        if self._sink is not None:
+            self._sink("")
+            return
         self.stream.write("\r\033[2K")
         self.stream.flush()
 
