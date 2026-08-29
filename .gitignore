@@ -2,6 +2,11 @@ __pycache__/
 *.pyc
 output/
 .tmt_key
+# Per-provider API keys, and the temporary file they are written through.
+# Obfuscated, not encrypted: staying out of commits is half of what protects
+# them, the file permissions being the other half.
+.tmt_providers.json
+.tmt_providers.json.tmp
 .tmt_git.local
 activatevenv.exe
 logs/

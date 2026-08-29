@@ -230,8 +230,11 @@ def test_a_saved_choice_survives_a_fresh_read_and_moves_agent_config():
         assert agent_models.set_model(chosen) == chosen
         assert agent_config.MODEL == chosen
         # Read from the disk again rather than trusting the value just set.
-        on_disk = agent_models.MODEL_FILE.read_text(encoding="utf-8").strip()
-        assert on_disk == chosen, on_disk
+        # The file records a choice per provider, since a model id is only
+        # meaningful to the provider that issued it.
+        on_disk = agent_models.MODEL_FILE.read_text(encoding="utf-8")
+        assert chosen in on_disk, on_disk
+        assert "openrouter" in on_disk, on_disk
         assert agent_models.read_saved_model() == chosen
         assert agent_models.current_model() == chosen
         assert agent_models.describe() == agent_models.FREE_MODELS[2]["label"]
@@ -343,9 +346,13 @@ def test_settings_enter_changes_the_current_model():
     box = Sandbox()
     chosen = agent_models.FREE_MODELS[1]["id"]
     try:
-        # The cursor starts on the active model, which with nothing saved is
-        # the default, the first row; one move down reaches the second.
-        choice, keys = start(box, "down", "enter", "down", "enter", "quit")
+        # Settings is a submenu now: down/enter opens it on AI Provider, two
+        # moves down reach Model, and Enter opens the picker. There the cursor
+        # starts on the active model, which with nothing saved is the default,
+        # the first row; one move down reaches the second. Esc leaves the
+        # submenu, which is why the run ends back on the menu.
+        choice, keys = start(box, "down", "enter", "down", "down", "enter",
+                             "down", "enter", "esc", "quit")
         assert agent_models.current_model() == chosen, agent_models.current_model()
         assert agent_models.read_saved_model() == chosen
         assert agent_config.MODEL == chosen

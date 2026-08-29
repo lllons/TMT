@@ -26,23 +26,76 @@ def _headers(stream=False):
         headers["Accept"] = "text/event-stream"
     return headers
 
+def _model_for_request():
+    """The model id for whichever provider is selected right now.
+
+    Read here rather than taken from agent_config.MODEL, because a model id is
+    only meaningful to the provider that issued it and the provider can change
+    between requests.
+    """
+    try:
+        import agent_models
+        return agent_models.current_model()
+    except Exception:
+        return _config.MODEL
+
+
+def selected_provider():
+    """The provider to call and the credential for it, resolved at call time.
+
+    Returns (provider, key, error). Settings can change either of the first two
+    mid-session, so neither is bound at import. An empty credential is reported
+    as an error here rather than sent, because a request without one comes back
+    as an authentication failure that reads like a broken key rather than a
+    missing one.
+    """
+    try:
+        import agent_credentials
+        import agent_providers
+    except Exception as error:
+        return None, "", f"Provider support is unavailable: {error}"
+    try:
+        provider = agent_providers.get_provider(agent_credentials.selected_provider())
+    except Exception:
+        provider = agent_providers.get_provider(agent_providers.DEFAULT_PROVIDER)
+    key = agent_credentials.credential(provider.id)
+    if not key:
+        return None, "", (
+            f"No API key is set for {provider.label}. Open Settings, choose "
+            "API Key, and add one."
+        )
+    return provider, key, ""
+
+
 def _post_chat(payload, spinner=True):
-    if spinner:
-        with console.status("[bold cyan]Thinking...[/bold cyan]", spinner="dots"):
-            response = _session.post(OPENROUTER_URL, headers=_headers(), json=payload, timeout=120, verify=VERIFY_SSL)
-    else:
-        response = _session.post(OPENROUTER_URL, headers=_headers(), json=payload, timeout=120, verify=VERIFY_SSL)
+    import agent_providers
+    provider, key, problem = selected_provider()
+    if problem:
+        return None, problem
+
+    def call():
+        return agent_providers.complete(
+            provider, key, payload.get("messages") or [],
+            model=payload.get("model"),
+            max_tokens=payload.get("max_tokens", 4096),
+            json_mode="response_format" in payload,
+        )
+
     try:
-        response.raise_for_status()
-    except requests.HTTPError:
-        return None, f"HTTP {response.status_code}: {response.text[:300]}"
-    try:
-        data = response.json()
-    except ValueError:
-        return None, f"reply was not JSON: {response.text[:300]}"
-    if "error" in data:
-        error = data["error"]
-        return None, error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        if spinner:
+            with console.status("[bold cyan]Thinking...[/bold cyan]", spinner="dots"):
+                text, tokens = call()
+        else:
+            text, tokens = call()
+    except agent_providers.ProviderError as error:
+        return None, str(error)
+    except Exception as error:
+        return None, f"{type(error).__name__}: {error}"
+    # Re-shaped into the single internal form ask_model reads, so no provider's
+    # own response layout escapes this module.
+    data = {"choices": [{"message": {"content": text}}]}
+    if tokens is not None:
+        data["usage"] = {"completion_tokens": tokens}
     return data, None
 
 class StreamError(RuntimeError):
@@ -62,11 +115,35 @@ def _completion_tokens(data):
     return None
 
 def stream_chat(payload, on_usage=None):
-    """Yield content fragments from the provider's server-sent event stream.
+    """Yield content fragments from the selected provider's stream.
 
-    Only generated content is yielded: SSE comments, keep-alives and role
-    deltas never reach the caller. A usage record, when the provider sends
-    one, goes to ``on_usage`` instead of the content stream.
+    The payload is TMT's own shape rather than any provider's; the adapter
+    converts it and normalises the stream, so every provider arrives here as
+    the same sequence of text fragments the action parser already reads.
+    """
+    import agent_providers
+    provider, key, problem = selected_provider()
+    if problem:
+        raise StreamError(problem)
+    try:
+        for fragment in agent_providers.stream_completion(
+            provider, key, payload.get("messages") or [],
+            model=payload.get("model"),
+            max_tokens=payload.get("max_tokens", 4096),
+            on_usage=on_usage,
+            json_mode="response_format" in payload,
+        ):
+            yield fragment
+    except agent_providers.ProviderError as error:
+        raise StreamError(str(error))
+    return
+
+
+def _legacy_openrouter_stream(payload, on_usage=None):
+    """The direct OpenRouter reader, kept for reference and for tests.
+
+    Superseded by the provider adapters, which reproduce this exchange
+    byte for byte for OpenRouter and add the other three.
     """
     response = _session.post(
         OPENROUTER_URL, headers=_headers(stream=True), json=payload,
@@ -307,7 +384,8 @@ def _ask_model_streaming(messages, on_event):
     """
     global _json_mode_ok
     for attempt in (0, 1):
-        payload = {"model": _config.MODEL, "max_tokens": 4096, "messages": messages, "stream": True}
+        payload = {"model": _model_for_request(), "max_tokens": 4096,
+                   "messages": messages, "stream": True}
         if _json_mode_ok:
             payload["response_format"] = {"type": "json_object"}
         parser = StreamingActionParser()
@@ -365,7 +443,7 @@ def ask_model(messages, on_event=None):
             return raw
         if not fall_back:
             return _error_reply("stream ended without a reply")
-    base = {"model": _config.MODEL, "max_tokens": 4096, "messages": messages}
+    base = {"model": _model_for_request(), "max_tokens": 4096, "messages": messages}
     payload = dict(base)
     if _json_mode_ok:
         payload["response_format"] = {"type": "json_object"}
