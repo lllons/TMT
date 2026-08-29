@@ -521,7 +521,14 @@ class Turn:
         if on_event is not None:
             on_event(("first_content", ""))
             on_event(("output", len(raw)))
-            obj = json.loads(raw)
+            try:
+                obj = json.loads(raw)
+            except ValueError:
+                # A reply that cannot be read reports no progress and no next
+                # step, which is what the real parser does with one: it never
+                # reaches the keys. Scripting an unreadable reply has to be
+                # possible here, because that is the case the loop hands back.
+                obj = {}
             # The real parser reports these mid-stream, before the object is
             # finished; reporting them here is the same contract.
             if obj.get("progress"):
@@ -710,19 +717,197 @@ def test_a_turn_that_failed_still_leaves_its_question_in_the_context():
     or a run out of steps dropped the user's QUESTION with it. The next
     question arrived with no sign the exchange had happened, which is exactly
     what "it has no context between prompts" looked like from outside."""
+    # Unreadable replies all the way down, so the retries really are spent
+    # rather than the turn ending on the first one. One more than the ceiling
+    # allows: the first attempt plus MAX_INVALID_RETRIES corrections.
+    #
+    # Each one different, so it is the retry ceiling being reached and not the
+    # circuit breaker, which stops three IDENTICAL replies and would otherwise
+    # get there first. Both are wanted; this is the test for one of them.
+    attempts = TMT.MAX_INVALID_RETRIES + 1
     drawn, seen, console = drive_session(
         ["translate the readme", "did that work?", "quit"],
-        ['{"action": "respond" "message": "broken"}',
-         json.dumps({"action": "done", "message": "Second turn answered."})])
+        ['{"action": "respond" "message": "broken %d"}' % number
+         for number in range(attempts)]
+        + [json.dumps({"action": "done", "message": "Second turn answered."})])
 
-    assert "Bad JSON" in console.said(), console.said()
+    # It really did keep asking, and it really did stop.
+    assert len(seen) == attempts + 1, len(seen)
+    assert "Gave up" in console.said(), console.said()
     # The second question carries the first, and says plainly what became of
     # it -- said by TMT, on the question, not as words the model never wrote.
     second = seen[-1]
     assert [message["role"] for message in second] == ["system", "user", "user"], second
     assert "translate the readme" in second[1]["content"], second[1]
-    assert "could not be read as JSON" in second[1]["content"], second[1]
+    assert "could not produce a usable action" in second[1]["content"], second[1]
     assert second[-1]["content"] == "did that work?", second[-1]
+
+
+def test_a_model_repeating_one_unreadable_reply_is_stopped_before_the_ceiling():
+    """The retry budget answers a model that is getting it wrong; the circuit
+    breaker answers one that is stuck. A model sending the SAME reply three
+    times is not correcting anything, so waiting for the full budget would be
+    six more requests to learn what the third already said.
+
+    This path had no test at all before retries made it reachable: nothing
+    used to send the same reply three times, because the first one ended the
+    turn."""
+    drawn, seen, console = drive_session(
+        ["translate the readme", "quit"],
+        ['{"action": "respond" "message": "stuck"}'] * 6)
+
+    assert "Circuit Breaker" in console.said(), console.said()
+    # Three identical replies, and it stopped there rather than spending the
+    # whole retry budget.
+    assert len(seen) == 4, len(seen)
+
+
+def test_an_unreadable_reply_is_handed_back_and_the_turn_carries_on():
+    """The defect this exists for. An action that failed validation had always
+    been returned to the model to be corrected, but a reply that would not
+    parse ended the turn where it stood -- throwing away whatever the turn had
+    already done and making the user ask the same question again. The two are
+    the same kind of mistake and now get the same answer."""
+    drawn, files = run_turn([
+        '{"action": "write_file" "path": "a.txt"}',      # no comma: unreadable
+        json.dumps({"action": "write_file", "path": "notes.txt",
+                    "content": "one\ntwo\n"}),
+        json.dumps({"action": "done", "message": "Wrote notes.txt."}),
+    ])
+
+    # The work happened, in the same turn, with no second question asked.
+    assert files.get("notes.txt") == "one\ntwo\n", files
+    assert "Wrote notes.txt." in drawn, drawn
+    # And what could not be read was never shown as the answer.
+    assert "broken" not in drawn, drawn
+    assert '"path": "a.txt"' not in drawn, drawn
+
+
+def test_a_truncated_reply_is_handed_back_like_any_other_unreadable_one():
+    """A stream that stops mid-object leaves brace-balanced nonsense or no
+    close at all. Either way it is unreadable, and unreadable is recoverable."""
+    drawn, files = run_turn([
+        '{"action": "write_file", "path": "a.txt", "content": "half',
+        json.dumps({"action": "write_file", "path": "whole.txt", "content": "x"}),
+        json.dumps({"action": "done", "message": "Recovered."}),
+    ])
+    assert files.get("whole.txt") == "x", files
+    assert "a.txt" not in files, files            # the truncated one never ran
+    assert "Recovered." in drawn, drawn
+
+
+def test_arguments_the_action_cannot_use_end_the_action_and_not_the_program():
+    """`execute_action` reads its arguments straight off the object, so a key
+    of the wrong type raised through the loop and out of main -- a model
+    writing a number where a path belongs could end the session. It is the
+    model's mistake and the model can correct it."""
+    drawn, files = run_turn([
+        json.dumps({"action": "write_file", "path": 123, "content": "x"}),
+        json.dumps({"action": "write_file", "path": "ok.txt", "content": "x"}),
+        json.dumps({"action": "done", "message": "Wrote ok.txt."}),
+    ])
+    assert files.get("ok.txt") == "x", files
+    assert "Wrote ok.txt." in drawn, drawn
+
+
+def test_a_missing_key_and_an_unknown_action_are_both_handed_back():
+    """Two validation failures that used to be handed back only for a batch.
+    Neither ends the task; both are corrected in the same turn."""
+    drawn, files = run_turn([
+        json.dumps({"action": "patch_file", "path": "a.txt", "search": "x"}),
+        json.dumps({"action": "frobnicate", "path": "a.txt"}),
+        json.dumps({"action": "write_file", "path": "fixed.txt", "content": "y"}),
+        json.dumps({"action": "done", "message": "Corrected twice."}),
+    ])
+    assert files.get("fixed.txt") == "y", files
+    assert "Corrected twice." in drawn, drawn
+
+
+def test_an_announcement_is_shown_and_the_work_still_happens():
+    """The progress defect. `respond` ends the task, which is right for an
+    answer and wrong for the sentence a model writes before it starts, so
+    "I'll inspect the files first" ended the turn with nothing inspected and
+    nothing to show for it. `final: false` is how the two are told apart."""
+    drawn, files = run_turn([
+        json.dumps({"action": "respond", "final": False,
+                    "message": "I'll inspect the files first."}),
+        json.dumps({"action": "write_file", "path": "made.txt", "content": "z"}),
+        json.dumps({"action": "done", "message": "Inspected and written."}),
+    ])
+
+    assert "I'll inspect the files first." in drawn, drawn   # the user saw it
+    assert files.get("made.txt") == "z", files               # and it carried on
+    assert "Inspected and written." in drawn, drawn
+    # The announcement is not the answer, so it is not in the answer's box.
+    assert drawn.index("I'll inspect the files first.") < drawn.index("Inspected and written."), drawn
+
+
+def test_several_announcements_can_come_before_the_answer():
+    """Nothing about an announcement is once-only. A model that narrates two
+    steps before it finishes is doing what it was asked to do."""
+    drawn, files = run_turn([
+        json.dumps({"action": "respond", "final": False, "message": "First I look."}),
+        json.dumps({"action": "respond", "final": False, "message": "Now I write."}),
+        json.dumps({"action": "write_file", "path": "two.txt", "content": "q"}),
+        json.dumps({"action": "done", "message": "Both said, one written."}),
+    ])
+    assert "First I look." in drawn and "Now I write." in drawn, drawn
+    assert files.get("two.txt") == "q", files
+    assert "Both said, one written." in drawn, drawn
+
+
+def test_a_result_still_reaches_the_model_after_an_announcement():
+    """An announcement must not break the chain the loop runs on: the action
+    after it still runs, and its result still comes back as the user turn the
+    model reads next."""
+    drawn, seen, _ = drive_session(
+        ["look around", "quit"],
+        [json.dumps({"action": "respond", "final": False, "message": "Looking."}),
+         json.dumps({"action": "list_files"}),
+         json.dumps({"action": "done", "message": "Looked."})])
+
+    assert len(seen) == 3, len(seen)
+    # The request after the announcement carries it as the assistant's turn
+    # and TMT's nudge as the user's, so the model is looking at what it said.
+    after_announcing = seen[1]
+    assert after_announcing[-2]["role"] == "assistant", after_announcing[-2]
+    assert "Looking." in after_announcing[-2]["content"], after_announcing[-2]
+    assert "not finished" in after_announcing[-1]["content"], after_announcing[-1]
+    # And the request after the action carries that action's real result.
+    assert "Result:" in seen[2][-1]["content"], seen[2][-1]
+
+
+def test_an_announcement_followed_by_an_unreadable_reply_still_recovers():
+    """The two failures together, which is the shape a real turn takes: the
+    model says what it will do, then fumbles the JSON for doing it."""
+    drawn, files = run_turn([
+        json.dumps({"action": "respond", "final": False, "message": "About to write."}),
+        '{"action": "write_file", "path" "broken.txt"}',
+        json.dumps({"action": "write_file", "path": "good.txt", "content": "v"}),
+        json.dumps({"action": "done", "message": "Written after all."}),
+    ])
+    assert "About to write." in drawn, drawn
+    assert files.get("good.txt") == "v", files
+    assert "broken.txt" not in files, files
+    assert "Written after all." in drawn, drawn
+
+
+def test_a_retry_never_runs_the_action_that_already_ran_a_second_time():
+    """An action runs only after its arguments have parsed and validated, so
+    a reply that could not be read cannot have run anything -- and the reply
+    handed back is the unreadable one, never the action before it. `append`
+    is the test that can tell: run twice, it says so."""
+    drawn, files = run_turn([
+        json.dumps({"action": "write_file", "path": "log.txt", "content": ""}),
+        json.dumps({"action": "append_file", "path": "log.txt", "content": "once\n"}),
+        '{"action": "done" "message": "unreadable"}',
+        json.dumps({"action": "done", "message": "Appended once."}),
+    ])
+    # Twice would read "once\nonce\n". The append ran before the unreadable
+    # reply and is not re-sent with it: what goes back is the reply that could
+    # not be read, never the action that already succeeded.
+    assert files.get("log.txt") == "once\n", files
+    assert "Appended once." in drawn, drawn
 
 
 def test_a_reply_tmt_made_up_is_shown_but_never_recorded_as_the_answer():

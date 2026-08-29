@@ -23,10 +23,30 @@ def plain(text):
 
 
 def drain(glitch, limit=5.0):
-    deadline = time.monotonic() + limit
-    while glitch.pending_count() and time.monotonic() < deadline:
-        glitch.tick()
-        time.sleep(0.004)
+    """Reveal everything, on a clock this drives rather than one it waits on.
+
+    `tick` takes the moment to reason from, so the reveal can be stepped
+    forward instead of slept through. That matters for more than speed: the
+    old version spent a fixed five seconds of real time, so it silently
+    depended on GLITCH_REVEAL_DURATION being small, and raising that display
+    setting failed a test about whether the text comes back exact. How fast
+    the animation runs and whether it corrupts anything are different
+    questions, and only the second one is being asked here.
+
+    `limit` is a ceiling on how much of that clock may pass, so a stream that
+    somehow never resolves still ends the test rather than looping forever.
+    """
+    now = time.monotonic()
+    step = max(1e-3, GLITCH_REVEAL_DURATION)
+    # One character resolves per step, so the budget is the queue's length in
+    # steps, with the caller's limit as the floor. It is virtual time; none of
+    # it is waited for.
+    budget = max(limit, step * (glitch.pending_count() + 4))
+    spent = 0.0
+    while glitch.pending_count() and spent < budget:
+        now += step
+        spent += step
+        glitch.tick(now)
     return glitch.text
 
 
@@ -70,11 +90,22 @@ def test_characters_resolve_left_to_right():
 
 
 def test_reveal_takes_about_the_configured_duration_per_character():
+    """The one test here that is about real time, so it keeps a real clock.
+
+    Everything else drains on a clock it drives, because how fast the reveal
+    runs and whether the text survives it are different questions and only
+    this one is asking the first. Keeping them apart is what lets
+    GLITCH_REVEAL_DURATION be tuned without failing a test about exactness.
+    """
     glitch = GlitchStream()
     glitch.feed("abcdefgh")
     start = time.monotonic()
-    drain(glitch)
+    deadline = start + 8 * GLITCH_REVEAL_DURATION * 3
+    while glitch.pending_count() and time.monotonic() < deadline:
+        glitch.tick()
+        time.sleep(min(0.004, GLITCH_REVEAL_DURATION / 4))
     elapsed = time.monotonic() - start
+    assert not glitch.pending_count(), glitch.pending_count()
     assert 8 * GLITCH_REVEAL_DURATION * 0.5 < elapsed < 8 * GLITCH_REVEAL_DURATION * 3
 
 

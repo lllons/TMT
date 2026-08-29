@@ -33,7 +33,9 @@ from agent_config import (
 from agent_config import REQUIRED_KEYS
 from agent_actions import authorizes_push, batch_summary, build_result_message, execute_action, trim_messages
 from agent_actions import READ_ONLY_ACTIONS, ACTION_LABELS, MAX_TURNS, action_event
-from agent_model import ask_model, is_synthetic
+from agent_model import (
+    PARSE_FAILURE, ask_model, is_prose, is_synthetic, synthetic_reason,
+)
 from agent_ui import (
     OPENING_SUGGESTION, RUNNING_HINT, AgentEvent, LiveUI, ResponseHistory,
     Transcript, fallback_suggestion, render_response, validate_suggestion,
@@ -100,6 +102,84 @@ def stream_handler(live_ui, relay, state, transcript=None, session=None):
         elif kind == "error":
             state["error"] = value
     return handle
+
+
+# How many unusable replies in a row a question may absorb before it is given
+# up on. Unusable means the model produced nothing the loop could act on --
+# JSON that would not parse, an action that failed validation, arguments the
+# action itself rejected. Every one of those is handed back with the error so
+# the model can correct it, which is a thing models are reliably good at, so
+# the ceiling is here only to stop a model that cannot be corrected from being
+# asked forever. It is deliberately not the round budget: a reply that could
+# not be read is not a step of the user's work, and charging it as one meant a
+# model with a comma out of place could exhaust a question it had not started.
+MAX_INVALID_RETRIES = 6
+
+# What the model is told when its reply could not be read at all. It names the
+# parser's own complaint, because "invalid JSON" without the position is a
+# thing to guess at rather than a thing to fix.
+_UNREADABLE_FEEDBACK = (
+    "INVALID: that reply could not be read as JSON. The parser said: %s\n"
+    "Reply with exactly one JSON object and nothing else -- no prose before "
+    "it, no prose after it, no code fences. Emit the action you meant."
+)
+
+# And what the turn records when the model never managed a usable reply. It
+# says how many attempts it took rather than "it failed", because the next
+# turn is shown this sentence and a count is a fact it can act on.
+_UNUSABLE_OUTCOME = "the model could not produce a usable action in %d attempts"
+
+# What the model is told when the action was well formed but would not run.
+# `execute_action` reads its arguments straight out of the object, so a key of
+# the wrong type raised out of the loop and took the whole program with it --
+# a model writing "start": "12" instead of 12 could end the session. The types
+# are named in the complaint because that is the mistake being made.
+_ACTION_RAISED = (
+    "INVALID: the action '%s' could not run with those arguments -- it raised "
+    "%s: %s\nCheck the type of every key you sent: paths and text are strings, "
+    "line numbers are unquoted numbers, flags are unquoted true or false. Emit "
+    "a corrected action."
+)
+
+# What the model is told after an announcement, so the turn goes on.
+_ANNOUNCED = ("That was shown to the user as progress. The task is not "
+              "finished. Emit the action you just announced.")
+
+
+def is_announcement(obj):
+    """Whether a `respond` is an announcement rather than the answer.
+
+    `respond` ends the task, which is right for an answer and wrong for the
+    sentence a model writes before it starts. "I'll read the parser first"
+    ended the turn with the parser unread, the work undone and nothing to show
+    for it, and the user had to ask again to get any of it.
+
+    `final: false` is how the model says which of the two it means. Absent, it
+    is an answer, so every reply written before this key existed still means
+    exactly what it meant. A string is read as well as a bool because a model
+    that writes "false" means false, and being pedantic about the type here
+    would resurrect the bug this exists to fix.
+    """
+    if not (isinstance(obj, dict) and obj.get("action") == "respond"):
+        return False
+    value = obj.get("final", True)
+    if isinstance(value, str):
+        value = value.strip().lower() not in ("false", "no", "0", "")
+    return not value
+
+
+def announce(obj, transcript):
+    """Show an announcement and return whether there was anything to show.
+
+    It goes to the transcript, not through `finish_response`: it is permanent,
+    it belongs in the scrollback with the rest of the turn, and it is not the
+    answer, so it must not be drawn in the answer's box.
+    """
+    said = " ".join(str((obj or {}).get("message") or "").split())
+    if not said:
+        return False
+    transcript.emit_kind("progress", said)
+    return True
 
 
 def declared_events(obj, transcript, state):
@@ -340,15 +420,54 @@ def _session_loop(root):
             return relay.write_above(text)
 
         transcript = Transcript(history=history, writer=write_permanently)
-        turn_state = {"next_step": "", "progress_seen": set()}
+        # `acted` records whether anything has actually run this turn. It is
+        # what tells an announcement apart from a summary: the same sentence
+        # ("I'll check the files") means the model is about to start when
+        # nothing has run yet, and means it is describing what it did when
+        # something has.
+        turn_state = {"next_step": "", "progress_seen": set(), "acted": False}
         suggestion = ""
         live_ui.attach_sink(relay.set_status)
         live_ui.start()
         try:
-            # How many rounds this question may take, from the effort
-            # setting. Read here rather than fixed, so /effort changes
-            # the next question rather than the next launch.
-            for _ in range(agent_config.rounds_for_effort()):
+            # Two budgets, because two different things can go wrong and only
+            # one of them is the question's to pay for.
+            #
+            # `rounds` is the work, from the effort setting. Read here rather
+            # than fixed, so /effort changes the next question rather than the
+            # next launch. A step is spent when the model produced something
+            # the loop could act on.
+            #
+            # `retries` is the model failing to produce anything usable at all
+            # -- unreadable JSON, an action that does not validate, arguments
+            # the action itself rejects. Those are handed back to be corrected
+            # and cost no step: ending the question on one threw away the work
+            # already done and made the user ask for it again. They are still
+            # bounded, because a model that cannot be corrected must be
+            # stopped rather than asked forever.
+            rounds = agent_config.rounds_for_effort()
+            steps, retries = 0, 0
+
+            def hand_back(said, feedback):
+                """Give the model its own error back so it can correct it.
+
+                Returns True when there is budget left to try again, and False
+                when the model has had its attempts and the turn has to stop.
+                The reply is kept in the conversation as the assistant's turn,
+                with the complaint as the user's answer to it, so the model is
+                looking at exactly what it wrote when it tries again -- and so
+                nothing that already ran this turn is lost or repeated.
+                """
+                nonlocal retries
+                retries += 1
+                if retries > MAX_INVALID_RETRIES:
+                    return False
+                relay.reset()
+                messages.extend([{"role": "assistant", "content": said},
+                                 {"role": "user", "content": feedback}])
+                return True
+
+            while steps < rounds:
                 messages[0]["content"] = get_system_prompt()
                 messages = trim_messages(messages, pinned)
                 state = {"error": None, "next_step": turn_state["next_step"],
@@ -381,17 +500,63 @@ def _session_loop(root):
                 try:
                     obj = json.loads(raw)
                 except json.JSONDecodeError as error:
+                    # Handed back rather than fatal. An action that fails
+                    # validation has always been returned to the model to be
+                    # corrected; a reply that would not parse was not, and it
+                    # ended the turn where it stood -- throwing away whatever
+                    # the turn had already done and making the user ask the
+                    # same question again. The two are the same kind of
+                    # mistake and now get the same answer.
+                    console.print(f"[yellow]Unreadable reply, asking again:[/yellow] {error}")
+                    if hand_back(raw, _UNREADABLE_FEEDBACK % error):
+                        continue
                     relay.release()
-                    console.print(f"[red]Bad JSON:[/red] {error}")
-                    turn_state["outcome"] = "the reply could not be read as JSON"
+                    console.print("[red]Gave up:[/red] the reply still could not be read.")
+                    turn_state["outcome"] = _UNUSABLE_OUTCOME % retries
+                    break
+                # A reply this program made up because it could not read what
+                # the model sent. Which failure it stands for decides what to
+                # do with it: a parse failure is the model's to correct, so it
+                # is handed back like any other unreadable reply, and showing
+                # it as the answer put a machine's report of a failure on
+                # screen where the user was waiting for their work. A provider
+                # failure is nobody's to correct -- the call itself did not
+                # land, and asking again would not land either -- so that one
+                # falls through and is shown, which is the safety valve.
+                if synthetic_reason(obj) == PARSE_FAILURE:
+                    complaint = str(obj.get("message") or "the reply could not be read")
+                    console.print(f"[yellow]Unreadable reply, asking again:[/yellow] {complaint}")
+                    if hand_back(raw, _UNREADABLE_FEEDBACK % complaint):
+                        continue
+                    relay.release()
+                    turn_state["outcome"] = _UNUSABLE_OUTCOME % retries
+                    break
+                # The model wrote a sentence instead of an action. When it has
+                # already done something this turn the sentence is its summary
+                # of that work and ends the turn, which is what it has always
+                # meant. When nothing has run yet it cannot be a summary -- it
+                # is an announcement of work not started -- so it is shown and
+                # the model is asked for the action it just described.
+                if is_prose(obj) and not turn_state["acted"]:
+                    said = str(obj.get("message") or "").strip()
+                    if said:
+                        transcript.emit_kind("progress", said)
+                    if hand_back(raw, "That was prose, and nothing has run yet, so it "
+                                      "announced work rather than reporting it. Emit the "
+                                      "action you just described, as one JSON object."):
+                        continue
+                    relay.release()
+                    turn_state["outcome"] = _UNUSABLE_OUTCOME % retries
                     break
                 declared_events(obj, transcript, turn_state)
                 if "actions" in obj:
                     batch = obj["actions"]
                     if not isinstance(batch, list) or not batch:
-                        relay.reset()
-                        messages.extend([{"role": "assistant", "content": raw}, {"role": "user", "content": "INVALID: 'actions' must be a non-empty list. Try again."}])
-                        continue
+                        if hand_back(raw, "INVALID: 'actions' must be a non-empty list. Try again."):
+                            continue
+                        relay.release()
+                        turn_state["outcome"] = _UNUSABLE_OUTCOME % retries
+                        break
                     live_ui.intermediate_event("Processing...")
                     results = []
                     invalid = ""
@@ -412,7 +577,27 @@ def _session_loop(root):
                         # top-level values. Read here, before the action runs,
                         # so the message still arrives ahead of its work.
                         declared_events(sub_obj, transcript, turn_state)
-                        result = execute_action(sub_obj, context)
+                        # An announcement inside a batch is shown and stepped
+                        # over. The entries after it are the work it announced,
+                        # and ending the turn on it would leave every one of
+                        # them unrun.
+                        if is_announcement(sub_obj):
+                            announce(sub_obj, transcript)
+                            results.append(f"{sub_action}: shown to the user")
+                            continue
+                        try:
+                            result = execute_action(sub_obj, context)
+                        except Exception as error:
+                            # An action whose arguments it could not read used
+                            # to raise straight out of the loop and end the
+                            # program. It is the model's mistake and the model
+                            # can fix it, so it is handed back with the rest of
+                            # the batch's results, exactly as a validation
+                            # failure is.
+                            invalid = _ACTION_RAISED % (sub_action,
+                                                        type(error).__name__, error)
+                            break
+                        turn_state["acted"] = True
                         session.count_event(
                             transcript.emit(action_event(sub_action, sub_obj, result)))
                         if sub_action in MUTATING_ACTIONS:
@@ -425,27 +610,62 @@ def _session_loop(root):
                         results.append(f"{sub_action}: {result}")
                     else:
                         relay.reset()
+                        # The batch ran and the model is asked what is next, so
+                        # this round was work and costs a step.
+                        steps += 1
+                        retries = 0
                         messages.extend([{"role": "assistant", "content": raw}, {"role": "user", "content": f"Batch results:\n{chr(10).join(results)}\nOutput your next action."}])
                         continue
                     if invalid:
-                        relay.release()
                         console.print(f"[red]Invalid action in batch:[/red] {invalid}")
                         ran = chr(10).join(results) if results else "Nothing ran."
-                        messages.extend([
-                            {"role": "assistant", "content": raw},
-                            {"role": "user",
-                             "content": f"INVALID: {invalid}\nRan before it:\n{ran}\n"
-                                        "Output a corrected action JSON."}])
-                        continue
+                        if hand_back(raw, f"INVALID: {invalid}\nRan before it:\n{ran}\n"
+                                          "Output a corrected action JSON."):
+                            continue
+                        relay.release()
+                        turn_state["outcome"] = _UNUSABLE_OUTCOME % retries
+                        break
                     break
                 error = validate_action(obj)
                 if error:
-                    relay.release()
                     console.print(f"[red]Invalid action:[/red] {error}")
-                    messages.extend([{"role": "assistant", "content": raw}, {"role": "user", "content": f"INVALID: {error}. Output a corrected action JSON."}])
-                    continue
+                    if hand_back(raw, f"INVALID: {error}. Output a corrected action JSON."):
+                        continue
+                    relay.release()
+                    turn_state["outcome"] = _UNUSABLE_OUTCOME % retries
+                    break
                 action = obj["action"]
-                result = execute_action(obj, context)
+                # An announcement is shown and the loop goes on. This is the
+                # whole of the progress fix: the model saying what it is about
+                # to do used to be indistinguishable from the model saying what
+                # it had done, so "I'll inspect the files first" ended the turn
+                # with nothing inspected.
+                if is_announcement(obj):
+                    announce(obj, transcript)
+                    relay.reset()
+                    live_ui.intermediate_event("Processing...")
+                    steps += 1
+                    retries = 0
+                    messages.extend([{"role": "assistant", "content": raw},
+                                     {"role": "user", "content": _ANNOUNCED}])
+                    continue
+                try:
+                    result = execute_action(obj, context)
+                except Exception as error:
+                    # The one path that used to end the program rather than the
+                    # turn: execute_action reads its arguments straight off the
+                    # object, so a key of the wrong type raised through the loop
+                    # and out of main. It is the model's mistake, so it is
+                    # handed back like every other one.
+                    console.print(f"[red]Action failed:[/red] {type(error).__name__}: {error}")
+                    if hand_back(raw, _ACTION_RAISED % (action, type(error).__name__, error)):
+                        continue
+                    relay.release()
+                    turn_state["outcome"] = _UNUSABLE_OUTCOME % retries
+                    break
+                turn_state["acted"] = True
+                steps += 1
+                retries = 0
                 # Counted as it happens, not when the turn ends: the meter
                 # has to move when the file is written, not two minutes
                 # later when the answer lands.

@@ -32,7 +32,7 @@ RESET = "\033[0m"
 
 # The activity readout drawn hard against the right edge of the status row,
 # opposite the progress bar: a turning glyph, elapsed time and token count.
-ACTIVITY_GLYPHS = ("✳", "✻", "✽", "✻")
+ACTIVITY_GLYPHS = ("✻", "✽", "✻")
 ACTIVITY_TICK = 0.4      # seconds each glyph is held
 ACTIVITY_GAP = 2         # minimum blank columns kept between the two halves
 CHARS_PER_TOKEN = 4      # token size assumed until the provider reports its own

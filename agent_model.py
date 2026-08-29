@@ -422,7 +422,7 @@ def _prose_reply(full):
     text = " ".join(str(full).split())
     if len(text) > PROSE_REPLY_LIMIT:
         text = text[:PROSE_REPLY_LIMIT].rstrip() + " […]"
-    return json.dumps({"action": "done", "message": text})
+    return json.dumps({"action": "done", "message": text, PROSE_KEY: True})
 
 
 # Marks an action object this module made up rather than one the model sent.
@@ -437,15 +437,42 @@ def _prose_reply(full):
 # the loop tells the two apart. It is stripped before anything is sent.
 SYNTHETIC_KEY = "tmt_synthetic"
 
+# Why a reply was fabricated. A parse failure is worth retrying -- the model
+# is there, it just needs to be asked again for valid JSON -- while a provider
+# failure is not, because the provider itself is down and asking it the same
+# question again wastes a round trip on a connection that just refused one.
+# The loop cannot tell these apart without this key, and used to retry both
+# the same way.
+SYNTHETIC_REASON = "tmt_synthetic_reason"
+PARSE_FAILURE = "parse"
+PROVIDER_FAILURE = "provider"
+
+# Marks a `done` that is the model's own prose, passed through as its answer
+# rather than made up here. Kept distinct from SYNTHETIC_KEY: is_synthetic()
+# must stay False for one of these, because the sentence in it is the model's
+# account of the work, not this module's report of a failure.
+PROSE_KEY = "tmt_prose"
+
 
 def is_synthetic(obj):
     """Whether an action object was made up here rather than sent by a model."""
     return bool(isinstance(obj, dict) and obj.get(SYNTHETIC_KEY))
 
 
-def _made_up(message):
+def synthetic_reason(obj):
+    """Why an action object was made up here, or "" when it was not."""
+    return obj.get(SYNTHETIC_REASON, "") if isinstance(obj, dict) else ""
+
+
+def is_prose(obj):
+    """Whether an action object is the model's own prose, passed through."""
+    return bool(isinstance(obj, dict) and obj.get(PROSE_KEY))
+
+
+def _made_up(message, reason=PARSE_FAILURE):
     """A `done` carrying an explanation, marked as not the model's words."""
-    return json.dumps({"action": "done", "message": message, SYNTHETIC_KEY: True})
+    return json.dumps({"action": "done", "message": message,
+                        SYNTHETIC_KEY: True, SYNTHETIC_REASON: reason})
 
 
 def _extract_json(full):
@@ -474,7 +501,7 @@ def _error_reply(message):
     # a false statement about where an error came from.
     provider = selected_provider()[0]
     label = getattr(provider, "label", "") or "The provider"
-    return _made_up(f"{label} error — {message}")
+    return _made_up(f"{label} error — {message}", reason=PROVIDER_FAILURE)
 
 def _ask_model_streaming(messages, on_event):
     """Consume the reply as a stream, reporting events as they arrive.
@@ -524,7 +551,7 @@ def _ask_model_streaming(messages, on_event):
         if raw:
             return raw, False
         if not parser.raw.strip():
-            return '{"action":"done","message":"empty response from model"}', False
+            return _made_up("empty response from model"), False
         return _extract_json(parser.raw), False
     return None, True
 

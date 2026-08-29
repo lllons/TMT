@@ -50,7 +50,7 @@ ASCII_FRAME = {"left": "|", "right": "|", "top": "+", "top_end": "+",
 BODY_LEFT = FRAME["left"]          # the default edges are two columns wide
 BODY_RIGHT = FRAME["right"]
 
-GLITCH_REVEAL_DURATION = 0.025   # seconds a character spends as a symbol
+GLITCH_REVEAL_DURATION = 0.25   # seconds a character spends as a symbol
 REVEAL_TICK = 0.012              # renderer refresh period
 BACKLOG_ACCELERATE_AT = 48       # queued characters before the reveal speeds up
 BACKLOG_DRAIN_TARGET = 0.35      # seconds allowed to clear a large backlog
