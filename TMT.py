@@ -21,7 +21,7 @@ if _INSTALL_DIR in sys.path:
 sys.path.insert(0, _INSTALL_DIR)
 
 import agent_config
-from agent_menu import render_status, run_startup
+from agent_menu import render_prompt, render_status, run_startup
 from agent_config import (
     MUTATING_ACTIONS, console, default_workspace, set_workspace_root,
     workspace_needs_confirmation, workspace_refusal,
@@ -134,19 +134,20 @@ def main(argv=None):
     # Offered once, and never blocking: a missing co-author address stops
     # commits, not the session, and the refusal explains itself when it happens.
     ensure_git_identity()
+    # The header is drawn once, as the session opens, and states what the
+    # whole session runs under: the provider, the model, the workspace and
+    # the moment it began. Settings has already closed by this point, so none
+    # of those can change underneath it, and repeating the block before every
+    # prompt only pushed the conversation up the screen. It leaves the cursor
+    # after the prompt, so the first read below is the same console.input as
+    # before with the prompt already on screen.
+    render_status(workspace=root)
+    first_turn = True
     while True:
-        # The header is drawn here, once per turn, immediately before the read
-        # rather than once at launch. Every fact on it -- the provider, the
-        # model, the workspace, the date and the clock -- is read at this
-        # moment, so a provider or model changed in Settings shows up on the
-        # next prompt and the time is the time this turn began. Redrawing is
-        # what makes the clock live: a background thread ticking it would have
-        # to repaint the row the reader is sitting on, and would fight both
-        # the input line and the live renderer for the same terminal region.
-        #
-        # It leaves the cursor after the prompt, so the read below is the same
-        # console.input as before with the prompt already on screen.
-        render_status(workspace=root)
+        # Every later turn gets the prompt alone, under a blank line.
+        if not first_turn:
+            render_prompt()
+        first_turn = False
         try:
             task = console.input("").strip()
         except KeyboardInterrupt:

@@ -1,10 +1,11 @@
 """The screens TMT draws for itself: the startup menu, and the running status.
 
 Two surfaces, one idiom. `render_startup_frame` is the menu TMT opens with;
-`render_status` is the header it redraws before every task prompt once a
-session is under way. They share the same brand row, the same rule and the
-same measured fields, so the running session looks like a continuation of the
-screen it was started from rather than a different program.
+`render_status` is the header the running session opens with, drawn once and
+followed thereafter by `render_prompt` alone. They share the same brand row,
+the same rule and the same measured fields, so the running session looks like
+a continuation of the screen it was started from rather than a different
+program.
 
 Everything here draws through the shared surfaces in agent_ui and repaints
 through the LiveRegion in agent_live_renderer, so the screen obeys the same
@@ -695,15 +696,18 @@ def task_prompt(stream=None, phase=None):
 
 
 def render_status(stream=None, **facts):
-    """Draw the status header and leave the cursor after the task prompt.
+    """Draw the status header once, and leave the cursor after the prompt.
 
-    The one call the agent loop makes, run immediately before each read rather
-    than once at launch, and deliberately with no thread behind it. A
-    background ticker would have to repaint the row the reader is sitting on,
-    fighting the input line and the live renderer for the same region, and it
-    would animate something the user is trying to read. Redrawing here keeps
-    the write on the thread that owns the terminal and makes every turn state
-    the time that turn began, which is the fact worth having.
+    Called a single time as the session opens. The header states what the
+    session runs under -- the service, the model, the directory, and when it
+    began -- and none of those change while the loop is running, so repeating
+    it before every prompt only pushed the conversation off the screen. Later
+    turns get `render_prompt` instead.
+
+    There is deliberately no thread behind the clock. A background ticker
+    would have to repaint the row the reader is sitting on, fighting the input
+    line and the live renderer for the same region, and it would animate
+    something the user is trying to read.
 
     Returns False when the stream has gone, so a caller can stop drawing to
     it. Decoration is never allowed to end the run.
@@ -713,6 +717,21 @@ def render_status(stream=None, **facts):
     if not safe_write(stream, "\n".join(lines) + "\n"):
         return False
     return safe_write(stream, task_prompt(stream))
+
+
+def render_prompt(stream=None, phase=None):
+    """Draw the task prompt on its own, for every turn after the first.
+
+    The blank line is the whole of the separation between the reply above and
+    the question below: the header has already said what the session is, and
+    saying it again each turn would bury the answer the user just read.
+
+    Returns False when the stream has gone, matching `render_status`.
+    """
+    stream = sys.stdout if stream is None else stream
+    if not safe_write(stream, "\n"):
+        return False
+    return safe_write(stream, task_prompt(stream, phase))
 
 
 def _context_label(context):

@@ -303,3 +303,86 @@ def test_the_entry_point_names_a_callable_that_exists():
     parameters = inspect.signature(target).parameters
     assert list(parameters) == ["argv"], parameters
     assert parameters["argv"].default is None
+
+
+# --- the session header is drawn once, not once per turn ---------------------
+
+class Replies:
+    """Stands in for the console the loop reads from.
+
+    Answers each prompt from a fixed script and records nothing else, so a
+    session of any length can be run without a terminal or a model.
+    """
+
+    def __init__(self, answers):
+        self.answers = list(answers)
+
+    def input(self, prompt=""):
+        if not self.answers:
+            raise EOFError
+        return self.answers.pop(0)
+
+    def print(self, *args, **kwargs):
+        return None
+
+
+def run_session(answers):
+    """Drive TMT.main through `answers` turns and return everything it drew.
+
+    Empty answers are used as the turns: the loop reaches the prompt, reads,
+    and comes back round without a model request, which is the path the header
+    is drawn on and nothing more.
+    """
+    box = Workspace()
+    screen = io.StringIO()
+    saved = (TMT.console, TMT.ensure_api_key, TMT.run_startup,
+             TMT.ensure_git_identity)
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(str(box.path))
+        TMT.console = Replies(answers)
+        TMT.ensure_api_key = lambda: True
+        TMT.run_startup = lambda **kwargs: "start"
+        TMT.ensure_git_identity = lambda *a, **k: None
+        with contextlib.redirect_stdout(screen):
+            TMT.main([])
+        return screen.getvalue()
+    finally:
+        os.chdir(str(previous_cwd))
+        (TMT.console, TMT.ensure_api_key, TMT.run_startup,
+         TMT.ensure_git_identity) = saved
+        box.close()
+
+
+def test_the_session_header_is_drawn_once_however_many_turns_are_taken():
+    """The header states what the whole session runs under, and none of it
+    changes while the loop is running. Redrawing it before every prompt pushed
+    the conversation off the screen for no new information."""
+    drawn = run_session(["", "", "", "quit"])
+    prompts = drawn.count("Task>")
+    assert prompts == 4, (prompts, drawn)
+    # The rule under the header is the row that was repeating, and the
+    # wordmark and the clock came with it. One of each, across four turns.
+    rules = [line for line in drawn.splitlines()
+             if line.strip() and set(line.strip()) <= set("\u2500-")]
+    assert len(rules) == 1, (rules, drawn)
+    assert drawn.count("TMT") == 1, drawn
+    assert len(re.findall(r"\d\d:\d\d:\d\d", drawn)) == 1, drawn
+
+
+def test_every_turn_after_the_first_still_gets_a_prompt():
+    """Drawing the header once must not cost the later turns their prompt:
+    a read with nothing on screen looks like a hung program."""
+    one = run_session(["quit"])
+    many = run_session(["", "", "quit"])
+    assert one.count("Task>") == 1, one
+    assert many.count("Task>") == 3, many
+    # Each later prompt opens with a newline of its own. That is what leaves a
+    # blank line between the reply above and the question below, once the
+    # terminal has echoed the user's own Enter -- which the console faked here
+    # does not, so it is asserted at the source rather than in the transcript.
+    screen = io.StringIO()
+    menu = importlib.import_module("agent_menu")
+    assert menu.render_prompt(screen) is not False
+    assert screen.getvalue().startswith("\n"), repr(screen.getvalue())
+    assert "Task>" in screen.getvalue(), repr(screen.getvalue())
