@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tmtcode"
+version = "0.1.0"
+description = "A CLI coding agent that works on whichever project directory you run it in."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "Liam" }]
+keywords = ["cli", "agent", "coding-assistant"]
+# The agent itself needs nothing beyond the standard library. requests and rich
+# only add live streaming and colour, and TMT falls back without them.
+dependencies = []
+
+[project.optional-dependencies]
+live = ["requests", "rich"]
+
+[project.urls]
+Homepage = "https://github.com/lllons/TMT"
+
+# The command this project exists to provide. Installing puts `tmtcode` on PATH,
+# so the agent can be started from any project without that project needing to
+# know where TMT itself lives.
+[project.scripts]
+tmtcode = "TMT:main"
+
+[tool.setuptools]
+# Flat modules rather than a package, matching how the project is laid out.
+py-modules = [
+    "TMT",
+    "agent_actions",
+    "agent_config",
+    "agent_execution",
+    "agent_file_ops",
+    "agent_git",
+    "agent_live_renderer",
+    "agent_model",
+    "agent_prompt",
+    "agent_setup",
+    "agent_ui",
+]

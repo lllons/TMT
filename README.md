@@ -7,27 +7,81 @@
 
 Needs Python 3.8+.
 
+## The command is `tmtcode`
+
+Installing puts one command on your PATH:
+
+```bash
+tmtcode
+```
+
+Run it from any directory on the system. **The directory you run it in becomes the
+project TMT works on.**
+
+```bash
+cd ~/Projects/MyWebsite && tmtcode      # TMT works on ~/Projects/MyWebsite
+cd ~/Documents/MyProject && tmtcode     # TMT works on ~/Documents/MyProject
+```
+
+Install TMT once, anywhere. You never copy it into a project, and a project never
+needs TMT files inside it.
+
+## Install
+
 ```bash
 git clone https://github.com/lllons/TMT.git
 cd TMT
-pip install requests rich      # optional: adds live streaming and colour
-python TMT.py                  # Windows: py TMT.py   macOS/Linux: python3 TMT.py
+pip install -e .                 # puts `tmtcode` on PATH
+pip install -e ".[live]"         # optional: adds requests and rich for streaming and colour
 ```
 
-First launch asks for an [OpenRouter key](https://openrouter.ai/keys) and saves it to
-`.tmt_key` (git-ignored). Set `OPENROUTER_API_KEY` to skip that.
+The agent itself needs nothing beyond the standard library; `requests` and `rich` only
+add live streaming and colour, and TMT falls back without them.
 
-Type a task at the `Task>` prompt. `quit` or `exit` to leave. Ctrl-C cancels the
-current task without closing TMT.
+After installing, leave the clone where it is and run `tmtcode` from wherever your work
+is. The clone is TMT's home, not your project.
 
-## Workspace
-
-TMT works on **the directory you run it in**.
+Without installing, a clone still runs directly, and from anywhere:
 
 ```bash
-cd ~/projects/my-repo && python /path/to/TMT/TMT.py   # that repo is the workspace
-python TMT.py --dir ~/projects/other-repo             # or name one
+python /path/to/TMT/TMT.py                    # the current directory is the project
+python /path/to/TMT/TMT.py ~/Projects/MyWebsite
 ```
+
+Windows: `py`. macOS/Linux: `python3`.
+
+## The two directories
+
+TMT keeps its own installation and your project strictly apart. They are separate
+things and they are meant to stay separate.
+
+| | What lives there | Where it is |
+|---|---|---|
+| **Installation directory** | TMT's own source, your saved API key, TMT's git identity, its logs | wherever you cloned it — `~/tools/TMT`, `C:\Coding\TMT` — set once, and it never moves |
+| **Project directory** (the workspace) | the files TMT reads, edits, runs and commits | wherever you ran `tmtcode` |
+
+Only the project directory is ever modified. TMT's own files stay in the installation
+directory whichever project you are standing in, so it is the same agent — same key,
+same git identity — everywhere.
+
+To say it plainly once more: **you do not copy TMT into a project to use it on that
+project.** One clone, one install, then `cd` to any project and type `tmtcode`.
+
+## Choosing the project directory
+
+| Command | Project directory |
+|---|---|
+| `tmtcode` | the current directory |
+| `tmtcode ../other-repo` | resolved against the current directory, then made absolute |
+| `tmtcode /abs/path/to/project` | that path |
+| `tmtcode --dir PATH` | the same thing as the positional `PATH`, kept for existing use |
+
+A relative path is resolved against the directory you ran the command in and then made
+absolute. Giving both a positional `PATH` and a `--dir` that name different directories
+is an error, and TMT exits without starting.
+
+TMT uses the directory it was given, exactly. It does not walk up looking for a project
+root: run it in `MyWebsite/src` and `MyWebsite/src` is the workspace.
 
 The resolved path is printed at launch, so a run from the wrong place is obvious:
 
@@ -35,15 +89,37 @@ The resolved path is printed at launch, so a run from the wrong place is obvious
 Workspace: C:\Projects\my-repo
 ```
 
-`--dir` selects a directory; it never creates one. Paths outside the workspace are
-refused. TMT will not start in a filesystem root or your home directory, and asks
-first if the directory already has files and is not a git repository.
+Everything outside that directory is off limits — a path that climbs out of the
+workspace is refused, not followed.
+
+## Permissions and limits
+
+- TMT can create, overwrite and delete files anywhere inside the project directory, and
+  nothing it does there is recoverable unless the directory is a git repository. It
+  needs ordinary read and write permission on it.
+- The installation directory must be writable: `.tmt_key` and `logs/` are written
+  there. `.tmt_git` and `.tmt_git.local` are only read from there.
+- A directory is selected, never created. TMT refuses a path that does not exist, a
+  file, a filesystem root, and your home directory.
+- If the directory already has files in it and is not inside a git working tree, TMT
+  describes what it is about to be pointed at and asks before starting. A git
+  repository is its own undo, so it starts without asking.
+- TMT never runs shell commands. It runs code only through `run_file`, and launches
+  only the two applications listed below.
+- Pushing uses whatever git credentials you already have. TMT stores none and
+  implements no login.
+
+## First launch
+
+First launch asks for an [OpenRouter key](https://openrouter.ai/keys) and saves it to
+`.tmt_key` in the installation directory (git-ignored). Set `OPENROUTER_API_KEY` to skip
+that. It is asked for once for the install, not once per project.
+
+Type a task at the `Task>` prompt. `quit` or `exit` to leave. Ctrl-C cancels the
+current task without closing TMT.
 
 Files under 8 KB are shown to the model automatically, up to a fixed number and total
 size; the listing says so when it stops early. Larger files are read on demand.
-
-Your API key and TMT's git identity live beside the TMT install, not in the
-workspace, so TMT is the same agent wherever you run it.
 
 ## What you can ask for
 
@@ -73,6 +149,9 @@ Task> commit the changes and push to main
 | `create_folder` / `delete_folder` | Folders (recursive delete is opt-in) |
 | `list_files` | List the workspace |
 
+Paths are interpreted relative to the project directory, and anything that resolves
+outside it is refused. Only that directory is listed, read or written.
+
 Editing an existing file uses `patch_file`, not a rewrite, so untouched lines stay
 untouched. Python files are syntax-checked before they are written; a broken edit is
 rejected rather than saved.
@@ -81,7 +160,7 @@ rejected rather than saved.
 
 `run_file` executes and returns the output. Python, JavaScript, TypeScript, Ruby,
 PHP, Lua, Perl, R, Go, C, C++, Java. 10-second timeout. The toolchain has to be on
-your PATH.
+your PATH. Code runs with the project directory as its working directory.
 
 ### Apps
 
@@ -90,7 +169,8 @@ never runs shell commands.
 
 ## Git
 
-TMT commits under its own identity, not yours.
+TMT commits under its own identity, not yours, in the repository containing the
+project directory — not in TMT's own repository.
 
 ```
 Task> commit this                        commits, does not push
@@ -120,20 +200,25 @@ Read in this order: `TMT_GIT_*` environment variables, then `.tmt_git.local`
 name defaults to `TMT code`. The email has no default and is never taken from your
 git config.
 
+Both files sit in the installation directory, so TMT commits under the same identity
+in every project you point it at.
+
 `.tmt_git` is tracked on purpose: a commit email is public metadata, not a
 credential, so every clone gets the same TMT identity without setup. Put no tokens,
 passwords or keys in it.
 
-Run `git_identity` to see which source won.
+Run `git_identity` to see which source won and which files were consulted.
 
 ### Setting up GitHub attribution
 
-`.tmt_git` ships with a placeholder, and TMT refuses to commit while it is there —
-an invented address identifies nobody. To make commits attribute to TMT:
+The tracked `.tmt_git` names the address verified on TMT's own GitHub account, so a
+fresh clone attributes correctly with no setup. If that email is ever a placeholder,
+TMT refuses to commit rather than sign with an address that identifies nobody. To
+attribute commits to an account of your own instead:
 
 1. Create a GitHub account for TMT.
 2. Add and verify an address on it.
-3. Put that address in `.tmt_git` and commit it once.
+3. Put that address in `.tmt_git.local`, or in `.tmt_git` and commit it once.
 
 Three separate things, only the first of which TMT controls:
 
@@ -151,7 +236,8 @@ While a task runs: a THINKING animation until the first output, then a progress 
 elapsed time and a live token count. Model text is revealed character by character as
 it streams. The final answer is boxed.
 
-Set `TMT_STREAM=0` to disable streaming.
+Set `TMT_STREAM=0` to disable streaming. Streaming also needs `requests`; without it
+TMT runs unstreamed.
 
 ## Configuration
 
@@ -162,8 +248,31 @@ Set `TMT_STREAM=0` to disable streaming.
 | `TMT_STREAM` | `1` |
 | `TMT_GIT_NAME` | `TMT code` |
 | `TMT_GIT_EMAIL` | none — required for commits |
-| `TMT_GIT_ROOT` | the repository containing the workspace |
-| `--dir` (flag) | the current directory |
+| `TMT_GIT_ROOT` | the repository containing the project directory |
+| the `PATH` argument, or `--dir` | the current directory |
+
+## `tmtcode` not recognised
+
+The command is installed, but the directory pip put it in is not on your PATH. Find
+that directory:
+
+```bash
+python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+```
+
+It is `Scripts` on Windows and `bin` on macOS and Linux, under the Python or virtual
+environment you installed into. Add it to PATH, or use either fallback — both take the
+same arguments and pick the project directory the same way:
+
+```bash
+python -m TMT                     # anywhere, once installed
+python /path/to/TMT/TMT.py        # anywhere, straight from a clone
+```
+
+If you installed into a virtual environment, `tmtcode` exists only while that
+environment is active.
+
+`tmtcode --help` prints the arguments.
 
 ## Tests
 

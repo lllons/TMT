@@ -26,7 +26,7 @@ _URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)[^/@\s]*@")
 # Git work is the only thing TMT does that reaches past this machine, so every
 # command, exit code and failure is written down where it can be read after the
 # fact. The directory is git-ignored: this is diagnostics, not source.
-LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOG_DIR = agent_config.INSTALL_DIR / "logs"
 LOGGING = os.environ.get("TMT_GIT_LOG", "1").lower() not in {"0", "false", "no", "off"}
 _log_file = None
 

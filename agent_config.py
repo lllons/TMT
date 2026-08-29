@@ -86,8 +86,22 @@ except ModuleNotFoundError:
 
 json_module = json
 console = Console()
-# The workspace TMT may modify: the directory it was started in, unless --dir
-# names another. Settled once at startup by set_workspace_root(), after the
+# The three directories TMT keeps apart, and must never conflate:
+#
+#   INSTALL_DIR   where TMT's own code and state live. Derived from this
+#                 module's location, so it is right however TMT was launched
+#                 and wherever it was installed.
+#   ROOT_DIR      the project TMT may modify. Chosen once at startup.
+#   Path.cwd()    consulted only to derive ROOT_DIR at startup, never after.
+#
+# Conflating the first two is the failure this design exists to prevent: it
+# would make TMT edit its own source whenever it was run from its own folder,
+# and lose track of its key and identity whenever it was run from anywhere
+# else.
+INSTALL_DIR = Path(__file__).resolve().parent
+
+# The workspace TMT may modify: the directory it was started in, unless a path
+# argument names another. Settled once at startup by set_workspace_root(), after the
 # arguments that should decide it have been read. Nothing is created here --
 # importing a module must not make directories on disk, and the workspace is
 # somewhere the user already chose rather than somewhere TMT provides.
@@ -176,7 +190,7 @@ def workspace_needs_confirmation(path):
 # are the same wherever TMT is run from. Moving them alongside the workspace
 # would scatter credentials across the filesystem and give TMT a different
 # identity in every directory it visited. They must not follow the CWD.
-KEY_FILE = Path(__file__).resolve().parent / ".tmt_key"
+KEY_FILE = INSTALL_DIR / ".tmt_key"
 
 def read_saved_key():
     """The API key stored by first-launch setup, or "" when there is none."""
@@ -204,8 +218,8 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "") or read_saved_key(
 # and overrides it on a single machine. A commit email is public metadata
 # printed in every commit, not a credential, which is why the shipped file can
 # be tracked. Credentials belong in neither file.
-GIT_IDENTITY_FILE = Path(__file__).resolve().parent / ".tmt_git"
-GIT_IDENTITY_LOCAL_FILE = Path(__file__).resolve().parent / ".tmt_git.local"
+GIT_IDENTITY_FILE = INSTALL_DIR / ".tmt_git"
+GIT_IDENTITY_LOCAL_FILE = INSTALL_DIR / ".tmt_git.local"
 _DEFAULT_GIT_IDENTITY_FILE = GIT_IDENTITY_FILE
 _DEFAULT_GIT_IDENTITY_LOCAL_FILE = GIT_IDENTITY_LOCAL_FILE
 

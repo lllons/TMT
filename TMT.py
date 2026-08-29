@@ -49,15 +49,28 @@ def stream_handler(live_ui, relay, state):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        prog="TMT",
-        description="A CLI coding agent that works on one directory.",
+        prog="tmtcode",
+        description="A CLI coding agent that works on one project directory.",
+        epilog="Run it inside a project and that project is the workspace. "
+               "TMT's own installation is never the workspace unless you are "
+               "standing in it.",
     )
     parser.add_argument(
-        "--dir", dest="directory", default=None, metavar="PATH",
-        help="the workspace TMT may modify (default: the current directory). "
+        "project", nargs="?", default=None, metavar="PATH",
+        help="the project TMT may modify (default: the current directory). "
              "It selects a directory; it never creates one.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--dir", dest="dir_option", default=None, metavar="PATH",
+        help="the same thing as the positional PATH, kept for existing use.",
+    )
+    args = parser.parse_args(argv)
+    if args.project and args.dir_option and args.project != args.dir_option:
+        parser.error(
+            "PATH and --dir name different directories; give only one."
+        )
+    args.directory = args.dir_option or args.project
+    return args
 
 
 def resolve_workspace(directory=None, ask=None):
