@@ -329,3 +329,64 @@ def test_a_usage_record_in_the_stream_is_not_relayed_as_content():
     assert json.loads(raw) == json.loads(RESPOND)
     assert ("usage", 29) in events
     assert total_counted(events) == 29
+
+
+class EncodingSensitiveResponse:
+    """A stand-in that decodes the way requests actually decodes.
+
+    requests assigns ISO-8859-1 to any text/* response without a charset, and
+    iter_lines(decode_unicode=True) honours that. Reproducing the fallback here
+    is the whole point: a fake that always decodes UTF-8 would pass whether or
+    not the bug is present.
+    """
+
+    def __init__(self, body, encoding="ISO-8859-1"):
+        self.body = body
+        self.encoding = encoding
+        self.status_code = 200
+        self.text = ""
+
+    def raise_for_status(self):
+        pass
+
+    def iter_lines(self, decode_unicode=True):
+        for line in self.body.split(b"\n"):
+            if decode_unicode and self.encoding:
+                yield line.decode(self.encoding, "replace")
+            else:
+                yield line
+
+    def close(self):
+        pass
+
+
+def test_a_multibyte_character_survives_the_stream_intact():
+    """An em dash must arrive as an em dash.
+
+    The stream is UTF-8, but requests defaults text/* without a charset to
+    ISO-8859-1. Decoded that way, every multi-byte character becomes several
+    latin-1 characters, gets written back out as UTF-8, and reaches the user's
+    files as bytes nothing can read. It is silent and it is not recoverable
+    afterwards, so it has to be prevented here.
+    """
+    # The provider sends real UTF-8 bytes; ensure_ascii=False below keeps
+    # them that way. An escaped \uXXXX would be pure ASCII with nothing
+    # left to mis-decode, and the test could not fail.
+    reply = '{"action":"respond","message":"an em dash \u2014 and an accent \u00e9"}'
+    body = b"".join(
+        b'data: ' + json.dumps({"choices": [{"delta": {"content": piece}}]}, ensure_ascii=False).encode("utf-8") + b"\n"
+        for piece in (reply[:30], reply[30:])
+    ) + b"data: [DONE]\n"
+
+    original = agent_model._session.post
+    agent_model._session.post = lambda *a, **k: EncodingSensitiveResponse(body)
+    try:
+        received = "".join(agent_model.stream_chat({"model": "x"}))
+    finally:
+        agent_model._session.post = original
+
+    assert "\u2014" in received, repr(received)
+    assert "\u00e9" in received, repr(received)
+    # The signature of the fault: an em dash read as latin-1 becomes these.
+    assert "\u00e2\u0080\u0094" not in received, repr(received)
+    assert json.loads(received)["message"] == "an em dash \u2014 and an accent \u00e9"

@@ -71,6 +71,15 @@ def stream_chat(payload, on_usage=None):
         OPENROUTER_URL, headers=_headers(stream=True), json=payload,
         timeout=120, verify=VERIFY_SSL, stream=True,
     )
+    # Server-sent events are UTF-8 by definition, but requests falls back to
+    # ISO-8859-1 for any text/* response that does not name a charset, and
+    # text/event-stream usually does not. Left to guess, it decodes every
+    # multi-byte character into mojibake: an em dash arrives as three latin-1
+    # characters, is written back out as UTF-8, and lands in the user's files
+    # as a sequence nothing can read. Nothing downstream can undo that, so the
+    # encoding is stated here rather than inferred.
+    if getattr(response, "encoding", None) is not None:
+        response.encoding = "utf-8"
     try:
         try:
             response.raise_for_status()
