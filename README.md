@@ -5,7 +5,7 @@
 
 ## "Too Many Tools" — a CLI coding agent. It edits files in a sandboxed workspace, runs code in a dozen languages, and commits and pushes under its own git identity.
 
-Needs Python 3.8+.
+>**Needs Python 3.8+.**
 
 ## The command is `tmtcode`
 
