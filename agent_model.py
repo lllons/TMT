@@ -5,8 +5,9 @@ import re
 import agent_config
 from agent_config import (
     APP_TITLE, APP_URL, OPENROUTER_URL, STREAM_ENABLED,
-    VERIFY_SSL, MODEL, _json_mode_ok, _session, console, requests,
+    VERIFY_SSL, _json_mode_ok, _session, console, requests,
 )
+import agent_config as _config
 
 JSON_MODE_REJECTIONS = ("response_format", "json_object", "structured output")
 
@@ -306,7 +307,7 @@ def _ask_model_streaming(messages, on_event):
     """
     global _json_mode_ok
     for attempt in (0, 1):
-        payload = {"model": MODEL, "max_tokens": 4096, "messages": messages, "stream": True}
+        payload = {"model": _config.MODEL, "max_tokens": 4096, "messages": messages, "stream": True}
         if _json_mode_ok:
             payload["response_format"] = {"type": "json_object"}
         parser = StreamingActionParser()
@@ -364,7 +365,7 @@ def ask_model(messages, on_event=None):
             return raw
         if not fall_back:
             return _error_reply("stream ended without a reply")
-    base = {"model": MODEL, "max_tokens": 4096, "messages": messages}
+    base = {"model": _config.MODEL, "max_tokens": 4096, "messages": messages}
     payload = dict(base)
     if _json_mode_ok:
         payload["response_format"] = {"type": "json_object"}

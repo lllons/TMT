@@ -10,3 +10,7 @@ logs/
 *.egg-info/
 build/
 dist/
+
+# Working references and per-install choices, not source.
+DESIGN_PRINCIPLES.md
+.tmt_model

@@ -3,6 +3,8 @@
 import argparse
 import json
 import sys
+import agent_config
+from agent_menu import run_startup
 from agent_config import (
     MODEL, MUTATING_ACTIONS, Panel, console, default_workspace,
     set_workspace_root, workspace_needs_confirmation, workspace_refusal,
@@ -104,7 +106,16 @@ def main(argv=None):
         return
     if not ensure_api_key():
         return
-    console.print(Panel.fit(f"[bold green]Local File AI[/bold green] (OpenRouter / {MODEL})"))
+    # Settings may have moved the model since import, and a request built from
+    # a stale value would quietly use the wrong one.
+    agent_config.refresh_model()
+    # Once per launch, and never again in this session. It returns immediately
+    # when the terminal cannot drive a menu, so a piped or scripted run reaches
+    # the agent exactly as it did before this screen existed.
+    if run_startup(workspace=root) == "exit":
+        return 0
+    console.print(Panel.fit(
+        f"[bold green]Local File AI[/bold green] (OpenRouter / {agent_config.MODEL})"))
     # Stated plainly and before the first prompt: this is the directory about
     # to be modified, and a run from the wrong place should be obvious here
     # rather than three edits later.

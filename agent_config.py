@@ -339,7 +339,27 @@ def save_git_email(email):
 
 TMT_GIT_ROOT = os.environ.get("TMT_GIT_ROOT", "")
 
-MODEL = os.environ.get("OPENROUTER_MODEL", "minimax/minimax-m3:free")
+# The active model. agent_models owns the catalogue and the persisted choice;
+# this is kept as the name the rest of the project already reads, and is
+# refreshed by agent_models.set_model. Read it through agent_config.MODEL rather
+# than binding it on import, or a change made in Settings will not be seen.
+MODEL = os.environ.get("OPENROUTER_MODEL", "").strip() or "minimax/minimax-m3:free"
+
+
+def refresh_model():
+    """Re-read the selected model. Called once at startup, after imports.
+
+    agent_models imports agent_config, so agent_config cannot import it back at
+    module scope; the lookup is deferred to here instead of inverting the
+    dependency for one value.
+    """
+    global MODEL
+    try:
+        import agent_models
+        MODEL = agent_models.current_model()
+    except Exception:
+        pass
+    return MODEL
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 APP_TITLE = "Local File AI"
 APP_URL = "http://localhost"
