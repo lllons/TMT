@@ -543,7 +543,7 @@ def test_the_corner_meter_says_what_the_session_changed_and_what_it_cost():
     session = meter_session()
     text = menu().meter_text(session, Console(), columns=120)
     bare = visible(text)
-    assert bare == "+1231 lines, -123 lines, ~15k tokens in, 30k out", bare
+    assert bare == "+1231 lines, -123 lines, ~15k context, 30k out", bare
     assert menu()._color("+1231", 95, Console()) in text, repr(text)
     assert menu()._color("-123", 10, Console()) in text, repr(text)
 
@@ -564,12 +564,12 @@ def test_the_corner_meter_marks_the_figures_it_had_to_estimate():
     when the provider did not report its own count. A number presented as
     measured when it was guessed is the one thing this project will not do."""
     exact = visible(menu().meter_text(meter_session(), Console(), columns=120))
-    assert "~15k tokens in" in exact, exact
+    assert "~15k context" in exact, exact
     assert "30k out" in exact and "~30k out" not in exact, exact
 
     guessed = visible(menu().meter_text(meter_session(exact=False), Console(),
                                         columns=120))
-    assert "~15k tokens in" in guessed and "~30k out" in guessed, guessed
+    assert "~15k context" in guessed and "~30k out" in guessed, guessed
 
 
 def test_the_corner_meter_gives_up_words_before_it_gives_up_figures():
@@ -855,6 +855,37 @@ def test_a_permanent_line_takes_a_blank_row_instead_of_moving_the_box():
     pad.take(99)
     assert pad.rows == 0
     assert menu().BottomPad(40).above(4, size=(80, 12)) <= 12 - 4
+
+
+def test_a_window_resized_mid_session_still_puts_the_box_at_the_foot():
+    """The pad counts the distance from the cursor to the bottom of the
+    window, and resizing the window moves the bottom. Made taller, it opens
+    rows underneath the box that nothing was holding, and the box stayed
+    where it was until enough output had been printed to spend the rest of
+    the pad -- which is to say it was stranded up the screen for exactly as
+    long as the user was looking at it.
+
+    The height is taken on the first paint, so it is the window the pad was
+    worked out for, and every later paint is answered against the window
+    there is now."""
+    height = menu().PROMPT_HEIGHT
+
+    pad = menu().BottomPad(10)
+    assert pad.above(height, size=(80, 30)) == 10      # the window it opened in
+    assert pad.above(height, size=(80, 40)) == 20      # ten rows taller
+    assert pad.above(height, size=(80, 22)) == 2       # eight rows shorter
+    assert pad.above(height, size=(80, 30)) == 10      # and back again
+
+    # Spent to nothing in the window it opened in, the box is held down by
+    # the terminal's own scrolling; a window made taller has to hold it again.
+    pad.take(99)
+    assert pad.rows == 0
+    assert pad.above(height, size=(80, 30)) == 0
+    assert pad.above(height, size=(80, 45)) == 15
+
+    # Never taller than the window, however far it was resized.
+    assert pad.above(height, size=(80, 6)) == 0
+    assert menu().BottomPad(40).above(height, size=(80, 12)) <= 12 - height
 
 
 def test_a_screen_opens_at_the_top_of_the_window():

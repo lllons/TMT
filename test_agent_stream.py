@@ -755,6 +755,39 @@ def test_prose_where_json_was_asked_for_is_shown_as_the_answer():
     assert mixed == {"action": "done", "message": "ok"}, mixed
 
 
+def test_the_system_prompt_is_sent_as_one_cacheable_block():
+    """A turn takes several steps and the API is stateless, so the whole
+    system prompt -- the largest thing in the request by far -- goes again on
+    every step. It cannot be sent less often; what it can be is marked, so the
+    provider charges for reading the prefix back rather than for reading it
+    afresh.
+
+    The breakpoint changes nothing about what is sent, and the readout does
+    not pretend the count drops. This asserts the shape the API needs, since
+    a `system` field of the wrong type is rejected outright and there is no
+    live request here to find that out."""
+    import agent_providers
+    provider = agent_providers.get_provider("anthropic")
+    messages = [{"role": "system", "content": "the rules"},
+                {"role": "user", "content": "list the files"}]
+    _url, payload = provider.chat_payload(messages, model="claude-sonnet-5")
+
+    assert payload["system"] == [{"type": "text", "text": "the rules",
+                                  "cache_control": {"type": "ephemeral"}}], payload["system"]
+    # Lifted out, not left in the conversation: a system role inside
+    # "messages" is rejected by this API.
+    assert [message["role"] for message in payload["messages"]] == ["user"], payload["messages"]
+    # It must survive being serialised -- that is the only form it is ever
+    # sent in.
+    assert json.loads(json.dumps(payload))["system"][0]["cache_control"] == {"type": "ephemeral"}
+
+    # No system prompt, no field at all, rather than an empty block the API
+    # would have to reject.
+    _url, bare = provider.chat_payload([{"role": "user", "content": "hi"}],
+                                       model="claude-sonnet-5")
+    assert "system" not in bare, bare
+
+
 def test_an_error_reply_names_the_provider_that_actually_failed():
     """It said "OpenRouter" whichever of the four had been called, which is a
     false statement about where an error came from."""

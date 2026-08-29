@@ -429,6 +429,34 @@ def test_tokens_sent_are_estimated_and_tokens_generated_are_exact_when_told():
     assert session.tokens_out_exact is False
 
 
+def test_the_same_prompt_sent_again_is_not_a_context_that_has_grown():
+    """One question can take several steps, and every step re-sends the whole
+    request: the API is stateless, so the system prompt goes again each time.
+    Adding each request to the last measured the same prompt over and over and
+    reported the total as the context, so a single question answered in three
+    steps read as a window three times as full as it was.
+
+    What the request carries and what the session has spent are different
+    questions. Both are kept; neither is reported under the other's name."""
+    session = Session(workspace="C:\\project")
+    request = [{"role": "system", "content": "a" * 4000},
+               {"role": "user", "content": "list the files"}]
+    one = session.record_request(request)
+    assert session.tokens_in == one and session.tokens_sent == one
+
+    # The same request again, twice, exactly as a three-step turn sends it.
+    session.record_request(request)
+    session.record_request(request)
+    assert session.tokens_in == one, session.tokens_in
+    assert session.tokens_sent == 3 * one, session.tokens_sent
+
+    # A longer request is a fuller window, and that does move.
+    bigger = session.record_request(request + [{"role": "assistant",
+                                                "content": "b" * 4000}])
+    assert bigger > one and session.tokens_in == bigger
+    assert session.tokens_sent == 3 * one + bigger
+
+
 def test_the_counters_belong_to_the_run_like_everything_else_here():
     """They are the session's, so a relaunch starts at zero for the same
     reason the conversation does."""

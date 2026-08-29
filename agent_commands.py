@@ -251,8 +251,13 @@ def _context(argument, session):
     # before it is sent, and this is characters over a constant.
     rows.append(("Carried", "~%s of ~%s tokens budgeted (%s window)"
                  % (_count(used), _count(budget), _count(window))))
-    rows.append(("Tokens", "~%s in, %s%s out"
-                 % (_count(session.tokens_in),
+    # Two figures, said apart, because they answer different questions and
+    # were once one number answering neither. The first is how big the last
+    # request was -- how full the window is. The second is every request added
+    # up, which is larger by however many steps the questions took, because a
+    # stateless API is sent the whole prompt again for each one.
+    rows.append(("Tokens", "~%s in the last request, ~%s sent in all, %s%s out"
+                 % (_count(session.tokens_in), _count(session.tokens_sent),
                     "" if session.tokens_out_exact and not session.streaming else "~",
                     _count(session.tokens_out))))
     rows.append(("Lines", "+%d  -%d" % (session.lines_added, session.lines_removed)))

@@ -815,7 +815,18 @@ class AnthropicProvider(Provider):
             # Top level, never a message: a system role inside "messages" is
             # rejected, and dropping it would silently produce an agent that
             # answers without any of TMT's rules.
-            payload["system"] = system
+            #
+            # Sent as one block carrying a cache breakpoint. The system prompt
+            # is the largest and by far the most repeated thing in a request:
+            # a turn takes several steps, the API is stateless, so the whole
+            # prompt goes again on every one of them. The breakpoint does not
+            # change what is sent -- it cannot, and TMT does not pretend the
+            # count drops -- it lets the provider charge for reading the
+            # prefix back rather than for reading it afresh. A prompt shorter
+            # than the provider's minimum is simply not cached, which costs
+            # nothing and needs no test here.
+            payload["system"] = [{"type": "text", "text": system,
+                                  "cache_control": {"type": "ephemeral"}}]
         if stream:
             payload["stream"] = True
         return self.chat_url, payload

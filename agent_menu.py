@@ -832,10 +832,17 @@ def meter_text(session, stream=None, columns=None):
     gradient, used for exactly what they already mean there. Everything else
     is the one neutral, because the counts are the message and the colour only
     confirms them: with the escapes stripped this still reads
-    "+1231 lines, -123 lines, ~15k tokens in, 30k out".
+    "+1231 lines, -123 lines, ~15k context, 30k out".
 
-    The tilde is not decoration. Tokens sent are estimated -- no provider will
-    count a request before it is sent -- and tokens generated are the
+    "Context" is what the request in flight carries, not what the session has
+    spent. The two were the same figure under the first one's name, so a
+    question answered in three steps read as a context that had tripled --
+    the same prompt sent three times, counted three times, and reported as
+    growth. The spend is still kept; it is `/context` that states it, where
+    there is room to say which number is which.
+
+    The tilde is not decoration. What goes out is estimated -- no provider
+    will count a request before it is sent -- and tokens generated are the
     provider's own figure whenever it gives one. A number that was guessed is
     marked as guessed.
     """
@@ -853,9 +860,9 @@ def meter_text(session, stream=None, columns=None):
     # the provider never gave a figure: part of what is on screen is then a
     # guess about text that has not finished being generated.
     out_mark = "" if (session.tokens_out_exact and not session.streaming) else "~"
-    full = "%s lines, %s lines, ~%s tokens in, %s%s out" % (
+    full = "%s lines, %s lines, ~%s context, %s%s out" % (
         added, removed, sent, out_mark, back)
-    short = "%s %s  ~%s in  %s%s out" % (added, removed, sent, out_mark, back)
+    short = "%s %s  ~%s ctx  %s%s out" % (added, removed, sent, out_mark, back)
     tiny = "%s %s" % (added, removed)
     for text in (full, short, tiny):
         if display_width(text) <= max(0, columns - 2):
@@ -898,8 +905,13 @@ _PROMPT_LEAD = 1         # the blank line the box writes above itself
 class BottomPad:
     """Blank rows that hold the live region against the foot of the window."""
 
-    def __init__(self, rows=0):
+    def __init__(self, rows=0, height=None):
         self.rows = max(0, int(rows))
+        # The window height these rows were counted against. Taken on the
+        # first paint rather than here, because a pad is built from
+        # `opening_pad` and both are answered from the same terminal, so the
+        # first question is the honest place to record which window it was.
+        self.height = int(height) if height else None
 
     def above(self, height, size=None):
         """Blank rows to draw above a region `height` rows tall.
@@ -908,10 +920,21 @@ class BottomPad:
         row as well as the box -- needs fewer of them to keep its bottom edge
         in the same place. Clamped to the window, so a terminal made shorter
         mid-session cannot ask for a region taller than it is.
+
+        Answered against the window as it is now, not as it was when the pad
+        was worked out. `self.rows` counts the distance from the cursor to the
+        foot, and resizing the window moves the foot: a window made taller
+        opens rows below the box that nothing was holding, and the box was
+        left stranded up the screen until enough output had been printed to
+        spend what was left. The difference in height is the difference in
+        that distance, so it is simply added.
         """
         rows = _terminal(size)[1]
+        if self.height is None:
+            self.height = rows
         room = max(0, rows - 1 - int(height))
-        return max(0, min(self.rows + PROMPT_HEIGHT - int(height), room))
+        slack = self.rows + PROMPT_HEIGHT + (rows - self.height)
+        return max(0, min(slack - int(height), room))
 
     def take(self, lines):
         """Give up `lines` rows to something printed permanently."""
@@ -919,8 +942,16 @@ class BottomPad:
         return self.rows
 
     def spend(self, text):
-        """Give up a row per line of `text`. Returns what is left."""
-        return self.take(str(text or "").count("\n"))
+        """Give up a row per line of `text`. Returns what is left.
+
+        A row per newline, and one more when the text does not end in one:
+        the writer supplies the missing newline, so that text still lands on
+        a row of its own and still costs the pad one.
+        """
+        text = str(text or "")
+        if not text:
+            return self.rows
+        return self.take(text.count("\n") + (0 if text.endswith("\n") else 1))
 
 
 def opening_pad(used, stream=None, size=None):
