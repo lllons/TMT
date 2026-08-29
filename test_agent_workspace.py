@@ -354,9 +354,18 @@ def test_git_acts_on_the_resolved_workspace_including_commit_all():
             {"action": "git_commit", "message": "from the selected workspace", "all": True},
             context={"push_authorized": False}))
         assert "Committed" in result, result
-        landed = box.git(["log", "-1", "--format=%an <%ae>%n%s"]).stdout
-        assert "TMT code <tmt-code@example.invalid>" in landed, landed
+        landed = box.git(["log", "-1", "--format=%an <%ae>%n%cn <%ce>%n%s"]).stdout
+        # The human who owns this repository stays the author and the committer
+        # of the commit TMT made in it; TMT is credited only in the trailer.
+        assert landed.count("Human Person <human@example.invalid>") == 2, landed
+        assert "TMT code" not in landed, landed
+        assert "tmt-code@example.invalid" not in landed, landed
         assert "from the selected workspace" in landed, landed
+        # git's own trailer parser, not a substring of the message: only what
+        # it returns is read as a co-author anywhere downstream.
+        trailer = box.git(
+            ["log", "-1", "--format=%(trailers:key=Co-authored-by)"]).stdout.strip()
+        assert trailer == "Co-authored-by: TMT code <tmt-code@example.invalid>", trailer
         assert "new.txt" in box.git(["show", "--name-only", "--format=", "HEAD"]).stdout
     finally:
         for name, value in saved.items():

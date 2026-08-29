@@ -317,6 +317,26 @@ _saved_git_identity = resolve_git_identity()
 TMT_GIT_NAME = _saved_git_identity["name"]
 TMT_GIT_EMAIL = _saved_git_identity["email"]
 # Overrides repository discovery when TMT must work outside the folder it lives in.
+def save_git_email(email):
+    """Store TMT's co-author address for this machine and make it live now.
+
+    Written to .tmt_git.local rather than the tracked .tmt_git, because an
+    address typed on one machine is that machine's answer: committing it would
+    push one user's setup onto every clone.
+    """
+    global TMT_GIT_EMAIL
+    address = (email or "").strip()
+    TMT_GIT_EMAIL = address
+    existing = read_git_identity_file(GIT_IDENTITY_LOCAL_FILE)
+    existing["email"] = address
+    lines = ["# TMT's co-author identity on this machine. Identity only:",
+             "# never put tokens, passwords or keys in this file."]
+    for key, value in sorted(existing.items()):
+        lines.append(f"TMT_GIT_{key.upper()}={value}")
+    GIT_IDENTITY_LOCAL_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return address
+
+
 TMT_GIT_ROOT = os.environ.get("TMT_GIT_ROOT", "")
 
 MODEL = os.environ.get("OPENROUTER_MODEL", "minimax/minimax-m3:free")

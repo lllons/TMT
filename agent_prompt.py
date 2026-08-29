@@ -149,13 +149,17 @@ git_identity - keys: none. The identity TMT commits under. Use it when a commit 
   {"action":"git_identity"}
   {"actions":[{"action":"git_identity"},{"action":"respond","message":"TMT commits as TMT code, using the address configured in .tmt_git."}]}
 
-git_commit - keys: message. Optional: paths (repo-relative files to stage), all (bool, stage every change).
+git_commit - keys: message. Optional: paths (repo-relative files to stage), all (bool, stage every change). The user stays the author; TMT is added as a co-author automatically.
   {"action":"git_commit","message":"Add the report generator","paths":["src/report.py"]}
   {"action":"git_commit","message":"Save the current work","all":true}
+  {"action":"git_commit","message":"Fix the timeout handling\n\nThe socket closed before the retry could run.","paths":["src/net.py"]}
+  {"actions":[{"action":"git_status"},{"action":"git_commit","message":"Add the parser","paths":["src/parse.py"]},{"action":"respond","message":"Committed src/parse.py. You are the author and TMT is recorded as co-author."}]}
 
 git_push - keys: none. Optional: branch, remote. Sends existing commits to the remote. Never pushes on its own initiative.
   {"action":"git_push"}
+  {"action":"git_push","branch":"main"}
   {"actions":[{"action":"git_commit","message":"Fix the timeout handling","paths":["src/net.py"]},{"action":"git_push"},{"action":"respond","message":"Committed the timeout fix and pushed it to the remote."}]}
+  {"actions":[{"action":"git_commit","message":"Update the changelog","all":true},{"action":"git_push","branch":"main"},{"action":"respond","message":"Committed everything and pushed to main."}]}
 
 respond - keys: message. The only text the user ever sees. Ends the task.
   {"action":"respond","message":"I created notes.txt with your shopping list."}
@@ -181,7 +185,10 @@ WORKFLOW_RULES = r"""=== BEHAVIOUR ===
 - Never run shell commands. Never leave the workspace root. Only the permitted apps listed above may be opened."""
 
 GIT_RULES = r"""=== GIT ===
-- TMT commits under its own git identity, never the user's. The user does not configure git for TMT; when the identity is missing, git_identity reports exactly what to set.
+- The user is the author of every commit; TMT is added as a co-author. git_commit appends a "Co-authored-by: TMT code <address>" trailer by itself, so never write that trailer into the message yourself and never claim the user has been replaced as author.
+- Write the commit message as the user's own: describe the change, not who made it. TMT's credit is the trailer, and adding it in prose as well is duplication.
+- A commit message may be a subject alone, or a subject, a blank line and a body. Both are fine. The trailer is placed after them automatically.
+- The user does not configure git for TMT; when TMT's co-author address is missing, git_identity reports exactly what to set.
 - git_commit and git_push are separate actions. Committing never implies pushing.
 - Only push when the user asked for a push in this task. Editing or committing files is not permission to push. When in doubt, commit, then tell the user what is ready and ask.
 - If a push comes back BLOCKED, the user did not ask for one. Do not retry it. Say what is committed and ask them to confirm.
@@ -193,6 +200,7 @@ GIT_RULES = r"""=== GIT ===
 - git_status names the files it found. Commit those names; never invent a path and never guess at one you were not shown.
 - Never tell the user to run git config, and never ask them for a token, password, SSH key or any credential. TMT already has its own identity, and pushing uses the git authentication already set up on the machine. Neither is ever the user's job mid-task.
 - Never state anything about TMT's identity from files you can see. Call git_identity and report what it says.
+- If git refuses because the user has no git identity of their own, pass that on. TMT will not stand in as the author to get a commit through.
 - Notes and logs in the workspace are not evidence about git, including ones you wrote yourself in an earlier task. They record what someone believed at the time, not what is true now. Never repeat a claim from one; run git_status or git_identity and report what it actually returns."""
 
 def repository_root():

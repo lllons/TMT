@@ -13,7 +13,9 @@ import threading
 
 import agent_config
 from agent_live_renderer import SYMBOL_POOL, encodable
-from agent_ui import GRADIENT_TICK, _supports_color, cycle_bar, cycle_text, gradient_phase
+from agent_ui import (
+    GRADIENT_TICK, _supports_color, cycle_bar, cycle_text, gradient_phase, safe_write,
+)
 
 KEY_URL = "https://openrouter.ai/keys"
 KEY_PREFIX = "sk-or-"
@@ -216,6 +218,64 @@ def run_setup(stream=None, ask=None, animate=True):
         return ""
     finally:
         title.stop()
+
+
+GIT_SETUP_TITLE = "TMT Git Contributor Setup"
+
+
+def run_git_setup(stream=None, ask=None):
+    """Ask for TMT's co-author address and return it, or "" if declined.
+
+    Only the TMT address is asked for. The user's own git identity is theirs to
+    set and TMT never collects, changes or stands in for it.
+    """
+    stream = stream or sys.stdout
+    ask = ask or (lambda prompt: input(prompt))
+    rule = "=" * 50
+    for line in (
+        "", rule, GIT_SETUP_TITLE, rule, "",
+        "TMT can be credited as a co-author on the commits it",
+        "makes. You stay the author; TMT is added beside you.",
+        "",
+        "  Author:    your own git identity, unchanged",
+        "  Co-author: TMT code",
+        "",
+        "For GitHub to credit it, this must be an address verified",
+        "on the GitHub account representing TMT. Leave it blank to",
+        "skip; commits will be refused until it is set.",
+        "",
+    ):
+        safe_write(stream, line + "\n")
+    try:
+        answer = ask("TMT git email: ")
+    except (EOFError, KeyboardInterrupt):
+        safe_write(stream, "\n")
+        return ""
+    address = (answer or "").strip()
+    if not address:
+        safe_write(stream, "\nSkipped. Run git_identity later to see what to set.\n")
+        return ""
+    safe_write(stream, f"\nTMT will be credited as: TMT code <{address}>\n")
+    return address
+
+
+def ensure_git_identity(stream=None, ask=None):
+    """Offer first-launch setup when TMT has no usable co-author address.
+
+    Never blocks the session: everything except committing works without it,
+    and a refused commit already explains exactly what to set.
+    """
+    try:
+        import agent_git
+        agent_git.TMTGitIdentity.resolve().validate()
+        return True
+    except Exception:
+        pass
+    address = run_git_setup(stream=stream, ask=ask)
+    if not address:
+        return False
+    agent_config.save_git_email(address)
+    return True
 
 
 def ensure_api_key(stream=None, ask=None, animate=True):

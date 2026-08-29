@@ -5,11 +5,19 @@ process runs with GIT_CONFIG_NOSYSTEM and a HOME pointed at a throwaway
 directory, and the engine's identity is an example.invalid address. Pushes go to
 a real bare repository created per test, so the push paths are genuinely
 exercised rather than simulated.
+
+TMT is the co-author of the commits it makes, never the author. The human whose
+git configuration the repository holds stays in %an, %ae, %cn and %ce, and TMT
+is credited by a Co-authored-by trailer beside them. That is one property, not
+two, so the tests below assert both halves of it together wherever they can: a
+change that put TMT back in the author field while still writing the trailer
+would satisfy either half on its own.
 """
 
 import ast
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -19,8 +27,17 @@ from pathlib import Path
 
 TMT_NAME = "TMT code"
 TMT_EMAIL = "tmt-code@example.invalid"
+REPO_NAME = "Repo Human"
 REPO_EMAIL = "repo-human@example.invalid"
 GLOBAL_EMAIL = "global-human@example.invalid"
+
+TMT_SIGNATURE = f"{TMT_NAME} <{TMT_EMAIL}>"
+TMT_TRAILER = f"Co-authored-by: {TMT_SIGNATURE}"
+HUMAN_SIGNATURE = f"{REPO_NAME} <{REPO_EMAIL}>"
+
+# Parsed here rather than by the module under test: a helper that asked
+# agent_git to read the trailers it wrote would agree with itself.
+_TRAILER_ADDRESS = re.compile(r"<([^<>]+)>")
 
 # Captured before any test mutates os.environ, so the developer's real global
 # config can still be read back for comparison.
@@ -237,8 +254,54 @@ def ready(*modules):
     return True
 
 
+def trailer_lines(sandbox, key=None, ref="HEAD", bare=False):
+    """The trailers git itself parses out of one commit's message.
+
+    Asked of git's own trailer parser rather than searched for in the message
+    text, because a line that merely looks like a trailer is not one. Only what
+    this returns will be read downstream, GitHub's co-author credit included.
+    """
+    token = key or agent_git.CO_AUTHOR_TOKEN
+    args = ["log", "-1", f"--format=%(trailers:key={token})", ref]
+    raw = sandbox.bare_git(args) if bare else sandbox.git(args)
+    return [line.strip() for line in raw.splitlines() if line.strip()]
+
+
+def trailer_addresses(lines):
+    """The addresses inside trailer lines, lowercased."""
+    found = []
+    for line in lines:
+        match = _TRAILER_ADDRESS.search(line)
+        if match:
+            found.append(match.group(1).strip().lower())
+    return found
+
+
+def identity_fields(sandbox, ref="HEAD", bare=False):
+    """[author name, author email, committer name, committer email]."""
+    args = ["log", "-1", "--format=%an|%ae|%cn|%ce", ref]
+    raw = sandbox.bare_git(args) if bare else sandbox.git(args)
+    return raw.split("|")
+
+
+def assert_human_authored_with_tmt_co_author(sandbox, ref="HEAD", bare=False):
+    """The property that matters, asserted as the single thing it is.
+
+    The human on all four identity fields and TMT credited in a trailer git
+    parses are checked on the same commit, because either half alone would
+    still pass if TMT were put back into the author field.
+    """
+    fields = identity_fields(sandbox, ref=ref, bare=bare)
+    assert fields == [REPO_NAME, REPO_EMAIL, REPO_NAME, REPO_EMAIL], (ref, fields)
+    for field in fields:
+        assert TMT_NAME not in field, (ref, fields)
+        assert TMT_EMAIL not in field, (ref, fields)
+    addresses = trailer_addresses(trailer_lines(sandbox, ref=ref, bare=bare))
+    assert TMT_EMAIL in addresses, (ref, addresses)
+
+
 # Case 1
-def test_commit_author_and_committer_are_both_the_tmt_identity():
+def test_commit_records_the_human_as_author_and_committer_with_tmt_as_co_author():
     if not ready("agent_git", "agent_config"):
         return
     sandbox = Sandbox()
@@ -247,9 +310,12 @@ def test_commit_author_and_committer_are_both_the_tmt_identity():
         sandbox.write("a.txt", "one\n")
         commit = sandbox.engine().commit("add a", paths=["a.txt"])
         fields = sandbox.git(["log", "-1", "--format=%an|%ae|%cn|%ce"]).split("|")
-        assert fields == [TMT_NAME, TMT_EMAIL, TMT_NAME, TMT_EMAIL], fields
-        assert commit["author"] == f"{TMT_NAME} <{TMT_EMAIL}>", commit
-        assert commit["committer"] == f"{TMT_NAME} <{TMT_EMAIL}>", commit
+        assert fields == [REPO_NAME, REPO_EMAIL, REPO_NAME, REPO_EMAIL], fields
+        assert_human_authored_with_tmt_co_author(sandbox)
+        assert trailer_lines(sandbox) == [TMT_TRAILER], trailer_lines(sandbox)
+        assert commit["author"] == HUMAN_SIGNATURE, commit
+        assert commit["committer"] == HUMAN_SIGNATURE, commit
+        assert commit["co_author"] == TMT_SIGNATURE, commit
         assert commit["branch"] == "main"
         assert commit["sha"] == sandbox.head()
         assert commit["sha"].startswith(commit["short"])
@@ -259,7 +325,7 @@ def test_commit_author_and_committer_are_both_the_tmt_identity():
 
 
 # Case 2
-def test_the_tmt_identity_wins_over_the_repo_local_user_email():
+def test_the_repo_local_user_stays_the_author_and_tmt_is_only_the_co_author():
     if not ready("agent_git", "agent_config"):
         return
     sandbox = Sandbox()
@@ -267,13 +333,15 @@ def test_the_tmt_identity_wins_over_the_repo_local_user_email():
         assert sandbox.git(["config", "user.email"]) == REPO_EMAIL
         assert REPO_EMAIL != TMT_EMAIL
         human = sandbox.git(["log", "-1", "--format=%ae"])
-        assert human == REPO_EMAIL          # the repo really would commit as the human
+        assert human == REPO_EMAIL          # the repo commits as the human, and keeps doing so
 
         sandbox.write("a.txt", "one\n")
         sandbox.engine().commit("add a", paths=["a.txt"])
-        assert sandbox.git(["log", "-1", "--format=%ae"]) == TMT_EMAIL
-        assert sandbox.git(["log", "-1", "--format=%ce"]) == TMT_EMAIL
-        # The environment override must not have rewritten the repo's own setting.
+        assert sandbox.git(["log", "-1", "--format=%ae"]) == REPO_EMAIL
+        assert sandbox.git(["log", "-1", "--format=%ce"]) == REPO_EMAIL
+        # TMT is credited beside the human rather than in place of them.
+        assert trailer_lines(sandbox) == [TMT_TRAILER], trailer_lines(sandbox)
+        # And it did not reach the author field by rewriting the repo's setting.
         assert sandbox.git(["config", "user.email"]) == REPO_EMAIL
     finally:
         sandbox.close()
@@ -335,6 +403,10 @@ def test_a_missing_tmt_git_email_raises_and_leaves_no_commit():
         assert "email" in str(raised).lower(), str(raised)
         assert sandbox.head() == before
         assert "a.txt" in sandbox.git(["status", "--porcelain"])
+        # No commit, and so no credit: an unusable address must leave no trace
+        # of TMT in the history, neither as an author nor as a co-author.
+        assert TMT_EMAIL not in sandbox.git(["log", "--format=%B%n%an%n%ae%n%cn%n%ce"])
+        assert trailer_lines(sandbox) == [], trailer_lines(sandbox)
     finally:
         sandbox.close()
 
@@ -376,7 +448,7 @@ def test_stage_all_commits_every_dirty_file():
 
 
 # Case 8
-def test_a_pushed_commit_reaches_the_bare_remote_under_the_tmt_identity():
+def test_a_pushed_commit_reaches_the_bare_remote_with_the_human_author_and_the_trailer():
     if not ready("agent_git", "agent_config"):
         return
     sandbox = Sandbox()
@@ -390,8 +462,12 @@ def test_a_pushed_commit_reaches_the_bare_remote_under_the_tmt_identity():
         assert pushed["remote"] == "origin"
         assert pushed["branch"] == "main"
         assert sandbox.bare_git(["rev-parse", "refs/heads/main"]) == commit["sha"]
+        # What reached the remote is what matters: whoever pulls this sees the
+        # human as the author and TMT only in a trailer git can parse.
+        assert_human_authored_with_tmt_co_author(sandbox, ref="refs/heads/main", bare=True)
+        assert trailer_lines(sandbox, ref="refs/heads/main", bare=True) == [TMT_TRAILER]
         who = sandbox.bare_git(["log", "-1", "--format=%an|%ae", "refs/heads/main"]).split("|")
-        assert who == [TMT_NAME, TMT_EMAIL], who
+        assert who == [REPO_NAME, REPO_EMAIL], who
     finally:
         sandbox.close()
 
@@ -1029,7 +1105,7 @@ def test_a_malformed_tmt_email_is_refused_and_creates_no_commit():
 
 
 # Round two, case 9
-def test_two_successive_commits_carry_the_identical_tmt_identity():
+def test_two_successive_commits_carry_the_identical_human_author_and_tmt_co_author():
     if not ready("agent_git", "agent_config"):
         return
     sandbox = Sandbox()
@@ -1041,27 +1117,32 @@ def test_two_successive_commits_carry_the_identical_tmt_identity():
         second = engine.commit("second change", paths=["second.txt"])
         assert first["sha"] != second["sha"]
 
-        signature = f"{TMT_NAME} <{TMT_EMAIL}>"
-        assert first["author"] == second["author"] == signature
-        assert first["committer"] == second["committer"] == signature
+        assert first["author"] == second["author"] == HUMAN_SIGNATURE
+        assert first["committer"] == second["committer"] == HUMAN_SIGNATURE
+        assert first["co_author"] == second["co_author"] == TMT_SIGNATURE
 
         rows = sandbox.git(["log", "-2", "--format=%an|%ae|%cn|%ce"]).splitlines()
         assert len(rows) == 2, rows
         for row in rows:
-            assert row.split("|") == [TMT_NAME, TMT_EMAIL, TMT_NAME, TMT_EMAIL], row
-        # The repository's own user is still configured, and still unused.
+            assert row.split("|") == [REPO_NAME, REPO_EMAIL, REPO_NAME, REPO_EMAIL], row
+        for ref in ("HEAD", "HEAD~1"):
+            assert_human_authored_with_tmt_co_author(sandbox, ref=ref)
+            assert trailer_lines(sandbox, ref=ref) == [TMT_TRAILER], ref
+        # The repository's own user decided both commits, and TMT never stood in.
         assert sandbox.git(["config", "user.email"]) == REPO_EMAIL
-        assert REPO_EMAIL not in sandbox.git(["log", "-2", "--format=%ae %ce"])
+        assert TMT_EMAIL not in sandbox.git(["log", "-2", "--format=%ae %ce"])
+        assert TMT_NAME not in sandbox.git(["log", "-2", "--format=%an %cn"])
     finally:
         sandbox.close()
 
 
 # Round two, case 10
-def test_git_log_format_fuller_names_tmt_on_both_the_author_and_commit_lines():
+def test_git_log_format_fuller_names_the_human_on_both_the_author_and_commit_lines():
     """The verification the user asked for, on git's own rendered output.
 
     --format=fuller is the view that separates author from committer, so it is
-    the one place a silently different committer would show itself.
+    the one place a silently substituted committer would show itself. TMT must
+    appear nowhere in that header and only in the trailer of the raw message.
     """
     if not ready("agent_git", "agent_config"):
         return
@@ -1072,19 +1153,29 @@ def test_git_log_format_fuller_names_tmt_on_both_the_author_and_commit_lines():
         commit = sandbox.engine().commit("add a", paths=["a.txt"])
         text = sandbox.git(["log", "--format=fuller", "-1"])
 
-        signature = f"{TMT_NAME} <{TMT_EMAIL}>"
         # "Author:" and "Commit:" only, never the AuthorDate:/CommitDate: lines.
         authors = re.findall(r"(?m)^Author:[ \t]+(.+?)[ \t]*$", text)
         committers = re.findall(r"(?m)^Commit:[ \t]+(.+?)[ \t]*$", text)
-        assert authors == [signature], f"Author line was {authors}, in:\n{text}"
-        assert committers == [signature], f"Commit line was {committers}, in:\n{text}"
+        assert authors == [HUMAN_SIGNATURE], f"Author line was {authors}, in:\n{text}"
+        assert committers == [HUMAN_SIGNATURE], f"Commit line was {committers}, in:\n{text}"
 
-        assert text.count(TMT_NAME) >= 2, text
-        assert text.count(TMT_EMAIL) >= 2, text
+        # The header block, before the indented message: TMT belongs in neither
+        # half of it, however the trailer below reads.
+        header = text.split("\n\n", 1)[0]
+        assert TMT_NAME not in header, header
+        assert TMT_EMAIL not in header, header
+        assert header.count(REPO_NAME) == 2, header
+        assert header.count(REPO_EMAIL) == 2, header
         assert "AuthorDate:" in text and "CommitDate:" in text, text
         assert commit["sha"] in text, text
-        assert REPO_EMAIL not in text, text
-        assert "Repo Human" not in text, text
+
+        # The other half of the same property: the trailer is there, and it is
+        # a trailer git parses rather than a line of the message that reads
+        # like one.
+        raw = sandbox.git(["log", "-1", "--format=%B"])
+        assert TMT_TRAILER in raw, raw
+        assert trailer_lines(sandbox) == [TMT_TRAILER], trailer_lines(sandbox)
+        assert TMT_TRAILER in text, text
     finally:
         sandbox.close()
 
@@ -1258,3 +1349,378 @@ def test_every_module_imports_and_is_clean_utf8_text():
         if source.name.startswith("test_") or source.name == "run_tests.py":
             continue
         importlib.import_module(source.stem)      # raises if it cannot load
+
+
+# ---------------------------------------------------------------------------
+# Round three: TMT as co-author rather than author.
+#
+# The commits are made by the engine and then read back with git's own trailer
+# parser, because the question these answer is not "does the message contain
+# this line" but "will anything downstream read this as a co-author", and only
+# git can answer that.
+# ---------------------------------------------------------------------------
+
+
+# Round three, case 1
+def test_tmt_appears_only_in_the_trailer_and_never_in_an_identity_field():
+    """The human is not displaced. Asserted as one property, not two.
+
+    Each identity field is read separately so a failure names the one that was
+    taken over, and the trailer is checked on the same commit: a change that
+    restored TMT as the author while still writing the trailer would pass
+    either half of this on its own.
+    """
+    if not ready("agent_git", "agent_config"):
+        return
+    sandbox = Sandbox()
+    try:
+        assert agent_git.CO_AUTHOR_TOKEN == "Co-authored-by", agent_git.CO_AUTHOR_TOKEN
+        sandbox.write("a.txt", "one\n")
+        result = sandbox.engine().commit("add a", paths=["a.txt"])
+
+        for placeholder, field in (("%an", "author name"), ("%ae", "author email"),
+                                   ("%cn", "committer name"), ("%ce", "committer email")):
+            value = sandbox.git(["log", "-1", "--format=" + placeholder])
+            assert TMT_NAME not in value, (field, value)
+            assert TMT_EMAIL not in value, (field, value)
+        assert identity_fields(sandbox) == [REPO_NAME, REPO_EMAIL, REPO_NAME, REPO_EMAIL]
+        assert trailer_lines(sandbox) == [TMT_TRAILER], trailer_lines(sandbox)
+
+        assert result["author"] == HUMAN_SIGNATURE, result
+        assert result["committer"] == HUMAN_SIGNATURE, result
+        assert result["co_author"] == TMT_SIGNATURE, result
+        # The engine kept no way to set an author at all: the environment it
+        # once built for that was removed rather than merely left unused.
+        assert not hasattr(agent_git.TMTGit, "commit_environment")
+    finally:
+        sandbox.close()
+
+
+# Round three, case 2
+def test_the_trailer_is_one_git_parses_not_a_line_that_merely_looks_like_one():
+    """A substring search cannot tell a trailer from prose. git can.
+
+    The control commit carries the exact trailer text inside a paragraph that
+    continues past it, which every substring search reads as a trailer and git
+    reads as prose. GitHub and everything else downstream see what git sees.
+    """
+    if not ready("agent_git", "agent_config"):
+        return
+    sandbox = Sandbox()
+    try:
+        lookalike = ("looks like a trailer\n\n" + TMT_TRAILER +
+                     "\nand a following line of prose that ends the paragraph.")
+        sandbox.write("control.txt", "one\n")
+        sandbox.git(["add", "control.txt"])
+        sandbox.git(["commit", "-q", "-m", lookalike])
+        assert TMT_TRAILER in sandbox.git(["log", "-1", "--format=%B"])
+        assert trailer_lines(sandbox) == [], (
+            "git must not read a line buried in a paragraph as a trailer")
+
+        sandbox.write("real.txt", "two\n")
+        sandbox.engine().commit("a real one", paths=["real.txt"])
+        assert trailer_lines(sandbox) == [TMT_TRAILER], trailer_lines(sandbox)
+        valueonly = sandbox.git([
+            "log", "-1",
+            f"--format=%(trailers:key={agent_git.CO_AUTHOR_TOKEN},valueonly=true)"])
+        assert valueonly.strip() == TMT_SIGNATURE, valueonly
+        assert_human_authored_with_tmt_co_author(sandbox)
+    finally:
+        sandbox.close()
+
+
+# Round three, case 3
+def test_the_co_author_address_is_read_from_the_tmt_git_file():
+    """The address reaches a real commit from the file, not only from the
+    environment, because the file is what every clone actually gets.
+
+    Both identity files are pointed at the sandbox, so neither the tracked
+    .tmt_git in this repository nor a developer's own .tmt_git.local can decide
+    the outcome.
+    """
+    if not ready("agent_git", "agent_config"):
+        return
+    sandbox = Sandbox(name=None, email=None)
+    previous = None
+    try:
+        tracked = sandbox.base / "identity.tmt_git"
+        local = sandbox.base / "identity.tmt_git.local"
+        tracked.write_text(
+            "# an identity file of the shape every clone receives\n"
+            "TMT_GIT_NAME=Filed Name\n"
+            "TMT_GIT_EMAIL=filed@example.invalid\n", encoding="utf-8")
+        previous = set_module_attrs(agent_config, {
+            "GIT_IDENTITY_FILE": tracked,
+            "GIT_IDENTITY_LOCAL_FILE": local,
+        })
+
+        identity = agent_git.TMTGitIdentity.resolve()
+        assert identity.email == "filed@example.invalid", identity.email
+        assert identity.name == "Filed Name", identity.name
+        assert identity.email_source == agent_config.GIT_SOURCE_TRACKED_FILE, (
+            identity.email_source)
+
+        sandbox.write("a.txt", "one\n")
+        sandbox.engine().commit("add a", paths=["a.txt"])
+        assert trailer_lines(sandbox) == [
+            "Co-authored-by: Filed Name <filed@example.invalid>"], trailer_lines(sandbox)
+        assert identity_fields(sandbox) == [REPO_NAME, REPO_EMAIL, REPO_NAME, REPO_EMAIL]
+
+        # The per-machine override sits above the tracked file, and the value
+        # it wins with has to reach a commit rather than only the resolver.
+        local.write_text("TMT_GIT_EMAIL=machine@example.invalid\n", encoding="utf-8")
+        assert agent_git.TMTGitIdentity.resolve().email_source == \
+            agent_config.GIT_SOURCE_LOCAL_FILE
+        sandbox.write("b.txt", "two\n")
+        sandbox.engine().commit("add b", paths=["b.txt"])
+        assert trailer_lines(sandbox) == [
+            "Co-authored-by: Filed Name <machine@example.invalid>"], trailer_lines(sandbox)
+        assert identity_fields(sandbox) == [REPO_NAME, REPO_EMAIL, REPO_NAME, REPO_EMAIL]
+    finally:
+        restore_module_attrs(agent_config, previous)
+        sandbox.close()
+
+
+# Round three, case 4
+def test_a_message_already_crediting_tmt_ends_with_exactly_one_trailer():
+    """A retry, or a model that wrote the trailer itself, must not accumulate
+    credit lines. The match is on the address alone, so the same co-author
+    under a different display name or a different case is still the same one.
+    """
+    if not ready("agent_git", "agent_config"):
+        return
+    variants = (
+        ("identical", TMT_TRAILER),
+        ("a different case", "co-authored-by: TMT code <TMT-Code@Example.Invalid>"),
+        ("a different display name", f"Co-authored-by: The TMT Agent <{TMT_EMAIL}>"),
+    )
+    for label, existing in variants:
+        assert agent_git.has_co_author("add a\n\n" + existing, TMT_EMAIL), label
+        sandbox = Sandbox()
+        try:
+            sandbox.write("a.txt", label + "\n")
+            sandbox.engine().commit("add a\n\n" + existing, paths=["a.txt"])
+            lines = trailer_lines(sandbox)
+            assert len(lines) == 1, (label, lines)
+            assert trailer_addresses(lines) == [TMT_EMAIL], (label, lines)
+            body = sandbox.git(["log", "-1", "--format=%B"])
+            assert body.lower().count("co-authored-by") == 1, (label, body)
+            assert_human_authored_with_tmt_co_author(sandbox)
+        finally:
+            sandbox.close()
+
+
+# Round three, case 5
+def test_an_existing_different_co_author_is_kept_and_tmt_is_credited_beside_it():
+    """Co-authorship is not exclusive. Someone already credited stays credited."""
+    if not ready("agent_git", "agent_config"):
+        return
+    other = "Co-authored-by: Other Person <other@example.invalid>"
+    sandbox = Sandbox()
+    try:
+        sandbox.write("a.txt", "one\n")
+        sandbox.engine().commit("add a\n\nSome body\n\n" + other, paths=["a.txt"])
+        lines = trailer_lines(sandbox)
+        assert lines == [other, TMT_TRAILER], lines
+        assert trailer_addresses(lines) == ["other@example.invalid", TMT_EMAIL], lines
+        assert "Some body" in sandbox.git(["log", "-1", "--format=%B"])
+        assert_human_authored_with_tmt_co_author(sandbox)
+    finally:
+        sandbox.close()
+
+
+# Round three, case 6
+def test_an_existing_signed_off_by_block_is_preserved_and_tmt_joins_it():
+    """A trailer that is not a co-author is still a trailer.
+
+    TMT has to join the block rather than start a paragraph after it: a blank
+    line between the two would end the block, and git would then read neither
+    line as a trailer.
+    """
+    if not ready("agent_git", "agent_config"):
+        return
+    signoff = f"Signed-off-by: {HUMAN_SIGNATURE}"
+    sandbox = Sandbox()
+    try:
+        sandbox.write("a.txt", "one\n")
+        sandbox.engine().commit("add a\n\nbody text here\n\n" + signoff, paths=["a.txt"])
+        body = sandbox.git(["log", "-1", "--format=%B"])
+        assert signoff + "\n" + TMT_TRAILER in body, body
+        assert signoff + "\n\n" + TMT_TRAILER not in body, body
+        assert "body text here" in body, body
+        assert trailer_lines(sandbox, key="Signed-off-by") == [signoff]
+        assert trailer_lines(sandbox) == [TMT_TRAILER]
+        assert_human_authored_with_tmt_co_author(sandbox)
+    finally:
+        sandbox.close()
+
+
+# Round three, case 7
+def test_a_commit_the_user_makes_themselves_never_gains_a_trailer():
+    """TMT adds the trailer to commits it creates and to nothing else.
+
+    A commit the user makes with plain git is left exactly as they wrote it,
+    before and after TMT commits alongside it.
+    """
+    if not ready("agent_git", "agent_config"):
+        return
+    sandbox = Sandbox()
+    try:
+        sandbox.write("human.txt", "the human's own work\n")
+        sandbox.git(["add", "human.txt"])
+        sandbox.git(["commit", "-q", "-m", "a commit made with plain git"])
+        manual = sandbox.head()
+        assert trailer_lines(sandbox) == [], trailer_lines(sandbox)
+        assert agent_git.co_authors(sandbox.git(["log", "-1", "--format=%B"])) == []
+
+        sandbox.write("tmt.txt", "work tmt did\n")
+        sandbox.engine().commit("a commit made by tmt", paths=["tmt.txt"])
+        assert trailer_lines(sandbox) == [TMT_TRAILER], trailer_lines(sandbox)
+
+        # The user's commit, and the one that predates TMT here, are untouched.
+        assert trailer_lines(sandbox, ref=manual) == [], manual
+        assert sandbox.git(["log", "-1", "--format=%B", manual]) == \
+            "a commit made with plain git"
+        assert trailer_lines(sandbox, ref="HEAD~2") == []
+    finally:
+        sandbox.close()
+
+
+# Round three, case 8
+def test_every_message_shape_keeps_its_text_and_gains_one_parsed_trailer():
+    """The shapes that decide where git puts a trailer: nothing to attach to,
+    a body to leave alone, a colon in prose that is not a token, and several
+    body lines."""
+    if not ready("agent_git", "agent_config"):
+        return
+    shapes = (
+        ("subject only", "add a"),
+        ("subject and body", "add a\n\nSome explanation of the change."),
+        ("a colon in prose", "fix the parser\n\nThe bug was here: the lexer dropped it."),
+        ("a multi-line body", "add a\n\nline one\nline two\nline three"),
+    )
+    for label, message in shapes:
+        sandbox = Sandbox()
+        try:
+            sandbox.write("a.txt", label + "\n")
+            sandbox.engine().commit(message, paths=["a.txt"])
+            body = sandbox.git(["log", "-1", "--format=%B"])
+            for line in message.splitlines():
+                assert line in body, (label, line, body)
+            assert trailer_lines(sandbox) == [TMT_TRAILER], (label, body)
+            # Every trailer git finds, not just the co-author ones: a body line
+            # read as a trailer would show up here and nowhere else.
+            everything = [line.strip() for line in
+                          sandbox.git(["log", "-1", "--format=%(trailers)"]).splitlines()
+                          if line.strip()]
+            assert everything == [TMT_TRAILER], (label, everything)
+            if label == "a colon in prose":
+                # Prose keeps the blank line that stops it being a trailer block.
+                assert "the lexer dropped it.\n\n" + TMT_TRAILER in body, body
+            assert_human_authored_with_tmt_co_author(sandbox)
+        finally:
+            sandbox.close()
+
+
+# Round three, case 9
+def test_a_tmt_commit_adds_to_history_without_rewriting_any_of_it():
+    """Every existing commit stays byte-identical.
+
+    Adding the trailer by amending would be a rewrite of a commit other clones
+    may already hold, so the engine appends and never amends -- including when
+    it finds the trailer missing after the fact.
+    """
+    if not ready("agent_git", "agent_config"):
+        return
+    sandbox = Sandbox()
+    try:
+        for index in range(3):
+            name = f"history_{index}.txt"
+            sandbox.write(name, f"{index}\n")
+            sandbox.git(["add", name])
+            sandbox.git(["commit", "-q", "-m", f"human commit {index}"])
+        before = sandbox.git(["log", "--format=%H"]).splitlines()
+        assert len(before) >= 4, before
+        objects = {sha: sandbox.git(["cat-file", "commit", sha]) for sha in before}
+
+        sandbox.write("new.txt", "new\n")
+        commit = sandbox.engine().commit("a tmt commit", paths=["new.txt"])
+
+        assert sandbox.git(["log", "--format=%H"]).splitlines() == [commit["sha"]] + before
+        for sha in before:
+            assert sandbox.git(["cat-file", "commit", sha]) == objects[sha], sha
+            assert trailer_lines(sandbox, ref=sha) == [], sha
+        assert trailer_lines(sandbox) == [TMT_TRAILER]
+        assert_human_authored_with_tmt_co_author(sandbox)
+    finally:
+        sandbox.close()
+
+
+# Round three, case 10
+def test_a_failed_push_leaves_the_commit_message_and_trailer_untouched():
+    """A push that fails changes nothing: not the sha, not the message, and not
+    the trailer that carries the credit."""
+    if not ready("agent_git", "agent_config"):
+        return
+    sandbox = Sandbox()
+    try:
+        sandbox.write("a.txt", "one\n")
+        engine = sandbox.engine()
+        commit = engine.commit("add a\n\nwith a body", paths=["a.txt"])
+        body_before = sandbox.git(["log", "-1", "--format=%B"])
+        # A remote that is not there, so the failure comes from git having
+        # tried rather than from TMT refusing before it started.
+        sandbox.git(["remote", "set-url", "origin",
+                     sandbox.url(sandbox.base / "absent.git")])
+
+        raised = None
+        try:
+            engine.push()
+        except agent_git.GitError as error:
+            raised = error
+        assert raised is not None, "a push to a missing remote must raise"
+        assert "local repository" in str(raised), str(raised)
+
+        assert sandbox.head() == commit["sha"]
+        assert sandbox.git(["log", "-1", "--format=%B"]) == body_before
+        assert trailer_lines(sandbox) == [TMT_TRAILER], trailer_lines(sandbox)
+        assert_human_authored_with_tmt_co_author(sandbox)
+    finally:
+        sandbox.close()
+
+
+# Round three, case 11
+def test_the_manual_trailer_fallback_matches_git_interpret_trailers():
+    """The fallback is only reached when interpret-trailers cannot run, so it
+    is compared against the real thing rather than assumed equivalent.
+
+    The one deliberate divergence is an exact duplicate, which git drops and
+    the fallback repeats. commit() never asks either of them in that case:
+    has_co_author short-circuits it, which is what keeps the count at one.
+    """
+    if not ready("agent_git", "agent_config"):
+        return
+    sandbox = Sandbox()
+    try:
+        shapes = (
+            "add a",
+            "add a\n\nSome explanation of the change.",
+            "fix the parser\n\nThe bug was here: the lexer dropped it.",
+            "add a\n\nline one\nline two\nline three",
+            "add a\n\nbody\n\nSigned-off-by: " + HUMAN_SIGNATURE,
+            "add a\n\nbody\n\nCo-authored-by: Other Person <other@example.invalid>",
+            "add a\n\nNote: this line is trailer-shaped.",
+        )
+        for message in shapes:
+            by_git = agent_git.add_co_author(message, TMT_TRAILER, sandbox.repo)
+            manual = agent_git._append_trailer_manually(message, TMT_TRAILER)
+            assert by_git == manual, (message, by_git, manual)
+            assert by_git.endswith(TMT_TRAILER + "\n"), (message, by_git)
+
+        duplicate = "add a\n\n" + TMT_TRAILER
+        assert agent_git.add_co_author(
+            duplicate, TMT_TRAILER, sandbox.repo).count(TMT_TRAILER) == 1
+        assert agent_git.has_co_author(duplicate, TMT_EMAIL), (
+            "an already-credited message must never reach either trailer path")
+    finally:
+        sandbox.close()

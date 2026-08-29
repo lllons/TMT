@@ -1,4 +1,9 @@
-"""Git operations performed under TMT's own commit identity."""
+"""Git operations that credit TMT as a co-author of the user's commits.
+
+The author and committer of every commit made here are whoever the
+repository's own git configuration says they are. TMT never writes itself
+into either field; it adds a Co-authored-by trailer and nothing else.
+"""
 
 import os
 import re
@@ -70,26 +75,27 @@ def log(event, detail=""):
 
 
 SETUP_HINT = (
-    "TMT commits under its own git identity and never under yours, so it needs "
-    "an address of its own.\n"
+    "TMT is credited as a co-author on commits it makes, never as the author, "
+    "so it needs an address of its own.\n"
     "Put a line 'TMT_GIT_EMAIL=tmt-code@example.invalid' in the tracked .tmt_git "
     "file beside the TMT modules to set it for every clone, or in .tmt_git.local "
     "to set it on this machine only, or set the TMT_GIT_EMAIL environment "
     "variable. TMT_GIT_NAME sets the display name (default 'TMT code').\n"
     "The address is public commit metadata, not a credential: never put tokens, "
     "passwords or keys in either file.\n"
-    "Your own git configuration is not read and not changed."
+    "You stay the author of your commits. Your own git configuration is not "
+    "read, not changed, and not replaced."
 )
 
 PLACEHOLDER_HINT = (
     "The TMT git email is still the placeholder the project ships with, so it "
-    "identifies nobody and GitHub cannot attribute a commit to it.\n"
+    "identifies nobody and GitHub cannot credit a co-author with it.\n"
     "Replace it with a real address that is verified on the GitHub account "
     "representing TMT: edit the TMT_GIT_EMAIL line in the tracked .tmt_git file "
     "beside the TMT modules, or override it for this machine alone in "
     ".tmt_git.local, or set the TMT_GIT_EMAIL environment variable.\n"
-    "Until then TMT refuses to commit rather than author commits under an "
-    "address that belongs to no one."
+    "Until then TMT refuses to commit rather than credit a co-author who "
+    "belongs to no one."
 )
 
 
@@ -121,6 +127,71 @@ def _scrub(text):
     return _URL_USERINFO.sub(r"\1", str(text))
 
 
+CO_AUTHOR_TOKEN = "Co-authored-by"
+
+# Matched case-insensitively and on the address alone. Git treats the token
+# case-insensitively, and GitHub keys attribution on the address, so the same
+# co-author under a different display name is still the same co-author.
+_CO_AUTHOR_LINE = re.compile(r"^[ \t]*co-authored-by[ \t]*:(?P<value>.*)$",
+                             re.IGNORECASE | re.MULTILINE)
+_ADDRESS = re.compile(r"<([^<>]+)>")
+# A trailer line for the purpose of deciding whether the last paragraph of a
+# message is a trailer block: "Token: value", or a folded continuation.
+_TRAILER_SHAPED = re.compile(r"^(?:[A-Za-z0-9-]+[ \t]*:[ \t]*\S|[ \t]+\S)")
+
+
+def co_authors(message):
+    """Every address already credited as a co-author, lowercased."""
+    found = []
+    for match in _CO_AUTHOR_LINE.finditer(message or ""):
+        address = _ADDRESS.search(match.group("value"))
+        if address:
+            found.append(address.group(1).strip().lower())
+    return found
+
+
+def has_co_author(message, email):
+    """Whether this address is already credited on the message."""
+    return bool(email) and email.strip().lower() in co_authors(message)
+
+
+def _append_trailer_manually(message, trailer):
+    """Git's trailer rule, applied without git.
+
+    Only reached when interpret-trailers is unavailable. A trailer joins the
+    final paragraph when that paragraph is already all trailers, and otherwise
+    starts a paragraph of its own -- which is the difference between a trailer
+    git can parse and a line of prose that happens to have a colon in it.
+
+    One deliberate divergence from interpret-trailers: given a trailer that is
+    already present verbatim, git drops the duplicate and this appends it. That
+    path is unreachable, because commit() checks has_co_author first and never
+    calls this with a trailer the message already carries.
+    """
+    body = (message or "").rstrip("\n")
+    if not body:
+        return trailer + "\n"
+    paragraphs = body.split("\n\n")
+    last = [line for line in paragraphs[-1].splitlines() if line.strip()]
+    joins_last = bool(last) and all(_TRAILER_SHAPED.match(line) for line in last)
+    separator = "\n" if joins_last else "\n\n"
+    return body + separator + trailer + "\n"
+
+
+def add_co_author(message, trailer, cwd):
+    """Return the message with `trailer` appended as a git trailer.
+
+    Uses git's own interpret-trailers, so blank-line placement, existing
+    trailer blocks and folded continuations behave exactly as git defines
+    them rather than as string surgery guesses they do.
+    """
+    result = _git(["interpret-trailers", "--trailer", trailer], cwd,
+                  check=False, stdin=(message or "") + "\n")
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.rstrip("\n") + "\n"
+    return _append_trailer_manually(message, trailer)
+
+
 def _clip(text, limit):
     text = text.strip()
     if len(text) <= limit:
@@ -128,7 +199,7 @@ def _clip(text, limit):
     return text[:limit] + "\n... (truncated)"
 
 
-def _git(args, cwd, env=None, timeout=GIT_TIMEOUT, check=True):
+def _git(args, cwd, env=None, timeout=GIT_TIMEOUT, check=True, stdin=None):
     """Run one git command. Never a shell, never inheriting a cwd by accident."""
     cmd = ["git"] + [str(a) for a in args]
     log("run", " ".join(cmd) + f"   (in {cwd})")
@@ -136,7 +207,8 @@ def _git(args, cwd, env=None, timeout=GIT_TIMEOUT, check=True):
     try:
         result = subprocess.run(
             cmd, cwd=str(cwd), env=env, shell=False, capture_output=True,
-            text=True, encoding="utf-8", errors="replace", timeout=timeout,
+            input=stdin, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout,
         )
     except FileNotFoundError:
         log("error", "git was not found on PATH")
@@ -218,17 +290,15 @@ class TMTGitIdentity:
                 + SETUP_HINT
             )
 
-    def commit_environment(self, base_env=None):
-        """A copy of base_env (default os.environ) with GIT_AUTHOR_NAME,
-        GIT_AUTHOR_EMAIL, GIT_COMMITTER_NAME and GIT_COMMITTER_EMAIL set.
-        Applies to one subprocess only; never touches global config."""
-        self.validate()
-        env = dict(os.environ if base_env is None else base_env)
-        env["GIT_AUTHOR_NAME"] = self.name
-        env["GIT_AUTHOR_EMAIL"] = self.email
-        env["GIT_COMMITTER_NAME"] = self.name
-        env["GIT_COMMITTER_EMAIL"] = self.email
-        return env
+    def trailer(self):
+        """The Co-authored-by line crediting TMT for a commit it made.
+
+        A trailer rather than an author override: the person who asked for the
+        work stays the author of it, and TMT is credited beside them. GitHub
+        reads this trailer when working out contributors, so the address here
+        is what decides whether TMT is credited at all.
+        """
+        return f"{CO_AUTHOR_TOKEN}: {self.signature()}"
 
     def signature(self):
         return f"{self.name} <{self.email}>"
@@ -240,13 +310,15 @@ class TMTGitIdentity:
         this identity to print.
         """
         lines = [
-            "TMT git identity",
+            "TMT git co-author identity",
             f"  name:  {self.name}  (from {self.name_source})",
             f"  email: {self.email or '(not set)'}  (from {self.email_source})",
             f"  tracked identity file: {_config('GIT_IDENTITY_FILE', '.tmt_git')}",
             f"  per-machine override:  {_local_identity_file()}",
             "  precedence: TMT_GIT_* environment variables, then .tmt_git.local, "
             "then .tmt_git",
+            "  role: co-author. You remain the author and committer of your own "
+            "commits; TMT is added with a Co-authored-by trailer.",
         ]
         try:
             self.validate()
@@ -421,14 +493,19 @@ class TMTGit:
         return _scrub(result.stdout.strip())
 
     def commit(self, message, paths=None, stage_all=False):
-        """Commit under the TMT identity. Returns
-        {'sha': str, 'short': str, 'author': 'Name <email>',
-         'committer': 'Name <email>', 'branch': str, 'files': [paths]}.
+        """Commit the work, crediting TMT as a co-author of it. Returns
+        {'sha', 'short', 'author', 'committer', 'co_author', 'branch', 'files'}.
 
-        Identity is applied ONLY through commit_environment() on this
-        subprocess. Raises GitError when the identity is unset, when nothing is
-        staged, or when git fails. `stage_all` is the explicit
-        commit-everything path; without it only `paths` are staged."""
+        The author and committer are whoever the repository's own git
+        configuration says they are: the person who asked for the work keeps
+        it. TMT is credited by a Co-authored-by trailer instead, which is what
+        GitHub reads when deciding contributors, and which leaves the human on
+        the commit rather than replacing them.
+
+        Raises GitError when TMT's co-author address is unset, when the user
+        has no git identity of their own, when nothing is staged, or when git
+        fails. `stage_all` is the explicit commit-everything path; without it
+        only `paths` are staged."""
         identity = self.identity
         log("commit", f"requested in {self.root} | paths={paths} | all={stage_all}")
         # Checked before anything is staged: an unusable identity must leave the
@@ -438,8 +515,8 @@ class TMTGit:
         except GitError as error:
             log("refused", f"identity unusable, nothing staged: {error}")
             raise
-        log("identity", f"{identity.signature()} (name from {identity.name_source}, "
-                        f"email from {identity.email_source})")
+        log("co-author", f"{identity.signature()} (name from {identity.name_source}, "
+                         f"email from {identity.email_source})")
         text = (message or "").strip()
         if not text:
             raise GitError("A commit message is required.")
@@ -455,7 +532,29 @@ class TMTGit:
                 "Nothing is staged, so there is nothing to commit. Name the "
                 "paths to commit, or ask to commit everything."
             )
-        self._run(["commit", "--message", text], env=identity.commit_environment())
+        # Already credited means already credited: a second identical trailer
+        # is noise, and on a retry it would accumulate.
+        if has_co_author(text, identity.email):
+            final = text
+            log("co-author", "already credited in this message; not repeated")
+        else:
+            final = add_co_author(text, identity.trailer(), self.root)
+        commit_result = self._run(["commit", "--message", final], check=False)
+        if commit_result.returncode != 0:
+            detail = _clip(_scrub(commit_result.stderr) or _scrub(commit_result.stdout),
+                           MAX_DETAIL_CHARS)
+            log("failed", f"git commit: {detail or 'no output'}")
+            if _looks_like_missing_author(detail):
+                raise GitError(
+                    "This repository has no git identity for you, so git will "
+                    "not record who authored the commit. TMT credits itself as "
+                    "a co-author and deliberately does not stand in as the "
+                    "author, so set your own first:\n"
+                    '  git config user.name "Your Name"\n'
+                    "  git config user.email you@example.com\n"
+                    "Nothing was committed."
+                )
+            raise GitError(f"git commit failed: {detail or 'no output'}")
         record = self._run(
             ["log", "-1", "--format=%H%x00%h%x00%an%x00%ae%x00%cn%x00%ce"]
         ).stdout
@@ -463,29 +562,25 @@ class TMTGit:
         if len(fields) < 6:
             raise GitError("The commit was created but git did not report it back.")
         sha, short, author_name, author_email, committer_name, committer_email = fields[:6]
-        mismatched = (
-            author_name != identity.name or author_email != identity.email
-            or committer_name != identity.name or committer_email != identity.email
-        )
+        recorded = self._run(["log", "-1", "--format=%B"]).stdout
         log("created", f"{short} on {self._branch_label()}")
-        log("verified", f"author {author_name} <{author_email}> | "
-                        f"committer {committer_name} <{committer_email}>")
-        if mismatched:
-            log("failed", "recorded identity is not TMT's; commit left untouched")
-            # Better to stop loudly than to leave the user believing a commit
-            # carries TMT's identity when it carries someone else's.
+        log("author", f"{author_name} <{author_email}> (the human, unchanged)")
+        log("co-author", identity.signature())
+        if not has_co_author(recorded, identity.email):
+            # Reported rather than repaired: amending to force the trailer in
+            # would rewrite a commit that already exists.
+            log("failed", "the co-author trailer is missing from the commit")
             raise GitError(
-                f"Commit {short} was recorded as {author_name} <{author_email}> / "
-                f"{committer_name} <{committer_email}> instead of "
-                f"{identity.signature()}. The commit exists locally and was left "
-                "untouched. Check for GIT_AUTHOR_* or GIT_COMMITTER_* overrides "
-                "in the environment."
+                f"Commit {short} was created but does not carry "
+                f"{identity.trailer()}. The commit exists locally and was left "
+                "untouched; TMT will not rewrite it to add the trailer."
             )
         return {
             "sha": sha,
             "short": short,
             "author": f"{author_name} <{author_email}>",
             "committer": f"{committer_name} <{committer_email}>",
+            "co_author": identity.signature(),
             "branch": self._branch_label(),
             "files": staged,
         }
@@ -533,6 +628,18 @@ class TMTGit:
             "remote_url_host": host,
             "summary": _clip(output, MAX_DETAIL_CHARS) or f"Pushed {name} to {target}.",
         }
+
+
+_MISSING_AUTHOR = (
+    "please tell me who you are", "unable to auto-detect email address",
+    "author identity unknown", "empty ident name", "no name was given",
+)
+
+
+def _looks_like_missing_author(detail):
+    """Whether git refused because the user has no identity configured."""
+    lowered = (detail or "").lower()
+    return any(marker in lowered for marker in _MISSING_AUTHOR)
 
 
 def _locate_root(start=None):

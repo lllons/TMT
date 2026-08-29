@@ -13,7 +13,7 @@ from agent_actions import READ_ONLY_ACTIONS, ACTION_LABELS, MAX_TURNS
 from agent_model import ask_model
 from agent_ui import LiveUI, render_response
 from agent_live_renderer import LiveRelay
-from agent_setup import ensure_api_key
+from agent_setup import ensure_api_key, ensure_git_identity
 from agent_prompt import get_system_prompt, invalidate_prompt, validate_action
 from agent_execution import APP_REGISTRY, RUNNERS, open_app, run_file, run_python
 from agent_file_ops import (
@@ -109,6 +109,9 @@ def main(argv=None):
     # to be modified, and a run from the wrong place should be obvious here
     # rather than three edits later.
     console.print(f"[bold]Workspace:[/bold] {root}")
+    # Offered once, and never blocking: a missing co-author address stops
+    # commits, not the session, and the refusal explains itself when it happens.
+    ensure_git_identity()
     while True:
         try:
             task = console.input("\n[bold cyan]Task> [/bold cyan]").strip()
