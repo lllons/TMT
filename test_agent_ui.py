@@ -301,3 +301,205 @@ def test_safe_write_reports_a_dead_stream_instead_of_raising():
     narrow = NarrowStream()
     assert agent_ui.safe_write(narrow, "rocket 🚀 done") is True
     assert "rocket" in narrow.getvalue() and "done" in narrow.getvalue()
+
+
+# --- the response history ----------------------------------------------------
+#
+# The surface these cover is the one that had to exist: everything shown during
+# a turn used to be a single row repainted in place, so each message erased the
+# one before it and a finished turn had kept nothing. What follows is mostly
+# about absence -- that nothing goes missing -- which is why the assertions are
+# about the whole sequence rather than about the newest entry.
+
+
+class Recorder(io.StringIO):
+    """A stream that reports an encoding and is not a terminal."""
+
+    encoding = "utf-8"
+
+    def isatty(self):
+        return False
+
+
+TURN = (
+    ("progress", "Inspecting the existing implementation."),
+    ("tool", "Read 5 files"),
+    ("progress", "Found the shared provider abstraction."),
+    ("file_edit", "Modified src/providers.py"),
+    ("progress", "Running the integration tests."),
+    ("tool", "Ran 1 shell command"),
+    ("success", "173 tests passed."),
+    ("next_step_suggestion", "Review the changed files"),
+    ("final", "The provider work is done."),
+)
+
+
+def played_turn(stream=None):
+    """Emit the whole reference turn and hand back the transcript."""
+    transcript = agent_ui.Transcript(stream=stream or Recorder())
+    for kind, message in TURN:
+        transcript.emit_kind(kind, message)
+    return transcript
+
+
+def test_every_event_of_a_turn_survives_the_events_that_follow_it():
+    """The defect this replaced: each new message overwrote the last, so a
+    finished turn had kept only its final line. Every entry must still be
+    there, in the order it happened, once the turn is over."""
+    stream = Recorder()
+    transcript = played_turn(stream)
+    kinds = transcript.history.kinds()
+    assert kinds == tuple(kind for kind, _ in TURN), kinds
+
+    # Present in the history is not the same as present on screen. Both.
+    shown = stream.getvalue()
+    for kind, message in TURN:
+        if kind == "final":
+            continue        # drawn by render_response, deliberately not here
+        assert message in shown, (message, shown)
+
+    # The specific claims from the request: an earlier progress message is
+    # still there after two later ones, and the tool and edit events with it.
+    first, second, third = (message for kind, message in TURN if kind == "progress")
+    assert shown.index(first) < shown.index(second) < shown.index(third), shown
+    assert "Read 5 files" in shown and "Modified src/providers.py" in shown, shown
+
+
+def test_the_suggestion_is_the_last_thing_before_the_final_answer():
+    """Placement is the whole contract for the hint: it is a lead-in to the
+    answer, not a footnote after it and not a banner before the work."""
+    kinds = played_turn().history.kinds()
+    assert kinds[-2:] == ("next_step_suggestion", "final"), kinds
+
+
+def test_an_event_is_written_once_and_never_repainted():
+    """The history is the terminal's own scrollback. A second copy of a line
+    would mean the renderer is repainting something it has already committed,
+    which is how a scrollback stops being a record."""
+    stream = Recorder()
+    played_turn(stream)
+    body = stream.getvalue()
+    for kind, message in TURN:
+        if kind == "final":
+            continue
+        assert body.count(message) == 1, (message, body.count(message))
+
+
+def test_progress_is_visibly_quieter_than_a_file_edit():
+    """A terminal cannot size type, so the hierarchy has to be carried by what
+    it does have. Progress is dimmed and tight; a file edit is indented, set
+    apart by a blank line, and not dimmed."""
+    transcript = agent_ui.Transcript(stream=Recorder())
+    progress = transcript.lines_for(agent_ui.AgentEvent.make("progress", "Checking the parser."))
+    edit = transcript.lines_for(
+        agent_ui.AgentEvent.make("file_edit", "Modified src/parser.py", added=18, removed=4))
+
+    assert agent_ui.PROMINENCE["progress"] < agent_ui.PROMINENCE["file_edit"]
+    # Indentation is the part that survives ANSI being stripped, and it must,
+    # because colour is never the message.
+    progress_indent = len(visible(progress[0])) - len(visible(progress[0]).lstrip())
+    edit_indent = len(visible(edit[0])) - len(visible(edit[0]).lstrip())
+    assert edit_indent > progress_indent, (edit_indent, progress_indent)
+    # The measured facts ride along with the edit, and are real ones.
+    assert any("+18 -4" in visible(line) for line in edit), edit
+
+
+def test_the_facts_on_an_event_are_only_the_ones_it_was_given():
+    """Nothing on screen may be invented. An event with no counts gets no
+    counts rather than a plausible-looking zero."""
+    transcript = agent_ui.Transcript(stream=Recorder())
+    bare = transcript.lines_for(agent_ui.AgentEvent.make("file_edit", "Touched a file"))
+    assert not any(re.search(r"[+-]\d", visible(line)) for line in bare), bare
+
+
+def test_the_history_cannot_be_rewritten_through_what_it_hands_out():
+    """Append-only has to mean it. A caller holding the events must not be
+    able to reach back into the record and change what happened."""
+    history = agent_ui.ResponseHistory()
+    history.append(agent_ui.AgentEvent.make("progress", "first"))
+    events = history.events
+    assert isinstance(events, tuple)
+    try:
+        events.append(agent_ui.AgentEvent.make("progress", "smuggled"))
+    except AttributeError:
+        pass
+    assert len(history) == 1, history.events
+
+
+def test_a_suggestion_over_five_words_is_refused_and_still_usable():
+    """Five words is a hard limit, but a refusal cannot leave the caller with
+    nothing: the trimmed form is still relevant to the turn, which a generic
+    fallback would not be."""
+    assert agent_ui.validate_suggestion("Run the integration tests")[0]
+    assert agent_ui.validate_suggestion("Review changed files")[0]
+    ok, cleaned, reason = agent_ui.validate_suggestion("Please run the integration tests now")
+    assert not ok and reason
+    assert agent_ui.count_words(cleaned) <= agent_ui.MAX_SUGGESTION_WORDS, cleaned
+    assert cleaned, "a refused suggestion must still leave something showable"
+
+
+def test_words_are_counted_the_way_a_reader_counts_them():
+    """Punctuation is not a word, and a hyphenated form is one."""
+    assert agent_ui.count_words("Run the tests.") == 3
+    assert agent_ui.count_words("Run the integration tests") == 4
+    assert agent_ui.count_words("Please run the integration tests now") == 6
+    assert agent_ui.count_words("Re-run the test-suite") == 3
+    assert agent_ui.count_words("") == 0
+    assert agent_ui.count_words(None) == 0
+
+
+def test_a_fallback_suggestion_never_claims_work_that_was_not_done():
+    """The hint is generated when the model gave none, so it has to be read
+    off the turn rather than guessed. A turn that ran no tests must not be
+    told to go and look at test results."""
+    empty = agent_ui.ResponseHistory()
+    assert "test" not in agent_ui.fallback_suggestion(empty).lower()
+
+    edited = agent_ui.ResponseHistory()
+    edited.append(agent_ui.AgentEvent.make("file_edit", "Modified a.py"))
+    assert agent_ui.fallback_suggestion(edited) == "Review the changed files"
+
+    tested = agent_ui.ResponseHistory()
+    tested.append(agent_ui.AgentEvent.make("test", "9 passed"))
+    assert "test" in agent_ui.fallback_suggestion(tested).lower()
+
+    for history in (None, empty, edited, tested):
+        text = agent_ui.fallback_suggestion(history)
+        assert agent_ui.validate_suggestion(text)[0], text
+
+
+def test_an_event_the_model_malformed_is_kept_rather_than_dropped():
+    """The model is not a trusted source of well-formed data, and a message it
+    meant the user to see must not vanish because its type was misspelt."""
+    assert agent_ui.AgentEvent.from_payload("not a dict") is None
+    assert agent_ui.AgentEvent.from_payload({"type": "progress"}) is None
+    assert agent_ui.AgentEvent.from_payload({"message": 7}) is None
+
+    odd = agent_ui.AgentEvent.from_payload({"type": "invented", "message": "still say it"})
+    assert odd is not None and odd.kind == "progress", odd
+    assert odd.detail.get("reported_kind") == "invented", odd.detail
+    assert odd.message == "still say it"
+
+
+def test_the_transcript_degrades_to_ascii_rather_than_emitting_junk():
+    """A console that cannot encode the markers gets a deliberate ASCII
+    interface. A row of replacement marks reads as a bug."""
+    narrow = NarrowStream()
+    transcript = agent_ui.Transcript(stream=narrow)
+    for kind in ("progress", "success", "warning", "error", "file_edit", "test"):
+        for line in transcript.lines_for(agent_ui.AgentEvent.make(kind, "a message")):
+            line.encode(narrow.encoding)        # raises if a glyph cannot be carried
+
+
+def test_a_row_of_the_transcript_never_reaches_the_last_column():
+    """Terminals disagree about what a row filled to the last column does, and
+    a wrapped row costs a screen line the caller did not account for."""
+    original = with_columns(40)
+    try:
+        transcript = agent_ui.Transcript(stream=Recorder())
+        long_message = "a considerable message " * 8
+        for kind in ("progress", "success", "file_edit", "next_step_suggestion"):
+            for line in transcript.lines_for(agent_ui.AgentEvent.make(kind, long_message)):
+                assert display_width(visible(line)) < 40, (kind, visible(line))
+    finally:
+        agent_ui.shutil.get_terminal_size = original

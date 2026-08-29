@@ -5,6 +5,7 @@ import json
 import threading
 
 import agent_model
+import agent_prompt
 from TMT import stream_handler
 from agent_live_renderer import LiveRelay
 from agent_model import StreamingActionParser, StreamError, ask_model
@@ -390,3 +391,273 @@ def test_a_multibyte_character_survives_the_stream_intact():
     # The signature of the fault: an em dash read as latin-1 becomes these.
     assert "\u00e2\u0080\u0094" not in received, repr(received)
     assert json.loads(received)["message"] == "an em dash \u2014 and an accent \u00e9"
+
+
+# --- progress, events and next_step: the optional response-history fields ---
+
+
+def feed_events(text, size=1):
+    """Drive a parser directly, one chunk of ``size`` characters at a time."""
+    parser = StreamingActionParser()
+    events = []
+    for chunk in chunk_text(text, size):
+        events.extend(parser.feed(chunk))
+    return parser, events
+
+
+def values(events, kind):
+    return [value for name, value in events if name == kind]
+
+
+def test_progress_is_emitted_before_the_object_completes():
+    """The point of the field: it reaches the screen while the action is
+    still being generated, not when the reply lands."""
+    reply = '{"action":"read_file","path":"a.txt","progress":"Reading a.txt now."}'
+    parser = StreamingActionParser()
+    progress_at, object_at = None, None
+    for index, char in enumerate(reply):
+        for kind, value in parser.feed(char):
+            if kind == "progress":
+                progress_at = index
+                assert value == "Reading a.txt now."
+            elif kind == "object":
+                object_at = index
+    assert progress_at is not None, "no progress event was emitted"
+    assert object_at is not None
+    assert progress_at < object_at, (progress_at, object_at)
+    assert json.loads(parser.result())["progress"] == "Reading a.txt now."
+
+
+def test_progress_and_next_step_never_appear_in_the_text_stream():
+    reply = ('{"action":"respond","progress":"Summarising the change.",'
+             '"message":"All set.","next_step":"Add a chart"}')
+    for size in (1, 4, 13, len(reply)):
+        _, events = feed_events(reply, size)
+        assert texts(events) == "All set.", size
+        assert values(events, "progress") == ["Summarising the change."], size
+        assert values(events, "next_step") == ["Add a chart"], size
+
+
+def test_no_protocol_json_leaks_into_the_text_stream():
+    reply = ('{"action":"write_file","path":"a.txt","content":"x",'
+             '"progress":"Writing a.txt.","events":[{"type":"file_create",'
+             '"message":"Created a.txt","stage":"apply"}]}')
+    _, events = feed_events(reply, 1)
+    assert texts(events) == ""
+    assert values(events, "progress") == ["Writing a.txt."]
+
+
+def test_a_progress_key_inside_file_content_is_not_emitted():
+    """File content is arbitrary user data and often holds JSON of its own."""
+    content = '{"progress": "from the file", "next_step": "from the file"}'
+    reply = json.dumps({"action": "write_file", "path": "data.json",
+                        "content": content, "progress": "Writing data.json."})
+    _, events = feed_events(reply, 1)
+    assert values(events, "progress") == ["Writing data.json."]
+    assert values(events, "next_step") == []
+
+
+def test_a_progress_key_inside_a_files_entry_is_not_emitted():
+    reply = ('{"action":"write_files","files":['
+             '{"path":"a.json","content":"x","progress":"from the file"},'
+             '{"path":"b.json","content":"y","next_step":"from the file"}],'
+             '"progress":"Writing two files."}')
+    _, events = feed_events(reply, 1)
+    assert values(events, "progress") == ["Writing two files."]
+    assert values(events, "next_step") == []
+
+
+def test_progress_inside_a_batch_action_is_not_streamed():
+    """Only a top-level key streams. Per-action fields inside an "actions"
+    array are read from the finished object, the same way "events" is."""
+    reply = ('{"actions":[{"action":"read_file","path":"a.txt",'
+             '"progress":"Reading a.txt."},'
+             '{"action":"respond","message":"Done.","next_step":"Edit a.txt"}]}')
+    parser, events = feed_events(reply, 1)
+    assert values(events, "progress") == []
+    assert values(events, "next_step") == []
+    assert texts(events) == "Done."
+    assert json.loads(parser.result())["actions"][1]["next_step"] == "Edit a.txt"
+
+
+def test_next_step_is_emitted_from_a_final_action():
+    for reply in ('{"action":"respond","message":"Done.","next_step":"Run the tests"}',
+                  '{"action":"done","next_step":"Run the tests"}'):
+        _, events = feed_events(reply, 1)
+        assert values(events, "next_step") == ["Run the tests"], reply
+
+
+def test_an_action_without_the_new_fields_emits_exactly_what_it_did_before():
+    for size in (1, 3, 7, len(RESPOND)):
+        _, events = feed_events(RESPOND, size)
+        kinds = [kind for kind, _ in events]
+        assert kinds[0] == "action", size
+        assert kinds[-1] == "object", size
+        assert set(kinds[1:-1]) == {"text"}, (size, kinds)
+        assert texts(events) == "Hello world", size
+
+
+def test_the_events_array_is_not_streamed():
+    """Deliberate: an entry only means anything once its object closes."""
+    reply = ('{"action":"respond","message":"Green.","events":['
+             '{"type":"test","message":"Ran 173 tests"},'
+             '{"type":"success","message":"173 tests passed"}],'
+             '"next_step":"Commit the fix"}')
+    parser, events = feed_events(reply, 1)
+    assert [kind for kind, _ in events if kind not in
+            ("text", "action", "next_step", "object")] == []
+    assert texts(events) == "Green."
+    assert len(json.loads(parser.result())["events"]) == 2
+
+
+def test_progress_survives_unicode_escapes_split_one_character_at_a_time():
+    reply = ('{"action":"respond","progress":"caf\\u00e9 \\u2014 checking",'
+             '"message":"ok"}')
+    parser, events = feed_events(reply, 1)
+    assert values(events, "progress") == ["café — checking"]
+    assert texts(events) == "ok"
+    assert json.loads(parser.result())["message"] == "ok"
+
+
+def test_truncated_json_keeps_the_events_that_already_parsed():
+    reply = '{"action":"respond","progress":"Halfway there.","message":"cut'
+    parser, events = feed_events(reply, 1)
+    assert values(events, "progress") == ["Halfway there."]
+    assert texts(events) == "cut"
+    assert parser.result() is None
+
+
+def test_invalid_json_around_the_new_fields_does_not_raise():
+    reply = '{"action":"respond",,,"progress":"Still fine.",}'
+    parser, events = feed_events(reply, 1)
+    assert values(events, "progress") == ["Still fine."]
+    assert parser.complete_json is not None
+
+
+def test_an_unknown_event_type_does_not_break_the_stream():
+    reply = ('{"action":"respond","message":"hi","events":['
+             '{"type":"not_a_real_type","message":"m"}],"next_step":"Try again"}')
+    parser, events = feed_events(reply, 1)
+    assert texts(events) == "hi"
+    assert values(events, "next_step") == ["Try again"]
+    assert json.loads(parser.result())["events"][0]["type"] == "not_a_real_type"
+
+
+def test_a_non_string_progress_is_ignored_rather_than_emitted():
+    reply = '{"action":"done","progress":123,"next_step":null,"message":"ok"}'
+    parser, events = feed_events(reply, 1)
+    assert values(events, "progress") == []
+    assert values(events, "next_step") == []
+    assert texts(events) == "ok"
+    assert json.loads(parser.result())["progress"] == 123
+
+
+def test_an_empty_progress_value_is_not_emitted():
+    reply = '{"action":"done","progress":"","message":"ok"}'
+    _, events = feed_events(reply, 1)
+    assert values(events, "progress") == []
+
+
+def test_progress_and_next_step_reach_the_caller_through_ask_model():
+    reply = ('{"action":"respond","progress":"Writing the summary.",'
+             '"message":"All set.","next_step":"Add a chart"}')
+    raw, events = collect(chunk_text(reply, 5))
+    assert ("progress", "Writing the summary.") in events
+    assert ("next_step", "Add a chart") in events
+    assert texts(events) == "All set."
+    assert json.loads(raw)["next_step"] == "Add a chart"
+
+
+def test_the_new_events_do_not_disturb_the_live_reply():
+    """Whatever the interface does with them, the streamed reply is still the
+    message and nothing else. Rendering them is a separate job."""
+    ui = LiveUI(stream=io.StringIO(), interval=0.01)
+    relay = LiveRelay(stream=io.StringIO(), ansi=False)
+    ui.attach_sink(relay.set_status)
+    ui.start()
+    state = {"error": None, "progress_seen": set(), "next_step": None}
+    handle = stream_handler(ui, relay, state)
+    try:
+        for event in (("first_content", ""), ("progress", "Reading a.txt."),
+                      ("text", "Done."), ("next_step", "Run the tests"),
+                      ("object", "{}")):
+            handle(event)
+    finally:
+        relay.finish()
+        ui.attach_sink(None)
+        ui.stop()
+    assert relay.glitch.exact_text() == "Done."
+    assert state["error"] is None
+
+
+def test_the_new_fields_do_not_change_validation():
+    plain = {"action": "read_file", "path": "a.txt"}
+    decorated = dict(plain, progress="Reading a.txt.",
+                     events=[{"type": "file_read", "message": "Read a.txt"}])
+    assert agent_prompt.validate_action(plain) is None
+    assert agent_prompt.validate_action(decorated) is None
+    assert agent_prompt.validate_action(
+        {"action": "respond", "message": "ok", "next_step": "Run the tests"}) is None
+    # A missing required key is still a missing required key.
+    assert agent_prompt.validate_action(
+        {"action": "read_file", "progress": "Reading."}) is not None
+
+
+def prompt_rules():
+    """The prompt's own instructions, without the workspace snapshot."""
+    return agent_prompt.get_system_prompt().split("=== CURRENT WORKSPACE FILES")[0]
+
+
+def test_the_system_prompt_teaches_progress_events_and_next_step():
+    rules = prompt_rules()
+    assert "=== PROGRESS, EVENTS AND NEXT STEP" in rules
+    assert '"progress"' in rules and '"events"' in rules and '"next_step"' in rules
+    assert "PUBLIC" in rules
+    assert "NOT your private reasoning" in rules
+    assert "chain-of-thought" in rules
+    assert "FIVE words" in rules
+    assert "Do not put one on every action" in rules
+    assert "Never put a credential" in rules
+    assert "never treated as their next message" in rules
+    assert "never claim anything was done" in rules
+    for event_type in agent_prompt.EVENT_TYPES:
+        assert event_type in rules, event_type
+
+
+def test_every_new_field_example_in_the_prompt_is_valid_and_obeys_its_own_rules():
+    carrying = {"progress": 0, "events": 0, "next_step": 0}
+    examples = 0
+    for line in agent_prompt.PROGRESS_RULES.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        examples += 1
+        obj = json.loads(line)          # an unparseable example is a broken example
+        for entry in obj.get("actions", [obj]):
+            assert agent_prompt.validate_action(entry) is None, line
+            for field in carrying:
+                if field in entry:
+                    carrying[field] += 1
+            for event in entry.get("events", []):
+                assert event["type"] in agent_prompt.EVENT_TYPES, line
+                assert event["message"], line
+            if "next_step" in entry:
+                assert entry["action"] in ("done", "respond"), line
+                assert len(entry["next_step"].split()) <= 5, line
+    assert examples >= 6, examples
+    assert all(count >= 2 for count in carrying.values()), carrying
+
+
+def test_the_prompt_still_carries_the_rules_that_came_before():
+    """Guard against the new section being pasted over an existing one."""
+    rules = prompt_rules()
+    for heading in ("=== OUTPUT FORMAT - ABSOLUTE RULES ===",
+                    "=== ACTIONS - REQUIRED KEYS AND TWO EXAMPLES EACH ===",
+                    "=== EDITING PREFERENCES - FOLLOW IN THIS ORDER ===",
+                    "=== BEHAVIOUR ===",
+                    "=== GIT ==="):
+        assert heading in rules, heading
+    assert "NEVER use write_file on a file that already exists" in rules
+    assert "Never tell the user to run git config" in rules
+    assert "Every task ends with a respond action" in rules
+    assert "Output EXACTLY ONE JSON object and nothing else" in rules

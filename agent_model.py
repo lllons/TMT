@@ -210,12 +210,33 @@ class StreamingActionParser:
     is never reported as text.
 
     ``feed`` returns a list of events:
-        ("text", str)     decoded user-facing characters
-        ("action", str)   an action name finished parsing
-        ("object", str)   the top-level JSON object is complete
+        ("text", str)       decoded user-facing characters
+        ("action", str)     an action name finished parsing
+        ("progress", str)   a completed top-level "progress" value
+        ("next_step", str)  a completed top-level "next_step" value
+        ("object", str)     the top-level JSON object is complete
+
+    ``progress`` and ``next_step`` are reported the moment their closing quote
+    arrives, so a progress line reaches the screen while the action that
+    carries it is still being generated. They are not user-facing *text*: they
+    never join the ("text", ...) stream, which still carries ``message`` values
+    and nothing else.
+
+    Only a TOP-LEVEL key of either name counts. The same name nested inside a
+    ``files`` entry -- or, far more often, inside a ``content`` string that
+    happens to hold JSON -- is arbitrary user data, and streaming it would put
+    a file's own words on screen as if the agent had said them.
+
+    The ``events`` array is deliberately not streamed. Its entries are only
+    meaningful once the array closes, and the caller reads it from the
+    completed object instead. An entry's own ``message`` is a display record
+    rather than something the agent said, so it is kept out of the text stream
+    as well.
     """
 
     USER_TEXT_KEYS = ("message",)
+    # Reported as their own event, named after the key itself.
+    LIVE_VALUE_KEYS = ("progress", "next_step")
 
     def __init__(self):
         self.raw = ""
@@ -224,6 +245,7 @@ class StreamingActionParser:
         self._started = False
         self._stack = []
         self._keys = []
+        self._owners = []
         self._awaiting_value = False
         self._in_string = False
         self._is_key = False
@@ -262,6 +284,15 @@ class StreamingActionParser:
     def _current_key(self):
         return self._keys[-1] if self._keys else None
 
+    def _at_top_level(self):
+        """True while the value being read belongs to the outermost object.
+
+        Structure characters are ignored inside strings, so the depth cannot
+        move between a value's opening and closing quote; reading it at either
+        end gives the same answer.
+        """
+        return len(self._stack) == 1 and len(self._keys) == 1
+
     def _consume(self, char):
         if self.complete_json is not None:
             return
@@ -271,6 +302,7 @@ class StreamingActionParser:
             self._started = True
             self._stack.append("{")
             self._keys.append(None)
+            self._owners.append(None)
             self.json_text = "{"
             return
         self.json_text += char
@@ -281,7 +313,11 @@ class StreamingActionParser:
             self._in_string = True
             self._token = []
             self._is_key = bool(self._stack) and self._stack[-1] == "{" and not self._awaiting_value
-            self._emitting = not self._is_key and self._current_key() in self.USER_TEXT_KEYS
+            self._emitting = (
+                not self._is_key
+                and self._current_key() in self.USER_TEXT_KEYS
+                and "events" not in self._owners
+            )
             return
         if char == ":":
             self._awaiting_value = True
@@ -290,6 +326,11 @@ class StreamingActionParser:
             if self._stack and self._stack[-1] == "{" and self._keys:
                 self._keys[-1] = None
         elif char in "{[":
+            # Recorded before the push, so it names the key this container is
+            # the value of. An "events" entry carries a "message" of its own,
+            # and without this the parser would relay a display record to the
+            # user as if the agent had said it.
+            self._owners.append(self._current_key())
             self._stack.append(char)
             if char == "{":
                 self._keys.append(None)
@@ -298,6 +339,8 @@ class StreamingActionParser:
             if self._stack:
                 if self._stack.pop() == "{" and self._keys:
                     self._keys.pop()
+                if self._owners:
+                    self._owners.pop()
             self._awaiting_value = False
             if not self._stack:
                 self.complete_json = self.json_text
@@ -329,6 +372,8 @@ class StreamingActionParser:
                     self._keys[-1] = token
             elif self._current_key() == "action" and token:
                 self._emit(("action", token))
+            elif token and self._current_key() in self.LIVE_VALUE_KEYS and self._at_top_level():
+                self._emit((self._current_key(), token))
             self._emitting = False
             self._token = []
             return
@@ -431,8 +476,9 @@ def ask_model(messages, on_event=None):
 
     With ``on_event`` supplied and streaming available, the reply is consumed
     from the provider's stream and events are reported as they arrive:
-    ("first_content", ""), ("text", str), ("action", str), ("object", str),
-    ("output", int), ("usage", int) and ("error", str). Without it — or when the provider or transport cannot
+    ("first_content", ""), ("text", str), ("action", str), ("progress", str),
+    ("next_step", str), ("object", str), ("output", int), ("usage", int) and
+    ("error", str). Without it — or when the provider or transport cannot
     stream — a single blocking request is used instead.
     """
     global _json_mode_ok

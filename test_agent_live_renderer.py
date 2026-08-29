@@ -279,3 +279,59 @@ def test_a_repaint_never_grows_the_region_it_replaces():
     assert relay.region._drawn == drawn
     assert output.getvalue().count("[%dA" % drawn) >= 1
     relay.abort()
+
+
+# --- permanent output against the repainting worker --------------------------
+
+def test_history_written_while_the_relay_repaints_is_never_lost():
+    """The two surfaces share one terminal and two threads reach it: the relay
+    worker repaints the live region on its own clock, while the turn's
+    permanent events arrive from the thread running the model.
+
+    Both go through the region's paint lock, so an interleaved cursor-move
+    sequence cannot corrupt the region and, more importantly, no permanent
+    line can be dropped or reordered. A history that loses entries under load
+    is the same failure as a history that never existed.
+    """
+    import threading
+
+    class Screen(io.StringIO):
+        encoding = "utf-8"
+
+        def isatty(self):
+            return True
+
+    screen = Screen()
+    relay = LiveRelay(stream=screen, ansi=True)
+    relay.start()
+    failures = []
+    rounds = 200
+
+    def temporary():
+        try:
+            for index in range(rounds):
+                relay.set_status("bar %d" % index)
+                relay.feed("x")
+        except Exception as error:          # noqa: BLE001 - reported, not raised
+            failures.append(error)
+
+    def permanent():
+        try:
+            for index in range(rounds):
+                relay.write_above("permanent %d\n" % index)
+        except Exception as error:          # noqa: BLE001
+            failures.append(error)
+
+    threads = [threading.Thread(target=temporary), threading.Thread(target=permanent)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    relay.abort()
+
+    assert not failures, failures
+    body = screen.getvalue()
+    kept = [index for index in range(rounds) if ("permanent %d" % index) in body]
+    assert len(kept) == rounds, "%d of %d permanent lines survived" % (len(kept), rounds)
+    positions = [body.index("permanent %d" % index) for index in kept]
+    assert positions == sorted(positions), "permanent lines arrived out of order"

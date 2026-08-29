@@ -207,6 +207,36 @@ class LiveRegion:
         self._drawn = len(lines)
         self._write("".join(parts))
 
+    def write_above(self, text):
+        """Print permanent text above the region, leaving the region below it.
+
+        This is how anything that must outlive the turn reaches the terminal
+        while a live region is on screen. The region is erased, the text is
+        written where it stood -- so it scrolls into the terminal's own
+        history like any other output -- and the region is then painted again
+        underneath.
+
+        Painted again rather than shifted: how far the terminal scrolled is
+        something only the terminal knows, because a long line wraps and a
+        full screen scrolls, so arithmetic that assumed a fixed offset would
+        put the next repaint on the wrong rows. That was the bug that made
+        earlier versions of this frame march down the screen.
+
+        Takes the paint lock, so the relay worker cannot interleave a repaint
+        into the middle of the sequence.
+        """
+        if not text:
+            return True
+        with self._paint_lock:
+            held = self._last
+            self.clear()
+            if not safe_write(self.stream, text if text.endswith("\n") else text + "\n"):
+                self.ansi = False
+                return False
+            if held:
+                self._paint(held)
+            return True
+
     def clear(self):
         with self._paint_lock:
             if not self.ansi or not self._drawn:
@@ -268,6 +298,16 @@ class LiveRelay:
         self._dirty.set()
         if not self.running:
             self._repaint()
+
+    def write_above(self, text):
+        """Print permanent text above the live area.
+
+        The seam between the two surfaces this module now carries: everything
+        the user keeps goes through here into the terminal's own scrollback,
+        while the status row and the response box below stay temporary and
+        keep being repainted in place.
+        """
+        return self.region.write_above(text)
 
     def feed(self, text):
         """Relay newly received model text. Returns immediately."""

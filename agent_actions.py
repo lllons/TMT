@@ -2,6 +2,8 @@
 
 import re
 from collections import Counter
+
+import agent_ui
 from agent_config import MUTATING_ACTIONS
 from agent_execution import open_app, run_file
 from agent_file_ops import (
@@ -225,3 +227,148 @@ def trim_messages(messages):
     if len(turns) <= max_messages:
         return messages
     return fixed + [{"role": "user", "content": f"[{len(turns) - max_messages} earlier messages trimmed to stay within context limits.]"}] + turns[-max_messages:]
+
+
+# --- actions as user-visible events --------------------------------------
+#
+# The transcript shows what the agent did, so the facts on it have to come from
+# what actually ran. Everything below is measured from the action object and
+# its result: a line count is counted, a path is the path that was written, a
+# failure is a failure the action reported. Nothing here estimates, and an
+# action whose outcome cannot be described honestly gets a plain event with no
+# facts rather than a plausible-looking one.
+
+_EVENT_KIND_FOR_ACTION = {
+    "write_file": "file_create", "write_files": "file_create",
+    "create_folder": "file_create",
+    "append_file": "file_edit", "patch_file": "file_edit",
+    "replace_lines": "file_edit", "rename_file": "file_edit",
+    "copy_file": "file_create",
+    "delete_file": "file_delete", "delete_folder": "file_delete",
+    "read_file": "file_read", "read_lines": "file_read",
+    "list_files": "file_read", "search_files": "file_read",
+    "run_python": "command", "run_file": "command", "open_app": "command",
+    "git_status": "tool", "git_diff": "tool", "git_identity": "tool",
+    "git_commit": "milestone", "git_push": "milestone",
+}
+
+# Only ever matched against a short sentence an action wrote about itself.
+_FAILURE_MARKERS = (
+    "not found", "error:", "syntaxerror", "refusing", "invalid",
+    "failed", "cancelled", "must be", "no matches for", "aborted",
+)
+
+# The actions whose result is a report on the action, and so can be read for
+# whether it worked. Every other action's result is data -- file content, the
+# output of a program someone ran -- where these words mean nothing about the
+# action itself. Scanning those produced a real false alarm: `run_python` on
+# the test suite returns "180 passed, 0 failed", and a substring search called
+# a fully green run a failure. An event that misreports what happened is worse
+# than no event, so the list is stated rather than inferred.
+_REPORTED_ACTIONS = frozenset((
+    "write_file", "write_files", "append_file", "patch_file", "replace_lines",
+    "delete_file", "delete_folder", "create_folder", "copy_file", "rename_file",
+    "git_status", "git_diff", "git_identity", "git_commit", "git_push",
+))
+
+
+def _line_count(text):
+    """Lines in a block of content, counting an unterminated last line."""
+    if not isinstance(text, str) or not text:
+        return 0
+    return len(text.splitlines())
+
+
+def _describe(action, obj, result):
+    """A one-line public description of what an action did.
+
+    The result string is already written for a person, so where it is short
+    and specific it is used as-is rather than paraphrased into something that
+    might not match what happened.
+    """
+    text = str(result).strip()
+    first = text.split("\n", 1)[0]
+    if action not in _REPORTED_ACTIONS:
+        # The result is data -- a file's contents, a program's output -- not a
+        # sentence about the action. Its first line describes neither what ran
+        # nor how it went: a test run whose output began "PASS test_retries"
+        # was labelled with that one line, which says less than the truth and
+        # implies it was all of it. Describe the request instead, which is the
+        # part that is known.
+        target = obj.get("path") or obj.get("query") or obj.get("app") or ""
+        label = ACTION_LABELS.get(action, action)
+        return "%s %s" % (label, target) if target else label
+    if first and len(first) <= 200:
+        return first
+    return ACTION_LABELS.get(action, action)
+
+
+def action_event(action, obj, result):
+    """One AgentEvent describing an action that has already run, or None.
+
+    Called after the action, never before, so the event can report what
+    happened rather than what was intended.
+    """
+    if action in ("respond", "done"):
+        return None
+    kind = _EVENT_KIND_FOR_ACTION.get(action, "tool")
+    text = str(result)
+    detail = {}
+
+    failed = False
+    if action in _REPORTED_ACTIONS:
+        lowered = text[:200].lower()
+        failed = any(marker in lowered for marker in _FAILURE_MARKERS)
+    if action == "git_push" and text == PUSH_BLOCKED:
+        failed = True
+
+    if failed:
+        # A refusal is not a crash, and a missing file is not a broken agent.
+        # Both are things the user needs to see, at a weight that does not
+        # read as the run having fallen over.
+        return agent_ui.AgentEvent.make("warning", _describe(action, obj, result))
+
+    # Counts, only where they can be counted exactly.
+    if action == "append_file":
+        # An append adds and removes nothing, so both halves are known.
+        detail["added"], detail["removed"] = _line_count(obj.get("content", "")), 0
+    elif action == "write_file":
+        # A write replaces whatever was there, and by the time this runs the
+        # old content is gone, so how many lines it removed is not knowable.
+        # Only the part that is certain gets reported: "+3 -0" on a write that
+        # flattened a hundred-line file would be a confident falsehood.
+        lines = _line_count(obj.get("content", ""))
+        if lines:
+            detail["lines"] = lines
+    elif action == "patch_file":
+        detail["added"] = _line_count(obj.get("replace", ""))
+        detail["removed"] = _line_count(obj.get("search", ""))
+    elif action == "replace_lines":
+        try:
+            detail["removed"] = max(0, int(obj["end"]) - int(obj["start"]) + 1)
+        except (KeyError, TypeError, ValueError):
+            pass
+        detail["added"] = _line_count(obj.get("content", ""))
+    elif action == "write_files":
+        files = obj.get("files")
+        if isinstance(files, list):
+            detail["files"] = len(files)
+
+    return agent_ui.AgentEvent.make(kind, _describe(action, obj, result), **detail)
+
+
+def batch_events(batch, results):
+    """Events for a batch, in the order the actions ran.
+
+    `results` is the list execute_action produced, which may be shorter than
+    the batch when one action ended it early. Pairing them by position keeps
+    every event tied to the action that actually produced it.
+    """
+    events = []
+    for sub_obj, result in zip(batch, results):
+        if not isinstance(sub_obj, dict):
+            continue
+        event = action_event(sub_obj.get("action", ""), sub_obj, result)
+        if event is not None:
+            events.append(event)
+    return events

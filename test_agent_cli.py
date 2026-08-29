@@ -19,6 +19,7 @@ import contextlib
 import importlib
 import inspect
 import io
+import json
 import os
 import re
 from pathlib import Path
@@ -359,15 +360,16 @@ def test_the_session_header_is_drawn_once_however_many_turns_are_taken():
     changes while the loop is running. Redrawing it before every prompt pushed
     the conversation off the screen for no new information."""
     drawn = run_session(["", "", "", "quit"])
-    prompts = drawn.count("Task>")
-    assert prompts == 4, (prompts, drawn)
-    # The rule under the header is the row that was repeating, and the
-    # wordmark and the clock came with it. One of each, across four turns.
-    rules = [line for line in drawn.splitlines()
-             if line.strip() and set(line.strip()) <= set("\u2500-")]
-    assert len(rules) == 1, (rules, drawn)
+    assert prompt_boxes(drawn) == 4, (prompt_boxes(drawn), drawn)
+    # The header is the part that was repeating. The wordmark and the clock
+    # belong to it, so one of each across four turns says it was drawn once.
     assert drawn.count("TMT") == 1, drawn
     assert len(re.findall(r"\d\d:\d\d:\d\d", drawn)) == 1, drawn
+
+
+def prompt_boxes(drawn):
+    """How many prompt boxes were drawn, counted by their marker row."""
+    return sum(1 for line in drawn.splitlines() if line.startswith(" > "))
 
 
 def test_every_turn_after_the_first_still_gets_a_prompt():
@@ -375,14 +377,279 @@ def test_every_turn_after_the_first_still_gets_a_prompt():
     a read with nothing on screen looks like a hung program."""
     one = run_session(["quit"])
     many = run_session(["", "", "quit"])
-    assert one.count("Task>") == 1, one
-    assert many.count("Task>") == 3, many
-    # Each later prompt opens with a newline of its own. That is what leaves a
-    # blank line between the reply above and the question below, once the
-    # terminal has echoed the user's own Enter -- which the console faked here
-    # does not, so it is asserted at the source rather than in the transcript.
+    assert prompt_boxes(one) == 1, one
+    assert prompt_boxes(many) == 3, many
+    # Each box opens with a blank line of its own, so it never runs into the
+    # rule or the reply above it. Asserted at the source: the console faked
+    # here does not echo the user's Enter the way a terminal does.
     screen = io.StringIO()
     menu = importlib.import_module("agent_menu")
-    assert menu.render_prompt(screen) is not False
+    menu.PromptBox(stream=screen, line_reader=lambda: "").ask("a hint")
     assert screen.getvalue().startswith("\n"), repr(screen.getvalue())
-    assert "Task>" in screen.getvalue(), repr(screen.getvalue())
+
+    # The bare prompt is still the one `render_status` draws by default, for
+    # any caller that is not putting a box under it. It has to keep working.
+    plain = io.StringIO()
+    assert menu.render_prompt(plain) is not False
+    assert "Task>" in plain.getvalue(), repr(plain.getvalue())
+
+
+# --- events, and a whole turn played through the real loop -------------------
+
+import agent_actions
+import agent_ui
+from agent_live_renderer import LiveRegion
+
+
+def test_an_event_never_reports_an_outcome_the_action_did_not_have():
+    """The one rule the transcript cannot bend. A result is only read for
+    success or failure when it is the action's own report; a program's output
+    is data. Scanning it for words like "failed" called a fully green test run
+    a failure, which is a lie told confidently."""
+    green = agent_actions.action_event("run_python", {"path": "run_tests.py"},
+                                       "180 passed, 0 failed")
+    assert green.kind == "command", green.kind
+
+    # A read's result is file content and may contain anything at all.
+    read = agent_actions.action_event("read_file", {"path": "a.py"},
+                                      "def f():\n    raise Error: not found")
+    assert read.kind == "file_read", read.kind
+
+    # An action's own report, though, is read and believed.
+    missed = agent_actions.action_event("patch_file",
+                                        {"path": "a.py", "search": "q", "replace": "r"},
+                                        "Search text not found in a.py")
+    assert missed.kind == "warning", missed.kind
+
+
+def test_the_counts_on_an_edit_are_counted_rather_than_guessed():
+    """+18 -4 has to mean eighteen lines arrived and four left."""
+    event = agent_actions.action_event(
+        "patch_file",
+        {"path": "a.py", "search": "one\ntwo\nthree\nfour", "replace": "x\ny"},
+        "Patched file: a.py")
+    assert event.detail["added"] == 2, event.detail
+    assert event.detail["removed"] == 4, event.detail
+
+    none_given = agent_actions.action_event("git_status", {}, "clean")
+    assert "added" not in none_given.detail, none_given.detail
+
+
+def test_permanent_output_leaves_the_live_region_intact():
+    """The two surfaces share one terminal. Writing history has to erase the
+    live region, print, and paint it again -- printing straight past it leaves
+    the next repaint pointing at rows that have since moved."""
+    screen = io.StringIO()
+    region = LiveRegion(stream=screen, ansi=True)
+    region.paint(["live status row"])
+    assert region.write_above("a permanent line\n")
+    body = screen.getvalue()
+    assert "a permanent line" in body
+    # The region was painted again after the permanent text, so its content is
+    # the last thing on screen rather than something the text scrolled over.
+    assert body.rindex("live status row") > body.rindex("a permanent line"), body
+
+
+def test_a_region_that_cannot_use_ansi_still_prints_its_history():
+    """A pipe has no cursor to move. The permanent record still has to arrive,
+    because that is the part the user keeps."""
+    screen = io.StringIO()
+    region = LiveRegion(stream=screen, ansi=False)
+    region.paint(["ignored"])
+    assert region.write_above("kept\n")
+    assert "kept" in screen.getvalue()
+
+
+class Turn:
+    """A scripted model: fixed replies, with progress reported as it streams."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.asked = 0
+
+    def __call__(self, messages, on_event=None):
+        raw = self.replies[min(self.asked, len(self.replies) - 1)]
+        self.asked += 1
+        if on_event is not None:
+            on_event(("first_content", ""))
+            on_event(("output", len(raw)))
+            obj = json.loads(raw)
+            # The real parser reports these mid-stream, before the object is
+            # finished; reporting them here is the same contract.
+            if obj.get("progress"):
+                on_event(("progress", obj["progress"]))
+            if obj.get("next_step"):
+                on_event(("next_step", obj["next_step"]))
+        return raw
+
+
+def run_turn(replies, answers=("do the thing", "quit")):
+    """Drive TMT.main through one real turn.
+
+    Returns (drawn, files). The workspace is read before it is removed, so a
+    caller can check what the actions actually did on disk -- which is the
+    only way to tell a real edit from a convincing message about one.
+    """
+    box = Workspace()
+    screen = io.StringIO()
+    saved = (TMT.console, TMT.ensure_api_key, TMT.run_startup,
+             TMT.ensure_git_identity, TMT.ask_model)
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(str(box.path))
+        TMT.console = Replies(list(answers))
+        TMT.ensure_api_key = lambda: True
+        TMT.run_startup = lambda **kwargs: "start"
+        TMT.ensure_git_identity = lambda *a, **k: None
+        TMT.ask_model = Turn(replies)
+        with contextlib.redirect_stdout(screen):
+            TMT.main([])
+        files = {item.name: item.read_text(encoding="utf-8")
+                 for item in box.path.iterdir() if item.is_file()}
+        return screen.getvalue(), files
+    finally:
+        os.chdir(str(previous_cwd))
+        (TMT.console, TMT.ensure_api_key, TMT.run_startup,
+         TMT.ensure_git_identity, TMT.ask_model) = saved
+        box.close()
+
+
+REAL_TURN = [
+    json.dumps({"action": "list_files",
+                "progress": "Inspecting the existing implementation."}),
+    json.dumps({"action": "write_file", "path": "notes.txt",
+                "content": "one\ntwo\nthree\n",
+                "progress": "Found the shared abstraction. Writing the change."}),
+    json.dumps({"action": "done", "message": "The change is written.",
+                "progress": "Checking the result.",
+                "events": [{"type": "success", "message": "The file was created."}],
+                "next_step": "Review the changed files"}),
+]
+
+
+def test_a_whole_turn_keeps_every_event_it_showed():
+    """The end-to-end claim. Three progress messages, two actions and a
+    declared success all happened during one turn, and every one of them has
+    to still be on screen when the turn is over -- which is exactly what the
+    single repainted status row could not do."""
+    drawn, files = run_turn(REAL_TURN)
+
+    expected = [
+        "Inspecting the existing implementation.",
+        "Found the shared abstraction. Writing the change.",
+        "Checking the result.",
+        "The file was created.",
+        "Review the changed files",
+    ]
+    for message in expected:
+        assert message in drawn, (message, drawn)
+
+    # In the order they happened, and each exactly once.
+    positions = [drawn.index(message) for message in expected]
+    assert positions == sorted(positions), positions
+    for message in expected[:-1]:
+        assert drawn.count(message) == 1, (message, drawn.count(message))
+    # The hint is the one thing drawn twice, and both are deliberate: once as
+    # the lead-in to the answer, and once as shadow text in the box waiting
+    # for the next task. The second is a drawing, not a value -- that it never
+    # becomes input is covered separately.
+    assert drawn.count(expected[-1]) == 2, drawn.count(expected[-1])
+
+    # The work was real: the action actually wrote the file it reported.
+    assert files.get("notes.txt") == "one\ntwo\nthree\n", sorted(files)
+    # And the file event carried the count that was actually written. A write
+    # replaces the file, so only the lines written are reported: how many the
+    # old content had is not knowable once it has been overwritten, and a
+    # "-0" there would be a confident falsehood.
+    assert "3 lines" in drawn, drawn
+    assert "-0" not in drawn, drawn
+
+
+def test_the_suggestion_lands_between_the_work_and_the_answer():
+    """Order is the contract: the hint reads as a lead-in to the answer, so it
+    sits after everything that was done and before the answer itself."""
+    drawn, _ = run_turn(REAL_TURN)
+    assert drawn.index("The file was created.") < drawn.index("Review the changed files")
+    assert drawn.index("Review the changed files") < drawn.index("The change is written."), drawn
+
+
+def test_the_suggestion_is_never_submitted_as_the_users_next_task():
+    """It is shadow text. The turn after it must be the user's own words, and
+    the transcript must show no second turn triggered by the hint."""
+    asked = []
+
+    class Watching(Replies):
+        def input(self, prompt=""):
+            answer = Replies.input(self, prompt)
+            asked.append(answer)
+            return answer
+
+    box = Workspace()
+    screen = io.StringIO()
+    saved = (TMT.console, TMT.ensure_api_key, TMT.run_startup,
+             TMT.ensure_git_identity, TMT.ask_model)
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(str(box.path))
+        TMT.console = Watching(["do the thing", "quit"])
+        TMT.ensure_api_key = lambda: True
+        TMT.run_startup = lambda **kwargs: "start"
+        TMT.ensure_git_identity = lambda *a, **k: None
+        TMT.ask_model = Turn(REAL_TURN)
+        with contextlib.redirect_stdout(screen):
+            TMT.main([])
+    finally:
+        os.chdir(str(previous_cwd))
+        (TMT.console, TMT.ensure_api_key, TMT.run_startup,
+         TMT.ensure_git_identity, TMT.ask_model) = saved
+        box.close()
+
+    assert asked == ["do the thing", "quit"], asked
+    assert "Review the changed files" not in asked
+
+
+def test_a_turn_that_offers_no_suggestion_still_gets_a_true_one():
+    """A missing hint cannot fail a turn, and the substitute has to be read
+    off what the turn did rather than invented."""
+    replies = [
+        json.dumps({"action": "write_file", "path": "a.txt", "content": "x\n"}),
+        json.dumps({"action": "done", "message": "Written."}),
+    ]
+    drawn, _ = run_turn(replies)
+    assert "Review the changed files" in drawn, drawn
+    assert "Written." in drawn, drawn
+
+
+def test_an_over_long_suggestion_is_cut_to_five_words_before_it_is_shown():
+    """The model does not get to decide the length."""
+    replies = [json.dumps({"action": "done", "message": "Done.",
+                           "next_step": "Please go and run the integration tests now"})]
+    drawn, _ = run_turn(replies)
+    assert "Please go and run the" in drawn, drawn
+    assert "integration tests now" not in drawn, drawn
+
+
+BATCH_TURN = [
+    json.dumps({"actions": [
+        {"action": "write_file", "path": "a.txt", "content": "one\n",
+         "progress": "Writing the first file."},
+        {"action": "write_file", "path": "b.txt", "content": "two\n",
+         "progress": "Writing the second file."},
+        {"action": "done", "message": "Both written.",
+         "next_step": "Review the new files"},
+    ]}),
+]
+
+
+def test_progress_on_a_batch_entry_is_shown_like_any_other():
+    """A batch carries its progress on the entries rather than on the object
+    around them, and only top-level values reach the stream. Reading the entry
+    before it runs is what keeps a batched turn as legible as a stepped one."""
+    drawn, files = run_turn(BATCH_TURN)
+    for message in ("Writing the first file.", "Writing the second file."):
+        assert message in drawn, (message, drawn)
+    assert drawn.index("Writing the first file.") < drawn.index("Writing the second file.")
+    # Both actions really ran, and the suggestion from the batch's final entry
+    # was picked up rather than falling back.
+    assert files.get("a.txt") == "one\n" and files.get("b.txt") == "two\n", sorted(files)
+    assert "Review the new files" in drawn, drawn

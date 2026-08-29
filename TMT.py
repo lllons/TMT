@@ -21,16 +21,19 @@ if _INSTALL_DIR in sys.path:
 sys.path.insert(0, _INSTALL_DIR)
 
 import agent_config
-from agent_menu import render_prompt, render_status, run_startup
+from agent_menu import PromptBox, render_status, run_startup
 from agent_config import (
     MUTATING_ACTIONS, console, default_workspace, set_workspace_root,
     workspace_needs_confirmation, workspace_refusal,
 )
 from agent_config import REQUIRED_KEYS
 from agent_actions import authorizes_push, batch_summary, build_result_message, execute_action, trim_messages
-from agent_actions import READ_ONLY_ACTIONS, ACTION_LABELS, MAX_TURNS
+from agent_actions import READ_ONLY_ACTIONS, ACTION_LABELS, MAX_TURNS, action_event
 from agent_model import ask_model
-from agent_ui import LiveUI, render_response
+from agent_ui import (
+    AgentEvent, LiveUI, ResponseHistory, Transcript, fallback_suggestion,
+    render_response, validate_suggestion,
+)
 from agent_live_renderer import LiveRelay
 from agent_setup import ensure_api_key, ensure_git_identity
 from agent_prompt import get_system_prompt, invalidate_prompt, validate_action
@@ -41,14 +44,22 @@ from agent_file_ops import (
     write_file, write_files,
 )
 
-def stream_handler(live_ui, relay, state):
+def stream_handler(live_ui, relay, state, transcript=None):
     """Turn model stream events into UI updates.
 
-    Only real generated content moves the UI on: the first content event
-    replaces THINKING with the progress bar, user-facing text goes to the live
-    relay, output and usage events feed the activity readout, and structured
-    action events drive progress. Text never advances progress, so a long reply
-    cannot produce one step per token.
+    Two destinations, and which one an event goes to is the whole distinction
+    the interface rests on. The temporary ones -- the progress bar, the
+    thinking word, the token and elapsed readout, the streamed reply -- go to
+    `live_ui` and `relay`, which repaint one region in place. A progress
+    message goes to the `transcript` instead, where it is printed once and
+    kept: it is something the user is meant to still have at the end of the
+    turn, and a row that gets repainted is exactly how it used to be lost.
+
+    Progress is emitted here, as it arrives off the stream, rather than when
+    the object finishes parsing. That is what makes it live.
+
+    Only real generated content moves the UI on. Text never advances progress,
+    so a long reply cannot produce one step per token.
     """
     def handle(event):
         kind, value = event
@@ -62,9 +73,76 @@ def stream_handler(live_ui, relay, state):
             live_ui.settle_tokens(value)
         elif kind == "action":
             live_ui.intermediate_event(ACTION_LABELS.get(value, "Processing..."))
+        elif kind == "progress":
+            if transcript is not None and str(value).strip():
+                transcript.emit_kind("progress", str(value).strip())
+                state["progress_seen"].add(str(value).strip())
+        elif kind == "next_step":
+            # Held, not shown. It belongs immediately before the final block,
+            # which has not been written yet.
+            state["next_step"] = str(value)
         elif kind == "error":
             state["error"] = value
     return handle
+
+
+def declared_events(obj, transcript, state):
+    """Emit the public events an action object declared, in order.
+
+    Covers two cases the stream cannot. A blocking request has no stream, so
+    its `progress` arrives only here; and the `events` array is read from the
+    finished object because a partially parsed array entry is not yet a fact.
+    Anything already shown live is skipped, so nothing appears twice.
+    """
+    if not isinstance(obj, dict):
+        return
+    progress = obj.get("progress")
+    if isinstance(progress, str) and progress.strip() and progress.strip() not in state["progress_seen"]:
+        transcript.emit_kind("progress", progress.strip())
+        state["progress_seen"].add(progress.strip())
+    declared = obj.get("events")
+    if isinstance(declared, list):
+        for payload in declared:
+            transcript.emit(AgentEvent.from_payload(payload))
+    step = obj.get("next_step")
+    if isinstance(step, str) and step.strip() and not state.get("next_step"):
+        state["next_step"] = step
+
+
+def resolve_suggestion(state, history):
+    """The next-step hint to show, guaranteed short and guaranteed true.
+
+    Three sources, in order of preference: what the model offered, a shorter
+    rewrite of it, and what the turn's own history says happened. The last of
+    those is why the hint can never describe work that was not done -- it is
+    read off the events, not invented.
+
+    A hint is decoration. Nothing here may fail a turn, so every path ends in
+    a usable string.
+    """
+    offered = state.get("next_step")
+    ok, cleaned, _ = validate_suggestion(offered)
+    if ok:
+        return cleaned
+    if cleaned:
+        # Offered but too long. The truncation is already correct and already
+        # relevant, which beats a generic line and costs no extra request.
+        return cleaned
+    return fallback_suggestion(history)
+
+def _console_line():
+    """One line from the console, or None when the input has ended.
+
+    The prompt box falls back to this wherever raw keys cannot be read. It
+    goes through the same console every other prompt in TMT uses rather than
+    reading the stream directly, so encoding, history and interruption behave
+    as they already do.
+    """
+    try:
+        return console.input("")
+    except (EOFError, KeyboardInterrupt):
+        return None
+
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
@@ -141,20 +219,24 @@ def main(argv=None):
     # prompt only pushed the conversation up the screen. It leaves the cursor
     # after the prompt, so the first read below is the same console.input as
     # before with the prompt already on screen.
-    render_status(workspace=root)
-    first_turn = True
+    render_status(workspace=root, prompt=False)
+    # One box for the session. It draws its own frame each time it is asked,
+    # so nothing needs redrawing between turns, and the console keeps being
+    # the line reader on any run that cannot take raw keys -- a pipe, a
+    # redirect, the test suite -- so a scripted run behaves as it always did.
+    prompt_box = PromptBox(line_reader=_console_line)
+    placeholder = ""
     while True:
-        # Every later turn gets the prompt alone, under a blank line.
-        if not first_turn:
-            render_prompt()
-        first_turn = False
-        try:
-            task = console.input("").strip()
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Use 'quit' or 'exit' to close.[/yellow]")
-            continue
-        except EOFError:
+        # The hint from the last turn is drawn inside the box and is nowhere
+        # else: `ask` returns what was typed, and an untouched box returns the
+        # empty line it actually holds.
+        answer = prompt_box.ask(placeholder)
+        if answer is None:
             break
+        if prompt_box.cancelled:
+            console.print("[yellow]Use 'quit' or 'exit' to close.[/yellow]")
+            continue
+        task = answer.strip()
         if task.lower() in {"quit", "exit"}:
             break
         if not task:
@@ -166,14 +248,25 @@ def main(argv=None):
         last_raw, identical_count = "", 0
         live_ui = LiveUI()
         relay = LiveRelay()
+        # The turn's permanent record. It is written through the live region
+        # rather than straight to the stream: the region is repainted in place
+        # a few rows further down, and printing past it without telling it
+        # would leave the repaint arithmetic pointing at rows that have moved.
+        history = ResponseHistory()
+        transcript = Transcript(history=history, writer=relay.write_above)
+        turn_state = {"next_step": "", "progress_seen": set()}
+        suggestion = ""
         live_ui.attach_sink(relay.set_status)
         live_ui.start()
         try:
             for _ in range(35):
                 messages[0]["content"] = get_system_prompt()
                 messages = trim_messages(messages)
-                state = {"error": None}
-                raw = ask_model(messages, on_event=stream_handler(live_ui, relay, state))
+                state = {"error": None, "next_step": turn_state["next_step"],
+                         "progress_seen": turn_state["progress_seen"]}
+                raw = ask_model(messages,
+                                on_event=stream_handler(live_ui, relay, state, transcript))
+                turn_state["next_step"] = state["next_step"] or turn_state["next_step"]
                 live_ui.meaningful_output()
                 if state["error"]:
                     relay.abort()
@@ -193,6 +286,7 @@ def main(argv=None):
                     relay.release()
                     console.print(f"[red]Bad JSON:[/red] {error}")
                     break
+                declared_events(obj, transcript, turn_state)
                 if "actions" in obj:
                     batch = obj["actions"]
                     if not isinstance(batch, list) or not batch:
@@ -207,11 +301,18 @@ def main(argv=None):
                             results.append(f"INVALID: {error}")
                             break
                         sub_action = sub_obj["action"]
+                        # A batch carries its progress on the entries, not on
+                        # the object around them, and the stream only reports
+                        # top-level values. Read here, before the action runs,
+                        # so the message still arrives ahead of its work.
+                        declared_events(sub_obj, transcript, turn_state)
                         result = execute_action(sub_obj, context)
+                        transcript.emit(action_event(sub_action, sub_obj, result))
                         if sub_action in MUTATING_ACTIONS:
                             invalidate_prompt()
                         if sub_action in ("done", "respond"):
-                            finish_response(live_ui, relay, result)
+                            suggestion = finish_response(live_ui, relay, result,
+                                                         transcript, turn_state)
                             break
                         results.append(f"{sub_action}: {result}")
                     else:
@@ -227,8 +328,10 @@ def main(argv=None):
                     continue
                 action = obj["action"]
                 result = execute_action(obj, context)
+                transcript.emit(action_event(action, obj, result))
                 if action in ("done", "respond"):
-                    finish_response(live_ui, relay, result)
+                    suggestion = finish_response(live_ui, relay, result,
+                                                 transcript, turn_state)
                 else:
                     relay.reset()
                     live_ui.intermediate_event(ACTION_LABELS.get(action, "Processing..."))
@@ -251,15 +354,37 @@ def main(argv=None):
             relay.abort()
             live_ui.attach_sink(None)
             live_ui.stop()
+        # Carried to the next prompt as shadow text only. It is drawn in the
+        # box and never put in the buffer, so pressing Enter on an untouched
+        # prompt still submits nothing.
+        placeholder = suggestion
 
-def finish_response(live_ui, relay, result):
-    """Close out a finished turn: 95% FINALIZING, let the live relay resolve
-    every remaining symbol, then 100% and the final response — shown once."""
+def finish_response(live_ui, relay, result, transcript=None, state=None):
+    """Close out a finished turn.
+
+    The order is the point. The suggestion is worked out and drawn first, then
+    the live strip is retired, and only then does the final answer go up. That
+    puts the hint immediately above the answer rather than after it, and it
+    means the strip is gone by the time the reply lands rather than sitting
+    between the reply and the prompt.
+
+    Returns the suggestion, which becomes the placeholder in the next prompt
+    box. It is a hint to look at, never a value: it is not put into the input.
+    """
     live_ui.final_event()
     relay.finish()
+    suggestion = ""
+    if transcript is not None:
+        suggestion = resolve_suggestion(state or {}, transcript.history)
+        transcript.emit_kind("next_step_suggestion", suggestion)
     live_ui.attach_sink(None)
     live_ui.complete()
     render_response(str(result))
+    if transcript is not None:
+        # Recorded, not drawn: render_response has already drawn it, and the
+        # history is what the turn is answerable from afterwards.
+        transcript.history.append(AgentEvent.make("final", str(result)))
+    return suggestion
 
 if __name__ == "__main__":
     main()

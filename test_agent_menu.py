@@ -19,6 +19,8 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import agent_config
@@ -614,3 +616,318 @@ def test_a_long_path_is_shortened_in_the_middle_and_keeps_both_ends():
                            model_id="z-ai/glm-5.2:free"):
             assert menu().display_width(line) <= max(24, min(72, columns - 2)), (
                 columns, line)
+
+
+# --- the prompt box, and the suggestion drawn in an empty one ----------------
+#
+# One property holds all of these up: the placeholder is drawn and never held.
+# A suggestion that could reach the buffer would be submitted as a task the
+# user never asked for, so the tests below check the buffer itself as well as
+# what the box returns.
+
+SUGGESTION = "Review the changed files"
+
+
+class Typing:
+    """A scripted raw-key reader for the prompt box.
+
+    Running past the end of the script ends the input rather than waiting: a
+    box still asking for keys after Enter has not returned, and the test says
+    so instead of hanging the suite.
+    """
+
+    def __init__(self, *strokes):
+        self.queue = list(strokes)
+        self.calls = 0
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        if not self.queue:
+            raise IndexError("the prompt box asked for key %d; the script had %d"
+                             % (self.calls, self.calls - 1))
+        return self.queue.pop(0)
+
+    @property
+    def remaining(self):
+        return len(self.queue)
+
+
+def editor(placeholder="", typed=""):
+    """A LineEditor with `typed` entered through it, one key at a time."""
+    made = menu().LineEditor(placeholder)
+    for char in typed:
+        made.handle("char", char)
+    return made
+
+
+def prompt_rows(state, columns=60, stream=None):
+    """The prompt box as the terminal shows it, escapes removed."""
+    stream = Console() if stream is None else stream
+    box = menu().PromptBox(stream=stream)
+    return [visible(line) for line in box.lines(state, size=(columns, 24))]
+
+
+def test_the_prompt_box_draws_the_suggestion_and_never_answers_with_it():
+    """The placeholder is shadow text: on screen while the box is empty, and
+    no part of the buffer at any moment. Enter on an untouched box is an empty
+    line, which is what the user entered."""
+    state = editor(SUGGESTION)
+    assert state.value == ""
+    assert state.cursor == 0
+    assert state.placeholder_visible is True
+
+    rows = prompt_rows(state)
+    assert len(rows) == 3, rows
+    assert SUGGESTION in rows[1], rows
+    # The marker carries the prompt on its own, with the colour stripped.
+    assert rows[1].strip().startswith(">"), rows
+
+    answer = menu().PromptBox(stream=Terminal(), reader=Typing("\r")).ask(SUGGESTION)
+    assert answer == "", repr(answer)
+
+
+def test_the_first_keystroke_replaces_the_suggestion_rather_than_appending():
+    """The one that must not regress. A placeholder still in the buffer when
+    the first character lands would submit "Review the changed filesR"."""
+    state = editor(SUGGESTION)
+    assert state.handle("char", "R") == "continue"
+    assert state.value == "R", repr(state.value)
+    assert state.cursor == 1
+    assert state.placeholder_visible is False
+
+    rows = prompt_rows(state)
+    assert rows[1].strip() == "> R", rows
+    assert SUGGESTION not in "\n".join(rows), rows
+
+    answer = menu().PromptBox(stream=Terminal(),
+                              reader=Typing("R", "\r")).ask(SUGGESTION)
+    assert answer == "R", repr(answer)
+    assert SUGGESTION not in answer, repr(answer)
+    assert "Review" not in answer, repr(answer)
+
+
+def test_the_suggestion_does_not_come_back_after_backspacing_to_empty():
+    """It was dismissed by the first character typed and stays dismissed: a
+    suggestion reappearing mid-edit reads as text about to be submitted."""
+    state = editor(SUGGESTION, "R")
+    assert state.handle("key", "backspace") == "continue"
+    assert state.value == ""
+    assert state.cursor == 0
+    assert state.placeholder_visible is False
+    assert "Review" not in "\n".join(prompt_rows(state)), prompt_rows(state)
+
+    answer = menu().PromptBox(stream=Terminal(),
+                              reader=Typing("R", "\x7f", "\r")).ask(SUGGESTION)
+    assert answer == "", repr(answer)
+
+
+def test_every_editing_key_edits_the_line():
+    """A field that can only append is not an editor. Each key is driven
+    through LineEditor.handle, where the whole of the editing lives."""
+    state = editor(typed="hello world")
+    assert (state.value, state.cursor) == ("hello world", 11)
+
+    state.handle("key", "backspace")
+    assert state.value == "hello worl", state.value
+    state.handle("key", "home")
+    assert state.cursor == 0
+    state.handle("key", "delete")
+    assert state.value == "ello worl", state.value
+    state.handle("key", "right")
+    assert state.cursor == 1
+    state.handle("key", "left")
+    assert state.cursor == 0
+    state.handle("key", "end")
+    assert state.cursor == len(state.value)
+    state.handle("key", "delete_word")          # Ctrl-W
+    assert state.value == "ello ", state.value
+    state.handle("key", "clear")                # Ctrl-U
+    assert (state.value, state.cursor) == ("", 0)
+
+    # A character typed with the cursor moved back lands where the cursor is,
+    # not at the end.
+    state = editor(typed="ac")
+    state.handle("key", "left")
+    state.handle("char", "b")
+    assert (state.value, state.cursor) == ("abc", 2)
+
+    # Neither end of the line can be walked off.
+    state.handle("key", "home")
+    state.handle("key", "left")
+    assert state.cursor == 0
+    state.handle("key", "backspace")
+    assert state.value == "abc", state.value
+    state.handle("key", "end")
+    state.handle("key", "right")
+    assert state.cursor == 3
+    state.handle("key", "delete")
+    assert state.value == "abc", state.value
+
+
+def test_the_keys_that_finish_a_line_say_which_way_it_finished():
+    """Enter, Ctrl-C and the end of the input are three different outcomes,
+    and only one of them is an answer."""
+    assert editor().handle("key", "enter") == "submit"
+    assert editor().handle("key", "interrupt") == "cancel"
+    assert editor().handle("key", "esc") == "cancel"
+    assert editor().handle("end", None) == "end"
+    assert editor().handle("", "") == "continue"        # an animation tick
+    assert editor().handle("key", "eof") == "end"       # Ctrl-D, empty line
+
+    # Ctrl-D with something typed is the forward delete it is everywhere else.
+    state = editor(typed="ab")
+    state.handle("key", "home")
+    assert state.handle("key", "eof") == "continue"
+    assert state.value == "b", state.value
+
+    # An abandoned line and an empty one both mean "ask me again", so both
+    # come back as "". `cancelled` is how a caller that wants to say something
+    # about it tells them apart. Only a genuinely ended input returns None,
+    # because that is the one case where asking again would never be answered.
+    for interrupt in ("\x03", "\x1b"):
+        box = menu().PromptBox(stream=Terminal(), reader=Typing(interrupt))
+        assert box.ask(SUGGESTION) == "", interrupt
+        assert box.cancelled, interrupt
+
+    ended = menu().PromptBox(stream=Terminal(), reader=Typing("\x04"))
+    assert ended.ask(SUGGESTION) is None
+    assert not ended.cancelled
+
+
+def test_a_paste_delivered_as_one_read_lands_whole():
+    """A paste arrives as a single multi-character read. Split into characters
+    it would be reordered by anything applied per keystroke, and truncated by
+    anything limited per keystroke."""
+    pasted = "refactor agent_menu.py, then run the tests"
+    assert menu().normalize_text_key(pasted) == ("char", pasted)
+
+    state = editor(SUGGESTION)
+    assert state.handle("char", pasted) == "continue"
+    assert state.value == pasted, state.value
+    assert state.cursor == len(pasted)
+    assert state.placeholder_visible is False
+
+    answer = menu().PromptBox(stream=Terminal(),
+                              reader=Typing(pasted, "\r")).ask(SUGGESTION)
+    assert answer == pasted, repr(answer)
+
+
+def test_the_editing_keys_arrive_however_the_terminal_sends_them():
+    """Terminals disagree about how they report a key. The field acts on the
+    name, so every spelling of one key has to reduce to the same name."""
+    expected = {
+        "\r": "enter", "\n": "enter", "\x03": "interrupt",
+        "\x7f": "backspace", "\x08": "backspace", "backspace": "backspace",
+        "\x1b[3~": "delete", "\x1b[3": "delete", "delete": "delete",
+        "\x1b[D": "left", "\x1bOD": "left", "left": "left",
+        "\x1b[C": "right", "\x1bOC": "right", "right": "right",
+        "\x1b[H": "home", "\x1b[1~": "home", "home": "home",
+        "\x1b[F": "end", "\x1b[4~": "end", "end": "end",
+        "\x15": "clear", "\x17": "delete_word", "\x04": "eof",
+    }
+    for stroke, name in expected.items():
+        assert menu().normalize_text_key(stroke) == ("key", name), repr(stroke)
+
+    # And what the API key screen already relies on is untouched: text is
+    # text, a tick is nothing, and the end of the input is the end.
+    assert menu().normalize_text_key("k") == ("char", "k")
+    assert menu().normalize_text_key("") == ("", "")
+    assert menu().normalize_text_key(None) == ("end", None)
+    assert menu().normalize_text_key("up") == ("", "")
+    assert menu().normalize_text_key("down") == ("", "")
+
+
+def test_the_prompt_box_borders_stay_well_formed_at_every_width():
+    """Measured to columns - 1 at every width, empty and full. A row drawn to
+    the last column wraps on the terminals that auto-wrap, which costs a
+    screen line the repaint arithmetic does not know about."""
+    long_text = "refactor the renderer so the input row scrolls sideways " * 3
+    states = (editor(SUGGESTION), editor(typed=long_text),
+              editor(typed="\u30d7\u30ed\u30b8\u30a7\u30af\u30c8" * 12))
+    for columns in (20, 24, 40, 80, 100, 200):
+        for state in states:
+            rows = prompt_rows(state, columns=columns)
+            assert len(rows) == 3, rows
+            for row in rows:
+                assert menu().display_width(row) <= columns - 1, (
+                    columns, row, menu().display_width(row))
+            assert rows[1].strip().startswith(">"), (columns, rows)
+            # The rules are a single repeated glyph, and the same rule twice.
+            assert set(rows[0].strip()) <= {"-", "\u2500"}, rows[0]
+            assert rows[0] == rows[2], rows
+
+
+def test_a_long_line_scrolls_sideways_to_keep_the_cursor_in_view():
+    """The line is one row however long it gets, so the row moves under the
+    cursor rather than the text wrapping out of the box."""
+    text = " ".join("word%d" % number for number in range(40))
+    state = editor(typed=text)
+    row = prompt_rows(state, columns=40)[1]
+    assert menu().display_width(row) <= 39, row
+    assert row.rstrip().endswith(text[-6:]), row      # the cursor end is shown
+    assert text[:6] not in row, row                   # the far end has scrolled
+
+    state.handle("key", "home")
+    row = prompt_rows(state, columns=40)[1]
+    assert row.strip().startswith("> " + text[:6]), row
+    assert not row.rstrip().endswith(text[-6:]), row
+
+
+def test_the_prompt_box_degrades_to_ascii_where_it_cannot_be_drawn():
+    """A deliberate ASCII box reads as a choice; a row of replacement marks
+    reads as a bug. cp1252 is what a plain Windows console reports."""
+    plain_console = Console(encoding="cp1252", tty=False)
+    drawn = "\n".join(prompt_rows(editor(SUGGESTION), stream=plain_console))
+    drawn.encode("cp1252")               # nothing drawn can fail to encode
+    assert "\u2500" not in drawn, drawn
+    assert "---" in drawn, drawn
+    assert "> " + SUGGESTION in drawn, drawn
+
+    # The same box on a terminal keeps its meaning once colour is stripped.
+    coloured = "\n".join(prompt_rows(editor(SUGGESTION), stream=Console()))
+    assert "> " + SUGGESTION in coloured, coloured
+    assert "\u2500" in coloured, coloured
+
+
+def test_a_prompt_box_without_raw_keys_reads_a_line_instead_of_blocking():
+    """The property the whole suite rests on. Where raw keys cannot arrive --
+    a pipe, a redirect, a scripted run -- the box is drawn and a whole line is
+    read, so nothing waits for a keystroke that can never come."""
+    stream = Terminal()
+    box = menu().PromptBox(stream=stream, instream=io.StringIO("fix the parser\n"))
+    # A terminal to draw on, an input that is not one: exactly the piped case.
+    assert menu().is_interactive(stream, box.instream) is False
+
+    # Answered on a watchdog rather than called directly, so a box that does
+    # wait for a keystroke here is a failure in five seconds instead of a
+    # suite that never finishes.
+    outcome = {}
+    worker = threading.Thread(target=lambda: outcome.setdefault("answer", box.ask(SUGGESTION)),
+                              daemon=True)
+    started = time.monotonic()
+    worker.start()
+    worker.join(5)
+    assert not worker.is_alive(), "the box waited for a key that cannot arrive"
+    assert outcome.get("answer") == "fix the parser", outcome
+    assert time.monotonic() - started < 5, "the fallback blocked"
+    assert SUGGESTION in stream.text(), stream.text()   # the box was still drawn
+
+    # The end of the input is None; an empty line is an empty line; and
+    # neither is ever the suggestion.
+    ended = menu().PromptBox(stream=Terminal(), instream=io.StringIO("")).ask(SUGGESTION)
+    assert ended is None, repr(ended)
+    blank = menu().PromptBox(stream=Terminal(), instream=io.StringIO("\n")).ask(SUGGESTION)
+    assert blank == "", repr(blank)
+
+
+def test_the_prompt_box_repaints_in_place_rather_than_reprinting_itself():
+    """Three rows repainted through LiveRegion, not a fresh box per keystroke
+    walking the conversation up the screen."""
+    stream = Terminal()
+    typed = Typing("h", "i", "\r")
+    answer = menu().PromptBox(stream=stream, reader=typed).ask(SUGGESTION)
+    assert answer == "hi", repr(answer)
+    assert typed.remaining == 0
+    raw = stream.getvalue()
+    assert "\033[3A" in raw, "the box was reprinted rather than repainted"
+    assert stream.text().count("> hi") >= 1, stream.text()

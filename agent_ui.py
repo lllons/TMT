@@ -530,3 +530,351 @@ def render_response(response: str, stream=None):
     out.extend(f"{left} {pad_to_width(line, inner)} {right}" for line in lines)
     out.append(cycle_text(bottom, stream, phase=gradient_phase() + 0.5))
     safe_write(stream, "\n".join(out) + "\n")
+
+
+# --- the response history -----------------------------------------------
+#
+# Everything above this point draws a row that is repainted in place: one
+# mutable status line, erased and rewritten as the turn moves on. That is the
+# right shape for a progress bar and the wrong shape for anything the user is
+# meant to keep. A message that says what the agent just did has to survive the
+# next message, and until now none did -- `_write_row` writes "\r\033[2K", which
+# is a carriage return and an erase, so each intermediate label overwrote the
+# one before it and the turn ended with nothing but its last line.
+#
+# So there are two surfaces, and the difference between them is the whole
+# design. An AgentEvent is permanent: appended to a ResponseHistory, printed
+# once into the terminal's own scrollback, never repainted and never erased.
+# The status row stays temporary. Nothing below writes to the status row and
+# nothing above appends to the history.
+
+EVENT_KINDS = ("progress", "milestone", "warning", "success", "error", "tool",
+               "file_read", "file_edit", "file_create", "file_delete", "command",
+               "test", "background_agent", "next_step_suggestion", "final")
+
+# Where each kind sits in the shared gradient, and how much of the screen it is
+# allowed to take. Position carries the meaning, exactly as it does on the
+# progress bar: red is trouble, green is finished, and the one neutral is for
+# detail that must recede. There is no second colour system.
+#
+# The level is prominence, 0 lowest to 3 highest. A terminal cannot size type
+# independently, so weight is carried by what it does have: dimness, indent,
+# the blank line before a block, and how loud the marker is.
+_EVENT_STYLE = {
+    "progress":           {"level": 0, "position": None, "mark": ("·", "-")},
+    "next_step_suggestion": {"level": 0, "position": None, "mark": ("", "")},
+    "tool":               {"level": 1, "position": 40, "mark": ("▸", ">")},
+    "file_read":          {"level": 1, "position": 40, "mark": ("▸", ">")},
+    "background_agent":   {"level": 1, "position": 40, "mark": ("▸", ">")},
+    "milestone":          {"level": 1, "position": 40, "mark": ("◆", "*")},
+    "warning":            {"level": 1, "position": 60, "mark": ("▲", "!")},
+    "error":              {"level": 1, "position": 10, "mark": ("✗", "x")},
+    "success":            {"level": 1, "position": 95, "mark": ("✓", "+")},
+    "command":            {"level": 2, "position": 40, "mark": ("▸", ">")},
+    "file_edit":          {"level": 2, "position": 80, "mark": ("▸", ">")},
+    "file_create":        {"level": 2, "position": 80, "mark": ("▸", ">")},
+    "file_delete":        {"level": 2, "position": 80, "mark": ("▸", ">")},
+    "test":               {"level": 2, "position": 80, "mark": ("▸", ">")},
+    "final":              {"level": 3, "position": None, "mark": ("", "")},
+}
+
+PROMINENCE = {kind: _EVENT_STYLE[kind]["level"] for kind in EVENT_KINDS}
+
+MAX_SUGGESTION_WORDS = 5
+
+# Used only when the model gave no usable suggestion and the history says
+# nothing more specific. Each is true of any turn, so none of them can claim
+# something that did not happen.
+FALLBACK_SUGGESTIONS = ("Review the changes", "Run the tests", "Continue working")
+
+_WORD = re.compile(r"[^\W_]+(?:['’-][^\W_]+)*", re.UNICODE)
+
+
+def count_words(text):
+    """Words in `text`, counting neither punctuation nor whitespace.
+
+    "Run the tests." is three. Hyphenated and apostrophed forms are one word
+    each, because a suggestion is measured the way a reader would measure it
+    rather than the way a tokeniser would.
+    """
+    if not isinstance(text, str):
+        return 0
+    return len(_WORD.findall(text))
+
+
+def validate_suggestion(text):
+    """Check a next-step suggestion. Returns (ok, cleaned, reason).
+
+    `cleaned` is usable whatever `ok` says: an over-long suggestion comes back
+    truncated to the first MAX_SUGGESTION_WORDS words, so a caller with no way
+    to ask for a shorter one still has something correct to show rather than
+    having to choose between a wrong length and nothing at all.
+    """
+    if not isinstance(text, str):
+        return False, "", "A suggestion must be text."
+    cleaned = " ".join(text.split())
+    if not cleaned:
+        return False, "", "The suggestion was empty."
+    words = count_words(cleaned)
+    if words == 0:
+        return False, "", "The suggestion had no words in it."
+    if words > MAX_SUGGESTION_WORDS:
+        kept, taken = [], 0
+        for piece in cleaned.split(" "):
+            if taken >= MAX_SUGGESTION_WORDS:
+                break
+            kept.append(piece)
+            taken += count_words(piece)
+        return (False, " ".join(kept).rstrip(" ,.;:-"),
+                "A suggestion may be at most %d words; this one had %d."
+                % (MAX_SUGGESTION_WORDS, words))
+    return True, cleaned, ""
+
+
+def fallback_suggestion(history=None):
+    """A suggestion drawn from what this turn actually did.
+
+    It reads the history rather than guessing, because the one thing a hint
+    must never do is describe work that did not happen. With nothing to go on
+    it says something true of every turn.
+    """
+    kinds = set(history.kinds()) if history else set()
+    if "test" in kinds:
+        return "Review the test results"
+    if kinds & {"file_edit", "file_create", "file_delete"}:
+        return "Review the changed files"
+    if "command" in kinds:
+        return FALLBACK_SUGGESTIONS[1]
+    return FALLBACK_SUGGESTIONS[0]
+
+
+class AgentEvent:
+    """One user-visible thing that happened, fixed once it is made.
+
+    Nothing here is private reasoning. An event exists to be shown, so it
+    carries only what the user may read: what happened, and the facts that go
+    with it. The agent's deliberation never becomes one of these.
+    """
+
+    __slots__ = ("kind", "message", "stage", "detail", "at")
+
+    def __init__(self, kind, message="", stage="", detail=None, at=None):
+        self.kind = kind
+        self.message = message
+        self.stage = stage
+        self.detail = dict(detail or {})
+        self.at = time.time() if at is None else at
+
+    @classmethod
+    def make(cls, kind, message="", stage="", **detail):
+        if kind not in EVENT_KINDS:
+            detail = dict(detail, reported_kind=kind)
+            kind = "progress"
+        return cls(kind, str(message or ""), str(stage or ""), detail)
+
+    @classmethod
+    def from_payload(cls, payload):
+        """Build an event from a dict the model wrote, or None.
+
+        The model is not a trusted source of well-formed data, so this accepts
+        anything and never raises. An unrecognised type is kept as a progress
+        event with the original name recorded rather than dropped: losing a
+        message the model meant the user to see is the exact failure this
+        whole surface exists to prevent.
+        """
+        if not isinstance(payload, dict):
+            return None
+        message = payload.get("message", payload.get("text", ""))
+        if not isinstance(message, str) or not message.strip():
+            return None
+        kind = payload.get("type", payload.get("kind", "progress"))
+        if not isinstance(kind, str):
+            kind = "progress"
+        stage = payload.get("stage", "")
+        if not isinstance(stage, str):
+            stage = ""
+        detail = {key: value for key, value in payload.items()
+                  if key not in ("message", "text", "type", "kind", "stage")}
+        return cls.make(kind, message.strip(), stage, **detail)
+
+    def __repr__(self):
+        return "AgentEvent(%r, %r)" % (self.kind, self.message)
+
+
+class ResponseHistory:
+    """The events of one turn, in the order they happened.
+
+    Append-only on purpose. There is no method here that replaces, reorders or
+    removes an event, because every one of those is a way for something the
+    user has already read to disappear from under them. `reset` is the single
+    exception and belongs to the start of a new turn.
+    """
+
+    def __init__(self, events=None):
+        self._events = list(events or [])
+
+    def append(self, event):
+        self._events.append(event)
+        return event
+
+    def extend(self, events):
+        added = tuple(event for event in events if event is not None)
+        self._events.extend(added)
+        return added
+
+    @property
+    def events(self):
+        # A tuple: a caller cannot reach in and mutate the record.
+        return tuple(self._events)
+
+    def kinds(self):
+        return tuple(event.kind for event in self._events)
+
+    def of_kind(self, kind):
+        return tuple(event for event in self._events if event.kind == kind)
+
+    def last(self, kind=None):
+        for event in reversed(self._events):
+            if kind is None or event.kind == kind:
+                return event
+        return None
+
+    def reset(self):
+        """Start a new turn. The only thing that clears the history."""
+        self._events = []
+
+    def __len__(self):
+        return len(self._events)
+
+    def __iter__(self):
+        return iter(self._events)
+
+    def __bool__(self):
+        return bool(self._events)
+
+
+class Transcript:
+    """Prints events once, into the terminal's own scrollback.
+
+    The counterpart to LiveUI: that class owns one row and repaints it, this
+    one owns everything that must outlive the row. Nothing printed here is
+    ever repainted, so the terminal's scrollback is the history and scrolling
+    up is how you read it -- no region to redraw, nothing to lose on a resize.
+
+    `writer` is how lines reach the terminal. It exists so the caller can pass
+    one that prints above a live region; the default writes straight to the
+    stream, which is what a run without a live region wants.
+    """
+
+    def __init__(self, stream=None, history=None, writer=None):
+        self.stream = sys.stdout if stream is None else stream
+        self._history = history if history is not None else ResponseHistory()
+        self._writer = writer
+        self._last_level = None
+
+    @property
+    def history(self):
+        return self._history
+
+    def emit(self, event):
+        """Record an event and print it. The event is returned either way."""
+        if event is None:
+            return None
+        self._history.append(event)
+        lines = self.lines_for(event)
+        if lines:
+            self._write(self._separator(event) + "\n".join(lines) + "\n")
+        return event
+
+    def _separator(self, event):
+        """A blank line where the prominence changes, and nowhere else.
+
+        Blank lines are structure, so one belongs at the edge of a block of
+        results rather than between every pair of rows. Two file edits in a
+        row are one group and stay together; a progress line after them is a
+        different thing being said and gets the gap.
+        """
+        level = PROMINENCE.get(event.kind, 0)
+        previous, self._last_level = self._last_level, level
+        if previous is None:
+            return ""
+        return "\n" if (level == 2) != (previous == 2) else ""
+
+    def emit_kind(self, kind, message="", stage="", **detail):
+        return self.emit(AgentEvent.make(kind, message, stage, **detail))
+
+    def _write(self, text):
+        if self._writer is not None:
+            return self._writer(text)
+        return safe_write(self.stream, text)
+
+    def _facts(self, event):
+        """The second row of a prominent event: only measured facts.
+
+        Every value here came from an action that ran. Nothing is estimated
+        and nothing is filled in, so an event with no facts gets no row.
+        """
+        detail = event.detail
+        parts = []
+        if detail.get("added") is not None or detail.get("removed") is not None:
+            parts.append("+%s -%s" % (detail.get("added", 0), detail.get("removed", 0)))
+        for key, label in (("lines", "lines"), ("files", "files"), ("bytes", "bytes")):
+            if isinstance(detail.get(key), int):
+                parts.append("%d %s" % (detail[key], label))
+        if detail.get("status") is not None:
+            parts.append("exit %s" % detail["status"])
+        return "  ".join(parts)
+
+    def lines_for(self, event):
+        """The painted lines for one event, without a trailing newline.
+
+        A `final` event returns nothing: the finished reply has its own box in
+        `render_response`, and drawing it twice in two styles would be two
+        answers on screen.
+        """
+        style = _EVENT_STYLE.get(event.kind, _EVENT_STYLE["progress"])
+        if style["level"] == 3:
+            return []
+        stream = self.stream
+        plain = plain_output(stream)
+        width = max(20, shutil.get_terminal_size((80, 24)).columns - 1)
+        mark = style["mark"][1 if plain else 0]
+
+        if event.kind == "next_step_suggestion":
+            # Secondary to everything: a hint about what to ask next must not
+            # compete with the answer it sits above.
+            label, body = "Next:", event.message
+            rows = wrap_lines(body, max(10, width - 4)) or [""]
+            out = [self._dim(" " + label, stream)]
+            out.extend(self._dim("   " + row, stream) for row in rows)
+            return out
+
+        if style["level"] == 0:
+            # Dim, tight, no blank line. It should read as something said in
+            # passing, not as a result.
+            rows = wrap_lines(event.message, max(10, width - 4)) or [""]
+            head = " %s " % mark if mark else "   "
+            return [self._dim(head + rows[0], stream)] + [
+                self._dim("   " + row, stream) for row in rows[1:]]
+
+        painted_mark = _color(mark, style["position"], stream) if mark else ""
+        if style["level"] == 1:
+            rows = wrap_lines(event.message, max(10, width - 4)) or [""]
+            return [" %s %s" % (painted_mark, rows[0])] + [
+                "   " + row for row in rows[1:]]
+
+        # Level 2: indented further and set apart by the blank line `emit`
+        # puts at the edge of the block. This is the part of a turn worth
+        # finding again when scrolling back, so it is the loudest thing below
+        # the answer itself.
+        rows = wrap_lines(event.message, max(10, width - 6)) or [""]
+        out = ["   %s %s" % (painted_mark, rows[0])]
+        out.extend("     " + row for row in rows[1:])
+        facts = self._facts(event)
+        if facts:
+            out.append(self._dim("     " + facts, stream))
+        return out
+
+    @staticmethod
+    def _dim(text, stream):
+        return DIM + text + RESET if _supports_color(stream) else text

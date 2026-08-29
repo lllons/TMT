@@ -26,9 +26,9 @@ import agent_config
 import agent_models
 from agent_live_renderer import LiveRegion
 from agent_ui import (
-    DIM, GRADIENT_TICK, RESET, _supports_color, cycle_text, display_width,
-    fit_to_width, gradient_phase, iter_graphemes, pad_to_width, plain_output,
-    safe_write, wrap_lines,
+    DIM, GRADIENT_TICK, RESET, _supports_color, clip_to_width, cycle_text,
+    display_width, fit_to_width, gradient_phase, iter_graphemes, pad_to_width,
+    plain_output, safe_write, wrap_lines,
 )
 
 FALLBACK_VERSION = "0.1.0"
@@ -695,7 +695,7 @@ def task_prompt(stream=None, phase=None):
     return " " + _paint(TASK_PROMPT.rstrip(), stream, phase) + " "
 
 
-def render_status(stream=None, **facts):
+def render_status(stream=None, prompt=True, **facts):
     """Draw the status header once, and leave the cursor after the prompt.
 
     Called a single time as the session opens. The header states what the
@@ -716,6 +716,10 @@ def render_status(stream=None, **facts):
     lines = render_status_lines(stream=stream, **facts)
     if not safe_write(stream, "\n".join(lines) + "\n"):
         return False
+    if not prompt:
+        # The caller draws its own input -- the prompt box does, and a second
+        # bare "Task>" above it would be two prompts for one question.
+        return True
     return safe_write(stream, task_prompt(stream))
 
 
@@ -914,14 +918,19 @@ def render_help_frame(stream=None, size=None, phase=None):
     return _fit_height(lines, rows, keep_tail=1)
 
 
-def is_interactive(stream=None):
+def is_interactive(stream=None, instream=None):
     """Whether a menu can be driven here at all.
 
     Any doubt counts as no: a wrong "yes" hangs the process on a read that
     will never be answered, while a wrong "no" only skips a menu.
+
+    `instream` is where the keys would come from, and defaults to the real
+    stdin. The prompt box passes its own, because a caller can hand it an
+    input that is not the process's.
     """
     stream = sys.stdout if stream is None else stream
-    for candidate in (sys.stdin, stream):
+    instream = sys.stdin if instream is None else instream
+    for candidate in (instream, stream):
         try:
             if not candidate.isatty():
                 return False
@@ -966,26 +975,40 @@ def normalize_key(key):
 
 
 # The only keys that mean something other than themselves while text is being
-# typed. Everything else printable is a character of the key.
+# typed. Everything else printable is a character of the key. Both the raw
+# sequence and the name are accepted, so a scripted reader can send either and
+# a terminal that reports a key one way is not treated as a different key.
 _TEXT_KEYS = {
     "\r": "enter", "\n": "enter", "\r\n": "enter", "enter": "enter",
     "\x1b": "esc", "esc": "esc",
     "\x7f": "backspace", "\x08": "backspace", "backspace": "backspace",
     "\x03": "interrupt", "interrupt": "interrupt",
+    # Editing keys. A field that can only append is not an editor, and every
+    # one of these is a key the terminal sends whether it is acted on or not.
+    "\x1b[3~": "delete", "\x1b[3": "delete", "delete": "delete",
+    "\x1b[D": "left", "\x1bOD": "left", "left": "left",
+    "\x1b[C": "right", "\x1bOC": "right", "right": "right",
+    "\x1b[H": "home", "\x1bOH": "home", "\x1b[1~": "home", "\x01": "home",
+    "home": "home",
+    "\x1b[F": "end", "\x1bOF": "end", "\x1b[4~": "end", "\x05": "end",
+    "end": "end",
+    "\x15": "clear",          # Ctrl-U, as it is in every shell
+    "\x17": "delete_word",    # Ctrl-W
+    "\x04": "eof", "eof": "eof",   # Ctrl-D
 }
 
-# Navigation names a scripted reader may send into a text field. They are not
-# text, so they are ignored rather than typed.
-_TEXT_IGNORED = ("up", "down", "left", "right")
+# Names a scripted reader may send into a text field that are not text and
+# have nothing to do here. They are ignored rather than typed.
+_TEXT_IGNORED = ("up", "down")
 
 
 def normalize_text_key(key):
     """One keystroke for a text field, as (kind, value).
 
-    ("end", None) when the input has ended, ("key", name) for the few keys
-    that edit rather than type, ("char", text) for characters, and ("", "")
-    for a tick or anything unprintable. A multi-character run is accepted
-    whole, so a paste that arrives in one read is not split or dropped.
+    ("end", None) when the input has ended, ("key", name) for the keys that
+    edit rather than type, ("char", text) for characters, and ("", "") for a
+    tick or anything unprintable. A multi-character run is accepted whole, so
+    a paste that arrives in one read is not split or dropped.
     """
     if key is None:
         return ("end", None)
@@ -998,6 +1021,12 @@ def normalize_text_key(key):
     return ("", "")
 
 
+# The keys the console reports as a scan code behind a lead byte. They have no
+# character of their own, so a name is the only thing either caller can act on.
+_WINDOWS_EXTENDED = {"H": "up", "P": "down", "K": "left", "M": "right",
+                     "G": "home", "O": "end", "S": "delete"}
+
+
 def _read_key_windows(msvcrt, timeout, raw=False):
     if timeout is not None:
         deadline = time.monotonic() + timeout
@@ -1007,9 +1036,10 @@ def _read_key_windows(msvcrt, timeout, raw=False):
             time.sleep(0.01)
     char = msvcrt.getwch()
     if char in ("\x00", "\xe0"):
-        arrow = {"H": "up", "P": "down", "K": "left", "M": "right"}.get(msvcrt.getwch(), "")
-        # An arrow is a name rather than text, so text entry ignores it.
-        return "" if raw else arrow
+        # The name, to both callers. The menu acts on up and down and ignores
+        # the rest; a text field acts on the editing keys, and there is no
+        # character it could type in their place.
+        return _WINDOWS_EXTENDED.get(msvcrt.getwch(), "")
     return char if raw else normalize_key(char)
 
 
@@ -1047,8 +1077,14 @@ def _read_key_posix(stream, timeout, raw=False):
         sequence = "\x1b" + take()
         if sequence[-1] in "[O":
             sequence += take()
+            # Delete, Home and End arrive as ESC [ number ~. The parameter
+            # bytes are read out here so the terminating '~' is not left
+            # behind to be read next as a printable character and typed.
+            while (sequence[-1].isdigit() or sequence[-1] == ";") and pending(0.05):
+                sequence += take()
         # Raw callers get the sequence itself; it carries an escape, which is
-        # not printable, so text entry drops it rather than typing it.
+        # not printable, so a field that does not know the sequence drops it
+        # rather than typing it.
         return sequence if raw else normalize_key(sequence)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, _saved_termios)
@@ -1128,6 +1164,296 @@ def _default_reader():
 
 def _default_text_reader():
     return lambda: read_key(timeout=GRADIENT_TICK, raw=True)
+
+
+# ---------------------------------------------------------------------------
+# The task prompt.
+#
+# A rule, a marked row, a rule: the same divider the rest of the interface
+# draws, with the line being typed between two of them. The suggestion drawn
+# in an empty box is a placeholder and nothing else. It is held beside the
+# buffer rather than in it, so there is no editing path, and no accident of
+# ordering, that can submit a suggestion the user never typed.
+
+PROMPT_MARKER = ">"
+
+_INPUT_ROW = 1           # which row of the frame the line is typed on
+_PROMPT_PREFIX = 3       # columns before the field: a margin, the marker, a gap
+_WORD_BREAK = " \t"
+
+
+class LineEditor:
+    """Pure editing logic for one line. No terminal, no I/O.
+
+    `value` is what the user typed and nothing else: it starts empty and the
+    placeholder is never assigned to it, at any point, by any key. That is the
+    whole of why a suggestion cannot be returned as a task.
+    """
+
+    def __init__(self, placeholder=""):
+        self.placeholder = str(placeholder or "")
+        self.value = ""
+        self.cursor = 0
+        self.placeholder_visible = bool(self.placeholder)
+
+    def insert(self, text):
+        """Insert text at the cursor, and dismiss the placeholder.
+
+        Whole rather than per character: a paste arrives as one read, and
+        splitting it would let anything applied per keystroke -- a limit, a
+        repaint, a cursor move -- land in the middle of it.
+        """
+        if not text:
+            return
+        # Same keystroke, not the next one: the placeholder stops being drawn
+        # at the moment the first character exists, so there is no frame in
+        # which both are on screen and none in which they are concatenated.
+        self.placeholder_visible = False
+        self.value = self.value[:self.cursor] + text + self.value[self.cursor:]
+        self.cursor += len(text)
+
+    def handle(self, kind, value):
+        """Apply one (kind, value) keystroke from `normalize_text_key`.
+
+        Returns "continue" to keep editing, "submit" for a finished line,
+        "cancel" for a line the user abandoned, and "end" when the input is
+        over.
+        """
+        if kind == "end":
+            return "end"
+        if kind == "char":
+            self.insert(value)
+            return "continue"
+        if kind != "key":
+            return "continue"        # an animation tick, or a key with no meaning here
+        if value == "enter":
+            return "submit"
+        if value in ("interrupt", "esc"):
+            return "cancel"
+        if value == "eof":
+            # Ctrl-D ends the input on an empty line, exactly as it does at a
+            # shell; with something typed it is the forward delete instead.
+            if not self.value:
+                return "end"
+            self._delete()
+        elif value == "backspace":
+            self._backspace()
+        elif value == "delete":
+            self._delete()
+        elif value == "left":
+            self.cursor -= self._back_step()
+        elif value == "right":
+            self.cursor += self._forward_step()
+        elif value == "home":
+            self.cursor = 0
+        elif value == "end":
+            self.cursor = len(self.value)
+        elif value == "clear":
+            self.value, self.cursor = "", 0
+        elif value == "delete_word":
+            self._delete_word()
+        return "continue"
+
+    # Movement is by grapheme rather than by index: a cursor that steps one
+    # code point can land inside a combining sequence, and everything drawn
+    # from that offset is then cut through a character.
+    def _back_step(self):
+        clusters = iter_graphemes(self.value[:self.cursor])
+        return len(clusters[-1]) if clusters else 0
+
+    def _forward_step(self):
+        clusters = iter_graphemes(self.value[self.cursor:])
+        return len(clusters[0]) if clusters else 0
+
+    def _backspace(self):
+        size = self._back_step()
+        if not size:
+            return
+        # An empty line does not bring the placeholder back. It was dismissed
+        # by the first character typed and stays dismissed for this prompt:
+        # a suggestion reappearing under a cursor mid-edit reads as text the
+        # user is about to submit.
+        self.value = self.value[:self.cursor - size] + self.value[self.cursor:]
+        self.cursor -= size
+
+    def _delete(self):
+        size = self._forward_step()
+        if size:
+            self.value = self.value[:self.cursor] + self.value[self.cursor + size:]
+
+    def _delete_word(self):
+        head = self.value[:self.cursor]
+        stripped = head.rstrip(_WORD_BREAK)
+        cut = max((stripped.rfind(char) for char in _WORD_BREAK), default=-1)
+        self.value = head[:cut + 1] + self.value[self.cursor:]
+        self.cursor = cut + 1
+
+
+class PromptBox:
+    """The bordered task prompt, repainted in place while it is typed.
+
+    Draws a rule, the line under a '>' marker, and a rule. What comes back is
+    the line as typed: the placeholder is drawn dim inside an empty box and is
+    never any part of the answer.
+    """
+
+    def __init__(self, stream=None, instream=None, reader=None, line_reader=None):
+        self.stream = sys.stdout if stream is None else stream
+        self.instream = sys.stdin if instream is None else instream
+        # reader() -> one raw keystroke. Injecting one is how a test drives
+        # the box; left alone it reads through read_key, as every other
+        # screen does.
+        self.reader = reader
+        # line_reader() -> a whole line, or None at the end of the input. The
+        # degraded path uses it instead of reading the stream directly, so a
+        # caller that already has a reader worth keeping -- the rich console,
+        # with its own encoding and history handling -- keeps it rather than
+        # having a second one grow up beside it.
+        self.line_reader = line_reader
+        self.cancelled = False
+
+    def ask(self, placeholder=""):
+        """Take one line. Returns the text, or None when the input ended.
+
+        Enter on an untouched box returns "" -- the empty line the user
+        actually entered, never the suggestion that was drawn in it. Esc and
+        Ctrl-C also return "", and set `cancelled`: an abandoned line and an
+        empty one both mean "ask me again", and only the caller cares which
+        it was.
+        """
+        self.cancelled = False
+        # Blank lines are structure. The box arrives under a header that ends
+        # in a rule, or under a reply that ends in a border, and butted
+        # straight against either it reads as part of it rather than as the
+        # next question. Written once, outside the repainted region, so the
+        # editing that follows does not redraw it.
+        safe_write(self.stream, "\n")
+        editor = LineEditor(placeholder)
+        reader = self.reader
+        if reader is None:
+            if not is_interactive(self.stream, self.instream):
+                # No raw keys to be had: a pipe, a redirect, or the test
+                # suite. Waiting on a keystroke that cannot arrive would hang
+                # the run, so the box is drawn and the line is read as a line.
+                return self._read_line(editor)
+            reader = _default_text_reader()
+        region = LiveRegion(self.stream)
+        placed = 0
+        try:
+            while True:
+                lines, column = self._frame(editor)
+                region.paint(lines)
+                # The caret is the terminal's own, moved into the row after
+                # the paint and returned to where LiveRegion left it before
+                # the next one, so the region's arithmetic still holds.
+                placed = self._place(lines, column)
+                kind, value = _next_text_key(reader)
+                placed = self._unplace(placed)
+                outcome = editor.handle(kind, value)
+                if outcome == "continue":
+                    continue
+                region.paint(self._frame(editor)[0])   # the last keystroke shows
+                if outcome == "submit":
+                    return editor.value
+                if outcome == "cancel":
+                    self.cancelled = True
+                    return ""
+                return None
+        finally:
+            self._unplace(placed)
+            _restore_terminal(self.stream)
+
+    def lines(self, editor, size=None, phase=None):
+        """The painted box, as a list of rows."""
+        return self._frame(editor, size, phase)[0]
+
+    def _frame(self, editor, size=None, phase=None):
+        """(rows, caret column) for the box as it stands.
+
+        The terminal is measured here rather than remembered, so a window
+        resized between two keystrokes is drawn at its new width.
+        """
+        stream = self.stream
+        columns = _terminal(size)[0]
+        phase = gradient_phase() if phase is None else phase
+        # A spare column, always: a row drawn to the last one wraps on the
+        # terminals that auto-wrap, and costs a screen line the repaint
+        # arithmetic does not know about.
+        # Six is the narrowest box that is still a box: a margin, the marker,
+        # a gap, one column of text and the spare column.
+        limit = max(6, columns - 1)
+        width = min(_content_width(columns), limit)
+        inner = max(1, width - _PROMPT_PREFIX)
+
+        rule = " " + _paint(_glyphs(stream)["rule"] * (width - 1), stream,
+                            phase + 0.5, spread=1.2)
+        text, caret = self._field(editor, inner)
+        body = _dim(text, stream) if editor.placeholder_visible else text
+        row = " " + _paint(PROMPT_MARKER, stream, phase) + " " + body
+        return [rule, row, rule], _PROMPT_PREFIX + caret
+
+    def _field(self, editor, inner):
+        """The visible slice of the line, and where the caret sits in it.
+
+        The row scrolls sideways rather than wrapping, so a long task stays on
+        one line with the caret in view. Both ends are measured in columns:
+        an offset counted in characters puts a wide one half off the edge.
+        """
+        if editor.placeholder_visible:
+            return fit_to_width(editor.placeholder, inner), 0
+        text, cursor = editor.value, editor.cursor
+        start = 0
+        # One column is kept for the caret itself, which sits after the last
+        # character rather than on it.
+        while display_width(text[start:cursor]) > inner - 1:
+            head, _ = clip_to_width(text[start:], 1)
+            if not head:
+                break
+            start += len(head)
+        visible, _ = clip_to_width(text[start:], inner)
+        return fit_to_width(visible, inner), display_width(text[start:cursor])
+
+    def _read_line(self, editor):
+        """Draw the box once, then take a whole line from the input.
+
+        The degraded path, and the one every scripted run takes. It reads a
+        line and returns it; nothing here can block on a key.
+        """
+        for line in self.lines(editor):
+            if not safe_write(self.stream, line + "\n"):
+                break
+        if self.line_reader is not None:
+            try:
+                return self.line_reader()
+            except (EOFError, KeyboardInterrupt):
+                return None
+        try:
+            line = self.instream.readline()
+        except (OSError, ValueError, EOFError, KeyboardInterrupt):
+            return None
+        if not line:
+            return None              # the input ended
+        return line.rstrip("\r\n")
+
+    def _ansi(self):
+        return bool(getattr(self.stream, "isatty", lambda: False)())
+
+    def _place(self, lines, column):
+        """Move the caret into the input row. Returns the rows moved up."""
+        if not self._ansi():
+            return 0
+        up = len(lines) - _INPUT_ROW
+        parts = ["\033[%dA" % up, "\r"]
+        if column:
+            parts.append("\033[%dC" % column)
+        safe_write(self.stream, "".join(parts))
+        return up
+
+    def _unplace(self, up):
+        """Put the caret back where LiveRegion expects to find it."""
+        if up and self._ansi():
+            safe_write(self.stream, "\r\033[%dB" % up)
+        return 0
 
 
 def _drive(render, key_reader, region, on_key):

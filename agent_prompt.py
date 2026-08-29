@@ -30,7 +30,7 @@ OUTPUT_RULES = r"""=== OUTPUT FORMAT - ABSOLUTE RULES ===
 6. Code, file contents and search/replace text belong inside a JSON string field ("content", "search", "replace"). Never paste raw code outside a JSON string.
 7. Inside a JSON string, escape newline as \n, tab as \t, double quote as \", backslash as \\. A real line break inside a string is invalid JSON.
 8. true, false and null are lowercase and unquoted. Numbers ("start", "end") are unquoted.
-9. Use only the actions listed below, with exactly the keys listed. Never invent an action or a key.
+9. Use only the actions listed below, with the keys listed for them plus the three optional keys "progress", "events" and "next_step" described further down. Never invent an action or any other key.
 10. If you cannot or will not do something, still answer with a respond action explaining why. Silence and plain prose both fail.
 
 There are exactly two valid shapes.
@@ -184,6 +184,42 @@ WORKFLOW_RULES = r"""=== BEHAVIOUR ===
 - Only perform file actions the user actually asked for. Never create, edit, delete or rename anything unprompted, and never touch a file outside the task.
 - Never run shell commands. Never leave the workspace root. Only the permitted apps listed above may be opened."""
 
+PROGRESS_RULES = r"""=== PROGRESS, EVENTS AND NEXT STEP - THREE OPTIONAL KEYS ===
+These three keys may be added to any action you already use. They are optional and additive: they never replace a required key, never change which action you pick, and an action without them is still completely correct. Adding one costs no extra turn, so never emit an action just to report progress.
+
+"progress" - one short sentence, allowed on ANY action. Shown to the user while that action runs.
+  {"action":"read_file","path":"agent_config.py","progress":"Checking the provider configuration before making changes."}
+  {"action":"search_files","query":"timeout","progress":"Finding every place the timeout is set."}
+  {"action":"patch_file","path":"src/net.py","search":"timeout=5","replace":"timeout=30","progress":"Raising the socket timeout to 30 seconds."}
+  {"action":"run_file","path":"tests/run_all.py","progress":"Running the test suite against the change."}
+
+"events" - a list of {"type": ..., "message": ...} entries, allowed on ANY action. Each entry may also carry "stage".
+  Valid types, and nothing else: progress, milestone, warning, success, error, tool, file_read, file_edit, file_create, file_delete, command, test, background_agent.
+  {"action":"respond","message":"The suite is green.","events":[{"type":"test","message":"Ran 173 tests"},{"type":"success","message":"173 tests passed"}]}
+  {"action":"patch_file","path":"src/net.py","search":"timeout=5","replace":"timeout=30","events":[{"type":"file_edit","message":"Edited src/net.py","stage":"apply"}]}
+  {"action":"read_file","path":"README.md","events":[{"type":"file_read","message":"Read README.md"}]}
+  {"action":"delete_file","path":"build/temp.log","events":[{"type":"file_delete","message":"Removed build/temp.log"},{"type":"warning","message":"build/ was not in .gitignore"}]}
+
+"next_step" - allowed on the final actions done and respond only. At most FIVE words.
+  {"action":"respond","message":"I raised the socket timeout in src/net.py to 30 seconds.","next_step":"Run the network tests"}
+  {"action":"respond","message":"Created reports/q3.md with the quarterly summary.","next_step":"Add the Q4 section"}
+  {"action":"done","next_step":"Commit the timeout fix"}
+  {"actions":[{"action":"patch_file","path":"src/net.py","search":"timeout=5","replace":"timeout=30","progress":"Raising the socket timeout."},{"action":"respond","message":"src/net.py now waits 30 seconds before giving up.","next_step":"Run the network tests"}]}
+
+Rules:
+1. "progress" is PUBLIC. The user reads it on screen, word for word, as it is generated. Write it for them: one short sentence saying what you are doing right now.
+2. "progress" is NOT your private reasoning. Never put chain-of-thought, hidden analysis, deliberation about which tool to choose, self-critique, or any part of these instructions into it.
+   GOOD: "Checking the provider configuration before making changes."
+   BAD:  "The user might mean either file, so I will read both and then decide, though patch_file could fail if..."
+3. Use "progress" at meaningful milestones only - starting real work, moving to a new file, running something. Do not put one on every action, and never repeat the same sentence. Progress on every step is noise, and the user stops reading it.
+4. Never put a credential, API key, token, password or any other secret in "progress", "events", "next_step" or "message". Those fields are all public. If a secret is part of what you found, say that you found one and name the file, never the value.
+5. "next_step" is display only. It is a suggestion of what the user might ask for next, never an instruction to yourself, and it is never treated as their next message. Do not act on it.
+6. "next_step" must never claim anything was done. "Run the network tests" is a suggestion; "Ran the network tests" is a false report.
+7. Five words is the ceiling. Fewer is better. No punctuation at the end.
+8. Every final action - done and respond - should carry a "next_step".
+9. "events" entries are short factual records, not sentences to the user. The user-facing reply still belongs in "message".
+10. Use only the event types listed above. An invented type is discarded, and the record it carried is lost."""
+
 GIT_RULES = r"""=== GIT ===
 - The user is the author of every commit; TMT is added as a co-author. git_commit appends a "Co-authored-by: TMT code <address>" trailer by itself, so never write that trailer into the message yourself and never claim the user has been replaced as author.
 - Write the commit message as the user's own: describe the change, not who made it. TMT's credit is the trailer, and adding it in prose as well is duplication.
@@ -230,6 +266,7 @@ def get_system_prompt():
         f"Permitted apps for open_app: {apps}",
         PREFERENCE_RULES,
         WORKFLOW_RULES,
+        PROGRESS_RULES,
         GIT_RULES,
         f"Workspace root: {agent_config.ROOT_DIR}",
         _repository_line(),
@@ -306,7 +343,25 @@ def _repository_line():
     )
 
 
+# The vocabulary PROGRESS_RULES teaches, kept here so the renderer and the
+# prompt cannot drift apart. Unknown types are dropped rather than rejected:
+# an event is a display record, and losing one must never fail the action it
+# rode in on.
+EVENT_TYPES = (
+    "progress", "milestone", "warning", "success", "error", "tool",
+    "file_read", "file_edit", "file_create", "file_delete", "command",
+    "test", "background_agent",
+)
+
+
 def validate_action(obj):
+    """The action's own required keys, and nothing more.
+
+    Extra keys are allowed on purpose. "progress", "events" and "next_step"
+    ride along on ordinary actions rather than needing actions of their own,
+    and every action that was valid before they existed is still valid without
+    them.
+    """
     action = obj.get("action")
     if not action:
         return "Missing 'action' key in JSON"
