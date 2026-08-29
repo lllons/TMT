@@ -1012,6 +1012,47 @@ def render_task(task, stream=None, size=None, moment=None):
     return safe_write(stream, caption + "\n" + row + "\n")
 
 
+def render_command(result, stream=None, size=None):
+    """Draw a slash command's answer into the terminal's scrollback.
+
+    Permanent, like everything else that outlives the turn it happened in: the
+    user asked what the model is or cleared the conversation, and scrolling
+    back to find out what they were told is the whole point of the record.
+    Nothing here repaints.
+
+    The title takes the wordmark's fixed gradient, so a command's answer reads
+    as TMT speaking rather than as a result the agent produced -- it is the
+    program answering about itself. The rows are the startup screen's field
+    rows, label dim and value plain, because they are the same kind of thing:
+    settled facts in two columns. A failed command's title takes the error
+    position on the gradient, and says so in words as well, because colour is
+    never the message.
+
+    Returns the number of rows it drew, or False when the stream has gone.
+    The count is what the caller spends from the pad holding the prompt box at
+    the foot of the window.
+    """
+    stream = sys.stdout if stream is None else stream
+    width = _content_width(_terminal(size)[0])
+    lines = ["", " " + (_color(result.title, 10, stream) if not result.ok
+                        else _paint(result.title, stream, BRAND_PHASE,
+                                    spread=BRAND_SPREAD))]
+    label_width = max([len(row[0]) for row in result.rows
+                       if isinstance(row, tuple)] or [0]) + 2
+    for row in result.rows:
+        if isinstance(row, tuple):
+            lines.append(_field(row[0], row[1], stream, width,
+                                name_width=max(10, label_width)))
+        else:
+            lines.append(fit_to_width("   " + str(row), width) if str(row).strip()
+                         else "")
+    if result.note:
+        lines.append(_dim(fit_to_width(" " + result.note, width), stream))
+    if not safe_write(stream, "\n".join(lines) + "\n"):
+        return False
+    return len(lines)
+
+
 def render_prompt(stream=None, phase=None):
     """Draw the task prompt on its own, for every turn after the first.
 
@@ -1281,6 +1322,10 @@ _TEXT_KEYS = {
     "home": "home",
     "\x1b[F": "end", "\x1bOF": "end", "\x1b[4~": "end", "\x05": "end",
     "end": "end",
+    # Tab completes a slash command and does nothing else. It reached here
+    # before and came back as ("", "") -- a tab is not printable, so it fell
+    # through to the ignored branch -- which is why it is free to take.
+    "\t": "tab", "tab": "tab",
     "\x15": "clear",          # Ctrl-U, as it is in every shell
     "\x17": "delete_word",    # Ctrl-W
     "\x04": "eof", "eof": "eof",   # Ctrl-D
@@ -1606,7 +1651,7 @@ class PromptBox:
     """
 
     def __init__(self, stream=None, instream=None, reader=None, line_reader=None,
-                 session=None, pad=None):
+                 session=None, pad=None, completer=None, completed=None):
         self.stream = sys.stdout if stream is None else stream
         self.instream = sys.stdin if instream is None else instream
         # The blank rows that hold the box against the foot of the window, or
@@ -1616,6 +1661,14 @@ class PromptBox:
         # box that reports none. Held rather than copied: the figures are read
         # off it at the moment the row is drawn, so they are never stale.
         self.session = session
+        # completer(text) -> ((name, summary), ...): the commands a partly
+        # typed line could still become. completed(text) -> the line with the
+        # completion accepted, for Tab. Both are plain functions of the text,
+        # and that is what keeps two frames of the same line equal -- state
+        # remembered here, or anything time-varying, would repaint under the
+        # caret and put the flicker back.
+        self.completer = completer
+        self.completed = completed
         # reader() -> one raw keystroke. Injecting one is how a test drives
         # the box; left alone it reads through read_key, as every other
         # screen does.
@@ -1681,10 +1734,18 @@ class PromptBox:
                     # at it.
                     placed = self._unplace(placed)
                     region.paint(frame[0])
-                    placed = self._place(frame[0], frame[1])
+                    placed = self._place(frame[0], frame[1], frame[2])
                     region.show_cursor()
                     shown = frame
                 kind, value = _next_text_key(reader)
+                if kind == "key" and value == "tab":
+                    # Taken before the editor sees it. Accepting a completion
+                    # is an edit the user asked for, so it goes through the
+                    # buffer like any other -- and a Tab that completes
+                    # nothing does nothing at all, which is what a Tab in a
+                    # line of prose should do.
+                    self._accept_completion(editor)
+                    continue
                 outcome = editor.handle(kind, value)
                 if outcome == "continue":
                     continue
@@ -1754,6 +1815,11 @@ class PromptBox:
 
         `caption` is off for the box the relay draws while a turn runs, which
         is not asking anything and so has nothing to stamp.
+
+        Returns (rows, caret column, rows below the caret). The third is what
+        `_place` counts back from the bottom, because the commands offered
+        under a half-typed `/mo` sit between the line and the bottom rule and
+        move the caret further from the foot of the frame.
         """
         stream = self.stream
         columns = _terminal(size)[0]
@@ -1772,7 +1838,8 @@ class PromptBox:
         text, caret = self._field(editor, inner)
         body = _dim(text, stream) if editor.placeholder_visible else text
         row = " " + PROMPT_MARKER + " " + body
-        rows = head + [rule, row, rule]
+        offered = self._offered(editor, width)
+        rows = head + [rule, row] + offered + [rule]
         # Blank rows above, so the box sits at the foot of the window from the
         # moment the session opens rather than wherever the last reply
         # stopped. They are part of the region, so the repaint arithmetic
@@ -1780,7 +1847,62 @@ class PromptBox:
         # as permanent output fills the window from the top.
         holding = self.pad if (pad and self.pad is not None) else None
         lead = [""] * (holding.above(len(rows), size) if holding else 0)
-        return lead + rows, _PROMPT_PREFIX + caret
+        return lead + rows, _PROMPT_PREFIX + caret, _INPUT_ROW + len(offered)
+
+    def _accept_completion(self, editor):
+        """Take the completion Tab offers, through the buffer.
+
+        Written by assigning `value` rather than by inserting text, because
+        what is accepted replaces the whole line rather than adding to it --
+        `/co` becomes `/con`, not `/co/con`. The caret goes to the end, which
+        is where the user is about to keep typing.
+
+        The placeholder is untouched either way: it is dismissed by the first
+        character typed and there is no path back to it, so a line long enough
+        to complete has already dismissed it.
+        """
+        if self.completed is None:
+            return False
+        try:
+            line = self.completed(editor.value)
+        except Exception:
+            return False
+        if not line or line == editor.value:
+            return False
+        editor.value = line
+        editor.cursor = len(line)
+        editor.placeholder_visible = False
+        return True
+
+    def _offered(self, editor, width):
+        """The commands the line being typed could still become.
+
+        Under the line rather than over it, which is the way round every
+        shell puts them and the way round a reader expects: what you typed
+        stays where you typed it and the list grows downward from it. The
+        box grows upward as a whole, because `BottomPad` gives a taller frame
+        fewer blank rows and its bottom edge does not move.
+
+        Dim, indented, and never under a '>' -- that marker means "type
+        here", and a row wearing it would be counted as a prompt by anything
+        reading the screen back. Plain text, so it reads with the colour
+        stripped and survives a console that can encode nothing decorative.
+
+        Nothing at all unless the line is a command being typed: an ordinary
+        task never grows a row, so nothing about the box a session spends its
+        time in has changed.
+        """
+        if self.completer is None or editor.placeholder_visible:
+            return []
+        try:
+            matches = self.completer(editor.value)
+        except Exception:
+            return []            # decoration is never allowed to end a run
+        rows = []
+        for name, summary in matches:
+            rows.append(_dim(fit_to_width("   %-9s %s" % (name, summary), width),
+                             self.stream))
+        return rows
 
     def _field(self, editor, inner):
         """The visible slice of the line, and where the caret sits in it.
@@ -1828,11 +1950,15 @@ class PromptBox:
     def _ansi(self):
         return bool(getattr(self.stream, "isatty", lambda: False)())
 
-    def _place(self, lines, column):
-        """Move the caret into the input row. Returns the rows moved up."""
+    def _place(self, lines, column, up=_INPUT_ROW):
+        """Move the caret into the input row. Returns the rows moved up.
+
+        `up` is how far the input row sits above the foot of the frame, which
+        `_frame` works out: two ordinarily, and more when commands are being
+        offered under the line.
+        """
         if not self._ansi():
             return 0
-        up = _INPUT_ROW          # counted from the bottom; see the constant
         parts = ["\033[%dA" % up, "\r"]
         if column:
             parts.append("\033[%dC" % column)

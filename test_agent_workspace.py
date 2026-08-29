@@ -268,7 +268,8 @@ def test_installation_state_does_not_follow_the_workspace():
     try:
         box.use()
         for path in (agent_config.KEY_FILE, agent_config.GIT_IDENTITY_FILE,
-                     agent_config.GIT_IDENTITY_LOCAL_FILE):
+                     agent_config.GIT_IDENTITY_LOCAL_FILE,
+                     agent_config.EFFORT_FILE):
             assert Path(path).resolve().parent == INSTALL_DIR, path
             assert box.path not in Path(path).resolve().parents
     finally:

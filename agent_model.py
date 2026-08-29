@@ -485,7 +485,8 @@ def _ask_model_streaming(messages, on_event):
     """
     global _json_mode_ok
     for attempt in (0, 1):
-        payload = {"model": _model_for_request(), "max_tokens": 4096,
+        payload = {"model": _model_for_request(),
+                   "max_tokens": _config.max_tokens_for_effort(),
                    "messages": messages, "stream": True}
         if _json_mode_ok:
             payload["response_format"] = {"type": "json_object"}
@@ -545,7 +546,11 @@ def ask_model(messages, on_event=None):
             return raw
         if not fall_back:
             return _error_reply("stream ended without a reply")
-    base = {"model": _model_for_request(), "max_tokens": 4096, "messages": messages}
+    # The reply length the effort setting asks for, read now rather than
+    # bound at import: /effort changes it between one turn and the next.
+    base = {"model": _model_for_request(),
+            "max_tokens": _config.max_tokens_for_effort(),
+            "messages": messages}
     payload = dict(base)
     if _json_mode_ok:
         payload["response_format"] = {"type": "json_object"}

@@ -172,6 +172,7 @@ def test_application_resources_stay_in_the_installation():
             "KEY_FILE": agent_config.KEY_FILE,
             "GIT_IDENTITY_FILE": agent_config.GIT_IDENTITY_FILE,
             "GIT_IDENTITY_LOCAL_FILE": agent_config.GIT_IDENTITY_LOCAL_FILE,
+            "EFFORT_FILE": agent_config.EFFORT_FILE,
             "agent_git.LOG_DIR": agent_git.LOG_DIR,
         }
         for name, value in resources.items():
@@ -872,3 +873,52 @@ def test_progress_on_a_batch_entry_is_shown_like_any_other():
     # was picked up rather than falling back.
     assert files.get("a.txt") == "one\n" and files.get("b.txt") == "two\n", sorted(files)
     assert "Review the new files" in drawn, drawn
+
+
+def test_a_slash_command_is_answered_by_tmt_and_never_becomes_a_request():
+    """The fork, checked where it actually happens. A command must be handled
+    before a task is built, and an ordinary line must still go all the way to
+    the model -- including one that merely starts with a path."""
+    import agent_commands
+    import agent_config
+    import agent_models
+    import shutil as _shutil
+    import tempfile
+
+    settings = Path(tempfile.mkdtemp(prefix="tmt_cmd_cli_"))
+    saved_effort_file = agent_config.EFFORT_FILE
+    saved_effort = agent_config.EFFORT
+    saved_model_file = agent_models.MODEL_FILE
+    saved_env = os.environ.get("OPENROUTER_MODEL")
+    try:
+        agent_config.EFFORT_FILE = settings / ".tmt_effort"
+        agent_models.MODEL_FILE = settings / ".tmt_model"
+        os.environ.pop("OPENROUTER_MODEL", None)
+        drawn, seen, _ = drive_session(
+            ["fix the bug", "/config", "/effort high", "/clear", "/bogus",
+             "/usr/bin/python is broken", "quit"],
+            [json.dumps({"action": "done", "message": "Did it."})])
+
+        # Two lines were tasks; four were commands and never left the loop.
+        asked = [request[-1]["content"] for request in seen]
+        assert asked == ["fix the bug", "/usr/bin/python is broken"], asked
+        for command in ("/config", "/effort high", "/clear", "/bogus"):
+            assert command not in asked, command
+
+        # Each was answered on screen instead.
+        for expected in ("Configuration", "Effort set to high",
+                         "Conversation cleared", "Unknown command"):
+            assert expected in drawn, expected
+        # And the setting one of them made actually took.
+        assert agent_config.EFFORT == "high"
+        assert agent_config.max_tokens_for_effort() == 8192
+        # No credential reached the screen.
+        assert "sk-or" not in drawn, drawn
+    finally:
+        agent_config.EFFORT_FILE = saved_effort_file
+        agent_config.EFFORT = saved_effort
+        agent_models.MODEL_FILE = saved_model_file
+        os.environ.pop("OPENROUTER_MODEL", None)
+        if saved_env is not None:
+            os.environ["OPENROUTER_MODEL"] = saved_env
+        _shutil.rmtree(settings, ignore_errors=True)

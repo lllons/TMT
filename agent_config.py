@@ -360,6 +360,104 @@ def refresh_model():
     except Exception:
         pass
     return MODEL
+
+
+# --- effort ----------------------------------------------------------------
+#
+# How much work TMT is willing to spend on one task, in the two places that
+# actually cost anything: how long a reply the provider is asked for, and how
+# many rounds of the agent loop a single question may take.
+#
+# Those two and nothing else. A reasoning-effort field would be the obvious
+# thing to send, but only some models on some providers accept one and the
+# rest reject the request outright, so it would turn a setting into a
+# provider-specific failure. `max_tokens` is understood by all four adapters
+# and the loop bound is TMT's own, so both are real everywhere.
+#
+# Kept beside the model choice in INSTALL_DIR: it belongs to the installation,
+# not to whichever project happens to be open.
+EFFORT_FILE = INSTALL_DIR / ".tmt_effort"
+DEFAULT_EFFORT = "medium"
+
+# (max_tokens asked of the provider, rounds of the agent loop per question).
+# Medium is exactly what TMT did before this setting existed, so a user who
+# never touches it sees no change at all.
+#
+# 4096 is a floor, not a starting point: low spends fewer rounds but asks for
+# replies of the same length. Every reply here is one JSON object, and the
+# ones that matter carry a file's whole contents inside it -- so a max_tokens
+# small enough to bite does not make the model terser, it cuts the object off
+# mid-string. What comes back then is unparseable, the write never happens,
+# and the work is lost. On Anthropic the field is documented as a hard stop
+# rather than a ceiling, which is the same thing said out loud.
+EFFORT_LEVELS = {
+    "low": {"max_tokens": 4096, "rounds": 12},
+    "medium": {"max_tokens": 4096, "rounds": 35},
+    "high": {"max_tokens": 8192, "rounds": 60},
+}
+
+EFFORT = DEFAULT_EFFORT
+
+
+def read_saved_effort():
+    """The effort level stored on disk, or the default.
+
+    Anything unrecognised is the default rather than an error: a settings file
+    that has been edited by hand should not stop TMT starting.
+    """
+    try:
+        stored = EFFORT_FILE.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return DEFAULT_EFFORT
+    return stored if stored in EFFORT_LEVELS else DEFAULT_EFFORT
+
+
+def refresh_effort():
+    """Re-read the stored effort. Called at startup, beside refresh_model."""
+    global EFFORT
+    EFFORT = read_saved_effort()
+    return EFFORT
+
+
+def set_effort(level):
+    """Persist an effort level and make it live.
+
+    Raises ValueError for anything not offered, so a typo cannot become the
+    active setting and surface much later as a request that behaves oddly.
+    """
+    global EFFORT
+    level = str(level or "").strip().lower()
+    if level not in EFFORT_LEVELS:
+        # Named in the order they mean something in, not alphabetically:
+        # "high, low, medium" reads as a list of unrelated words.
+        raise ValueError("Effort is one of %s; got %r."
+                         % (", ".join(effort_names()), level))
+    EFFORT_FILE.write_text(level + "\n", encoding="utf-8")
+    EFFORT = level
+    return level
+
+
+def effort_names():
+    """The levels, in the order they escalate rather than alphabetically."""
+    return sorted(EFFORT_LEVELS,
+                  key=lambda name: (EFFORT_LEVELS[name]["rounds"],
+                                    EFFORT_LEVELS[name]["max_tokens"]))
+
+
+def effort_settings(level=None):
+    """What an effort level actually changes, read at request time."""
+    return dict(EFFORT_LEVELS[(level or EFFORT) if (level or EFFORT) in EFFORT_LEVELS
+                              else DEFAULT_EFFORT])
+
+
+def max_tokens_for_effort(level=None):
+    return effort_settings(level)["max_tokens"]
+
+
+def rounds_for_effort(level=None):
+    return effort_settings(level)["rounds"]
+
+
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # The app's own name. It is sent to OpenRouter as X-Title, so it is what
 # requests are attributed to there as well as what TMT calls itself.

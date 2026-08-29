@@ -23,8 +23,8 @@ sys.path.insert(0, _INSTALL_DIR)
 
 import agent_config
 from agent_menu import (
-    BottomPad, PromptBox, clear_screen, opening_pad, render_status,
-    render_task, run_startup,
+    BottomPad, PromptBox, clear_screen, opening_pad, render_command,
+    render_status, render_task, run_startup,
 )
 from agent_config import (
     MUTATING_ACTIONS, console, default_workspace, set_workspace_root,
@@ -39,6 +39,7 @@ from agent_ui import (
     Transcript, fallback_suggestion, render_response, validate_suggestion,
     wrap_lines,
 )
+import agent_commands
 from agent_session import Session
 from agent_live_renderer import LiveRelay
 from agent_setup import ensure_api_key, ensure_git_identity
@@ -219,6 +220,10 @@ def main(argv=None):
     # Settings may have moved the model since import, and a request built from
     # a stale value would quietly use the wrong one.
     agent_config.refresh_model()
+    # And the effort level, for the same reason: it is stored beside the model
+    # and would otherwise be written but never read, so /effort would last a
+    # session and quietly revert on the next launch.
+    agent_config.refresh_effort()
     # Once per launch, and never again in this session. It returns immediately
     # when the terminal cannot drive a menu, so a piped or scripted run reaches
     # the agent exactly as it did before this screen existed.
@@ -263,7 +268,9 @@ def _session_loop(root):
     # so nothing needs redrawing between turns, and the console keeps being
     # the line reader on any run that cannot take raw keys -- a pipe, a
     # redirect, the test suite -- so a scripted run behaves as it always did.
-    prompt_box = PromptBox(line_reader=_console_line, session=session, pad=pad)
+    prompt_box = PromptBox(line_reader=_console_line, session=session, pad=pad,
+                           completer=agent_commands.completions,
+                           completed=agent_commands.completed)
     placeholder = OPENING_SUGGESTION
     while True:
         # Shadow text, and nowhere else. The opening line on the first
@@ -280,6 +287,19 @@ def _session_loop(root):
         if task.lower() in {"quit", "exit"}:
             break
         if not task:
+            continue
+        # A slash command is answered here and never becomes a request. The
+        # test is the parser's, not a prefix check: a task that happens to
+        # start with a path is not a command and goes to the model exactly as
+        # it always did.
+        answered = agent_commands.dispatch(task, session)
+        if answered is not None:
+            render_task(task, moment=prompt_box.asked_at)
+            # The rows just printed take blank rows from the pad, the same
+            # as any other permanent output, so the box does not move. The
+            # placeholder is left alone: asking what the model is does not
+            # change what the last turn suggested doing next.
+            pad.take(2 + (render_command(answered) or 0))
             continue
         # The question, into scrollback. The box that collected it is a live
         # region and has already been taken down, so this is the only record
@@ -325,7 +345,10 @@ def _session_loop(root):
         live_ui.attach_sink(relay.set_status)
         live_ui.start()
         try:
-            for _ in range(35):
+            # How many rounds this question may take, from the effort
+            # setting. Read here rather than fixed, so /effort changes
+            # the next question rather than the next launch.
+            for _ in range(agent_config.rounds_for_effort()):
                 messages[0]["content"] = get_system_prompt()
                 messages = trim_messages(messages, pinned)
                 state = {"error": None, "next_step": turn_state["next_step"],
