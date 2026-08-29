@@ -3,7 +3,7 @@
 import platform
 import subprocess
 from pathlib import Path
-from agent_config import ROOT_DIR
+import agent_config
 from agent_file_ops import safe_path
 
 RUNNERS = {
@@ -15,7 +15,7 @@ RUNNERS = {
 
 def _run_cmd(cmd):
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, cwd=ROOT_DIR)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, cwd=agent_config.ROOT_DIR)
         output = (result.stdout + result.stderr).strip()
         return output[:2000] if output else "(no output)"
     except subprocess.TimeoutExpired:

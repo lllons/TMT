@@ -1,7 +1,12 @@
 """Command-line entry point for the local file AI agent."""
 
+import argparse
 import json
-from agent_config import MODEL, MUTATING_ACTIONS, Panel, console
+import sys
+from agent_config import (
+    MODEL, MUTATING_ACTIONS, Panel, console, default_workspace,
+    set_workspace_root, workspace_needs_confirmation, workspace_refusal,
+)
 from agent_config import REQUIRED_KEYS
 from agent_actions import authorizes_push, batch_summary, build_result_message, execute_action, trim_messages
 from agent_actions import READ_ONLY_ACTIONS, ACTION_LABELS, MAX_TURNS
@@ -42,10 +47,55 @@ def stream_handler(live_ui, relay, state):
             state["error"] = value
     return handle
 
-def main():
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="TMT",
+        description="A CLI coding agent that works on one directory.",
+    )
+    parser.add_argument(
+        "--dir", dest="directory", default=None, metavar="PATH",
+        help="the workspace TMT may modify (default: the current directory). "
+             "It selects a directory; it never creates one.",
+    )
+    return parser.parse_args(argv)
+
+
+def resolve_workspace(directory=None, ask=None):
+    """Settle the workspace once, before anything can reach the disk.
+
+    Returns the resolved root, or None when the run must not start. The checks
+    are front-loaded on purpose: once TMT is running, every path it touches is
+    judged against this root, so this is the decision that bounds the session.
+    """
+    candidate = directory or default_workspace()
+    refusal = workspace_refusal(candidate)
+    if refusal:
+        console.print(f"[red]Not a usable workspace:[/red] {refusal}")
+        console.print("Run TMT from inside a project, or name one with --dir.")
+        return None
+    root = set_workspace_root(candidate)
+    if workspace_needs_confirmation(root):
+        console.print(f"\n[yellow]{root}[/yellow] already has files in it and is not a git repository.")
+        console.print("TMT can create, overwrite and delete files there, and nothing it does will be recoverable.")
+        answer = (ask or console.input)("Use it as the workspace? (y/N): ")
+        if answer.strip().lower() != "y":
+            console.print("[yellow]Stopped. No files were touched.[/yellow]")
+            return None
+    return root
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    root = resolve_workspace(args.directory)
+    if root is None:
+        return
     if not ensure_api_key():
         return
     console.print(Panel.fit(f"[bold green]Local File AI[/bold green] (OpenRouter / {MODEL})"))
+    # Stated plainly and before the first prompt: this is the directory about
+    # to be modified, and a run from the wrong place should be obvious here
+    # rather than three edits later.
+    console.print(f"[bold]Workspace:[/bold] {root}")
     while True:
         try:
             task = console.input("\n[bold cyan]Task> [/bold cyan]").strip()

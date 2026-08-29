@@ -1,7 +1,12 @@
 """Cached system prompt and action validation."""
 
-from agent_config import REQUIRED_KEYS, ROOT_DIR
+import agent_config
+from agent_config import (
+    REQUIRED_KEYS, SNAPSHOT_MAX_BYTES, SNAPSHOT_MAX_FILES, SNAPSHOT_MAX_FILE_BYTES,
+    WORKSPACE_MAX_SCAN,
+)
 from agent_execution import APP_REGISTRY
+from agent_file_ops import iter_workspace_files
 
 _cached_prompt = None
 _prompt_dirty = True
@@ -190,13 +195,6 @@ GIT_RULES = r"""=== GIT ===
 - Never state anything about TMT's identity from files you can see. Call git_identity and report what it says.
 - Notes and logs in the workspace are not evidence about git, including ones you wrote yourself in an earlier task. They record what someone believed at the time, not what is true now. Never repeat a claim from one; run git_status or git_identity and report what it actually returns."""
 
-# Machinery, not work. A checkout inside the workspace otherwise contributes
-# its whole .git directory to the snapshot: hook samples, refs, and a config
-# naming a remote TMT does not act on. Shown that, the model reasons about the
-# wrong repository entirely.
-SNAPSHOT_SKIP = {".git", "__pycache__", ".venv", "venv", "node_modules", ".mypy_cache"}
-
-
 def repository_root():
     """The repository the git actions address, or "" if there is not one.
 
@@ -215,14 +213,7 @@ def get_system_prompt():
     global _cached_prompt, _prompt_dirty
     if not _prompt_dirty and _cached_prompt is not None:
         return _cached_prompt
-    snapshot = ""
-    for path in sorted(ROOT_DIR.rglob("*")):
-        relative = path.relative_to(ROOT_DIR)
-        if any(part in SNAPSHOT_SKIP for part in relative.parts):
-            continue
-        if path.is_file() and path.stat().st_size < 8000:
-            snapshot += f"\n--- {relative} ---\n{path.read_text(encoding='utf-8', errors='replace')}\n"
-    snapshot = snapshot or "(empty workspace)"
+    snapshot = _workspace_snapshot()
     apps = ", ".join(f"{key} ({value['description']})" for key, value in APP_REGISTRY.items()) or "none"
     _cached_prompt = "\n\n".join([
         HEADER,
@@ -232,13 +223,68 @@ def get_system_prompt():
         PREFERENCE_RULES,
         WORKFLOW_RULES,
         GIT_RULES,
-        f"Workspace root: {ROOT_DIR}",
+        f"Workspace root: {agent_config.ROOT_DIR}",
         _repository_line(),
         f"=== CURRENT WORKSPACE FILES AND CONTENTS ===\n{snapshot}",
         "Reminder: reply with one JSON object only. Start with { and end with }.",
     ]).strip()
     _prompt_dirty = False
     return _cached_prompt
+
+def _workspace_snapshot():
+    """The workspace as the model sees it, within fixed limits.
+
+    A workspace is a real project now, so this cannot inline everything. When
+    it stops early it says exactly why: a model that believes it has seen the
+    whole workspace will act confidently on a file it was never shown, and
+    silence here reads as completeness.
+    """
+    shown, skipped_large, inlined_bytes, seen = [], 0, 0, 0
+    truncated_by = ""
+    for relative, path in iter_workspace_files(limit=WORKSPACE_MAX_SCAN):
+        seen += 1
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size >= SNAPSHOT_MAX_FILE_BYTES:
+            skipped_large += 1
+            continue
+        if len(shown) >= SNAPSHOT_MAX_FILES:
+            truncated_by = "file count"
+            break
+        if inlined_bytes + size > SNAPSHOT_MAX_BYTES:
+            truncated_by = "total size"
+            break
+        try:
+            body = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        shown.append(f"\n--- {relative} ---\n{body}\n")
+        inlined_bytes += size
+    if not shown and not skipped_large:
+        return "(empty workspace)"
+    notes = []
+    if truncated_by:
+        notes.append(
+            f"Only the first {len(shown)} files are shown here; the listing "
+            f"stopped at the {truncated_by} limit. There are more files in the "
+            "workspace than appear below."
+        )
+    if seen >= WORKSPACE_MAX_SCAN:
+        notes.append(
+            f"The workspace scan stopped after {WORKSPACE_MAX_SCAN} entries, so "
+            "even the file count above is a lower bound."
+        )
+    if skipped_large:
+        notes.append(
+            f"{skipped_large} file(s) were too large to inline; read them with "
+            "read_lines."
+        )
+    if notes:
+        notes.append("Use list_files or search_files to find anything not shown.")
+    return ("\n".join(notes) + "\n" if notes else "") + "".join(shown)
+
 
 def _repository_line():
     root = repository_root()

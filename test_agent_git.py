@@ -1182,7 +1182,12 @@ def test_the_workspace_snapshot_never_carries_a_nested_git_directory():
     """
     if not ready("agent_prompt", "agent_config"):
         return
-    planted = Path(agent_config.ROOT_DIR) / "nested_repo_probe" / ".git"
+    # A workspace of its own: the root is now wherever TMT was started, and a
+    # test must not plant files there.
+    previous_root = agent_config.ROOT_DIR
+    holder = Path(tempfile.mkdtemp(prefix="tmt_snapshot_probe_"))
+    agent_config.set_workspace_root(holder)
+    planted = holder / "nested_repo_probe" / ".git"
     try:
         planted.mkdir(parents=True, exist_ok=True)
         (planted / "config").write_text(
@@ -1197,10 +1202,8 @@ def test_the_workspace_snapshot_never_carries_a_nested_git_directory():
         leaked = [n for n in listed if ".git" in n.replace("\\", "/").split("/")]
         assert not leaked, leaked
     finally:
-        for leftover in sorted(planted.rglob("*"), reverse=True):
-            leftover.unlink()
-        planted.rmdir()
-        planted.parent.rmdir()
+        agent_config.ROOT_DIR = previous_root
+        remove_tree(holder)
         agent_prompt.invalidate_prompt()
 
 

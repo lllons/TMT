@@ -86,13 +86,96 @@ except ModuleNotFoundError:
 
 json_module = json
 console = Console()
-# Workspace the agent is allowed to touch: an "output" folder beside this
-# module, created on first launch.
-ROOT_DIR = (Path(__file__).resolve().parent / "output").resolve()
-ROOT_DIR.mkdir(parents=True, exist_ok=True)
+# The workspace TMT may modify: the directory it was started in, unless --dir
+# names another. Settled once at startup by set_workspace_root(), after the
+# arguments that should decide it have been read. Nothing is created here --
+# importing a module must not make directories on disk, and the workspace is
+# somewhere the user already chose rather than somewhere TMT provides.
+def default_workspace():
+    """The directory TMT was started in.
 
-# The key lives beside the modules in a git-ignored file, so a checkout on
-# another machine simply starts empty and runs first-launch setup.
+    Read when startup asks for it rather than when this module is imported, so
+    the answer cannot be decided before the arguments that should decide it.
+    """
+    return Path.cwd().resolve()
+
+
+# A placeholder until startup replaces it. Anything importing agent_config
+# outside a TMT session (the tests, tooling) gets a real directory rather than
+# None, and no directory is created either way.
+ROOT_DIR = default_workspace()
+
+
+def set_workspace_root(path):
+    """Point TMT at the workspace it may modify.
+
+    Call once, at startup. Modules read agent_config.ROOT_DIR at call time
+    rather than binding it on import, so this reaches all of them.
+    """
+    global ROOT_DIR
+    ROOT_DIR = Path(path).expanduser().resolve()
+    return ROOT_DIR
+
+
+def _is_filesystem_root(path):
+    return path.parent == path
+
+
+def in_git_repo(path):
+    """Whether `path` sits inside a git working tree.
+
+    A filesystem check rather than a git call: this runs before anything else
+    at startup, and the answer only decides how loudly to ask.
+    """
+    path = Path(path)
+    for candidate in [path] + list(path.parents):
+        if (candidate / ".git").exists():
+            return True
+    return False
+
+
+def workspace_refusal(path):
+    """Why `path` must never be a workspace, or "" if it may be one.
+
+    A filesystem root or a home directory is not a project. Pointing something
+    that can overwrite and delete at either is a mistake no confirmation
+    should be able to talk anyone into, so these refuse rather than prompt.
+    """
+    try:
+        path = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError) as error:
+        return f"that path cannot be resolved ({error})."
+    if not path.exists():
+        return f"{path} does not exist. TMT selects a workspace; it does not create one."
+    if not path.is_dir():
+        return f"{path} is a file, not a directory."
+    if _is_filesystem_root(path):
+        return f"{path} is a filesystem root, which is never a project."
+    if path == Path.home().resolve():
+        return f"{path} is your home directory, which is never a project."
+    return ""
+
+
+def workspace_needs_confirmation(path):
+    """Whether this workspace should be confirmed out loud before starting.
+
+    A git repository is its own undo, so it starts silently. A directory that
+    already holds files and has no version control has no such safety net, and
+    is also the shape of an accidental run from the wrong place.
+    """
+    path = Path(path).expanduser().resolve()
+    if in_git_repo(path):
+        return False
+    try:
+        return any(path.iterdir())
+    except OSError:
+        return True
+
+# Installation state, deliberately anchored to the TMT modules and NOT to the
+# workspace. The key and TMT's git identity belong to the installation, so they
+# are the same wherever TMT is run from. Moving them alongside the workspace
+# would scatter credentials across the filesystem and give TMT a different
+# identity in every directory it visited. They must not follow the CWD.
 KEY_FILE = Path(__file__).resolve().parent / ".tmt_key"
 
 def read_saved_key():
@@ -250,6 +333,15 @@ if FORCE_IPV4:
 if not VERIFY_SSL:
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# A workspace can be a real project rather than a scratch folder, so every
+# reader of it needs a ceiling. Without one, a large tree either floods the
+# model's context or spends seconds being walked on every turn.
+SNAPSHOT_MAX_FILES = 60          # files inlined into the prompt
+SNAPSHOT_MAX_BYTES = 40000       # total inlined characters
+SNAPSHOT_MAX_FILE_BYTES = 8000   # per-file ceiling, as before
+WORKSPACE_MAX_SCAN = 20000       # directory entries examined before giving up
+LIST_FILES_MAX = 400             # paths returned by list_files
 
 MUTATING_ACTIONS = {
     "write_file", "append_file", "write_files", "patch_file", "delete_file",

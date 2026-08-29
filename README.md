@@ -22,9 +22,28 @@ current task without closing TMT.
 
 ## Workspace
 
-TMT only touches `output/`, created beside the code on first launch. Paths outside it
-are refused. Files under 8 KB are shown to the model automatically; larger ones are
-read on demand.
+TMT works on **the directory you run it in**.
+
+```bash
+cd ~/projects/my-repo && python /path/to/TMT/TMT.py   # that repo is the workspace
+python TMT.py --dir ~/projects/other-repo             # or name one
+```
+
+The resolved path is printed at launch, so a run from the wrong place is obvious:
+
+```
+Workspace: C:\Projects\my-repo
+```
+
+`--dir` selects a directory; it never creates one. Paths outside the workspace are
+refused. TMT will not start in a filesystem root or your home directory, and asks
+first if the directory already has files and is not a git repository.
+
+Files under 8 KB are shown to the model automatically, up to a fixed number and total
+size; the listing says so when it stops early. Larger files are read on demand.
+
+Your API key and TMT's git identity live beside the TMT install, not in the
+workspace, so TMT is the same agent wherever you run it.
 
 ## What you can ask for
 
@@ -144,6 +163,7 @@ Set `TMT_STREAM=0` to disable streaming.
 | `TMT_GIT_NAME` | `TMT code` |
 | `TMT_GIT_EMAIL` | none — required for commits |
 | `TMT_GIT_ROOT` | the repository containing the workspace |
+| `--dir` (flag) | the current directory |
 
 ## Tests
 
