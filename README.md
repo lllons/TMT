@@ -207,7 +207,7 @@ CommitDate: Sat Aug 29 13:10:01 2026 +1200
 
     Add a greeting file
 
-    Co-authored-by: TMT code <tmt.tmt@gmail.com>
+    Co-authored-by: TMT code <TMT.tmt.code@gmail.com>
 ```
 
 It is a git trailer, not a line of prose that happens to have a colon in it, so git
@@ -215,7 +215,7 @@ itself will hand it back:
 
 ```
 $ git log -1 --format=%(trailers:key=Co-authored-by)
-Co-authored-by: TMT code <tmt.tmt@gmail.com>
+Co-authored-by: TMT code <TMT.tmt.code@gmail.com>
 ```
 
 What that means in practice:
