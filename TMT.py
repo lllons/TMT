@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -21,7 +22,11 @@ if _INSTALL_DIR in sys.path:
 sys.path.insert(0, _INSTALL_DIR)
 
 import agent_config
-from agent_menu import PromptBox, render_status, run_startup
+from agent_menu import (
+    BottomPad, PromptBox, _TOP_ROW_RESERVED, clear_screen, meter_sequence,
+    meter_text, opening_pad, release_top_row, render_status, render_task,
+    reserve_top_row, run_startup,
+)
 from agent_config import (
     MUTATING_ACTIONS, console, default_workspace, set_workspace_root,
     workspace_needs_confirmation, workspace_refusal,
@@ -31,9 +36,11 @@ from agent_actions import authorizes_push, batch_summary, build_result_message, 
 from agent_actions import READ_ONLY_ACTIONS, ACTION_LABELS, MAX_TURNS, action_event
 from agent_model import ask_model
 from agent_ui import (
-    AgentEvent, LiveUI, ResponseHistory, Transcript, fallback_suggestion,
-    render_response, validate_suggestion,
+    OPENING_SUGGESTION, RUNNING_HINT, AgentEvent, LiveUI, ResponseHistory,
+    Transcript, fallback_suggestion, render_response, validate_suggestion,
+    wrap_lines,
 )
+from agent_session import Session
 from agent_live_renderer import LiveRelay
 from agent_setup import ensure_api_key, ensure_git_identity
 from agent_prompt import get_system_prompt, invalidate_prompt, validate_action
@@ -71,6 +78,10 @@ def stream_handler(live_ui, relay, state, transcript=None):
             live_ui.add_output(value)
         elif kind == "usage":
             live_ui.settle_tokens(value)
+            # The provider's own count of what it generated. Kept so the
+            # session's running total can be the exact figure rather than the
+            # estimate it would otherwise have to fall back on.
+            state["usage"] = value
         elif kind == "action":
             live_ui.intermediate_event(ACTION_LABELS.get(value, "Processing..."))
         elif kind == "progress":
@@ -212,24 +223,62 @@ def main(argv=None):
     # Offered once, and never blocking: a missing co-author address stops
     # commits, not the session, and the refusal explains itself when it happens.
     ensure_git_identity()
-    # The header is drawn once, as the session opens, and states what the
-    # whole session runs under: the provider, the model, the workspace and
-    # the moment it began. Settings has already closed by this point, so none
-    # of those can change underneath it, and repeating the block before every
-    # prompt only pushed the conversation up the screen. It leaves the cursor
-    # after the prompt, so the first read below is the same console.input as
-    # before with the prompt already on screen.
-    render_status(workspace=root, prompt=False)
+    # The startup menu has just been on this screen. Clearing it puts the
+    # session at the top of the window: the header first, then the questions,
+    # the work and the answers reading downward from it in the order they
+    # happened. Once the window is full the terminal scrolls and the prompt
+    # box, always the last thing written, stays at the foot of it.
+    clear_screen()
+    # Row one is kept out of the terminal's scrolling from here, so the meter
+    # in the corner can sit still while everything else moves under it. Given
+    # back in the finally below on every path out, including a crash: a
+    # terminal left with a scrolling region behaves oddly for whatever the
+    # user runs next.
+    reserve_top_row()
+    try:
+        return _session_loop(root)
+    finally:
+        release_top_row()
+
+
+def _session_loop(root):
+    """Ask, answer, repeat, until the user leaves."""
+    # The header is drawn once, as the session opens: the wordmark, the date,
+    # and the directory this run may write to. Those cannot change while the
+    # loop is running, and repeating them before every prompt only pushed the
+    # conversation up the screen. The facts that do change -- the clock, the
+    # provider, the model -- are stated by the prompt box instead, which is
+    # drawn again for every question anyway.
+    drawn = render_status(workspace=root, prompt=False)
+    # Blank rows enough to put the first prompt box at the foot of the window.
+    # They live inside the live region and are given up one at a time as
+    # permanent output is printed into it, so the session fills the window
+    # downward from the header while the box stays where the eye left it, and
+    # once they are gone the terminal's own scrolling keeps it there.
+    #
+    # Worked out here because here is the one moment it is answerable: the
+    # screen has just been cleared, so the cursor is on a row we know rather
+    # than one we would have to guess.
+    pad = BottomPad(opening_pad(_TOP_ROW_RESERVED + (drawn or 0)))
+    # One session object for the run, and the only place the conversation
+    # lives. It is created here and dropped when this function returns, so
+    # nothing it holds can reach the next launch.
+    session = Session(workspace=root)
+    # The readout in the top right: what this session has changed, and what it
+    # has cost. Built fresh every time a region repaints, so it is never a
+    # stored number that has gone stale.
+    corner = lambda: meter_sequence(meter_text(session))
     # One box for the session. It draws its own frame each time it is asked,
     # so nothing needs redrawing between turns, and the console keeps being
     # the line reader on any run that cannot take raw keys -- a pipe, a
     # redirect, the test suite -- so a scripted run behaves as it always did.
-    prompt_box = PromptBox(line_reader=_console_line)
-    placeholder = ""
+    prompt_box = PromptBox(line_reader=_console_line, corner=corner, pad=pad)
+    placeholder = OPENING_SUGGESTION
     while True:
-        # The hint from the last turn is drawn inside the box and is nowhere
-        # else: `ask` returns what was typed, and an untouched box returns the
-        # empty line it actually holds.
+        # Shadow text, and nowhere else. The opening line on the first
+        # question and the last turn's hint after that: `ask` returns what was
+        # typed, and an untouched box returns the empty line it actually
+        # holds, never the line drawn in it.
         answer = prompt_box.ask(placeholder)
         if answer is None:
             break
@@ -241,19 +290,46 @@ def main(argv=None):
             break
         if not task:
             continue
+        # The question, into scrollback. The box that collected it is a live
+        # region and has already been taken down, so this is the only record
+        # of what was asked -- and it belongs above the work the answer came
+        # out of, which is why it is written here rather than at the end.
+        render_task(task, moment=prompt_box.asked_at)
+        pad.take(2)              # the caption and the marker row it just wrote
         # Authority to push comes from this task's wording alone, decided once
         # here so nothing the model later writes can widen it.
         context = {"push_authorized": authorizes_push(task)}
-        messages = [{"role": "system", "content": get_system_prompt()}, {"role": "user", "content": task}]
+        # The request the turn starts from: the system prompt, the earlier
+        # questions and answers this session has already had, and then the new
+        # task. `pinned` is how much of that the loop's own trimming must
+        # leave alone -- everything up to and including the task.
+        messages, pinned = session.begin_turn(task, get_system_prompt())
         last_raw, identical_count = "", 0
         live_ui = LiveUI()
-        relay = LiveRelay()
+        # The live area for this turn, drawn as one block at the foot of the
+        # window: the reply as it arrives, then the prompt box, then the
+        # status row. The box is in the region rather than left behind above
+        # it, so the whole of the bottom of the screen holds still while the
+        # turn's permanent output scrolls past over it.
+        relay = LiveRelay(footer=lambda: prompt_box.running_lines(RUNNING_HINT),
+                          pad=pad)
+        relay.region.set_corner(corner)
         # The turn's permanent record. It is written through the live region
         # rather than straight to the stream: the region is repainted in place
         # a few rows further down, and printing past it without telling it
         # would leave the repaint arithmetic pointing at rows that have moved.
         history = ResponseHistory()
-        transcript = Transcript(history=history, writer=relay.write_above)
+
+        def write_permanently(text):
+            # Every permanent line takes one of the blank rows holding the box
+            # against the foot of the window, so the box does not move and the
+            # line lands in the space the pad gave up. The count need not be
+            # exact -- it only ever decreases, and being a row out means the
+            # box sits a row off the bottom until the next line corrects it.
+            pad.spend(text)
+            return relay.write_above(text)
+
+        transcript = Transcript(history=history, writer=write_permanently)
         turn_state = {"next_step": "", "progress_seen": set()}
         suggestion = ""
         live_ui.attach_sink(relay.set_status)
@@ -261,11 +337,17 @@ def main(argv=None):
         try:
             for _ in range(35):
                 messages[0]["content"] = get_system_prompt()
-                messages = trim_messages(messages)
+                messages = trim_messages(messages, pinned)
                 state = {"error": None, "next_step": turn_state["next_step"],
-                         "progress_seen": turn_state["progress_seen"]}
+                         "progress_seen": turn_state["progress_seen"],
+                         "usage": None}
+                # Counted before the request goes, because after it there is
+                # no longer a list to measure. An estimate, and the readout
+                # says so.
+                session.record_request(messages)
                 raw = ask_model(messages,
                                 on_event=stream_handler(live_ui, relay, state, transcript))
+                session.record_reply(raw, state["usage"])
                 turn_state["next_step"] = state["next_step"] or turn_state["next_step"]
                 live_ui.meaningful_output()
                 if state["error"]:
@@ -312,7 +394,8 @@ def main(argv=None):
                             invalidate_prompt()
                         if sub_action in ("done", "respond"):
                             suggestion = finish_response(live_ui, relay, result,
-                                                         transcript, turn_state)
+                                                         transcript, turn_state,
+                                                         pad)
                             break
                         results.append(f"{sub_action}: {result}")
                     else:
@@ -331,7 +414,7 @@ def main(argv=None):
                 transcript.emit(action_event(action, obj, result))
                 if action in ("done", "respond"):
                     suggestion = finish_response(live_ui, relay, result,
-                                                 transcript, turn_state)
+                                                 transcript, turn_state, pad)
                 else:
                     relay.reset()
                     live_ui.intermediate_event(ACTION_LABELS.get(action, "Processing..."))
@@ -354,22 +437,37 @@ def main(argv=None):
             relay.abort()
             live_ui.attach_sink(None)
             live_ui.stop()
+        # What the turn changed, on every path out of it. A cancelled turn
+        # still counts: a file that was written before Ctrl-C was still
+        # written, and the readout would be lying if it said otherwise.
+        session.count_history(history)
+        # The turn joins the session, and the next question is asked with it
+        # already in front of the model. Only a turn that produced an answer:
+        # a cancelled one and a failed one have nothing to carry, and a
+        # question recorded without its answer would read, next time round, as
+        # something TMT had been told and ignored.
+        if turn_state.get("answer"):
+            session.record(task, turn_state["answer"], history)
         # Carried to the next prompt as shadow text only. It is drawn in the
         # box and never put in the buffer, so pressing Enter on an untouched
         # prompt still submits nothing.
-        placeholder = suggestion
+        placeholder = suggestion or OPENING_SUGGESTION
 
-def finish_response(live_ui, relay, result, transcript=None, state=None):
+def finish_response(live_ui, relay, result, transcript=None, state=None, pad=None):
     """Close out a finished turn.
 
-    The order is the point. The suggestion is worked out and drawn first, then
-    the live strip is retired, and only then does the final answer go up. That
-    puts the hint immediately above the answer rather than after it, and it
-    means the strip is gone by the time the reply lands rather than sitting
-    between the reply and the prompt.
+    The order is the point. The suggestion is settled first, then the live
+    strip is retired, and only then does the final answer go up, so the strip
+    is gone by the time the reply lands rather than sitting between the reply
+    and the prompt.
 
-    Returns the suggestion, which becomes the placeholder in the next prompt
-    box. It is a hint to look at, never a value: it is not put into the input.
+    The suggestion is recorded and never printed. It is the shadow text of the
+    next prompt box and nothing else -- announcing it in the reply as well
+    would tell the user, in the answer, about a line they are one row away
+    from reading under their own cursor.
+
+    Returns the suggestion, which becomes that placeholder. It is a hint to
+    look at, never a value: it is not put into the input.
     """
     live_ui.final_event()
     relay.finish()
@@ -380,10 +478,20 @@ def finish_response(live_ui, relay, result, transcript=None, state=None):
     live_ui.attach_sink(None)
     live_ui.complete()
     render_response(str(result))
+    if pad is not None:
+        # The answer's own box: two borders and however many rows the reply
+        # wrapped to. Measured from the reply rather than assumed, so a long
+        # answer takes the room it actually used.
+        pad.take(2 + len(wrap_lines(str(result),
+                                    max(10, shutil.get_terminal_size((80, 24)).columns - 5))))
     if transcript is not None:
         # Recorded, not drawn: render_response has already drawn it, and the
         # history is what the turn is answerable from afterwards.
         transcript.history.append(AgentEvent.make("final", str(result)))
+    if state is not None:
+        # Handed to the session by the loop once the turn has finished, so the
+        # next question arrives with this answer already behind it.
+        state["answer"] = str(result)
     return suggestion
 
 if __name__ == "__main__":

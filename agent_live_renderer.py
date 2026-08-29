@@ -172,6 +172,18 @@ class GlitchStream:
         self._deadline = None
 
 
+# The terminal's own caret, switched off and on again. A repaint walks the
+# cursor up through every row of the region and back down, and the terminal
+# draws it at each stop: on screen that is a caret flickering through rows
+# nobody is typing in, several times a second, wherever the region happens to
+# end. Suppressing it for the length of the write is the fix at the cause --
+# the caret is not moved anywhere it should not be, it is simply not drawn
+# while it is being moved. Nothing hides it for longer than one write, and
+# `show_cursor` puts it back the moment the region gives the terminal up.
+HIDE_CURSOR = "\033[?25l"
+SHOW_CURSOR = "\033[?25h"
+
+
 class LiveRegion:
     """A block of terminal lines repainted in place, without full clears."""
 
@@ -182,19 +194,67 @@ class LiveRegion:
         self.ansi = ansi
         self._drawn = 0
         self._last = None
+        self._cursor_hidden = False
+        # corner() -> the escape sequence for the readout in the top right, or
+        # "". It rides along with the repaint rather than being written on a
+        # timer of its own: a region that is painting is already holding the
+        # terminal and already has the caret suppressed, which is exactly the
+        # moment a jump to row one and back is invisible.
+        self._corner = None
+        self._corner_drawn = None
         # The relay worker and the status sink can both reach paint():
         # one interleaved cursor-move sequence would corrupt the region.
         self._paint_lock = threading.RLock()
+
+    def set_corner(self, corner):
+        """Set the callable that supplies the top-right readout, or None."""
+        with self._paint_lock:
+            self._corner = corner
+
+    def _corner_sequence(self):
+        """The readout to draw with this repaint, or "".
+
+        Decoration is never allowed to end a turn, so a corner that raises is
+        one fewer thing on screen.
+        """
+        if self._corner is None:
+            return ""
+        try:
+            return self._corner() or ""
+        except Exception:
+            return ""
 
     def paint(self, lines):
         with self._paint_lock:
             self._paint(lines)
 
     def _paint(self, lines):
-        if not self.ansi or lines == self._last:
+        if not self.ansi:
+            return
+        corner = self._corner_sequence()
+        unchanged = lines == self._last
+        if unchanged and corner == self._corner_drawn:
+            return
+        self._corner_drawn = corner
+        if unchanged:
+            # Only the readout moved. The rows below it have not, so they are
+            # left exactly as they are: repainting rows that did not change is
+            # how the caret gets taken out of the input row for nothing, which
+            # is the whole of what the flicker was. The caret is put back the
+            # way it was found rather than simply shown -- during a turn there
+            # is nothing to type into and it should stay off.
+            if corner:
+                self._write(HIDE_CURSOR + corner
+                            + ("" if self._cursor_hidden else SHOW_CURSOR))
             return
         self._last = list(lines)
-        parts = []
+        # Hidden inside the same write as the cursor moves it is hiding, so
+        # there is no window in which the terminal has been told to move the
+        # caret but not yet told to stop drawing it. The corner goes first,
+        # before anything below can scroll: it restores the caret to an
+        # absolute row, and a line printed in between would move the terminal
+        # out from under that.
+        parts = [HIDE_CURSOR, corner]
         if self._drawn:
             parts.append("\033[%dA" % self._drawn)
         for line in lines:
@@ -205,7 +265,24 @@ class LiveRegion:
         if extra:
             parts.append("\033[%dA" % extra)
         self._drawn = len(lines)
+        self._cursor_hidden = True
         self._write("".join(parts))
+
+    def show_cursor(self):
+        """Draw the caret again, wherever it now stands.
+
+        The counterpart to the suppression in `_paint`, and called by whoever
+        owns the caret next: the prompt box, once it has moved it into the row
+        being typed in, and `clear`, which is the region giving the terminal
+        back. A region that only ever paints leaves it off, which is right --
+        while a turn is running there is nothing to type into and no caret
+        that belongs anywhere.
+        """
+        with self._paint_lock:
+            if not self.ansi or not self._cursor_hidden:
+                return
+            self._cursor_hidden = False
+            self._write(SHOW_CURSOR)
 
     def write_above(self, text):
         """Print permanent text above the region, leaving the region below it.
@@ -229,7 +306,10 @@ class LiveRegion:
             return True
         with self._paint_lock:
             held = self._last
-            self.clear()
+            # Erased without giving the caret back: the region is about to be
+            # painted again three lines further down, and showing the caret
+            # for the length of one print only puts the flicker back.
+            self._erase(restore=False)
             if not safe_write(self.stream, text if text.endswith("\n") else text + "\n"):
                 self.ansi = False
                 return False
@@ -239,14 +319,24 @@ class LiveRegion:
 
     def clear(self):
         with self._paint_lock:
-            if not self.ansi or not self._drawn:
-                self._drawn, self._last = 0, None
-                return
-            parts = ["\033[%dA" % self._drawn]
-            parts.extend("\r\033[2K\n" for _ in range(self._drawn))
-            parts.append("\033[%dA" % self._drawn)
+            self._erase(restore=True)
+
+    def _erase(self, restore=True):
+        if not self.ansi or not self._drawn:
             self._drawn, self._last = 0, None
-            self._write("".join(parts))
+            if restore:
+                self.show_cursor()
+            return
+        parts = ["\033[%dA" % self._drawn]
+        parts.extend("\r\033[2K\n" for _ in range(self._drawn))
+        parts.append("\033[%dA" % self._drawn)
+        # A region that is handing the rows back gives the caret back with
+        # them; one that is only making room for a permanent line keeps it.
+        if restore and self._cursor_hidden:
+            parts.append(SHOW_CURSOR)
+            self._cursor_hidden = False
+        self._drawn, self._last = 0, None
+        self._write("".join(parts))
 
     def _write(self, text):
         if not safe_write(self.stream, text):
@@ -254,18 +344,39 @@ class LiveRegion:
 
 
 class LiveRelay:
-    """Status line plus a live response box fed by the model stream.
+    """The live area at the foot of the screen while a turn runs.
+
+    Top to bottom: the reply as it arrives, then whatever `footer` draws --
+    the prompt box, in a session -- and the status row last of all. All of it
+    is one region, repainted in place, so the three keep their order and their
+    distance from the bottom of the window however much permanent output
+    scrolls past above them.
+
+    The status row is at the bottom because it is the instrument: it measures
+    the turn that the box above it asked for, and an instrument belongs under
+    the thing it is measuring rather than floating above the reply.
 
     A single background worker resolves symbols and repaints; feeding text from
     the stream thread never blocks and never waits on the animation.
     """
 
-    def __init__(self, stream=None, ansi=None, symbols=None, body_lines=LIVE_BODY_LINES):
+    def __init__(self, stream=None, ansi=None, symbols=None,
+                 body_lines=LIVE_BODY_LINES, footer=None, pad=None):
         self.region = LiveRegion(stream, ansi)
         if symbols is None:
             symbols = SYMBOL_POOL if symbols_supported(self.region.stream) else ASCII_SYMBOL_POOL
         self.glitch = GlitchStream(symbols=symbols)
         self.body_lines = body_lines
+        # footer() -> the rows drawn between the reply and the status row, or
+        # None for none. A callable rather than a list so the rows are built
+        # at the width the terminal has now: a window resized mid-turn is
+        # redrawn at its new size, exactly as the prompt box already is.
+        self.footer = footer
+        # The blank rows that hold this region against the foot of the window,
+        # or None to draw it wherever the cursor is. It is asked how many rows
+        # a region of this height needs, so a taller one -- a long reply -- is
+        # given fewer and the bottom edge does not move.
+        self.pad = pad
         self.streamed = False
         self._status = ""
         self._lock = threading.Lock()
@@ -327,9 +438,14 @@ class LiveRelay:
                 changed = self.glitch.tick()
                 pending = self.glitch.pending_count()
             now = time.monotonic()
-            # Repaint on new text, on a status change, and otherwise often
-            # enough that the border keeps riding the shared colour cycle.
-            if changed or self._dirty.is_set() or now - last_paint >= GRADIENT_TICK:
+            # Repaint when the reply has moved on and when the status row has
+            # changed, and at no other time. There used to be a third reason
+            # -- keeping the border riding the colour cycle -- and it meant
+            # the whole box was rewritten twelve times a second while the
+            # reader was reading it, for no change in what it said. The
+            # border does not carry the gradient any more, so the only
+            # repaints left are the ones that have something new to show.
+            if changed or self._dirty.is_set():
                 self._dirty.clear()
                 last_paint = now
                 self._repaint()
@@ -344,12 +460,35 @@ class LiveRelay:
             body = self.glitch.display_text() if self.streamed else ""
         self.region.paint(self._compose(status, body))
 
+    def _footer_rows(self):
+        """The rows between the reply and the status row, or none.
+
+        Decoration is never allowed to end a turn, so a footer that raises is
+        simply not drawn.
+        """
+        if self.footer is None:
+            return []
+        try:
+            return list(self.footer() or ())
+        except Exception:
+            return []
+
+    def _lead(self, height):
+        """The blank rows that hold a region this tall against the foot."""
+        if self.pad is None:
+            return []
+        try:
+            return [""] * self.pad.above(height)
+        except Exception:
+            return []
+
     def _compose(self, status, body):
         size = shutil.get_terminal_size((80, 24))
         width = max(24, size.columns)
-        lines = [status] if status else []
+        footer = self._footer_rows()
+        tail = footer + ([status] if status else [])
         if not body:
-            return lines
+            return self._lead(len(tail)) + tail
         # BODY_LEFT and BODY_RIGHT are East Asian wide: two columns each, not
         # one. Measure the chrome instead of assuming it, and leave a spare
         # column so a full row never reaches the terminal's auto-wrap. A
@@ -360,17 +499,24 @@ class LiveRelay:
         chrome = display_width(frame["left"]) + display_width(frame["right"]) + 2
         inner = max(10, width - chrome - 1)
         # Keep the whole region on screen: a region taller than the terminal
-        # would scroll away from the cursor moves that repaint it.
-        visible = max(1, min(self.body_lines, size.lines - 4))
+        # would scroll away from the cursor moves that repaint it. The reply is
+        # what gives up rows for the footer, because the footer is the box the
+        # user is looking at and the status row is one line.
+        room = size.lines - 3 - len(tail)
+        visible = max(1, min(self.body_lines, room))
         wrapped = wrap_lines(body, inner)[-visible:]
-        stream, phase = self.region.stream, gradient_phase()
+        # Undecorated on purpose. This box holds the reply as it arrives, and
+        # a reply is read rather than watched: the gradient belongs on the
+        # instruments -- the bar, the thinking word -- not on the border of
+        # the thing being read. Plain also means two consecutive frames of an
+        # unchanged reply are identical, which is what lets the repaint be
+        # skipped entirely.
         rule = frame["rule"] * (inner + chrome - 2)
-        lines.append(cycle_text(frame["top"] + rule + frame["top_end"], stream, phase))
-        left = cycle_text(frame["left"], stream, phase)
-        right = cycle_text(frame["right"], stream, phase + 0.5)
+        left, right = frame["left"], frame["right"]
+        lines = [frame["top"] + rule + frame["top_end"]]
         lines.extend(f"{left} {pad_to_width(line, inner)} {right}" for line in wrapped)
-        lines.append(cycle_text(frame["bottom"] + rule + frame["bottom_end"], stream, phase + 0.5))
-        return lines
+        lines.append(frame["bottom"] + rule + frame["bottom_end"])
+        return self._lead(len(lines) + len(tail)) + lines + tail
 
     def wait_for_reveal(self, timeout=FINALIZE_TIMEOUT):
         """Block until every queued symbol has resolved to its character."""

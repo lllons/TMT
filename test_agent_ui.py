@@ -351,11 +351,15 @@ def test_every_event_of_a_turn_survives_the_events_that_follow_it():
     kinds = transcript.history.kinds()
     assert kinds == tuple(kind for kind, _ in TURN), kinds
 
-    # Present in the history is not the same as present on screen. Both.
+    # Present in the history is not the same as present on screen. Both --
+    # except for the two kinds something else on screen already is. The final
+    # answer is drawn by render_response, and the suggestion is the shadow
+    # text of the next prompt box; printing either here would put a second
+    # copy of it on the screen in a different style.
     shown = stream.getvalue()
     for kind, message in TURN:
-        if kind == "final":
-            continue        # drawn by render_response, deliberately not here
+        if kind in ("final", "next_step_suggestion"):
+            continue
         assert message in shown, (message, shown)
 
     # The specific claims from the request: an earlier progress message is
@@ -363,6 +367,25 @@ def test_every_event_of_a_turn_survives_the_events_that_follow_it():
     first, second, third = (message for kind, message in TURN if kind == "progress")
     assert shown.index(first) < shown.index(second) < shown.index(third), shown
     assert "Read 5 files" in shown and "Modified src/providers.py" in shown, shown
+
+
+def test_the_suggestion_is_recorded_and_never_printed():
+    """It is the shadow text of the next prompt box and nothing else. Printed
+    here as well, the user would be told in the reply about a line they are
+    one row away from reading under their own cursor -- and would then see it
+    twice, in two different styles, saying the same thing.
+
+    Recorded all the same: a hint that was offered was offered, and the
+    history is what the turn is answerable from afterwards."""
+    stream = Recorder()
+    transcript = played_turn(stream)
+    hint = dict((kind, message) for kind, message in TURN)["next_step_suggestion"]
+    assert "next_step_suggestion" in transcript.history.kinds()
+    assert transcript.history.last("next_step_suggestion").message == hint
+    assert hint not in stream.getvalue(), stream.getvalue()
+    assert "Next:" not in stream.getvalue(), stream.getvalue()
+    assert transcript.lines_for(
+        agent_ui.AgentEvent.make("next_step_suggestion", hint)) == []
 
 
 def test_the_suggestion_is_the_last_thing_before_the_final_answer():
@@ -380,8 +403,8 @@ def test_an_event_is_written_once_and_never_repainted():
     played_turn(stream)
     body = stream.getvalue()
     for kind, message in TURN:
-        if kind == "final":
-            continue
+        if kind in ("final", "next_step_suggestion"):
+            continue        # neither is drawn here; each has its own place
         assert body.count(message) == 1, (message, body.count(message))
 
 

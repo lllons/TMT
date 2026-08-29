@@ -608,6 +608,35 @@ def prompt_rules():
     return agent_prompt.get_system_prompt().split("=== CURRENT WORKSPACE FILES")[0]
 
 
+def test_the_system_prompt_requires_a_closing_summary_of_what_was_made():
+    """The respond message is the only thing the user ever reads, so a turn
+    that ends without one has failed however much work it did -- and one that
+    ends with "done" has told them nothing. The prompt has to say both, in the
+    rules and in the behaviour section, because a model that skims one may
+    still read the other."""
+    rules = prompt_rules()
+    assert "You HAVE to end every task with a respond action" in rules, rules
+    assert "YOU MUST FINISH BY SUMMARISING WHAT YOU MADE" in rules, rules
+    # What a summary is: the files, and what was run and reported.
+    for phrase in ("which files you created, changed or deleted",
+                   "what you ran and what it reported",
+                   "Name the files"):
+        assert phrase in rules, phrase
+    # And what it is not, shown rather than only described.
+    assert '{"action":"respond","message":"Done."}' in rules, rules
+    assert "A task that changed nothing still ends with a respond" in rules
+
+    # The wrong examples are wrong on purpose and must not be mistaken for the
+    # right ones: every example in the section is still valid JSON and a valid
+    # action, whichever side of the line it is illustrating.
+    for line in agent_prompt.WORKFLOW_RULES.splitlines():
+        line = line.strip()
+        for marker in ("WRONG: ", "RIGHT: "):
+            if line.startswith(marker):
+                obj = json.loads(line[len(marker):])
+                assert agent_prompt.validate_action(obj) is None, line
+
+
 def test_the_system_prompt_teaches_progress_events_and_next_step():
     rules = prompt_rules()
     assert "=== PROGRESS, EVENTS AND NEXT STEP" in rules

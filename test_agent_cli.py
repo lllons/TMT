@@ -355,16 +355,43 @@ def run_session(answers):
         box.close()
 
 
+def test_the_session_opens_at_the_top_of_the_window_once():
+    """The startup menu has just been on this screen. Clearing it puts the
+    session at the top of the window, so the header is the first thing on it
+    and everything after reads downward from there.
+
+    Once, and before the header: clearing afterwards would erase it."""
+    calls = []
+    saved = TMT.clear_screen
+    try:
+        def watched(*args, **kwargs):
+            calls.append(len(args))
+            return False
+        TMT.clear_screen = watched
+        drawn = run_session(["", "quit"])
+    finally:
+        TMT.clear_screen = saved
+    assert len(calls) == 1, calls
+    # A pipe has no screen to clear, so a captured run gets no escape -- the
+    # real one clears, this one just proves it asked.
+    assert "\033[2J" not in drawn, repr(drawn[:40])
+    assert drawn.lstrip("\n").startswith(" TMT"), repr(drawn[:60])
+
+
 def test_the_session_header_is_drawn_once_however_many_turns_are_taken():
-    """The header states what the whole session runs under, and none of it
+    """The header states what the session was started with, and none of that
     changes while the loop is running. Redrawing it before every prompt pushed
-    the conversation off the screen for no new information."""
+    the conversation off the screen for no new information.
+
+    The clock is not part of it. That is the fact which does change, so it is
+    stated on the prompt box -- once per question, drawn again with the box it
+    belongs to -- and a session that asked four questions has four of them."""
     drawn = run_session(["", "", "", "quit"])
     assert prompt_boxes(drawn) == 4, (prompt_boxes(drawn), drawn)
-    # The header is the part that was repeating. The wordmark and the clock
-    # belong to it, so one of each across four turns says it was drawn once.
+    # The wordmark belongs to the header, so one of it across four turns says
+    # the header was drawn once.
     assert drawn.count("TMT") == 1, drawn
-    assert len(re.findall(r"\d\d:\d\d:\d\d", drawn)) == 1, drawn
+    assert len(re.findall(r"\d\d:\d\d:\d\d", drawn)) == 4, drawn
 
 
 def prompt_boxes(drawn):
@@ -547,13 +574,15 @@ def test_a_whole_turn_keeps_every_event_it_showed():
     # In the order they happened, and each exactly once.
     positions = [drawn.index(message) for message in expected]
     assert positions == sorted(positions), positions
-    for message in expected[:-1]:
+    for message in expected:
         assert drawn.count(message) == 1, (message, drawn.count(message))
-    # The hint is the one thing drawn twice, and both are deliberate: once as
-    # the lead-in to the answer, and once as shadow text in the box waiting
-    # for the next task. The second is a drawing, not a value -- that it never
-    # becomes input is covered separately.
-    assert drawn.count(expected[-1]) == 2, drawn.count(expected[-1])
+    # The hint's one appearance is the shadow text in the box waiting for the
+    # next task, after the answer rather than before it. It is a drawing and
+    # not a value -- that it never becomes input is covered separately -- and
+    # it is not also announced in the reply, which would be the same sentence
+    # twice in two styles a few rows apart.
+    assert drawn.index(expected[-1]) > drawn.index("The change is written."), drawn
+    assert "Next:" not in drawn, drawn
 
     # The work was real: the action actually wrote the file it reported.
     assert files.get("notes.txt") == "one\ntwo\nthree\n", sorted(files)
@@ -565,12 +594,22 @@ def test_a_whole_turn_keeps_every_event_it_showed():
     assert "-0" not in drawn, drawn
 
 
-def test_the_suggestion_lands_between_the_work_and_the_answer():
-    """Order is the contract: the hint reads as a lead-in to the answer, so it
-    sits after everything that was done and before the answer itself."""
+def test_the_suggestion_reaches_the_next_prompt_and_nowhere_else():
+    """It is shadow text in the box that asks the next question, and that is
+    the whole of where it appears. It used to be printed as a lead-in above
+    the answer as well, which put the same five words on screen twice, a few
+    rows apart, in two different styles -- and announced, inside the reply,
+    a line the user was about to read under their own cursor."""
     drawn, _ = run_turn(REAL_TURN)
-    assert drawn.index("The file was created.") < drawn.index("Review the changed files")
-    assert drawn.index("Review the changed files") < drawn.index("The change is written."), drawn
+    hint = "Review the changed files"
+    assert drawn.count(hint) == 1, drawn
+    # After the work and after the answer: it is drawn in the next box, not
+    # in the reply that came before it.
+    assert drawn.index("The file was created.") < drawn.index(hint), drawn
+    assert drawn.index("The change is written.") < drawn.index(hint), drawn
+    # And it is on the marker row of a prompt box, not on a row of its own.
+    marker_rows = [line for line in drawn.splitlines() if line.startswith(" > ")]
+    assert any(hint in line for line in marker_rows), marker_rows
 
 
 def test_the_suggestion_is_never_submitted_as_the_users_next_task():
@@ -606,6 +645,60 @@ def test_the_suggestion_is_never_submitted_as_the_users_next_task():
 
     assert asked == ["do the thing", "quit"], asked
     assert "Review the changed files" not in asked
+    # Nor is the opening placeholder, which is the same thing on the first
+    # question of a session: the box opens with it drawn and the buffer empty.
+    assert agent_ui.OPENING_SUGGESTION not in asked, asked
+    assert agent_ui.OPENING_SUGGESTION in screen.getvalue(), screen.getvalue()
+
+
+def test_the_question_and_the_answer_reach_the_next_turns_request():
+    """The end-to-end claim for the session context, made where it can only
+    pass for the right reason: at the messages the model is actually handed.
+
+    "Now add percentage support" means nothing on its own. It means what it
+    means because of the turn before it, so that turn has to be in the second
+    request or the model is answering a fragment."""
+    seen = []
+
+    def watching_model(messages, on_event=None):
+        seen.append([dict(message) for message in messages])
+        return json.dumps({"action": "done", "message": "Done: %d." % len(seen)})
+
+    box = Workspace()
+    screen = io.StringIO()
+    saved = (TMT.console, TMT.ensure_api_key, TMT.run_startup,
+             TMT.ensure_git_identity, TMT.ask_model)
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(str(box.path))
+        TMT.console = Replies(["Use the Calc.py architecture.",
+                               "Now add percentage support.", "quit"])
+        TMT.ensure_api_key = lambda: True
+        TMT.run_startup = lambda **kwargs: "start"
+        TMT.ensure_git_identity = lambda *a, **k: None
+        TMT.ask_model = watching_model
+        with contextlib.redirect_stdout(screen):
+            TMT.main([])
+    finally:
+        os.chdir(str(previous_cwd))
+        (TMT.console, TMT.ensure_api_key, TMT.run_startup,
+         TMT.ensure_git_identity, TMT.ask_model) = saved
+        box.close()
+
+    assert len(seen) == 2, len(seen)
+    # The first question arrives on its own: there is nothing behind it yet.
+    assert [message["role"] for message in seen[0]] == ["system", "user"], seen[0]
+
+    second = seen[1]
+    roles = [message["role"] for message in second]
+    assert roles == ["system", "user", "assistant", "user"], roles
+    assert "Calc.py architecture" in second[1]["content"], second[1]
+    assert second[2]["content"].startswith("Done: 1."), second[2]
+    assert second[-1]["content"] == "Now add percentage support.", second[-1]
+
+    # And the question itself is in the terminal's own scrollback, because the
+    # box that collected it is taken down as soon as it is answered.
+    assert "> Use the Calc.py architecture." in screen.getvalue(), screen.getvalue()
 
 
 def test_a_turn_that_offers_no_suggestion_still_gets_a_true_one():

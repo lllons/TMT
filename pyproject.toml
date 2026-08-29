@@ -43,6 +43,7 @@ py-modules = [
     "agent_models",
     "agent_prompt",
     "agent_providers",
+    "agent_session",
     "agent_setup",
     "agent_ui",
 ]

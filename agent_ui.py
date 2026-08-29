@@ -19,9 +19,8 @@ _THINKING_STYLES = [
     "✧ THINKING ✧", "◆ THINKING ◆", "◇ THINKING ◇", "◈ THINKING ◈", "» THINKING «",
     "« THINKING »", "── THINKING ──", "━━ THINKING ━━", "▸ THINKING", "◂ THINKING",
     "⟶ THINKING", "⟵ THINKING", "☼ THINKING", "✺ THINKING", "✹ THINKING", "✷ THINKING",
-    "✦ T H I N K I N G ✦", "⟡ T H I N K I N G ⟡", "Ｔ·Ｈ·Ｉ·Ｎ·Ｋ·Ｉ·Ｎ·Ｇ",
     "T̲H̲I̲N̲K̲I̲N̲G̲", "T̶H̶I̶N̶K̶I̶N̶G̶", "T̳H̳I̳N̳K̳I̳N̳G̳", "T͟H͟I͟N͟K͟I͟N͟G͟",
-    "T H I N K I N G...", "THINKING...", "THINKING ···", "THINKING /", "THINKING \\",
+    "THINKING...", "THINKING ···", "THINKING /", "THINKING \\",
 ]
 
 # The colour cycle every animated surface shares: red -> orange -> green and
@@ -53,6 +52,25 @@ def display_width(text):
             continue
         width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
     return width
+
+
+_SGR_RE = re.compile("\033\\[[0-9;?]*[A-Za-z]")
+
+
+def strip_ansi(text):
+    """The text a reader sees, with every escape sequence removed."""
+    return _SGR_RE.sub("", text or "")
+
+
+def visible_width(text):
+    """Terminal columns occupied by painted text.
+
+    `display_width` measures characters, and an escape sequence is made of
+    characters that occupy no columns at all. Anything that has already been
+    painted has to be measured through this or it comes out several times too
+    wide, which for a right-aligned readout means it starts off the screen.
+    """
+    return display_width(strip_ansi(text))
 
 
 def fit_to_width(text, columns):
@@ -513,6 +531,12 @@ def render_response(response: str, stream=None):
     reply carrying wide or combining characters cannot push a row past the
     edge and wrap it onto a second line. One column is left spare because
     terminals disagree about what a row filled to the last column does.
+
+    The box is undecorated. It is the one thing on screen the user is there
+    to read, and the gradient's job is to mark what is alive or measuring --
+    the bar, the thinking word, the wordmark. Colouring the border of the
+    answer as well made the answer look like another instrument, and the
+    border is structure the reader does not need drawn to.
     """
     stream = stream or sys.stdout
     width = max(20, shutil.get_terminal_size((80, 24)).columns)
@@ -525,10 +549,9 @@ def render_response(response: str, stream=None):
         border = bottom = "+" + fill + "+"
     else:
         border, bottom = "┌" + fill + "┐", "└" + fill + "┘"
-    out = [cycle_text(border, stream)]
-    left = right = cycle_text(edge, stream)
-    out.extend(f"{left} {pad_to_width(line, inner)} {right}" for line in lines)
-    out.append(cycle_text(bottom, stream, phase=gradient_phase() + 0.5))
+    out = [border]
+    out.extend(f"{edge} {pad_to_width(line, inner)} {edge}" for line in lines)
+    out.append(bottom)
     safe_write(stream, "\n".join(out) + "\n")
 
 
@@ -586,6 +609,19 @@ MAX_SUGGESTION_WORDS = 5
 # nothing more specific. Each is true of any turn, so none of them can claim
 # something that did not happen.
 FALLBACK_SUGGESTIONS = ("Review the changes", "Run the tests", "Continue working")
+
+# What the first prompt of a session shows, before there is a turn to read a
+# hint off. It is a placeholder like every other one: drawn dim in an empty
+# box, never assigned to the buffer, and gone on the first character typed.
+# Measured by the same rule as the rest -- five words at most -- so the
+# opening line and every line after it read as the same kind of thing.
+OPENING_SUGGESTION = "Describe a task to start"
+
+# Drawn in the box while the turn it asked for is running. The box is on
+# screen then -- pinned above the status row at the foot of the window -- but
+# nothing typed into it would be read, so it says what is happening and the
+# one thing the user can do about it rather than sitting there looking ready.
+RUNNING_HINT = "Working. Ctrl-C to stop."
 
 _WORD = re.compile(r"[^\W_]+(?:['’-][^\W_]+)*", re.UNICODE)
 
@@ -828,26 +864,23 @@ class Transcript:
     def lines_for(self, event):
         """The painted lines for one event, without a trailing newline.
 
-        A `final` event returns nothing: the finished reply has its own box in
-        `render_response`, and drawing it twice in two styles would be two
-        answers on screen.
+        Two kinds return nothing, for the same reason: something else on
+        screen already is them. A `final` event has its own box in
+        `render_response`, and drawing it here too would be two answers at
+        once. A `next_step_suggestion` is the shadow text of the next prompt
+        box and nothing else -- printing it as well would announce, in the
+        reply, a line the user is about to see under their own cursor.
+
+        Both are still recorded. The history is what the turn is answerable
+        from afterwards, and a hint that was never drawn was still offered.
         """
         style = _EVENT_STYLE.get(event.kind, _EVENT_STYLE["progress"])
-        if style["level"] == 3:
+        if style["level"] == 3 or event.kind == "next_step_suggestion":
             return []
         stream = self.stream
         plain = plain_output(stream)
         width = max(20, shutil.get_terminal_size((80, 24)).columns - 1)
         mark = style["mark"][1 if plain else 0]
-
-        if event.kind == "next_step_suggestion":
-            # Secondary to everything: a hint about what to ask next must not
-            # compete with the answer it sits above.
-            label, body = "Next:", event.message
-            rows = wrap_lines(body, max(10, width - 4)) or [""]
-            out = [self._dim(" " + label, stream)]
-            out.extend(self._dim("   " + row, stream) for row in rows)
-            return out
 
         if style["level"] == 0:
             # Dim, tight, no blank line. It should read as something said in

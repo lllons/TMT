@@ -26,9 +26,9 @@ import agent_config
 import agent_models
 from agent_live_renderer import LiveRegion
 from agent_ui import (
-    DIM, GRADIENT_TICK, RESET, _supports_color, clip_to_width, cycle_text,
-    display_width, fit_to_width, gradient_phase, iter_graphemes, pad_to_width,
-    plain_output, safe_write, wrap_lines,
+    DIM, GRADIENT_TICK, RESET, _color, _supports_color, clip_to_width,
+    cycle_text, display_width, fit_to_width, gradient_phase, iter_graphemes,
+    pad_to_width, plain_output, safe_write, visible_width, wrap_lines,
 )
 
 FALLBACK_VERSION = "0.1.0"
@@ -113,7 +113,13 @@ SETTINGS_ITEMS = (
 # the decorative glyphs.
 MASK_CHAR = "*"
 
-_MAX_CONTENT = 72        # widest the screen grows on a wide terminal
+# The narrowest the screen is drawn for. There is deliberately no widest: the
+# interface fills the window it was given. It used to stop growing at 72
+# columns, which on a wide terminal left the rules, the box and the whole
+# session sitting in a strip down the left with the rest of the window unused
+# -- and made the box look like a panel dropped onto the terminal rather than
+# the interface of the thing running in it.
+_MIN_CONTENT = 24
 _LOGO_ROW_SPREAD = 0.05  # gradient offset per logo row, so colour flows down
 
 # Set while POSIX raw mode is in force, so any exit path can put the terminal
@@ -150,7 +156,17 @@ def _terminal(size=None):
 
 
 def _content_width(columns):
-    return max(24, min(_MAX_CONTENT, columns - 2))
+    """How wide a row may be drawn, in columns.
+
+    The window, less the one spare column every row leaves at the right: a row
+    drawn to the last column wraps on the terminals that auto-wrap, and costs
+    a screen line the repaint arithmetic does not know about.
+
+    Floored rather than capped. A terminal narrower than the floor overflows
+    it, which is a known and accepted limit; a terminal wider than the window
+    does not exist.
+    """
+    return max(_MIN_CONTENT, columns - 1)
 
 
 def _paint(text, stream, phase, spread=0.8):
@@ -523,16 +539,35 @@ def render_startup_frame(selected=0, stream=None, model_id=None, workspace=None,
 
 
 # ---------------------------------------------------------------------------
-# The running session status.
+# The running session screen: a header, whatever the turn printed, and the
+# prompt box at the bottom.
 #
 # The startup screen answers "what is about to run". Once a session is under
-# way that answer keeps moving -- Settings rewrites the provider and the model,
-# TMT_PROVIDER and OPENROUTER_MODEL override them, and the clock never stops --
-# so the same facts are stated again at the top of every turn. Nothing here is
-# a second copy of that state: each fact is read from the module that owns it
-# at the moment the row is drawn.
+# way part of that answer keeps moving -- Settings rewrites the provider and
+# the model, TMT_PROVIDER and OPENROUTER_MODEL override them, and the clock
+# never stops -- and part of it cannot: the workspace was settled before the
+# first request and the date will not change under anyone.
+#
+# So the two are drawn in different places. What is settled goes in the header
+# and is printed once; what moves is stated on the prompt box, which is drawn
+# again for every question anyway. Nothing here keeps a copy of either: every
+# fact is read from the module that owns it at the moment the row is drawn.
 
 TASK_PROMPT = "Task> "
+
+# Where the fixed, non-animating gradient starts and how far it travels.
+# Anything printed once into scrollback is being read rather than watched, so
+# it takes a point on the gradient rather than the ambient cycle -- and a
+# fixed point rather than whatever `gradient_phase()` happened to return,
+# because a wordmark that is a different colour every launch is not a
+# wordmark. The span deliberately starts past red: red is the error end of
+# the scale, and a header is not an error.
+BRAND_PHASE = 0.15
+BRAND_SPREAD = 0.35
+
+# The header's second row hangs under the first, at the indent the prominence
+# ladder already uses for detail belonging to the row above it.
+_HEADER_INDENT = 3
 
 
 def _clock(moment=None):
@@ -631,57 +666,314 @@ def status_facts(provider_id=None, model_id=None, workspace=None):
 
 def render_status_lines(stream=None, size=None, phase=None, moment=None,
                         provider_id=None, model_id=None, workspace=None):
-    """The status header for one turn, as a list of ready-to-paint lines.
+    """The session header, as a list of ready-to-paint lines.
 
-    The same shape as the startup screen: the brand row, the facts, then the
-    rule the prompt sits under. Every row is trimmed to measured width before
-    it is painted, so none can overflow onto a second screen line, and what is
-    given up first is decided rather than incidental -- the weekday goes before
-    the year, and the workspace takes a row of its own before it is shortened.
+    Two rows and no border. The wordmark and the date are the heading; the
+    workspace hangs under them at the indent the prominence ladder already
+    uses for detail belonging to the row above. That indent is the whole of
+    the grouping -- one element, not two strings that happen to be adjacent --
+    and it costs nothing that a reader has to look past.
+
+    There is deliberately no rule at the bottom. There used to be, and the
+    prompt box draws one of its own two lines below it, so the screen opened
+    with two near-identical dividers around an empty gap that read as a badly
+    placed box. One rule, drawn by the thing it belongs to.
+
+    The volatile facts -- the clock, the provider, the model -- are not here.
+    They are stated by `prompt_caption` on the box itself, where they are
+    re-read for every question rather than frozen at launch. What is left
+    here is what cannot change while the session runs.
+
+    Every row is trimmed to measured width before it is painted, so none can
+    overflow onto a second screen line, and what is given up first is decided
+    rather than incidental: the weekday goes before the year, and a long path
+    is shortened through the middle so both its ends survive.
     """
     stream = sys.stdout if stream is None else stream
     columns, rows = _terminal(size)
-    phase = gradient_phase() if phase is None else phase
+    phase = BRAND_PHASE if phase is None else phase
     moment = _clock(moment)
     width = _content_width(columns)
     separator = " %s " % _glyphs(stream)["dot"]
     marker = "..." if plain_output(stream) else "…"
 
-    provider, model, workspace = status_facts(provider_id, model_id, workspace)
+    workspace = status_facts(provider_id, model_id, workspace)[2]
 
-    # Row one: whose interface this is, and when this turn started. The date
-    # and the clock are context, so they recede to the one neutral; the
-    # wordmark carries the gradient, exactly as it does on the startup screen.
-    clock = moment.strftime("%H:%M:%S")
-    spent = display_width(" TMT" + separator + separator + clock)
+    # The heading: whose interface this is, and what day the session opened
+    # on. The date is context, so it recedes to the one neutral; the wordmark
+    # carries the gradient at a fixed point on it, so TMT is the same colour
+    # every launch instead of whatever the colour cycle happened to be on.
+    spent = display_width(" TMT" + separator)
     date = _date_text(moment, max(0, width - spent))
-    brand = (" " + _paint("TMT", stream, phase)
-             + _dim(separator + date + separator + clock, stream))
+    brand = (" " + _paint("TMT", stream, phase, spread=BRAND_SPREAD)
+             + _dim(separator + date, stream))
 
-    # Row two: which service, which model, which directory. Read left to right
-    # it is the whole of what the next request does and where it lands.
-    provider = fit_to_width(provider, max(1, width - 2))
-    room = width - 1 - display_width(provider) - display_width(separator)
-    model = _shorten_middle(model, max(1, room), marker)
-    room -= display_width(model) + display_width(separator)
+    # Hanging under it: the directory this session may write to. It is the
+    # one fact here with real consequences, so it is not dimmed.
+    room = max(1, width - _HEADER_INDENT)
+    place = " " * _HEADER_INDENT + _shorten_middle(workspace, room, marker)
 
-    def row(values):
-        painted = " "
-        for index, value in enumerate(values):
-            painted += _dim(separator, stream) if index else ""
-            painted += value
-        return painted
+    return _fit_height(["", brand, place], rows, keep_tail=1)
 
-    if display_width(workspace) <= room:
-        facts = [row([provider, model, workspace])]
+
+def prompt_caption(stream=None, width=None, moment=None, provider_id=None,
+                   model_id=None):
+    """The dim line above the prompt box: when, and what will answer.
+
+    These are the three facts that can be different from one question to the
+    next -- the clock always is, and the provider and the model are read from
+    the modules that own them rather than from anything captured at launch --
+    so they are stated on the box rather than in the header, and re-read every
+    time the box is drawn. It also means they are still on screen once the
+    header has scrolled away, which on a long session is most of the time.
+
+    Right-aligned so it ends where the rule below it ends: the two read as one
+    component, and the left column stays clear for the markers and the '>'.
+    Dim, because it is the lowest thing in the prominence ladder -- context
+    for the question, never the question.
+
+    What is given up first as the terminal narrows is decided: the provider
+    goes before the model, because which model answers is the more useful of
+    the two, and the clock is the last thing standing.
+    """
+    stream = sys.stdout if stream is None else stream
+    width = _content_width(_terminal()[0]) if width is None else int(width)
+    moment = _clock(moment)
+    separator = " %s " % _glyphs(stream)["dot"]
+    provider, model, _ = status_facts(provider_id, model_id, "")
+
+    clock = moment.strftime("%H:%M:%S")
+    text = clock
+    for parts in ((clock, provider, model), (clock, model), (clock,)):
+        text = separator.join(parts)
+        if display_width(text) <= max(0, width - 1):
+            break
+    text = fit_to_width(text, max(1, width - 1))
+    pad = max(0, width - display_width(text))
+    return " " * pad + _dim(text, stream)
+
+
+def clear_screen(stream=None):
+    """Erase the visible screen and put the cursor at the top of it.
+
+    Called as a screen opens -- the startup menu, and the session behind it --
+    so each begins at the top of the window rather than wherever the shell
+    left the cursor. Everything TMT then prints reads downward from there:
+    the header, the question, the work, the answer, in the order they
+    happened, filling the window from the top. Once the window is full the
+    terminal scrolls, and from that point the prompt box -- always the last
+    thing written -- sits at the foot of the screen and stays there.
+
+    The viewport only. `\\033[3J` would take the scrollback with it, and that
+    scrollback is somebody's shell session, not TMT's to throw away. It is
+    deliberately not sent, and TMT's own history is safe for the opposite
+    reason: it has not been written yet.
+
+    Nothing is written where the stream is not a terminal -- a pipe has no
+    screen to clear, and the escape would land in whatever was capturing the
+    output. Returns whether it did anything.
+    """
+    stream = sys.stdout if stream is None else stream
+    if not getattr(stream, "isatty", lambda: False)():
+        return False
+    return safe_write(stream, "\033[2J\033[H")
+
+
+# ---------------------------------------------------------------------------
+# The meter in the top right corner.
+#
+# What the session has changed and what it has cost, in one short row that
+# never scrolls. It is the only thing TMT draws outside the flow of the
+# screen, and it earns that by never moving: the scrolling region is set to
+# start at row two, so row one is TMT's and the terminal's own scrolling never
+# touches it. Without that the readout would be stamped over whatever happened
+# to be at the top of the window and then scrolled into the history as
+# wreckage, and the history is the one surface this project will not spoil.
+#
+# Everything about it degrades. A stream that is not a terminal gets nothing;
+# a terminal that ignores the sequence simply scrolls as it always did, and
+# the readout is repainted over row one instead of being pinned there, which
+# is untidy rather than broken. The region is always released again.
+
+_TOP_ROW_RESERVED = 1
+
+
+def _meter_counts(added, removed, tokens_in, tokens_out):
+    """The four figures as text, and nothing about how they were arrived at."""
+    return ("+%d" % added, "-%d" % removed,
+            _short_count(tokens_in), _short_count(tokens_out))
+
+
+def _short_count(value):
+    """A token count at the size a corner readout can carry."""
+    value = max(0, int(value))
+    if value >= 1000000:
+        return "%.1fM" % (value / 1000000.0)
+    if value >= 1000:
+        return "%dk" % (value // 1000)
+    return str(value)
+
+
+def meter_text(session, stream=None, columns=None):
+    """The corner readout for a session, painted, or "" when it says nothing.
+
+    Green for what arrived and red for what left -- the two ends of the one
+    gradient, used for exactly what they already mean there. Everything else
+    is the one neutral, because the counts are the message and the colour only
+    confirms them: with the escapes stripped this still reads
+    "+1231 lines, -123 lines, ~15k tokens in, 30k out".
+
+    The tilde is not decoration. Tokens sent are estimated -- no provider will
+    count a request before it is sent -- and tokens generated are the
+    provider's own figure whenever it gives one. A number that was guessed is
+    marked as guessed.
+    """
+    stream = sys.stdout if stream is None else stream
+    if session is None:
+        return ""
+    added, removed, sent, back = _meter_counts(
+        session.lines_added, session.lines_removed,
+        session.tokens_in, session.tokens_out)
+    if not (session.lines_added or session.lines_removed
+            or session.tokens_in or session.tokens_out):
+        return ""
+    columns = _terminal()[0] if columns is None else int(columns)
+    out_mark = "" if session.tokens_out_exact else "~"
+    full = "%s lines, %s lines, ~%s tokens in, %s%s out" % (
+        added, removed, sent, out_mark, back)
+    short = "%s %s  ~%s in  %s%s out" % (added, removed, sent, out_mark, back)
+    tiny = "%s %s" % (added, removed)
+    for text in (full, short, tiny):
+        if display_width(text) <= max(0, columns - 2):
+            break
     else:
-        # A long Windows path is worth a row of its own before it is worth
-        # shortening, and is shortened only once it has outgrown that too.
-        facts = [row([provider, model]),
-                 " " + _shorten_middle(workspace, width - 1, marker)]
+        return ""
+    if not _supports_color(stream):
+        return text
+    # Only the two counts are coloured, and each takes the position it already
+    # holds on the gradient: green is arrived, red is gone.
+    painted = text.replace(added, _color(added, 95, stream), 1)
+    return painted.replace(" " + removed, " " + _color(removed, 10, stream), 1)
 
-    return _fit_height(["", brand] + facts + [_rule(stream, phase, width)],
-                       rows, keep_tail=1)
+
+# ---------------------------------------------------------------------------
+# Holding the prompt box at the foot of the window.
+#
+# Two things are wanted at once and they look like they contradict: the box at
+# the bottom from the moment the session opens, and the session's output
+# reading downward from the header at the top. What reconciles them is that
+# the gap between the two is *inside* the live region, as blank rows above the
+# box, and a permanent line printed into the region takes one of them.
+#
+# `LiveRegion.write_above` erases the region, prints where it stood, and paints
+# it again below. Painting it again one row shorter puts it back on exactly the
+# rows it already occupied, so the box does not move and the printed line lands
+# in the space the pad gave up. The output fills the window from the top while
+# the box stays where the eye left it, and when the pad is gone the box is at
+# the bottom and the terminal's own scrolling keeps it there.
+#
+# The count never has to be exact. It only ever decreases, it is part of the
+# region's own line list so no repaint arithmetic depends on it, and being a
+# row or two out means the box sits a row or two off the bottom until the next
+# line of output corrects it.
+
+PROMPT_HEIGHT = 4        # the caption, a rule, the line, a rule
+_PROMPT_LEAD = 1         # the blank line the box writes above itself
+
+
+class BottomPad:
+    """Blank rows that hold the live region against the foot of the window."""
+
+    def __init__(self, rows=0):
+        self.rows = max(0, int(rows))
+
+    def above(self, height, size=None):
+        """Blank rows to draw above a region `height` rows tall.
+
+        A taller region -- the relay's, which carries the reply and the status
+        row as well as the box -- needs fewer of them to keep its bottom edge
+        in the same place. Clamped to the window, so a terminal made shorter
+        mid-session cannot ask for a region taller than it is.
+        """
+        rows = _terminal(size)[1]
+        room = max(0, rows - _TOP_ROW_RESERVED - 1 - int(height))
+        return max(0, min(self.rows + PROMPT_HEIGHT - int(height), room))
+
+    def take(self, lines):
+        """Give up `lines` rows to something printed permanently."""
+        self.rows = max(0, self.rows - max(0, int(lines)))
+        return self.rows
+
+    def spend(self, text):
+        """Give up a row per line of `text`. Returns what is left."""
+        return self.take(str(text or "").count("\n"))
+
+
+def opening_pad(used, stream=None, size=None):
+    """Blank rows that put the first prompt box at the foot of the window.
+
+    Answerable only here, and only because the screen has just been cleared:
+    the cursor is on a row we know, so the distance to the bottom is
+    arithmetic rather than a guess. It never has to be answered again.
+
+    `used` is how many rows have been written since the top of the window --
+    the reserved row, if there is one, plus the header.
+
+    The last row of the window is not part of the box. A region is painted by
+    writing each of its rows and a newline, so the cursor ends one row below
+    it, and a box drawn onto the last row would put the cursor past the bottom
+    and scroll the window by one before the session had begun.
+    """
+    stream = sys.stdout if stream is None else stream
+    if not getattr(stream, "isatty", lambda: False)():
+        return 0
+    rows = _terminal(size)[1]
+    return max(0, rows - int(used) - _PROMPT_LEAD - PROMPT_HEIGHT - 1)
+
+
+def reserve_top_row(stream=None, size=None):
+    """Keep row one out of the terminal's scrolling, for the meter.
+
+    Sets the scrolling region to rows two and below and leaves the cursor at
+    the top of it, so everything TMT prints from here scrolls under a row it
+    can never reach. Must be paired with `release_top_row`, on every path out
+    including a crash -- a terminal left with a scrolling region is a terminal
+    that behaves oddly for whatever the user runs next.
+    """
+    stream = sys.stdout if stream is None else stream
+    if not getattr(stream, "isatty", lambda: False)():
+        return False
+    rows = _terminal(size)[1]
+    if rows <= _TOP_ROW_RESERVED + 4:
+        return False          # too short to give a row away
+    return safe_write(stream, "\033[%d;%dr\033[%d;1H"
+                              % (_TOP_ROW_RESERVED + 1, rows, _TOP_ROW_RESERVED + 1))
+
+
+def release_top_row(stream=None):
+    """Give the whole window back to the terminal's own scrolling."""
+    stream = sys.stdout if stream is None else stream
+    if not getattr(stream, "isatty", lambda: False)():
+        return False
+    return safe_write(stream, "\033[r")
+
+
+def meter_sequence(text, stream=None, size=None):
+    """The escape sequence that draws `text` in the top right corner.
+
+    Saves the cursor, jumps to row one, clears it, writes the readout against
+    the right edge, and puts the cursor back. It is emitted as one string, at
+    the front of a repaint and before anything that could scroll, because a
+    restore is to an absolute row: a line printed between the save and the
+    restore would move the terminal out from under it.
+    """
+    stream = sys.stdout if stream is None else stream
+    if not text:
+        return ""
+    columns = _terminal(size)[0]
+    width = visible_width(text)
+    column = max(1, columns - width)
+    return "\0337\033[1;1H\033[2K\033[1;%dH%s\0338" % (column, text)
 
 
 def task_prompt(stream=None, phase=None):
@@ -709,8 +1001,11 @@ def render_status(stream=None, prompt=True, **facts):
     line and the live renderer for the same region, and it would animate
     something the user is trying to read.
 
-    Returns False when the stream has gone, so a caller can stop drawing to
-    it. Decoration is never allowed to end the run.
+    Returns the number of rows it drew, or False when the stream has gone so
+    a caller can stop drawing to it. The count is what tells the caller how
+    far down the window the cursor now is, which is the one moment that is
+    answerable and the one the opening pad is worked out from. Decoration is
+    never allowed to end the run.
     """
     stream = sys.stdout if stream is None else stream
     lines = render_status_lines(stream=stream, **facts)
@@ -719,8 +1014,33 @@ def render_status(stream=None, prompt=True, **facts):
     if not prompt:
         # The caller draws its own input -- the prompt box does, and a second
         # bare "Task>" above it would be two prompts for one question.
+        return len(lines)
+    return len(lines) if safe_write(stream, task_prompt(stream)) else False
+
+
+def render_task(task, stream=None, size=None, moment=None):
+    """Write the question that was just asked into the terminal's scrollback.
+
+    The box that collected it is a live region and is taken down the moment it
+    is answered, so without this the session would keep its replies and lose
+    every question that produced them. This is the permanent half: the caption
+    that was above the box, and the line as it was typed under the same marker
+    it was typed under.
+
+    No rules. The box's rules said "type here", and this is a record of
+    something already said -- drawing them again would put an input surface in
+    the scrollback that nothing can be entered into.
+
+    Returns False when the stream has gone, like the rest of the drawing here.
+    """
+    stream = sys.stdout if stream is None else stream
+    task = " ".join(str(task or "").split())
+    if not task:
         return True
-    return safe_write(stream, task_prompt(stream))
+    width = _content_width(_terminal(size)[0])
+    caption = prompt_caption(stream, width, moment)
+    row = " " + PROMPT_MARKER + " " + fit_to_width(task, max(1, width - _PROMPT_PREFIX))
+    return safe_write(stream, caption + "\n" + row + "\n")
 
 
 def render_prompt(stream=None, phase=None):
@@ -1169,15 +1489,29 @@ def _default_text_reader():
 # ---------------------------------------------------------------------------
 # The task prompt.
 #
-# A rule, a marked row, a rule: the same divider the rest of the interface
-# draws, with the line being typed between two of them. The suggestion drawn
-# in an empty box is a placeholder and nothing else. It is held beside the
-# buffer rather than in it, so there is no editing path, and no accident of
-# ordering, that can submit a suggestion the user never typed.
+# A dim caption, a rule, a marked row, a rule. It is the primary surface of
+# the screen -- the only bordered thing below the answer -- and the only one
+# with a live caret in it, which is prominence enough without decoration.
+#
+# Undecorated on purpose. The gradient marks what is alive or measuring, and
+# this is neither: it is a surface being read and typed into, and the design
+# rule for those is explicit. It also buys the cursor fix below: two frames
+# of an untouched box are now byte-identical, so there is nothing to repaint
+# while the user sits and thinks, and nothing to move the caret for.
+#
+# The suggestion drawn in an empty box is a placeholder and nothing else. It
+# is held beside the buffer rather than in it, so there is no editing path,
+# and no accident of ordering, that can submit a suggestion the user never
+# typed.
 
 PROMPT_MARKER = ">"
 
-_INPUT_ROW = 1           # which row of the frame the line is typed on
+# Where the line being typed sits, counted from the BOTTOM of the frame: the
+# bottom rule is one, the line is two. Counted that way because the top of the
+# frame moves -- the caption is dropped while a turn runs, and the blank rows
+# holding the box against the foot of the window come and go as output fills
+# it -- while the distance from the line to the bottom rule never changes.
+_INPUT_ROW = 2
 _PROMPT_PREFIX = 3       # columns before the field: a margin, the marker, a gap
 _WORD_BREAK = " \t"
 
@@ -1292,14 +1626,28 @@ class LineEditor:
 class PromptBox:
     """The bordered task prompt, repainted in place while it is typed.
 
-    Draws a rule, the line under a '>' marker, and a rule. What comes back is
-    the line as typed: the placeholder is drawn dim inside an empty box and is
-    never any part of the answer.
+    Draws a dim caption, a rule, the line under a '>' marker, and a rule.
+    What comes back is the line as typed: the placeholder is drawn dim inside
+    an empty box and is never any part of the answer.
+
+    The caret is the terminal's own and it stays in the input row. It is moved
+    out only for a repaint that has something new to show, and the repaint
+    itself is written with the caret suppressed, so it is never drawn anywhere
+    but where the user is typing.
     """
 
-    def __init__(self, stream=None, instream=None, reader=None, line_reader=None):
+    def __init__(self, stream=None, instream=None, reader=None, line_reader=None,
+                 corner=None, pad=None):
         self.stream = sys.stdout if stream is None else stream
         self.instream = sys.stdin if instream is None else instream
+        # The blank rows that hold the box against the foot of the window, or
+        # None to draw it wherever the cursor is. See BottomPad.
+        self.pad = pad
+        # corner() -> the escape sequence for the readout in the top right, or
+        # "". Handed to the region the box paints through, so the readout is
+        # refreshed by the same write that draws the box and never by one of
+        # its own.
+        self.corner = corner
         # reader() -> one raw keystroke. Injecting one is how a test drives
         # the box; left alone it reads through read_key, as every other
         # screen does.
@@ -1311,6 +1659,11 @@ class PromptBox:
         # having a second one grow up beside it.
         self.line_reader = line_reader
         self.cancelled = False
+        # When the box last asked something. The caller writes the question
+        # into scrollback afterwards and stamps it with this, so the record
+        # carries the time the user actually saw rather than a second one read
+        # a moment later.
+        self.asked_at = None
 
     def ask(self, placeholder=""):
         """Take one line. Returns the text, or None when the input ended.
@@ -1322,37 +1675,62 @@ class PromptBox:
         it was.
         """
         self.cancelled = False
-        # Blank lines are structure. The box arrives under a header that ends
-        # in a rule, or under a reply that ends in a border, and butted
-        # straight against either it reads as part of it rather than as the
-        # next question. Written once, outside the repainted region, so the
-        # editing that follows does not redraw it.
+        # Blank lines are structure. The box arrives under the header, or
+        # under a reply that ends in a border, and butted straight against
+        # either it reads as part of it rather than as the next question.
+        # Written once, outside the repainted region, so the editing that
+        # follows does not redraw it.
         safe_write(self.stream, "\n")
         editor = LineEditor(placeholder)
+        # The time this question was asked, fixed for the life of the box. A
+        # clock re-read on every repaint would change under the reader's own
+        # cursor, and animating something being typed into is the one thing
+        # the interface is not allowed to do.
+        moment = self.asked_at = _clock()
         reader = self.reader
         if reader is None:
             if not is_interactive(self.stream, self.instream):
                 # No raw keys to be had: a pipe, a redirect, or the test
                 # suite. Waiting on a keystroke that cannot arrive would hang
                 # the run, so the box is drawn and the line is read as a line.
-                return self._read_line(editor)
+                return self._read_line(editor, moment=moment)
             reader = _default_text_reader()
         region = LiveRegion(self.stream)
-        placed = 0
+        region.set_corner(self.corner)
+        placed, shown = 0, None
         try:
             while True:
-                lines, column = self._frame(editor)
-                region.paint(lines)
-                # The caret is the terminal's own, moved into the row after
-                # the paint and returned to where LiveRegion left it before
-                # the next one, so the region's arithmetic still holds.
-                placed = self._place(lines, column)
+                frame = self._frame(editor, moment=moment)
+                if frame != shown:
+                    # Something actually changed -- a character, a caret move,
+                    # a resize. Only then is the caret taken out of the input
+                    # row, and it is put straight back below.
+                    #
+                    # This is the whole of the flicker fix. The loop used to
+                    # do this on every pass, and the reader below returns
+                    # every 80ms whether a key arrived or not, so an untouched
+                    # prompt walked the caret down to the foot of the box and
+                    # back twelve times a second for as long as anyone looked
+                    # at it.
+                    placed = self._unplace(placed)
+                    region.paint(frame[0])
+                    placed = self._place(frame[0], frame[1])
+                    region.show_cursor()
+                    shown = frame
                 kind, value = _next_text_key(reader)
-                placed = self._unplace(placed)
                 outcome = editor.handle(kind, value)
                 if outcome == "continue":
                     continue
-                region.paint(self._frame(editor)[0])   # the last keystroke shows
+                placed = self._unplace(placed)
+                # The box is taken down with the answer. It is a live region,
+                # not a record: what the user asked is written into scrollback
+                # by the caller, in the transcript's own voice, and the box
+                # itself is drawn again a moment later at the foot of the turn
+                # with the running task in it. Left behind instead, every
+                # question of the session would sit on screen inside a frame
+                # that no longer accepts anything, and an empty prompt would
+                # stack an empty box each time it was answered.
+                region.clear()
                 if outcome == "submit":
                     return editor.value
                 if outcome == "cancel":
@@ -1363,19 +1741,49 @@ class PromptBox:
             self._unplace(placed)
             _restore_terminal(self.stream)
 
-    def lines(self, editor, size=None, phase=None):
+    def lines(self, editor, size=None, phase=None, moment=None, caption=True,
+              pad=True):
         """The painted box, as a list of rows."""
-        return self._frame(editor, size, phase)[0]
+        return self._frame(editor, size, phase, moment, caption, pad)[0]
 
-    def _frame(self, editor, size=None, phase=None):
+    def running_lines(self, hint="", size=None):
+        """The box as it stands while the turn it asked for is running.
+
+        Empty, with the hint drawn as shadow text: there is no caret in it and
+        nothing typed into it would be read, so a box that looked ready for
+        input would be a lie about what the program is doing. The hint says
+        what is happening and how to stop it, which is the only thing the user
+        can actually do from here.
+
+        No caption. The caption stamps a question with when it was asked and
+        what will answer it, and the question this box is waiting on already
+        carries one, three rows up in the scrollback. A second copy of it,
+        moving under the reply as it arrives, would be the same fact twice.
+
+        Drawn by the live relay as the footer of its region, so it stays put
+        at the foot of the window while the turn's output scrolls past above.
+        No blank rows above it either: the relay pads that region as a whole,
+        and a pad here would be counted twice and push the box off the bottom.
+        """
+        return self.lines(LineEditor(hint), size=size, caption=False, pad=False)
+
+    def _frame(self, editor, size=None, phase=None, moment=None, caption=True,
+               pad=True):
         """(rows, caret column) for the box as it stands.
 
         The terminal is measured here rather than remembered, so a window
         resized between two keystrokes is drawn at its new width.
+
+        Undecorated: the rules and the marker are the terminal's own colour.
+        That is what makes two frames of an untouched box equal, which is what
+        lets `ask` leave the caret alone -- and a box that is being typed into
+        has no business carrying a colour that means progress.
+
+        `caption` is off for the box the relay draws while a turn runs, which
+        is not asking anything and so has nothing to stamp.
         """
         stream = self.stream
         columns = _terminal(size)[0]
-        phase = gradient_phase() if phase is None else phase
         # A spare column, always: a row drawn to the last one wraps on the
         # terminals that auto-wrap, and costs a screen line the repaint
         # arithmetic does not know about.
@@ -1385,12 +1793,19 @@ class PromptBox:
         width = min(_content_width(columns), limit)
         inner = max(1, width - _PROMPT_PREFIX)
 
-        rule = " " + _paint(_glyphs(stream)["rule"] * (width - 1), stream,
-                            phase + 0.5, spread=1.2)
+        head = [prompt_caption(stream, width, moment)] if caption else []
+        rule = " " + _glyphs(stream)["rule"] * (width - 1)
         text, caret = self._field(editor, inner)
         body = _dim(text, stream) if editor.placeholder_visible else text
-        row = " " + _paint(PROMPT_MARKER, stream, phase) + " " + body
-        return [rule, row, rule], _PROMPT_PREFIX + caret
+        row = " " + PROMPT_MARKER + " " + body
+        rows = head + [rule, row, rule]
+        # Blank rows above, so the box sits at the foot of the window from the
+        # moment the session opens rather than wherever the last reply
+        # stopped. They are part of the region, so the repaint arithmetic
+        # counts them like any other row, and they are given up one at a time
+        # as permanent output fills the window from the top.
+        lead = [""] * (self.pad.above(len(rows), size) if self.pad else 0)
+        return lead + rows, _PROMPT_PREFIX + caret
 
     def _field(self, editor, inner):
         """The visible slice of the line, and where the caret sits in it.
@@ -1413,13 +1828,13 @@ class PromptBox:
         visible, _ = clip_to_width(text[start:], inner)
         return fit_to_width(visible, inner), display_width(text[start:cursor])
 
-    def _read_line(self, editor):
+    def _read_line(self, editor, moment=None):
         """Draw the box once, then take a whole line from the input.
 
         The degraded path, and the one every scripted run takes. It reads a
         line and returns it; nothing here can block on a key.
         """
-        for line in self.lines(editor):
+        for line in self.lines(editor, moment=moment):
             if not safe_write(self.stream, line + "\n"):
                 break
         if self.line_reader is not None:
@@ -1442,7 +1857,7 @@ class PromptBox:
         """Move the caret into the input row. Returns the rows moved up."""
         if not self._ansi():
             return 0
-        up = len(lines) - _INPUT_ROW
+        up = _INPUT_ROW          # counted from the bottom; see the constant
         parts = ["\033[%dA" % up, "\r"]
         if column:
             parts.append("\033[%dC" % column)
@@ -1752,6 +2167,9 @@ def run_startup(stream=None, key_reader=None, model_id=None, workspace=None):
     selected = 0
     try:
         _hide_cursor(stream)
+        # The menu is a screen, so it starts at the top of one rather than
+        # halfway down whatever the shell last printed.
+        clear_screen(stream)
         # Only when TMT has no way to reach a model at all. Anyone who already
         # has a provider goes straight to the menu and changes it in Settings.
         if not provider_is_configured():

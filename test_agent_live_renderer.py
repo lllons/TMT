@@ -11,6 +11,15 @@ from agent_live_renderer import (
 )
 
 ANSI_RE = re.compile("\033\[[0-9;]*m")
+# Every escape, not only the colour ones. The region also writes cursor moves
+# and the show/hide pair, and "\033[?25l" carries a "?" that a test looking
+# for a stray symbol in the text would otherwise find in a control sequence.
+ESCAPE_RE = re.compile("\033\[[0-9;?]*[A-Za-z]")
+
+
+def plain(text):
+    """What the terminal shows, with every control sequence removed."""
+    return ESCAPE_RE.sub("", text)
 
 
 def drain(glitch, limit=5.0):
@@ -158,7 +167,104 @@ def test_region_repaints_in_place_instead_of_reprinting():
     assert text.count("\033[2A") == 1
     assert text.count("three") == 1
     region.clear()
-    assert output.getvalue().endswith("\033[2A")
+    # The rows are handed back with the caret on them. The region hid it for
+    # the length of each repaint -- a caret dragged up and down through rows
+    # nobody is typing in is what the flicker was -- and clearing is the
+    # region giving the terminal up, so the last thing it writes is the caret
+    # coming back.
+    assert output.getvalue().endswith("\033[2A\033[?25h")
+
+
+def test_a_repaint_never_draws_the_caret_on_a_row_being_repainted():
+    """The bug this exists for was visible from across the room: a caret
+    flickering at the foot of the terminal several times a second while
+    nothing was being typed.
+
+    The cause is that a repaint walks the cursor up through every row of the
+    region and back down again, and the terminal draws it at each stop. So the
+    caret is switched off inside the same write as the moves it is hiding --
+    there is no window in which the terminal has been told to move it but not
+    yet told to stop drawing it -- and switched back on only by whoever owns
+    it next: the prompt box, once it has put it in the row being typed in, or
+    `clear`, which is the region giving the terminal up.
+    """
+    output = io.StringIO()
+    region = LiveRegion(stream=output, ansi=True)
+    region.paint(["one", "two"])
+    first = output.getvalue()
+    assert first.startswith("\033[?25l"), repr(first[:12])
+    assert "\033[?25h" not in first, repr(first)
+
+    # And it stays off across repaints rather than being toggled per frame:
+    # a caret switched on and off twelve times a second is the same flicker.
+    output.truncate(0), output.seek(0)
+    region.paint(["one", "three"])
+    assert output.getvalue().count("\033[?25h") == 0, repr(output.getvalue())
+
+    # Whoever takes the caret back gets it back.
+    output.truncate(0), output.seek(0)
+    region.show_cursor()
+    assert output.getvalue() == "\033[?25h", repr(output.getvalue())
+    # Asked twice, it is not written twice: it is already the caret's owner.
+    output.truncate(0), output.seek(0)
+    region.show_cursor()
+    assert output.getvalue() == "", repr(output.getvalue())
+
+
+def test_permanent_text_printed_past_the_region_keeps_the_caret_hidden():
+    """`write_above` erases the region, prints, and paints it again three rows
+    further down. Handing the caret back for the length of that print would
+    put the flicker straight back -- once per progress line, which during a
+    turn is most of them."""
+    output = io.StringIO()
+    region = LiveRegion(stream=output, ansi=True)
+    region.paint(["status"])
+    output.truncate(0), output.seek(0)
+    assert region.write_above("Patched file: config.py") is True
+    written = output.getvalue()
+    assert "Patched file: config.py" in written
+    assert "\033[?25h" not in written, repr(written)
+
+
+def test_the_corner_rides_along_with_the_repaint_and_never_repaints_alone():
+    """The readout in the top right is written by whoever is already holding
+    the terminal, because a region that is painting has the caret suppressed
+    already -- which is the one moment a jump to row one and back is
+    invisible. It goes at the front of the write, before anything below can
+    scroll: the restore is to an absolute row, and a line printed in between
+    would move the terminal out from under it.
+
+    And when only the readout has changed, the rows below it are left exactly
+    as they are. Repainting rows that did not change is how the caret gets
+    taken out of the input row for nothing."""
+    corner = {"text": "\0337<corner one>\0338"}
+    output = io.StringIO()
+    region = LiveRegion(stream=output, ansi=True)
+    region.set_corner(lambda: corner["text"])
+    region.paint(["one", "two"])
+    first = output.getvalue()
+    assert first.startswith(HIDE := "\033[?25l"), repr(first[:20])
+    assert first.index("<corner one>") < first.index("one"), repr(first)
+
+    # Same rows, same readout: nothing at all.
+    output.truncate(0), output.seek(0)
+    region.paint(["one", "two"])
+    assert output.getvalue() == "", repr(output.getvalue())
+
+    # Same rows, new readout: the readout and nothing else.
+    output.truncate(0), output.seek(0)
+    corner["text"] = "\0337<corner two>\0338"
+    region.paint(["one", "two"])
+    written = output.getvalue()
+    assert "<corner two>" in written, repr(written)
+    assert "one" not in written and "\033[2A" not in written, repr(written)
+
+    # A corner that fails is one fewer thing on screen, not a turn that ended.
+    def broken():
+        raise RuntimeError("no terminal")
+    region.set_corner(broken)
+    region.paint(["three"])
+    assert "three" in output.getvalue()
 
 
 def test_region_shrinks_cleanly():
@@ -186,7 +292,7 @@ def test_finalized_output_contains_no_leftover_symbols():
     relay = LiveRelay(stream=output, ansi=True, symbols=ASCII_SYMBOL_POOL)
     relay.feed("Decoded")
     relay.finish()
-    final_box = output.getvalue().rsplit("┌", 1)[-1]
+    final_box = plain(output.getvalue()).rsplit("┌", 1)[-1]
     assert not set(final_box) & set("+*#@%&^~<>?")
 
 
@@ -256,13 +362,109 @@ def test_every_painted_row_fits_inside_the_terminal(monkeypatch=None):
             relay = LiveRelay(stream=io.StringIO(), ansi=True)
             relay.streamed = True
             body = "A response long enough to wrap several times. " * 6
-            painted = relay._compose("███░░░ 23% Respond", body)
-            widths = {visible_width(line) for line in painted[1:]}
+            status = "███░░░ 23% Respond"
+            painted = relay._compose(status, body)
+            # The status row is the last thing in the region, under the reply
+            # and under whatever footer the caller draws: it is the instrument
+            # measuring the turn, and an instrument belongs beneath the thing
+            # it is measuring.
+            assert painted[-1] == status, painted[-1]
+            widths = {visible_width(line) for line in painted[:-1]}
             assert max(widths) < columns, (columns, sorted(widths))
             # One box: every row of the frame is the same width.
             assert len(widths) == 1, (columns, sorted(widths))
     finally:
         renderer.shutil.get_terminal_size = original
+
+
+def test_the_live_area_holds_the_reply_the_box_and_the_status_in_that_order():
+    """The bottom of the screen is one block: the reply as it arrives, the
+    prompt box, and the status row under it. All three are in the same region,
+    so they keep their order and their distance from the foot of the window
+    however much permanent output scrolls past above them.
+
+    The status row is last because it is the instrument. It measures the turn
+    the box above it asked for, and an instrument belongs under the thing it
+    is measuring rather than floating above the reply."""
+    footer = [" ------------", " > Working. Ctrl-C to stop.", " ------------"]
+    relay = LiveRelay(stream=io.StringIO(), ansi=True, footer=lambda: list(footer))
+    relay.streamed = True
+    painted = relay._compose("### 42% Patching", "the reply so far")
+
+    assert painted[-1] == "### 42% Patching", painted[-1]
+    assert painted[-4:-1] == footer, painted[-4:-1]
+    # And the reply's box is above the footer, not interleaved with it.
+    body = painted[:-4]
+    assert body and body[0].startswith("┌"), body
+    assert body[-1].startswith("└"), body
+
+
+def test_the_live_area_still_draws_with_no_footer_and_no_reply():
+    """A relay with no footer is the shape every existing caller had, and a
+    turn that has produced no text yet is a status row on its own."""
+    bare = LiveRelay(stream=io.StringIO(), ansi=True)
+    bare.streamed = True
+    assert bare._compose("### 42%", "")[-1] == "### 42%"
+    assert bare._compose("### 42%", "hello")[-1] == "### 42%"
+    assert len(bare._compose("", "")) == 0
+
+    footed = LiveRelay(stream=io.StringIO(), ansi=True, footer=lambda: [" > box"])
+    assert footed._compose("", "") == [" > box"]
+    assert footed._compose("### 42%", "") == [" > box", "### 42%"]
+
+
+def test_a_footer_that_fails_is_not_drawn_and_does_not_end_the_turn():
+    """Decoration is never allowed to end a run. A footer that raises is one
+    fewer thing on screen, not a turn that stopped."""
+    def broken():
+        raise RuntimeError("the terminal went away")
+    relay = LiveRelay(stream=io.StringIO(), ansi=True, footer=broken)
+    relay.streamed = True
+    painted = relay._compose("### 42%", "the reply")
+    assert painted[-1] == "### 42%", painted
+
+
+def test_the_reply_gives_up_rows_so_the_whole_region_stays_on_screen():
+    """A region taller than the terminal scrolls away from the cursor moves
+    that repaint it, which walks the frame down the screen. The reply is what
+    shrinks, because the footer is the box the user is looking at and the
+    status row is a single line."""
+    import shutil as _shutil
+    import agent_live_renderer as renderer
+
+    original = renderer.shutil.get_terminal_size
+    footer = [" ---", " > Working. Ctrl-C to stop.", " ---"]
+    try:
+        for lines in (12, 18, 24, 40):
+            renderer.shutil.get_terminal_size = (
+                lambda default=None, rows=lines: _shutil.os.terminal_size((80, rows))
+            )
+            relay = LiveRelay(stream=io.StringIO(), ansi=True,
+                              footer=lambda: list(footer))
+            relay.streamed = True
+            painted = relay._compose("### 42%", "a reply that wraps. " * 40)
+            assert len(painted) < lines, (lines, len(painted))
+            assert painted[-4:] == footer + ["### 42%"], painted[-4:]
+    finally:
+        renderer.shutil.get_terminal_size = original
+
+
+def test_every_way_a_turn_can_end_gives_the_caret_back():
+    """The caret is suppressed for as long as the region owns the rows, and
+    the region owns them for the length of a turn. So every path that ends one
+    has to hand it back -- a finished turn, a cancelled one, and a turn that
+    released the terminal to print an error. A caret that stayed hidden would
+    be the flicker fix turned into a worse bug: an input line with nothing in
+    it to show where you are typing."""
+    for ending in ("finish", "abort", "release"):
+        output = io.StringIO()
+        relay = LiveRelay(stream=output, ansi=True)
+        relay.set_status("### 42% Patching")
+        relay.feed("the reply")
+        getattr(relay, ending)()
+        assert "\033[?25h" in output.getvalue(), (ending, repr(output.getvalue()[-60:]))
+        assert output.getvalue().rstrip().endswith("\033[?25h"), (
+            ending, repr(output.getvalue()[-60:]))
 
 
 def test_a_repaint_never_grows_the_region_it_replaces():

@@ -221,8 +221,22 @@ def batch_summary(batch):
     )
 
 MAX_TURNS = 10
-def trim_messages(messages):
-    fixed, turns = messages[:2], messages[2:]
+def trim_messages(messages, pinned=2):
+    """Drop the middle of a long turn, keeping its head and its tail.
+
+    `pinned` is how many messages at the front must survive whatever else
+    goes. It is the system prompt, the conversation carried in from earlier
+    questions, and the task itself -- everything the session put there before
+    the loop started adding actions and results. Trimming into that would take
+    the question out of the request and leave the model answering something
+    nobody asked, which is the one failure this cannot be allowed to have.
+
+    The default of two is the shape this had before a session context existed:
+    a system prompt and a task. Callers that carry history pass their own
+    count, which `Session.begin_turn` returns for exactly this.
+    """
+    pinned = max(0, min(int(pinned), len(messages)))
+    fixed, turns = messages[:pinned], messages[pinned:]
     max_messages = MAX_TURNS * 2
     if len(turns) <= max_messages:
         return messages
@@ -354,7 +368,44 @@ def action_event(action, obj, result):
         if isinstance(files, list):
             detail["files"] = len(files)
 
+    # Which files the action named. Recorded, not drawn: the transcript's
+    # second row reports only counts, and the description above already says
+    # the path in the words the action used. It is here for the session
+    # record, which carries "what the last turn changed" into the next
+    # question -- and a path is the one part of that a follow-up like "now
+    # add percentage support" depends on and never states.
+    paths = _paths_named(action, obj)
+    if paths:
+        detail["paths"] = paths
+
     return agent_ui.AgentEvent.make(kind, _describe(action, obj, result), **detail)
+
+
+def _paths_named(action, obj):
+    """The workspace paths an action was given, in order, each once.
+
+    Taken from the request rather than parsed back out of the result: the
+    request is where a path is a fact. An action that names none contributes
+    none.
+    """
+    if not isinstance(obj, dict):
+        return ()
+    candidates = []
+    if action == "write_files":
+        for entry in obj.get("files") or ():
+            if isinstance(entry, dict):
+                candidates.append(entry.get("path"))
+    else:
+        candidates.extend((obj.get("path"), obj.get("destination"), obj.get("new_path")))
+    seen, out = set(), []
+    for value in candidates:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        value = value.strip()
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return tuple(out)
 
 
 def batch_events(batch, results):
