@@ -153,4 +153,4 @@ python run_tests.py
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Apache license 2. See [LICENSE](LICENSE).
