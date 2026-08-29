@@ -3,6 +3,23 @@
 import argparse
 import json
 import sys
+from pathlib import Path
+
+# An editable install writes a fixed list of the modules it maps, built at
+# install time. A module added to the project afterwards is invisible to it, so
+# the console script loads this file and then fails importing a sibling that is
+# sitting right beside it. Putting this file's own directory on the path first
+# makes the siblings resolvable however TMT was started -- console script, -m,
+# or the file directly -- and means a new module never needs a reinstall.
+#
+# First rather than last on purpose: TMT now runs inside arbitrary projects,
+# and a project of its own with a file named agent_config.py would otherwise
+# shadow TMT's.
+_INSTALL_DIR = str(Path(__file__).resolve().parent)
+if _INSTALL_DIR in sys.path:
+    sys.path.remove(_INSTALL_DIR)
+sys.path.insert(0, _INSTALL_DIR)
+
 import agent_config
 from agent_menu import run_startup
 from agent_config import (
