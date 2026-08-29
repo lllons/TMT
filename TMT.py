@@ -23,9 +23,8 @@ sys.path.insert(0, _INSTALL_DIR)
 
 import agent_config
 from agent_menu import (
-    BottomPad, PromptBox, _TOP_ROW_RESERVED, clear_screen, meter_sequence,
-    meter_text, opening_pad, release_top_row, render_status, render_task,
-    reserve_top_row, run_startup,
+    BottomPad, PromptBox, clear_screen, opening_pad, render_status,
+    render_task, run_startup,
 )
 from agent_config import (
     MUTATING_ACTIONS, console, default_workspace, set_workspace_root,
@@ -34,7 +33,7 @@ from agent_config import (
 from agent_config import REQUIRED_KEYS
 from agent_actions import authorizes_push, batch_summary, build_result_message, execute_action, trim_messages
 from agent_actions import READ_ONLY_ACTIONS, ACTION_LABELS, MAX_TURNS, action_event
-from agent_model import ask_model
+from agent_model import ask_model, is_synthetic
 from agent_ui import (
     OPENING_SUGGESTION, RUNNING_HINT, AgentEvent, LiveUI, ResponseHistory,
     Transcript, fallback_suggestion, render_response, validate_suggestion,
@@ -51,7 +50,7 @@ from agent_file_ops import (
     write_file, write_files,
 )
 
-def stream_handler(live_ui, relay, state, transcript=None):
+def stream_handler(live_ui, relay, state, transcript=None, session=None):
     """Turn model stream events into UI updates.
 
     Two destinations, and which one an event goes to is the whole distinction
@@ -76,6 +75,11 @@ def stream_handler(live_ui, relay, state, transcript=None):
             relay.feed(value)
         elif kind == "output":
             live_ui.add_output(value)
+            # The same characters, to the same running total the meter reads,
+            # so the readout climbs while the reply arrives instead of
+            # standing still and then jumping when the turn ends.
+            if session is not None:
+                session.note_output(value)
         elif kind == "usage":
             live_ui.settle_tokens(value)
             # The provider's own count of what it generated. Kept so the
@@ -229,16 +233,7 @@ def main(argv=None):
     # happened. Once the window is full the terminal scrolls and the prompt
     # box, always the last thing written, stays at the foot of it.
     clear_screen()
-    # Row one is kept out of the terminal's scrolling from here, so the meter
-    # in the corner can sit still while everything else moves under it. Given
-    # back in the finally below on every path out, including a crash: a
-    # terminal left with a scrolling region behaves oddly for whatever the
-    # user runs next.
-    reserve_top_row()
-    try:
-        return _session_loop(root)
-    finally:
-        release_top_row()
+    return _session_loop(root)
 
 
 def _session_loop(root):
@@ -259,20 +254,16 @@ def _session_loop(root):
     # Worked out here because here is the one moment it is answerable: the
     # screen has just been cleared, so the cursor is on a row we know rather
     # than one we would have to guess.
-    pad = BottomPad(opening_pad(_TOP_ROW_RESERVED + (drawn or 0)))
+    pad = BottomPad(opening_pad(drawn or 0))
     # One session object for the run, and the only place the conversation
     # lives. It is created here and dropped when this function returns, so
     # nothing it holds can reach the next launch.
     session = Session(workspace=root)
-    # The readout in the top right: what this session has changed, and what it
-    # has cost. Built fresh every time a region repaints, so it is never a
-    # stored number that has gone stale.
-    corner = lambda: meter_sequence(meter_text(session))
     # One box for the session. It draws its own frame each time it is asked,
     # so nothing needs redrawing between turns, and the console keeps being
     # the line reader on any run that cannot take raw keys -- a pipe, a
     # redirect, the test suite -- so a scripted run behaves as it always did.
-    prompt_box = PromptBox(line_reader=_console_line, corner=corner, pad=pad)
+    prompt_box = PromptBox(line_reader=_console_line, session=session, pad=pad)
     placeholder = OPENING_SUGGESTION
     while True:
         # Shadow text, and nowhere else. The opening line on the first
@@ -313,7 +304,6 @@ def _session_loop(root):
         # turn's permanent output scrolls past over it.
         relay = LiveRelay(footer=lambda: prompt_box.running_lines(RUNNING_HINT),
                           pad=pad)
-        relay.region.set_corner(corner)
         # The turn's permanent record. It is written through the live region
         # rather than straight to the stream: the region is repainted in place
         # a few rows further down, and printing past it without telling it
@@ -346,7 +336,8 @@ def _session_loop(root):
                 # says so.
                 session.record_request(messages)
                 raw = ask_model(messages,
-                                on_event=stream_handler(live_ui, relay, state, transcript))
+                                on_event=stream_handler(live_ui, relay, state,
+                                                        transcript, session))
                 session.record_reply(raw, state["usage"])
                 turn_state["next_step"] = state["next_step"] or turn_state["next_step"]
                 live_ui.meaningful_output()
@@ -355,18 +346,21 @@ def _session_loop(root):
                     live_ui.attach_sink(None)
                     live_ui.stop()
                     console.print(f"[red]Stream failed:[/red] {state['error']}")
+                    turn_state["outcome"] = "the stream failed"
                     break
                 identical_count = identical_count + 1 if raw == last_raw else 0
                 last_raw = raw
                 if identical_count >= 3:
                     relay.release()
                     console.print("[bold red]Circuit Breaker Tripped:[/bold red] Identical response 3 times in a row. Stopping.")
+                    turn_state["outcome"] = "the model repeated itself and was stopped"
                     break
                 try:
                     obj = json.loads(raw)
                 except json.JSONDecodeError as error:
                     relay.release()
                     console.print(f"[red]Bad JSON:[/red] {error}")
+                    turn_state["outcome"] = "the reply could not be read as JSON"
                     break
                 declared_events(obj, transcript, turn_state)
                 if "actions" in obj:
@@ -377,10 +371,17 @@ def _session_loop(root):
                         continue
                     live_ui.intermediate_event("Processing...")
                     results = []
+                    invalid = ""
                     for sub_obj in batch:
-                        error = validate_action(sub_obj)
-                        if error:
-                            results.append(f"INVALID: {error}")
+                        invalid = validate_action(sub_obj)
+                        if invalid:
+                            # Handed back below so the model can correct it,
+                            # exactly as a bad single action is. It used to
+                            # break out of both loops onto the bare `break`,
+                            # which threw the batch's results away, told the
+                            # model nothing, printed nothing, and ended the
+                            # turn where it stood -- work done and no word
+                            # about why it had stopped.
                             break
                         sub_action = sub_obj["action"]
                         # A batch carries its progress on the entries, not on
@@ -389,7 +390,8 @@ def _session_loop(root):
                         # so the message still arrives ahead of its work.
                         declared_events(sub_obj, transcript, turn_state)
                         result = execute_action(sub_obj, context)
-                        transcript.emit(action_event(sub_action, sub_obj, result))
+                        session.count_event(
+                            transcript.emit(action_event(sub_action, sub_obj, result)))
                         if sub_action in MUTATING_ACTIONS:
                             invalidate_prompt()
                         if sub_action in ("done", "respond"):
@@ -402,6 +404,16 @@ def _session_loop(root):
                         relay.reset()
                         messages.extend([{"role": "assistant", "content": raw}, {"role": "user", "content": f"Batch results:\n{chr(10).join(results)}\nOutput your next action."}])
                         continue
+                    if invalid:
+                        relay.release()
+                        console.print(f"[red]Invalid action in batch:[/red] {invalid}")
+                        ran = chr(10).join(results) if results else "Nothing ran."
+                        messages.extend([
+                            {"role": "assistant", "content": raw},
+                            {"role": "user",
+                             "content": f"INVALID: {invalid}\nRan before it:\n{ran}\n"
+                                        "Output a corrected action JSON."}])
+                        continue
                     break
                 error = validate_action(obj)
                 if error:
@@ -411,8 +423,20 @@ def _session_loop(root):
                     continue
                 action = obj["action"]
                 result = execute_action(obj, context)
-                transcript.emit(action_event(action, obj, result))
+                # Counted as it happens, not when the turn ends: the meter
+                # has to move when the file is written, not two minutes
+                # later when the answer lands.
+                session.count_event(
+                    transcript.emit(action_event(action, obj, result)))
                 if action in ("done", "respond"):
+                    # A reply ask_model made up to report a failure is shown
+                    # like any other, because the user has to be told. It is
+                    # not recorded as the model's answer: the sentence in it
+                    # is a machine's report about a failure, and carrying it
+                    # forward told the next turn that the model had said
+                    # "no JSON object found in response".
+                    if is_synthetic(obj):
+                        turn_state["outcome"] = str(result)
                     suggestion = finish_response(live_ui, relay, result,
                                                  transcript, turn_state, pad)
                 else:
@@ -423,11 +447,17 @@ def _session_loop(root):
                 if action in ("done", "respond"):
                     break
                 messages.extend([{"role": "assistant", "content": raw}, {"role": "user", "content": build_result_message(action, result)}])
+            else:
+                # Thirty-five rounds and no final action. The work that did
+                # happen is on screen; what is missing is the answer, and the
+                # next question is told that rather than left to infer it.
+                turn_state["outcome"] = "it ran out of steps before answering"
         except KeyboardInterrupt:
             relay.abort()
             live_ui.attach_sink(None)
             live_ui.stop()
             console.print("\n[yellow]Task cancelled. Returning to prompt.[/yellow]")
+            turn_state["outcome"] = "you stopped it with Ctrl-C"
         except Exception:
             relay.abort()
             live_ui.attach_sink(None)
@@ -437,17 +467,16 @@ def _session_loop(root):
             relay.abort()
             live_ui.attach_sink(None)
             live_ui.stop()
-        # What the turn changed, on every path out of it. A cancelled turn
-        # still counts: a file that was written before Ctrl-C was still
-        # written, and the readout would be lying if it said otherwise.
-        session.count_history(history)
         # The turn joins the session, and the next question is asked with it
-        # already in front of the model. Only a turn that produced an answer:
-        # a cancelled one and a failed one have nothing to carry, and a
-        # question recorded without its answer would read, next time round, as
-        # something TMT had been told and ignored.
-        if turn_state.get("answer"):
-            session.record(task, turn_state["answer"], history)
+        # already in front of the model. Every turn, however it ended: it used
+        # to take an answer to be recorded at all, so a stream failure, a
+        # circuit break, an unreadable reply or a turn that ran out of steps
+        # dropped the user's question along with it, and the next question
+        # arrived with no sign the exchange had happened. That is exactly what
+        # "it has no context between prompts" looked like from outside. A turn
+        # with no answer says so, in words, rather than being left out.
+        answer = "" if turn_state.get("outcome") else turn_state.get("answer", "")
+        session.record(task, answer, history, turn_state.get("outcome", ""))
         # Carried to the next prompt as shadow text only. It is drawn in the
         # box and never put in the buffer, so pressing Enter on an untouched
         # prompt still submits nothing.

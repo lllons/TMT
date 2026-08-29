@@ -69,8 +69,15 @@ def write_file(path, content):
             ast.parse(content)
         except SyntaxError as error:
             return f"SyntaxError in generated code: {error}. File NOT written. Please fix."
+    # Asked before the write, because afterwards there is no way to tell. The
+    # two cases are genuinely different facts and the interface reports them
+    # differently: a file that did not exist gained every line it now has and
+    # lost none, and both halves of that are known. A file that did exist lost
+    # a number of lines nobody can count any more, so only what was written is
+    # ever claimed for it.
+    existed = p.exists()
     p.write_text(content, encoding="utf-8")
-    return f"Wrote file: {path}"
+    return f"Wrote file: {path}" if existed else f"Created file: {path}"
 
 def append_file(path, content):
     p = safe_path(path)

@@ -6,6 +6,7 @@ in TMT's own message shape, bounded by the model's real window -- and none of
 it may survive the process.
 """
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -116,7 +117,11 @@ def test_the_conversation_never_reaches_the_disk():
     context on Wednesday, and the way to be sure of that is that there is no
     code here that writes anything."""
     source = Path(agent_session.__file__).read_text(encoding="utf-8")
-    for forbidden in ("write_text", "open(", "json.dump", "pickle", "shelve"):
+    # Anything that could reach a file. `json.dump(` writes to one; `json.dumps`
+    # returns a string and is how a carried turn is put back into the shape the
+    # model speaks, which never leaves memory.
+    for forbidden in ("write_text", "open(", "json.dump(", "pickle", "shelve",
+                      "Path(", "os.remove"):
         assert forbidden not in source, forbidden
 
     # And a fresh session in a fresh working directory starts with nothing,
@@ -146,14 +151,68 @@ def test_a_new_session_starts_empty_and_clear_empties_one():
 
 # --- what is not recorded ---------------------------------------------------
 
-def test_a_turn_with_no_answer_is_not_recorded():
-    """A cancelled turn has nothing to carry. Recorded without its answer it
-    would read, next time round, as something TMT had been told and ignored."""
+def test_a_turn_that_produced_no_answer_is_still_recorded_and_says_why():
+    """The bug this replaced: it took an answer to be recorded at all, so a
+    stream failure, a circuit break, an unreadable reply or a turn that ran
+    out of steps dropped the user's QUESTION along with it. The next question
+    then arrived with no sign the exchange had ever happened, which is exactly
+    what "it has no context between prompts" looked like from outside.
+
+    The reason is stated rather than glossed, and it is stated by TMT -- it
+    rides on the question, not on an assistant message the model never sent."""
     session = Session(workspace="C:\\project")
-    assert session.record("Do the thing.", "") is None or len(session) <= 1
-    session.clear()
+    session.record("Translate the README.", "", outcome="the stream failed")
+    assert len(session) == 1
+
+    carried = session.carried_messages()
+    assert len(carried) == 1, carried          # no answer, so no assistant turn
+    assert carried[0]["role"] == "user"
+    assert "Translate the README." in carried[0]["content"]
+    assert "the stream failed" in carried[0]["content"], carried[0]
+    assert "[That turn ended with no answer" in carried[0]["content"]
+
+    # The next question still sees it, which is the whole point.
+    messages = session.begin_turn("Now do the Japanese one.", "SYSTEM")[0]
+    assert len(messages) == 3, messages
+    assert messages[-1]["content"] == "Now do the Japanese one."
+
+    # A question with nothing in it is still not a turn.
     assert session.record("", "An answer to nothing.") is None
-    assert len(session) == 0
+    assert len(session) == 1
+
+
+def test_the_carried_answer_is_the_json_action_the_model_speaks_in():
+    """Every other assistant message in a request is a JSON object -- that is
+    the whole of what the system prompt demands. Dropping the previous turn's
+    answer in as loose prose put an example of the forbidden shape in front of
+    the model, in its own voice, immediately before asking it not to use that
+    shape. The words are the model's own either way; only the wrapper is
+    restored."""
+    session = Session(workspace="C:\\project")
+    session.record("Build it.", "Built it in Calc.py.")
+    carried = session.carried_messages()
+    assert carried[0]["role"] == "user"
+    assistant = carried[1]
+    assert assistant["role"] == "assistant"
+    payload = json.loads(assistant["content"])       # loose prose would raise
+    assert payload["action"] == "respond", payload
+    assert payload["message"].startswith("Built it in Calc.py."), payload
+
+
+def test_a_turn_that_only_used_git_still_carries_what_it_did():
+    """A commit and a push touch no file the path list would catch, so a
+    git-only turn used to carry nothing but its answer text -- and when that
+    text was a machine's error string it carried nothing true at all."""
+    session = Session(workspace="C:\\project")
+    session.record("push to main", "Pushed.", [
+        event("milestone", "Committed 6f0a4f5 on main"),
+        event("milestone", "Pushed main to origin (github.com)"),
+        event("progress", "Checking the remote."),
+    ])
+    carried = json.loads(session.carried_messages()[1]["content"])["message"]
+    assert "Committed 6f0a4f5 on main" in carried, carried
+    assert "Pushed main to origin" in carried, carried
+    assert "Checking the remote" not in carried, carried
 
 
 def test_a_very_long_answer_is_cut_and_says_so():
@@ -301,24 +360,50 @@ def test_lines_are_counted_only_where_both_halves_are_known():
     assert (session.lines_added, session.lines_removed) == (21, 5), (
         session.lines_added, session.lines_removed)
 
-    # A write reports what it wrote and nothing about what it replaced, so it
+    # A write OVER an existing file reports what it wrote and nothing about
+    # what it replaced -- that was gone before anyone could count it -- so it
     # moves neither total.
     written = agent_actions.action_event(
         "write_file", {"action": "write_file", "path": "d.py", "content": "a\nb\n"},
-        "Wrote 2 lines to d.py")
+        "Wrote file: d.py")
+    assert "added" not in written.detail and "removed" not in written.detail, written.detail
     session.count_event(written)
     assert (session.lines_added, session.lines_removed) == (21, 5)
+
+    # A write to a path that did not exist is a different fact, and the action
+    # says which it was. It gained every line it now has and lost none, and
+    # that "none" is a measurement rather than a guess -- which is why a
+    # session that only creates files must not read "+0 lines".
+    created = agent_actions.action_event(
+        "write_file", {"action": "write_file", "path": "e.py", "content": "a\nb\nc\n"},
+        "Created file: e.py")
+    assert created.detail.get("added") == 3 and created.detail.get("removed") == 0
+    session.count_event(created)
+    assert (session.lines_added, session.lines_removed) == (24, 5)
+
+    # A batch claims both halves only when every one of its writes was a
+    # creation. One overwrite among them and the removed count is unknowable
+    # for the batch as a whole, so it is not given at all.
+    entries = [{"path": "f.py", "content": "a\n"}, {"path": "g.py", "content": "b\nc\n"}]
+    batch = agent_actions.action_event(
+        "write_files", {"action": "write_files", "files": entries},
+        "Created file: f.py\nCreated file: g.py")
+    assert batch.detail.get("added") == 3 and batch.detail.get("removed") == 0
+    mixed = agent_actions.action_event(
+        "write_files", {"action": "write_files", "files": entries},
+        "Created file: f.py\nWrote file: g.py")
+    assert "added" not in mixed.detail and "removed" not in mixed.detail, mixed.detail
 
     # An append knows both halves, because it removed nothing.
     appended = agent_actions.action_event(
         "append_file", {"action": "append_file", "path": "d.py", "content": "c\n"},
         "Appended 1 line to d.py")
     session.count_event(appended)
-    assert (session.lines_added, session.lines_removed) == (22, 5)
+    assert (session.lines_added, session.lines_removed) == (25, 5)
 
     session.count_event(None)
     session.count_history(None)
-    assert (session.lines_added, session.lines_removed) == (22, 5)
+    assert (session.lines_added, session.lines_removed) == (25, 5)
 
 
 def test_tokens_sent_are_estimated_and_tokens_generated_are_exact_when_told():

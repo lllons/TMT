@@ -317,6 +317,10 @@ class Replies:
 
     def __init__(self, answers):
         self.answers = list(answers)
+        # What the loop reported through the console rather than through the
+        # transcript -- the errors and refusals. They go nowhere near stdout,
+        # so a test that wants to see them has to look here.
+        self.printed = []
 
     def input(self, prompt=""):
         if not self.answers:
@@ -325,6 +329,21 @@ class Replies:
 
     def print(self, *args, **kwargs):
         return None
+
+    def said(self):
+        return "\n".join(self.printed)
+
+
+class Reporting(Replies):
+    """A Replies that keeps what the loop printed through the console.
+
+    The loop's errors -- Bad JSON, an invalid action, a stream failure -- go to
+    `console.print`, not to stdout, so a test that captures only the drawn
+    screen cannot see them at all.
+    """
+
+    def print(self, *args, **kwargs):
+        self.printed.append(" ".join(str(value) for value in args))
 
 
 def run_session(answers):
@@ -424,6 +443,7 @@ def test_every_turn_after_the_first_still_gets_a_prompt():
 # --- events, and a whole turn played through the real loop -------------------
 
 import agent_actions
+import agent_model
 import agent_ui
 from agent_live_renderer import LiveRegion
 
@@ -586,12 +606,10 @@ def test_a_whole_turn_keeps_every_event_it_showed():
 
     # The work was real: the action actually wrote the file it reported.
     assert files.get("notes.txt") == "one\ntwo\nthree\n", sorted(files)
-    # And the file event carried the count that was actually written. A write
-    # replaces the file, so only the lines written are reported: how many the
-    # old content had is not knowable once it has been overwritten, and a
-    # "-0" there would be a confident falsehood.
-    assert "3 lines" in drawn, drawn
-    assert "-0" not in drawn, drawn
+    # notes.txt did not exist, so this was a creation: it gained three lines
+    # and lost none, and "none" there is a measurement rather than a guess.
+    assert "Created file: notes.txt" in drawn, drawn
+    assert "+3 -0" in drawn, drawn
 
 
 def test_the_suggestion_reaches_the_next_prompt_and_nowhere_else():
@@ -651,6 +669,107 @@ def test_the_suggestion_is_never_submitted_as_the_users_next_task():
     assert agent_ui.OPENING_SUGGESTION in screen.getvalue(), screen.getvalue()
 
 
+def drive_session(answers, replies):
+    """Run TMT.main through `answers`, answering with `replies` in order.
+
+    Returns (what was drawn, the message list of every request made, and the
+    console the loop reported its errors through).
+    """
+    seen = []
+
+    def watching_model(messages, on_event=None):
+        seen.append([dict(message) for message in messages])
+        return replies[min(len(seen) - 1, len(replies) - 1)]
+
+    box = Workspace()
+    screen = io.StringIO()
+    saved = (TMT.console, TMT.ensure_api_key, TMT.run_startup,
+             TMT.ensure_git_identity, TMT.ask_model)
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(str(box.path))
+        console = TMT.console = Reporting(answers)
+        TMT.ensure_api_key = lambda: True
+        TMT.run_startup = lambda **kwargs: "start"
+        TMT.ensure_git_identity = lambda *a, **k: None
+        TMT.ask_model = watching_model
+        with contextlib.redirect_stdout(screen):
+            TMT.main([])
+    finally:
+        os.chdir(str(previous_cwd))
+        (TMT.console, TMT.ensure_api_key, TMT.run_startup,
+         TMT.ensure_git_identity, TMT.ask_model) = saved
+        box.close()
+    return screen.getvalue(), seen, console
+
+
+def test_a_turn_that_failed_still_leaves_its_question_in_the_context():
+    """The bug this exists for: it took an answer to be recorded at all, so a
+    turn that ended in a stream failure, a circuit break, an unreadable reply
+    or a run out of steps dropped the user's QUESTION with it. The next
+    question arrived with no sign the exchange had happened, which is exactly
+    what "it has no context between prompts" looked like from outside."""
+    drawn, seen, console = drive_session(
+        ["translate the readme", "did that work?", "quit"],
+        ['{"action": "respond" "message": "broken"}',
+         json.dumps({"action": "done", "message": "Second turn answered."})])
+
+    assert "Bad JSON" in console.said(), console.said()
+    # The second question carries the first, and says plainly what became of
+    # it -- said by TMT, on the question, not as words the model never wrote.
+    second = seen[-1]
+    assert [message["role"] for message in second] == ["system", "user", "user"], second
+    assert "translate the readme" in second[1]["content"], second[1]
+    assert "could not be read as JSON" in second[1]["content"], second[1]
+    assert second[-1]["content"] == "did that work?", second[-1]
+
+
+def test_a_reply_tmt_made_up_is_shown_but_never_recorded_as_the_answer():
+    """A stream that died and a reply that could not be read both arrive as a
+    `done` carrying an explanation, because the loop has no other shape to
+    receive one in. It is shown -- the user has to be told -- and it is not
+    written into the session as the model's answer, which used to tell the
+    next turn that the model had said "no JSON object found in response"."""
+    made_up = agent_model._error_reply("HTTP 429 rate limited")
+    drawn, seen, _ = drive_session(
+        ["push it", "did that work?", "quit"],
+        [made_up, json.dumps({"action": "done", "message": "ok"})])
+
+    assert "429" in drawn, drawn                       # shown to the user
+    second = seen[-1]
+    # No assistant turn at all: the model never said this, TMT did. What is
+    # carried is the question, and what became of it, in TMT's own voice.
+    assert [message["role"] for message in second] == ["system", "user", "user"], second
+    carried = second[1]["content"]
+    assert carried.startswith("push it"), carried
+    assert "[That turn ended with no answer" in carried, carried
+    assert "429" in carried, carried
+
+
+def test_an_invalid_entry_in_a_batch_is_handed_back_rather_than_ending_the_turn():
+    """It used to break out of both loops onto a bare `break`: the batch's
+    results were thrown away, the model was told nothing, nothing was printed,
+    and the turn ended where it stood with work done and no word about why.
+    A bad single action has always been handed back to be corrected; a bad
+    batch entry now is too."""
+    batch = json.dumps({"actions": [
+        {"action": "write_file", "path": "a.txt", "content": "one\n"},
+        {"action": "write_file"},                      # no content: invalid
+    ]})
+    drawn, seen, console = drive_session(
+        ["do the thing", "quit"],
+        [batch, json.dumps({"action": "done", "message": "Corrected."})])
+
+    assert "Invalid action in batch" in console.said(), console.said()
+    assert "Corrected." in drawn, drawn
+    # The model was told what was wrong AND what had already run before it.
+    assert len(seen) == 2, len(seen)
+    handed_back = seen[1][-1]["content"]
+    assert handed_back.startswith("INVALID:"), handed_back
+    assert "Ran before it:" in handed_back, handed_back
+    assert "a.txt" in handed_back, handed_back
+
+
 def test_the_question_and_the_answer_reach_the_next_turns_request():
     """The end-to-end claim for the session context, made where it can only
     pass for the right reason: at the messages the model is actually handed.
@@ -693,8 +812,15 @@ def test_the_question_and_the_answer_reach_the_next_turns_request():
     roles = [message["role"] for message in second]
     assert roles == ["system", "user", "assistant", "user"], roles
     assert "Calc.py architecture" in second[1]["content"], second[1]
-    assert second[2]["content"].startswith("Done: 1."), second[2]
     assert second[-1]["content"] == "Now add percentage support.", second[-1]
+    # The carried answer is the JSON action the model speaks in, not the bare
+    # sentence. Every other assistant message in a request is a JSON object,
+    # and dropping loose prose into the same array put an example of the
+    # forbidden shape in front of the model, in its own voice, immediately
+    # before asking it not to use that shape.
+    carried = json.loads(second[2]["content"])
+    assert carried["action"] == "respond", carried
+    assert carried["message"].startswith("Done: 1."), carried
 
     # And the question itself is in the terminal's own scrollback, because the
     # box that collected it is taken down as soon as it is answered.

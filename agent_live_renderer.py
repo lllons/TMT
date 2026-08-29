@@ -195,66 +195,22 @@ class LiveRegion:
         self._drawn = 0
         self._last = None
         self._cursor_hidden = False
-        # corner() -> the escape sequence for the readout in the top right, or
-        # "". It rides along with the repaint rather than being written on a
-        # timer of its own: a region that is painting is already holding the
-        # terminal and already has the caret suppressed, which is exactly the
-        # moment a jump to row one and back is invisible.
-        self._corner = None
-        self._corner_drawn = None
         # The relay worker and the status sink can both reach paint():
         # one interleaved cursor-move sequence would corrupt the region.
         self._paint_lock = threading.RLock()
-
-    def set_corner(self, corner):
-        """Set the callable that supplies the top-right readout, or None."""
-        with self._paint_lock:
-            self._corner = corner
-
-    def _corner_sequence(self):
-        """The readout to draw with this repaint, or "".
-
-        Decoration is never allowed to end a turn, so a corner that raises is
-        one fewer thing on screen.
-        """
-        if self._corner is None:
-            return ""
-        try:
-            return self._corner() or ""
-        except Exception:
-            return ""
 
     def paint(self, lines):
         with self._paint_lock:
             self._paint(lines)
 
     def _paint(self, lines):
-        if not self.ansi:
-            return
-        corner = self._corner_sequence()
-        unchanged = lines == self._last
-        if unchanged and corner == self._corner_drawn:
-            return
-        self._corner_drawn = corner
-        if unchanged:
-            # Only the readout moved. The rows below it have not, so they are
-            # left exactly as they are: repainting rows that did not change is
-            # how the caret gets taken out of the input row for nothing, which
-            # is the whole of what the flicker was. The caret is put back the
-            # way it was found rather than simply shown -- during a turn there
-            # is nothing to type into and it should stay off.
-            if corner:
-                self._write(HIDE_CURSOR + corner
-                            + ("" if self._cursor_hidden else SHOW_CURSOR))
+        if not self.ansi or lines == self._last:
             return
         self._last = list(lines)
         # Hidden inside the same write as the cursor moves it is hiding, so
         # there is no window in which the terminal has been told to move the
-        # caret but not yet told to stop drawing it. The corner goes first,
-        # before anything below can scroll: it restores the caret to an
-        # absolute row, and a line printed in between would move the terminal
-        # out from under that.
-        parts = [HIDE_CURSOR, corner]
+        # caret but not yet told to stop drawing it.
+        parts = [HIDE_CURSOR]
         if self._drawn:
             parts.append("\033[%dA" % self._drawn)
         for line in lines:
@@ -284,7 +240,7 @@ class LiveRegion:
             self._cursor_hidden = False
             self._write(SHOW_CURSOR)
 
-    def write_above(self, text):
+    def write_above(self, text, lines=None):
         """Print permanent text above the region, leaving the region below it.
 
         This is how anything that must outlive the turn reaches the terminal
@@ -299,13 +255,23 @@ class LiveRegion:
         put the next repaint on the wrong rows. That was the bug that made
         earlier versions of this frame march down the screen.
 
+        `lines` is the region as it should stand AFTER the text has been
+        printed, for a caller whose frame depends on how much has been printed
+        -- which is every caller holding blank rows against the foot of the
+        window. Repainting the frame that was on screen before instead put the
+        same number of rows back one row lower for each row printed, so the
+        region crossed the bottom of the window and the terminal scrolled; the
+        next composed repaint was then shorter and the whole block jumped up
+        by exactly the rows that had been given up. That is what made the
+        prompt box drift off the foot after a turn or two.
+
         Takes the paint lock, so the relay worker cannot interleave a repaint
         into the middle of the sequence.
         """
         if not text:
             return True
         with self._paint_lock:
-            held = self._last
+            held = self._last if lines is None else list(lines)
             # Erased without giving the caret back: the region is about to be
             # painted again three lines further down, and showing the caret
             # for the length of one print only puts the flicker back.
@@ -417,8 +383,26 @@ class LiveRelay:
         the user keeps goes through here into the terminal's own scrollback,
         while the status row and the response box below stay temporary and
         keep being repainted in place.
+
+        The region is handed a frame composed AFTER the print rather than
+        being left to repaint the one that was on screen before it. The caller
+        spends a blank row from the pad for every row it prints, so the frame
+        that belongs under this text is shorter than the frame that was above
+        it -- and repainting the taller one pushed the region past the foot of
+        the window, scrolled, and then jumped it up again on the next compose.
+        Composed outside the region's lock, so the two locks are never held in
+        opposite orders.
         """
-        return self.region.write_above(text)
+        return self.region.write_above(text, self._frame_now())
+
+    def _frame_now(self):
+        """The region as it should stand right now, or None if it has none."""
+        if self._closed:
+            return None
+        with self._lock:
+            status = self._status
+            body = self.glitch.display_text() if self.streamed else ""
+        return self._compose(status, body) or None
 
     def feed(self, text):
         """Relay newly received model text. Returns immediately."""

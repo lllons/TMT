@@ -526,7 +526,9 @@ def meter_session(added=1231, removed=123, sent=15400, back=30120, exact=True):
     import agent_session
     session = agent_session.Session(workspace="C:\\project")
     session.lines_added, session.lines_removed = added, removed
-    session.tokens_in, session.tokens_out = sent, back
+    # The settled total, not the display property: `tokens_out` now adds an
+    # estimate of the reply still arriving, and has no setter.
+    session.tokens_in, session._tokens_out = sent, back
     session.tokens_out_exact = exact
     return session
 
@@ -585,41 +587,46 @@ def test_the_corner_meter_gives_up_words_before_it_gives_up_figures():
     assert menu().meter_text(session, Console(), columns=6) == ""
 
 
-def test_the_corner_meter_is_drawn_where_the_scrolling_cannot_reach_it():
-    """Row one is kept out of the terminal's scrolling region, so the readout
-    sits still while everything else moves under it. Without that it would be
-    stamped over whatever was at the top of the window and then scrolled into
-    the history as wreckage, and the history is the surface this project will
-    not spoil.
+def test_the_meter_rides_on_the_caption_and_nothing_narrows_the_scrolling():
+    """The meter was briefly pinned to row one, held there by narrowing the
+    terminal's scrolling region to rows two and below. That worked, and the
+    cost was the whole session: lines scrolled out of a narrowed region are
+    discarded rather than pushed into the terminal's scrollback, so the
+    history stopped accumulating, scrolling up no longer reached it, and the
+    box jumped about when it was scrolled back down.
 
-    The sequence saves the cursor, clears row one, writes against the right
-    edge and puts the cursor back -- as one string, because a restore is to an
-    absolute row and a line printed in between would move the terminal out
-    from under it."""
-    text = menu().meter_text(meter_session(), Console(), columns=100)
-    sequence = menu().meter_sequence(text, Console(), size=(100, 40))
-    assert sequence.startswith("\0337") and sequence.endswith("\0338"), repr(sequence)
-    assert "\033[1;1H\033[2K" in sequence, repr(sequence)
-    # Against the right edge, ending on the last column TMT draws to -- the
-    # spare one is left, as everywhere else, because a row filled to the last
-    # column wraps on the terminals that auto-wrap.
-    column = int(re.search(r"\033\[1;(\d+)H(?!\033\[2K)", sequence).group(1))
-    assert column + menu().visible_width(text) - 1 == 99, (column, text)
-    assert column > 1, "the readout is in the corner, not against the left edge"
-    assert menu().meter_sequence("", Console()) == ""
+    TMT's permanent surface IS that scrollback -- it is the only record a
+    finished session leaves -- so nothing may be bought with it. The readout
+    lives on the caption instead: in the flow, redrawn with the box, costing
+    nothing.
 
-    screen = Terminal()
-    assert menu().reserve_top_row(screen, size=(100, 40)) is True
-    assert screen.getvalue() == "\033[2;40r\033[2;1H", repr(screen.getvalue())
-    back = Terminal()
-    assert menu().release_top_row(back) is True
-    assert back.getvalue() == "\033[r", repr(back.getvalue())
+    This test is the guard. `\\033[...r` is DECSTBM; it must not appear."""
+    caption = visible(menu().prompt_caption(
+        Console(), 100, datetime.datetime(2026, 8, 29, 15, 42, 7),
+        provider_id="openrouter", model_id="z-ai/glm-5.2:free",
+        session=meter_session()))
+    assert "+1231" in caption and "-123" in caption, caption   # the meter, left
+    assert "15:42:07" in caption and "GLM 5.2" in caption, caption  # facts, right
+    assert caption.index("+1231") < caption.index("15:42:07"), caption
+    assert menu().display_width(caption) == 100, menu().display_width(caption)
 
-    # A window too short to spare a row keeps all of them, and a pipe has no
-    # scrolling region to set.
-    assert menu().reserve_top_row(Terminal(), size=(100, 4)) is False
-    assert menu().reserve_top_row(Console(tty=False), size=(100, 40)) is False
-    assert menu().release_top_row(Console(tty=False)) is False
+    # Without a session there is no meter and the row is unchanged.
+    bare = visible(menu().prompt_caption(Console(), 100,
+                                         datetime.datetime(2026, 8, 29, 15, 42, 7),
+                                         provider_id="openrouter",
+                                         model_id="z-ai/glm-5.2:free"))
+    assert "+1231" not in bare, bare
+    assert bare.strip().startswith("15:42:07"), bare
+
+    # And nothing anywhere sets a scrolling region or leaves one to be reset.
+    install = Path(menu().__file__).resolve().parent
+    for module in ("agent_menu.py", "agent_live_renderer.py", "agent_ui.py",
+                   "TMT.py"):
+        for line in (install / module).read_text(encoding="utf-8").splitlines():
+            if line.lstrip().startswith("#") or "DECSTBM" in line:
+                continue          # the note explaining why, not an escape
+            assert "reserve_top_row" not in line, (module, line)
+            assert not re.search(r"\\033\[[^\"']*r[\"']", line), (module, line)
 
 
 def test_the_header_is_one_component_and_draws_no_rule_of_its_own():
@@ -802,7 +809,7 @@ def test_the_prompt_box_is_at_the_foot_of_the_window_from_the_first_frame():
     reserved row, the header, the blank line the box writes and the box itself
     is pad."""
     rows, header = 30, 3
-    used = menu()._TOP_ROW_RESERVED + header
+    used = header
     pad = menu().opening_pad(used, Terminal(), size=(80, rows))
     # The last row is not part of the box: a region is painted by writing each
     # row and a newline, so the cursor ends one below it.
@@ -1018,10 +1025,17 @@ def test_the_running_box_says_what_is_happening_and_carries_no_caption():
     caption in the scrollback above, so a second one here would be the same
     fact twice, moving under the reply as it arrives."""
     import agent_ui
-    box = menu().PromptBox(stream=Console())
+    # With a pad, deliberately: the relay pads its own region as a whole, so
+    # a lead here would be counted twice and push the box off the bottom. A
+    # box with no pad cannot show that, and this test passed for that reason
+    # while `_frame` was quietly ignoring the argument that suppresses it.
+    box = menu().PromptBox(stream=Console(), pad=menu().BottomPad(12))
     rows = [visible(line) for line in box.running_lines(agent_ui.RUNNING_HINT,
                                                         size=(80, 24))]
     assert len(rows) == 3, rows                    # a rule, the line, a rule
+    # And the box it asks for itself does get the blank rows.
+    padded = box.lines(editor(SUGGESTION), size=(80, 24))
+    assert len(padded) == 12 + menu().PROMPT_HEIGHT, len(padded)
     assert rows[0] == rows[2], rows
     assert rows[1].strip() == "> " + agent_ui.RUNNING_HINT, rows[1]
     # No clock, so nothing here ticks under the reply.

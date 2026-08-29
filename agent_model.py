@@ -400,13 +400,64 @@ class StreamingActionParser:
         if self._emitting:
             self._text.append(value)
 
+# A reply that arrived as prose is shown at this length and no further. Long
+# enough for the summary such a reply almost always is, short enough that a
+# model which started writing an essay does not fill the screen with it.
+PROSE_REPLY_LIMIT = 2000
+
+
+def _prose_reply(full):
+    """A plain-language reply, passed through as the answer.
+
+    The model was asked for JSON and wrote a sentence instead. The work it
+    describes has usually already happened -- the actions ran on earlier turns
+    of the loop -- so the sentence is the summary of that work, and replacing
+    it with "no JSON object found in response" told the user nothing at all
+    about a task that had in fact been done.
+
+    Nothing here is invented: the text shown is the model's own, trimmed and
+    marked when it had to be trimmed. It is still a `done`, so the turn ends
+    exactly where it ended before.
+    """
+    text = " ".join(str(full).split())
+    if len(text) > PROSE_REPLY_LIMIT:
+        text = text[:PROSE_REPLY_LIMIT].rstrip() + " […]"
+    return json.dumps({"action": "done", "message": text})
+
+
+# Marks an action object this module made up rather than one the model sent.
+#
+# Every failure here has to come back as a valid action, because the agent loop
+# has no other shape to receive one in -- so a stream that died and a reply
+# that could not be read both arrive as a `done` carrying an explanation. That
+# is right for the screen and wrong for the record: the sentence in it is a
+# machine's report of a failure, not the model's account of the work, and
+# writing it into the session as the assistant's answer told the NEXT turn
+# that the model had said "no JSON object found in response". This key is how
+# the loop tells the two apart. It is stripped before anything is sent.
+SYNTHETIC_KEY = "tmt_synthetic"
+
+
+def is_synthetic(obj):
+    """Whether an action object was made up here rather than sent by a model."""
+    return bool(isinstance(obj, dict) and obj.get(SYNTHETIC_KEY))
+
+
+def _made_up(message):
+    """A `done` carrying an explanation, marked as not the model's words."""
+    return json.dumps({"action": "done", "message": message, SYNTHETIC_KEY: True})
+
+
 def _extract_json(full):
     """Pull the first balanced JSON object out of a complete model reply."""
     if not full:
-        return '{"action":"done","message":"empty response from model"}'
+        return _made_up("empty response from model")
     start = full.find("{")
     if start == -1:
-        return '{"action":"done","message":"no JSON object found in response"}'
+        # Prose, not a failure: the model wrote a sentence instead of JSON,
+        # and that sentence is its own answer rather than a report about it.
+        return _prose_reply(full) if full.strip() else \
+            _made_up("no JSON object found in response")
     depth = 0
     for index, char in enumerate(full[start:]):
         if char == "{":
@@ -415,10 +466,15 @@ def _extract_json(full):
             depth -= 1
             if depth == 0:
                 return clean_model_json(full[start:start + index + 1])
-    return '{"action":"done","message":"invalid JSON structure"}'
+    return _made_up("invalid JSON structure")
 
 def _error_reply(message):
-    return json.dumps({"action": "done", "message": f"OpenRouter error — {message}"})
+    # The provider that actually failed, asked at the moment it failed. It
+    # used to say "OpenRouter" whichever of the four had been called, which is
+    # a false statement about where an error came from.
+    provider = selected_provider()[0]
+    label = getattr(provider, "label", "") or "The provider"
+    return _made_up(f"{label} error — {message}")
 
 def _ask_model_streaming(messages, on_event):
     """Consume the reply as a stream, reporting events as they arrive.
@@ -503,7 +559,7 @@ def ask_model(messages, on_event=None):
     try:
         full = data["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError, TypeError):
-        return json.dumps({"action": "done", "message": f"Unexpected response shape: {str(data)[:300]}"})
+        return _made_up(f"Unexpected response shape: {str(data)[:300]}")
     if on_event:
         # A blocking reply is generated output too, and it always carries the
         # provider's own usage record, so it needs no estimating.

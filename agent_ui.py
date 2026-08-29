@@ -492,6 +492,13 @@ class LiveUI:
         if self._sink is not None:
             self._sink(painted)
             return
+        # The escape goes to a stream that may not be a terminal. That is
+        # deliberate rather than overlooked: this path is what a LiveUI with no
+        # sink attached does, and the tests around it exist precisely to pin
+        # down what happens "wherever no cursor could overwrite". A session
+        # never takes it -- the loop attaches the relay's sink before the first
+        # request -- so the row a pipe sees comes from LiveRegion, which does
+        # check. Suppressing it here silences the case the tests are about.
         safe_write(self.stream, "\r\033[2K" + painted)
 
     def _render_progress(self, label, estimate="calculating..."):
@@ -603,7 +610,17 @@ _EVENT_STYLE = {
 
 PROMINENCE = {kind: _EVENT_STYLE[kind]["level"] for kind in EVENT_KINDS}
 
-MAX_SUGGESTION_WORDS = 5
+# Two numbers, and the gap between them is deliberate.
+#
+# TARGET is what the prompt asks the model for and what every example in it
+# obeys: four words. MAX is what the code lets through: six. Models kept
+# overshooting a single stated limit, and a limit that is also the truncation
+# point means every overshoot is cut mid-phrase -- "Run the integration tests
+# for" reads worse than the five-word line it was. So the ask is strict and
+# the ceiling above it is slack: aim at four, and a five or a six arrives
+# whole rather than beheaded. Seven is where it stops being a hint.
+TARGET_SUGGESTION_WORDS = 4
+MAX_SUGGESTION_WORDS = 6
 
 # Used only when the model gave no usable suggestion and the history says
 # nothing more specific. Each is true of any turn, so none of them can claim
@@ -615,7 +632,7 @@ FALLBACK_SUGGESTIONS = ("Review the changes", "Run the tests", "Continue working
 # box, never assigned to the buffer, and gone on the first character typed.
 # Measured by the same rule as the rest -- five words at most -- so the
 # opening line and every line after it read as the same kind of thing.
-OPENING_SUGGESTION = "Describe a task to start"
+OPENING_SUGGESTION = "Describe your first task"
 
 # Drawn in the box while the turn it asked for is running. The box is on
 # screen then -- pinned above the status row at the foot of the window -- but

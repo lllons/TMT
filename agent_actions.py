@@ -347,12 +347,16 @@ def action_event(action, obj, result):
         # An append adds and removes nothing, so both halves are known.
         detail["added"], detail["removed"] = _line_count(obj.get("content", "")), 0
     elif action == "write_file":
-        # A write replaces whatever was there, and by the time this runs the
-        # old content is gone, so how many lines it removed is not knowable.
-        # Only the part that is certain gets reported: "+3 -0" on a write that
-        # flattened a hundred-line file would be a confident falsehood.
+        # Two cases, and only the action's own report can tell them apart.
+        # A write over an existing file replaces content that was gone before
+        # anyone could count it, so only what was written is ever claimed:
+        # "+3 -0" on a write that flattened a hundred-line file would be a
+        # confident falsehood. A write to a path that did not exist removed
+        # nothing, and that "nothing" is a measurement rather than a guess.
         lines = _line_count(obj.get("content", ""))
-        if lines:
+        if text.startswith("Created file:"):
+            detail["added"], detail["removed"] = lines, 0
+        elif lines:
             detail["lines"] = lines
     elif action == "patch_file":
         detail["added"] = _line_count(obj.get("replace", ""))
@@ -367,6 +371,14 @@ def action_event(action, obj, result):
         files = obj.get("files")
         if isinstance(files, list):
             detail["files"] = len(files)
+            # Both halves only when every one of them was a creation, which is
+            # the batch's own report. One overwrite among them and the removed
+            # count is unknowable for the batch as a whole, so it is not given.
+            reports = [line for line in text.splitlines() if line.strip()]
+            if reports and all(line.startswith("Created file:") for line in reports):
+                detail["added"] = sum(_line_count(entry.get("content", ""))
+                                      for entry in files if isinstance(entry, dict))
+                detail["removed"] = 0
 
     # Which files the action named. Recorded, not drawn: the transcript's
     # second row reports only counts, and the description above already says

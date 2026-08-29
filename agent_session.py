@@ -27,6 +27,8 @@ be rebuilt or thrown away: no provider's request format ever gets to be the
 place the conversation is stored.
 """
 
+import json
+
 import agent_config
 import agent_models
 from agent_ui import CHARS_PER_TOKEN
@@ -63,6 +65,16 @@ _TRUNCATION_NOTE = "\n[...answer truncated for context.]"
 # described -- the same rule the transcript works under.
 _FILE_KINDS = ("file_create", "file_edit", "file_delete")
 
+# And the kinds whose own message is the fact. A commit and a push say what
+# they did in one line -- "Committed 6f0a4f5 on main" -- and say it nowhere
+# else: they touch no file that `_FILE_KINDS` would catch, so a turn that only
+# used git carried nothing at all into the next question.
+_MILESTONE_KINDS = ("milestone",)
+
+# How much of a milestone's own sentence is kept. It is one line by
+# construction; the cap is only so a long one cannot crowd out the answer.
+MAX_FACT_CHARS = 120
+
 
 def estimate_tokens(text):
     """A token estimate for a block of text, and it is only an estimate.
@@ -77,57 +89,91 @@ def estimate_tokens(text):
 
 
 class Turn:
-    """One question and the answer it got.
+    """One question and what came of it.
 
-    `facts` is what the turn measurably did -- the files it changed -- taken
-    from the events the turn actually emitted. It is carried with the answer
-    because "now add percentage support" is a sentence about a file, and the
-    file is the part the answer most often leaves out.
+    `facts` is what the turn measurably did -- the files it changed and the
+    milestones it reached -- taken from the events the turn actually emitted.
+    It is carried with the answer because "now add percentage support" is a
+    sentence about a file, and the file is the part the answer most often
+    leaves out; and because a turn that committed and pushed says so nowhere
+    else once its answer text has been read.
+
+    `outcome` is why there is no answer, for a turn that did not produce one.
+    Such a turn is still recorded: the question was asked, and dropping it
+    left the next question with no idea the exchange had happened, which is
+    the whole of what "it has no context" looked like from the outside.
     """
 
-    __slots__ = ("task", "answer", "facts")
+    __slots__ = ("task", "answer", "facts", "outcome")
 
-    def __init__(self, task, answer="", facts=()):
+    def __init__(self, task, answer="", facts=(), outcome=""):
         self.task = str(task or "")
         self.answer = str(answer or "")
         self.facts = tuple(facts)
+        self.outcome = str(outcome or "")
 
     def messages(self):
-        """The turn as TMT's own provider-independent message pair."""
+        """The turn as TMT's own provider-independent messages.
+
+        The answer is carried as the JSON action the model speaks in, not as
+        the bare sentence. Every other assistant message in a request is a
+        JSON object -- that is the whole of what the system prompt demands --
+        and dropping loose prose into the same array put examples of the
+        forbidden shape in front of the model, in its own voice, immediately
+        before asking it not to use that shape. The words are the model's own
+        either way; only the wrapper is restored.
+        """
         out = []
-        if self.task:
-            out.append({"role": "user", "content": self.task})
-        content = self.answer
-        if self.facts:
-            note = "Files changed in that turn: " + ", ".join(self.facts)
-            content = (content + "\n\n" + note) if content else note
-        if content:
-            out.append({"role": "assistant", "content": content})
+        task = self.task
+        if self.outcome:
+            # Said by TMT rather than by the model, because it is TMT's report
+            # of what happened to the turn. It rides on the question so the
+            # roles still alternate, which some providers require.
+            task = (task + "\n\n[That turn ended with no answer: %s]" % self.outcome).strip()
+        if task:
+            out.append({"role": "user", "content": task})
+        if self.answer:
+            message = self.answer
+            if self.facts:
+                message += "\n\nIn that turn: " + ", ".join(self.facts)
+            out.append({"role": "assistant",
+                        "content": json.dumps({"action": "respond",
+                                               "message": message})})
         return out
 
     def size(self):
         return sum(estimate_tokens(message["content"]) for message in self.messages())
 
     def __repr__(self):
-        return "Turn(task=%r, answer=%r)" % (self.task[:40], self.answer[:40])
+        return "Turn(task=%r, answer=%r, outcome=%r)" % (
+            self.task[:40], self.answer[:40], self.outcome)
 
 
 def files_touched(history):
-    """The files a turn changed, in order, each named once.
+    """What a turn measurably did, in order, each stated once.
 
-    Read off the history's own events. An event that does not name a file
-    contributes nothing rather than a guess, and a turn that changed no files
-    reports none rather than an empty-looking zero.
+    Read off the history's own events, so it is the same set of facts the
+    transcript printed rather than a second account of them. A file event
+    contributes the path it named; a milestone contributes its own sentence,
+    which is where a commit and a push are recorded. An event that carries
+    neither contributes nothing rather than a guess, and a turn that did
+    neither reports nothing rather than an empty-looking zero.
     """
     seen, out = set(), []
+
+    def keep(value):
+        value = " ".join(str(value or "").split())[:MAX_FACT_CHARS]
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+
     for event in (history or ()):
-        if getattr(event, "kind", "") not in _FILE_KINDS:
-            continue
-        for name in (getattr(event, "detail", None) or {}).get("paths") or ():
-            name = str(name)
-            if name and name not in seen:
-                seen.add(name)
-                out.append(name)
+        kind = getattr(event, "kind", "")
+        if kind in _FILE_KINDS:
+            for name in (getattr(event, "detail", None) or {}).get("paths") or ():
+                keep(name)
+        elif kind in _MILESTONE_KINDS:
+            keep(getattr(event, "message", ""))
     return tuple(out)
 
 
@@ -152,8 +198,14 @@ class Session:
         self.lines_added = 0
         self.lines_removed = 0
         self.tokens_in = 0
-        self.tokens_out = 0
+        self._tokens_out = 0
         self.tokens_out_exact = True
+        # Characters generated by the request in flight, before the provider
+        # has said how many tokens they were. The readout has to move while
+        # the reply is arriving rather than jumping at the end of it, so what
+        # is on screen is this estimate until the real figure lands and
+        # replaces it.
+        self._streaming_chars = 0
 
     # --- what the next request runs under ---------------------------------
 
@@ -247,13 +299,21 @@ class Session:
         messages.append({"role": "user", "content": str(task)})
         return messages, len(messages)
 
-    def record(self, task, answer, history=None):
-        """Append a finished turn. Called once, when the answer is known.
+    def record(self, task, answer="", history=None, outcome=""):
+        """Append a finished turn. Called once, however the turn ended.
 
-        The answer is stored as the model wrote it, capped at
-        MAX_ANSWER_CHARS and saying so when it had to be cut. A cap that
-        silently truncated would carry a sentence forward with its meaning
-        changed by where it stopped.
+        Every turn is recorded, including one that produced no answer. It used
+        to take an answer to be recorded at all, which meant a stream failure,
+        a circuit break, an unreadable reply or a turn that ran out of steps
+        dropped the user's question with it -- and the next question then
+        arrived with no sign the exchange had ever happened. That is precisely
+        what "it has no context between prompts" looked like from outside.
+        `outcome` is what to say instead, and it is stated rather than glossed.
+
+        The answer is stored as the model wrote it, capped at MAX_ANSWER_CHARS
+        and saying so when it had to be cut. A cap that silently truncated
+        would carry a sentence forward with its meaning changed by where it
+        stopped.
         """
         task = str(task or "").strip()
         if not task:
@@ -261,7 +321,7 @@ class Session:
         answer = str(answer or "").strip()
         if len(answer) > MAX_ANSWER_CHARS:
             answer = answer[:MAX_ANSWER_CHARS].rstrip() + _TRUNCATION_NOTE
-        turn = Turn(task, answer, files_touched(history))
+        turn = Turn(task, answer, files_touched(history), outcome)
         self._turns.append(turn)
         return turn
 
@@ -304,6 +364,37 @@ class Session:
             estimate_tokens(str(message.get("content", "")))
             for message in (messages or ()) if isinstance(message, dict))
 
+    @property
+    def tokens_out(self):
+        """What has been generated, including the reply still arriving.
+
+        The settled total plus an estimate of the request in flight, so the
+        readout climbs while the reply streams instead of standing still and
+        then jumping when the turn ends. The estimate is replaced by the
+        provider's own figure the moment `record_reply` is called, and the
+        readout is marked as an estimate for as long as one is in it.
+        """
+        return self._tokens_out + estimate_tokens("x" * self._streaming_chars)
+
+    @property
+    def streaming(self):
+        """Whether part of the token total is still an estimate in flight."""
+        return bool(self._streaming_chars)
+
+    @property
+    def tokens_settled(self):
+        """Only what has actually been accounted for. For tests, not display."""
+        return self._tokens_out
+
+    def note_output(self, characters):
+        """More characters have arrived from the request in flight.
+
+        Counted the way LiveUI counts them -- incrementally, across the whole
+        turn -- so the two readouts on screen never disagree about how much
+        has been generated.
+        """
+        self._streaming_chars += max(0, int(characters or 0))
+
     def record_reply(self, text, tokens=None):
         """Add what a reply cost, exactly when the provider said so.
 
@@ -311,11 +402,15 @@ class Session:
         gives one it supersedes any estimate; when it does not, the reply's
         length is the only thing there is, and the whole readout drops to
         being labelled an estimate rather than quietly mixing the two.
+
+        Either way the streaming estimate is cleared, because whatever it was
+        standing in for has now been counted properly.
         """
+        self._streaming_chars = 0
         if isinstance(tokens, int) and tokens >= 0:
-            self.tokens_out += tokens
+            self._tokens_out += tokens
         else:
-            self.tokens_out += estimate_tokens(text)
+            self._tokens_out += estimate_tokens(text)
             self.tokens_out_exact = False
 
     def clear(self):

@@ -226,47 +226,6 @@ def test_permanent_text_printed_past_the_region_keeps_the_caret_hidden():
     assert "\033[?25h" not in written, repr(written)
 
 
-def test_the_corner_rides_along_with_the_repaint_and_never_repaints_alone():
-    """The readout in the top right is written by whoever is already holding
-    the terminal, because a region that is painting has the caret suppressed
-    already -- which is the one moment a jump to row one and back is
-    invisible. It goes at the front of the write, before anything below can
-    scroll: the restore is to an absolute row, and a line printed in between
-    would move the terminal out from under it.
-
-    And when only the readout has changed, the rows below it are left exactly
-    as they are. Repainting rows that did not change is how the caret gets
-    taken out of the input row for nothing."""
-    corner = {"text": "\0337<corner one>\0338"}
-    output = io.StringIO()
-    region = LiveRegion(stream=output, ansi=True)
-    region.set_corner(lambda: corner["text"])
-    region.paint(["one", "two"])
-    first = output.getvalue()
-    assert first.startswith(HIDE := "\033[?25l"), repr(first[:20])
-    assert first.index("<corner one>") < first.index("one"), repr(first)
-
-    # Same rows, same readout: nothing at all.
-    output.truncate(0), output.seek(0)
-    region.paint(["one", "two"])
-    assert output.getvalue() == "", repr(output.getvalue())
-
-    # Same rows, new readout: the readout and nothing else.
-    output.truncate(0), output.seek(0)
-    corner["text"] = "\0337<corner two>\0338"
-    region.paint(["one", "two"])
-    written = output.getvalue()
-    assert "<corner two>" in written, repr(written)
-    assert "one" not in written and "\033[2A" not in written, repr(written)
-
-    # A corner that fails is one fewer thing on screen, not a turn that ended.
-    def broken():
-        raise RuntimeError("no terminal")
-    region.set_corner(broken)
-    region.paint(["three"])
-    assert "three" in output.getvalue()
-
-
 def test_region_shrinks_cleanly():
     output = io.StringIO()
     region = LiveRegion(stream=output, ansi=True)

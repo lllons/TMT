@@ -449,16 +449,37 @@ def test_the_history_cannot_be_rewritten_through_what_it_hands_out():
     assert len(history) == 1, history.events
 
 
-def test_a_suggestion_over_five_words_is_refused_and_still_usable():
-    """Five words is a hard limit, but a refusal cannot leave the caller with
-    nothing: the trimmed form is still relevant to the turn, which a generic
-    fallback would not be."""
-    assert agent_ui.validate_suggestion("Run the integration tests")[0]
-    assert agent_ui.validate_suggestion("Review changed files")[0]
-    ok, cleaned, reason = agent_ui.validate_suggestion("Please run the integration tests now")
+def test_the_ask_is_four_words_and_the_ceiling_above_it_is_slack():
+    """Two numbers, and the gap between them is the point.
+
+    The prompt asks for four and every example in it obeys that. The code lets
+    six through. A single limit that was also the truncation point meant every
+    overshoot came out cut mid-phrase, and "Run the integration tests for"
+    reads worse than the five-word line it was. So: aim at four, let a five or
+    a six arrive whole, and cut only at seven, where it has stopped being a
+    hint at all.
+
+    A refusal still cannot leave the caller with nothing -- the trimmed form
+    is relevant to the turn, which a generic fallback would not be."""
+    assert agent_ui.TARGET_SUGGESTION_WORDS == 4
+    assert agent_ui.MAX_SUGGESTION_WORDS == 6
+    assert agent_ui.TARGET_SUGGESTION_WORDS < agent_ui.MAX_SUGGESTION_WORDS
+
+    for good in ("Run the tests", "Run the integration tests", "Review changed files",
+                 "Please run the integration tests"):
+        assert agent_ui.validate_suggestion(good)[0], good
+
+    ok, cleaned, reason = agent_ui.validate_suggestion(
+        "Please run the integration tests now and report back")
     assert not ok and reason
     assert agent_ui.count_words(cleaned) <= agent_ui.MAX_SUGGESTION_WORDS, cleaned
     assert cleaned, "a refused suggestion must still leave something showable"
+
+    # Every line TMT itself offers obeys the ask, not merely the ceiling: the
+    # opening placeholder and every fallback.
+    for line in (agent_ui.OPENING_SUGGESTION,) + agent_ui.FALLBACK_SUGGESTIONS:
+        assert agent_ui.count_words(line) <= agent_ui.TARGET_SUGGESTION_WORDS, line
+        assert agent_ui.validate_suggestion(line)[0], line
 
 
 def test_words_are_counted_the_way_a_reader_counts_them():

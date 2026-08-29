@@ -6,6 +6,7 @@ import threading
 
 import agent_model
 import agent_prompt
+import agent_ui
 from TMT import stream_handler
 from agent_live_renderer import LiveRelay
 from agent_model import StreamingActionParser, StreamError, ask_model
@@ -644,7 +645,11 @@ def test_the_system_prompt_teaches_progress_events_and_next_step():
     assert "PUBLIC" in rules
     assert "NOT your private reasoning" in rules
     assert "chain-of-thought" in rules
-    assert "FIVE words" in rules
+    # Four is the ask, stated as a number and again as a count the model
+    # can check its own line against.
+    assert "FOUR WORDS" in rules
+    assert "Not five" in rules
+    assert "Count them" in rules
     assert "Do not put one on every action" in rules
     assert "Never put a credential" in rules
     assert "never treated as their next message" in rules
@@ -672,7 +677,10 @@ def test_every_new_field_example_in_the_prompt_is_valid_and_obeys_its_own_rules(
                 assert event["message"], line
             if "next_step" in entry:
                 assert entry["action"] in ("done", "respond"), line
-                assert len(entry["next_step"].split()) <= 5, line
+                # Four is the ask, and the prompt's own examples are
+                # where a model would otherwise learn that five is fine.
+                assert agent_ui.count_words(entry["next_step"]) <= (
+                    agent_ui.TARGET_SUGGESTION_WORDS), line
     assert examples >= 6, examples
     assert all(count >= 2 for count in carrying.values()), carrying
 
@@ -690,3 +698,138 @@ def test_the_prompt_still_carries_the_rules_that_came_before():
     assert "Never tell the user to run git config" in rules
     assert "Every task ends with a respond action" in rules
     assert "Output EXACTLY ONE JSON object and nothing else" in rules
+
+
+# --- a reply TMT had to make up, and one the model wrote in prose ------------
+#
+# Every failure in agent_model has to come back as a valid action, because the
+# agent loop has no other shape to receive one in. That is right for the screen
+# and wrong for the record: the sentence in such a reply is a machine's report
+# about a failure, not the model's account of the work, and it used to be
+# written into the session as the assistant's answer -- so the NEXT turn was
+# told the model had said "no JSON object found in response".
+
+def test_a_reply_tmt_made_up_says_so_and_is_still_a_usable_action():
+    """The loop has to be able to act on it and the session has to be able to
+    tell it apart. Both, from the same object."""
+    for raw in (agent_model._extract_json(""),
+                agent_model._extract_json("   "),
+                agent_model._extract_json('{"action":"done"'),
+                agent_model._error_reply("HTTP 429 rate limited")):
+        obj = json.loads(raw)
+        assert obj["action"] == "done", obj
+        assert obj["message"], obj
+        assert agent_model.is_synthetic(obj), obj
+        assert agent_prompt.validate_action(obj) is None, obj
+
+    # A reply the model actually sent is not marked, whatever it says.
+    real = json.loads(agent_model._extract_json('{"action":"done","message":"ok"}'))
+    assert agent_model.is_synthetic(real) is False, real
+    assert agent_model.is_synthetic(None) is False
+    assert agent_model.is_synthetic("done") is False
+
+
+def test_prose_where_json_was_asked_for_is_shown_as_the_answer():
+    """The model wrote a sentence instead of JSON. The work it describes has
+    usually already happened -- the actions ran on earlier rounds of the loop
+    -- so the sentence is the summary of that work. Replacing it with "no JSON
+    object found in response" told the user nothing at all about a task that
+    had in fact been done, and then carried that non-answer into the next
+    turn as though the model had said it."""
+    reply = "I committed the change and pushed it to main."
+    obj = json.loads(agent_model._extract_json(reply))
+    assert obj["action"] == "done"
+    assert obj["message"] == reply, obj
+    # The model's own words, so not marked as something TMT made up.
+    assert agent_model.is_synthetic(obj) is False, obj
+
+    # Long prose is cut, and says it was cut rather than just stopping.
+    long_reply = "word " * 2000
+    cut = json.loads(agent_model._extract_json(long_reply))["message"]
+    assert len(cut) <= agent_model.PROSE_REPLY_LIMIT + 8, len(cut)
+    assert cut.endswith("[…]"), cut[-20:]
+
+    # Prose wrapped around a JSON object is still the JSON object.
+    mixed = json.loads(agent_model._extract_json(
+        'Sure! {"action":"done","message":"ok"} hope that helps'))
+    assert mixed == {"action": "done", "message": "ok"}, mixed
+
+
+def test_an_error_reply_names_the_provider_that_actually_failed():
+    """It said "OpenRouter" whichever of the four had been called, which is a
+    false statement about where an error came from."""
+    import agent_credentials, os as _os
+    previous = _os.environ.get("TMT_PROVIDER")
+    try:
+        for provider_id, label in (("anthropic", "Anthropic"), ("gemini", "Gemini")):
+            _os.environ["TMT_PROVIDER"] = provider_id
+            agent_credentials.credential = lambda pid: "test-key"
+            message = json.loads(agent_model._error_reply("HTTP 500"))["message"]
+            assert message.startswith(label), (provider_id, message)
+            assert "HTTP 500" in message, message
+    finally:
+        _os.environ.pop("TMT_PROVIDER", None)
+        if previous is not None:
+            _os.environ["TMT_PROVIDER"] = previous
+
+
+def test_every_worked_example_is_exactly_what_the_model_should_emit():
+    """The worked examples are the prompt's main teaching device: a model that
+    reads nothing else copies the shape of the nearest one. So each has to be
+    valid JSON, a valid action, and obey every rule the prompt states
+    elsewhere -- an example that broke a rule would teach breaking it.
+
+    The BAD lines are excluded by construction: they are the ones that are not
+    valid, which is the point of them."""
+    lines = [line.strip() for line in agent_prompt.ANSWERING_EXAMPLES.splitlines()]
+    examples = [line[len("You emit:"):].strip() for line in lines
+                if line.startswith("You emit:")]
+    assert len(examples) >= 12, len(examples)
+
+    respond_seen = 0
+    for line in examples:
+        obj = json.loads(line)                    # an unparseable example is broken
+        entries = obj.get("actions", [obj])
+        assert entries, line
+        for entry in entries:
+            assert agent_prompt.validate_action(entry) is None, line
+            if "next_step" in entry:
+                assert entry["action"] in ("done", "respond"), line
+                # The prompt asks for four words; its own examples must not be
+                # the place a model learns that five is fine.
+                assert agent_ui.count_words(entry["next_step"]) <= \
+                    agent_ui.TARGET_SUGGESTION_WORDS, line
+                assert not entry["next_step"].rstrip().endswith((".", "?", "!")), line
+            for event in entry.get("events", []):
+                assert event["type"] in agent_prompt.EVENT_TYPES, line
+        if entries[-1]["action"] in ("done", "respond"):
+            respond_seen += 1
+        # A batch that does work must finish it, exactly as the rules say.
+        if len(entries) > 1:
+            assert entries[-1]["action"] in ("done", "respond"), line
+    assert respond_seen >= 8, respond_seen
+
+
+def test_the_prompt_says_plainly_that_prose_reaches_nobody():
+    """The header used to open with "You chat naturally with the user", which
+    is exactly what a capable model then did -- it read a licence to answer in
+    prose and took it. Conversation happens INSIDE the message field; that has
+    to be the first thing the prompt establishes, not a rule buried at nine."""
+    rules = prompt_rules()
+    assert "chat naturally with the user" not in rules, rules[:400]
+    assert "It goes to a JSON parser" in rules, rules[:400]
+    assert "you are not writing TO the user" in rules
+    assert "There is no situation, none, in which the right answer is text outside JSON" in rules
+    # Every kind of turn the model might think is an exception is named as one
+    # that is not: a greeting, a refusal, and a question back.
+    assert "A greeting is a respond action" in rules
+    assert "A refusal is a respond action" in rules
+    assert "A question back to the user is a respond action" in rules
+    # And the worked examples cover those same cases, so the rule is shown as
+    # well as stated.
+    examples = agent_prompt.ANSWERING_EXAMPLES
+    for situation in ("greets you or makes small talk", "You will not do it",
+                      "There was nothing to do", "Something failed",
+                      "need something from the user first",
+                      "refers to something from earlier in this session"):
+        assert situation in examples, situation
