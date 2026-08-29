@@ -3,7 +3,7 @@
 </p>
 
 
-## "Too Many Tools" — a CLI coding agent. It edits files in a sandboxed workspace, runs code in a dozen languages, and commits and pushes as a co-author on your commits.
+## "Too Many Tools" — a CLI coding agent. It edits files in a sandboxed workspace, runs code in a dozen languages, and commits and pushes automatically on any repo.
 
 >**Needs Python 3.8+.**
 
