@@ -1,4 +1,10 @@
-"""The startup screen: the menu TMT opens with.
+"""The screens TMT draws for itself: the startup menu, and the running status.
+
+Two surfaces, one idiom. `render_startup_frame` is the menu TMT opens with;
+`render_status` is the header it redraws before every task prompt once a
+session is under way. They share the same brand row, the same rule and the
+same measured fields, so the running session looks like a continuation of the
+screen it was started from rather than a different program.
 
 Everything here draws through the shared surfaces in agent_ui and repaints
 through the LiveRegion in agent_live_renderer, so the screen obeys the same
@@ -10,6 +16,7 @@ single character being drawn or read, because a menu that blocks on raw input
 there would hang the process rather than fail.
 """
 
+import datetime
 import shutil
 import sys
 import time
@@ -512,6 +519,200 @@ def render_startup_frame(selected=0, stream=None, model_id=None, workspace=None,
     if len(lines) > max(1, rows - 1):
         lines = body          # the logo is the first thing given up for room
     return _fit_height(lines, rows, keep_tail=1)
+
+
+# ---------------------------------------------------------------------------
+# The running session status.
+#
+# The startup screen answers "what is about to run". Once a session is under
+# way that answer keeps moving -- Settings rewrites the provider and the model,
+# TMT_PROVIDER and OPENROUTER_MODEL override them, and the clock never stops --
+# so the same facts are stated again at the top of every turn. Nothing here is
+# a second copy of that state: each fact is read from the module that owns it
+# at the moment the row is drawn.
+
+TASK_PROMPT = "Task> "
+
+
+def _clock(moment=None):
+    """The local wall clock, read now.
+
+    The one seam a test uses to freeze it, and the reason no caller is offered
+    somewhere to keep a time: a stored time is a time that goes stale.
+    """
+    return datetime.datetime.now() if moment is None else moment
+
+
+def _shorten_middle(text, columns, marker="…"):
+    """Drop the middle of a string so the whole fits in `columns` columns.
+
+    Measured, never counted: a path is exactly the kind of string that carries
+    characters wider than one column, and trimming it by len() puts the row
+    onto a second screen line. Head and tail are taken in turn, so a Windows
+    path keeps both its drive and the directory actually being worked in --
+    the two ends a reader needs to recognise it.
+    """
+    text = str(text)
+    if columns <= 0:
+        return ""
+    if display_width(text) <= columns:
+        return text
+    marker_width = display_width(marker)
+    if columns <= marker_width:
+        return fit_to_width(text, columns)
+    budget = columns - marker_width
+    clusters = iter_graphemes(text)
+    left, right = 0, len(clusters) - 1
+    head, tail, used, take_head = [], [], 0, True
+    while left <= right:
+        cluster = clusters[left] if take_head else clusters[right]
+        size = display_width(cluster)
+        if used + size > budget:
+            break
+        if take_head:
+            head.append(cluster)
+            left += 1
+        else:
+            tail.append(cluster)
+            right -= 1
+        used += size
+        take_head = not take_head
+    return "".join(head) + marker + "".join(reversed(tail))
+
+
+def _date_text(moment, columns):
+    """The date, giving up the weekday and then the year as room runs out."""
+    for pattern in ("%a %d %b %Y", "%d %b %Y", "%d %b"):
+        text = moment.strftime(pattern)
+        if display_width(text) <= columns:
+            return text
+    return moment.strftime("%d %b")
+
+
+def provider_title(provider_id):
+    """What the provider calls itself.
+
+    agent_providers is the authority, so its adapter's own label is preferred;
+    the menu's table answers for an installation where the adapters cannot be
+    imported, which is the same reason every other screen here can draw
+    without them.
+    """
+    if not provider_id:
+        return "not set"
+    return getattr(_adapter(provider_id), "label", "") or provider_label(provider_id)
+
+
+def status_facts(provider_id=None, model_id=None, workspace=None):
+    """(provider, model, workspace) for the status row, read at call time.
+
+    Each comes from the module that owns it -- agent_credentials for the
+    provider, agent_models for the model, agent_config for the workspace --
+    and none of it is remembered here. A model chosen in Settings has to reach
+    the next prompt rather than the next launch, and an agent_config.MODEL
+    captured at import would not carry it there.
+    """
+    if provider_id is None:
+        provider_id = current_provider()
+    if model_id is None:
+        try:
+            model_id = agent_models.current_model(provider_id or None)
+        except Exception:
+            model_id = ""
+    try:
+        model = agent_models.describe(model_id, provider_id or None)
+    except Exception:
+        model = model_id
+    workspace = agent_config.ROOT_DIR if workspace is None else workspace
+    return (provider_title(provider_id),
+            str(model or model_id or "not set"),
+            str(workspace))
+
+
+def render_status_lines(stream=None, size=None, phase=None, moment=None,
+                        provider_id=None, model_id=None, workspace=None):
+    """The status header for one turn, as a list of ready-to-paint lines.
+
+    The same shape as the startup screen: the brand row, the facts, then the
+    rule the prompt sits under. Every row is trimmed to measured width before
+    it is painted, so none can overflow onto a second screen line, and what is
+    given up first is decided rather than incidental -- the weekday goes before
+    the year, and the workspace takes a row of its own before it is shortened.
+    """
+    stream = sys.stdout if stream is None else stream
+    columns, rows = _terminal(size)
+    phase = gradient_phase() if phase is None else phase
+    moment = _clock(moment)
+    width = _content_width(columns)
+    separator = " %s " % _glyphs(stream)["dot"]
+    marker = "..." if plain_output(stream) else "…"
+
+    provider, model, workspace = status_facts(provider_id, model_id, workspace)
+
+    # Row one: whose interface this is, and when this turn started. The date
+    # and the clock are context, so they recede to the one neutral; the
+    # wordmark carries the gradient, exactly as it does on the startup screen.
+    clock = moment.strftime("%H:%M:%S")
+    spent = display_width(" TMT" + separator + separator + clock)
+    date = _date_text(moment, max(0, width - spent))
+    brand = (" " + _paint("TMT", stream, phase)
+             + _dim(separator + date + separator + clock, stream))
+
+    # Row two: which service, which model, which directory. Read left to right
+    # it is the whole of what the next request does and where it lands.
+    provider = fit_to_width(provider, max(1, width - 2))
+    room = width - 1 - display_width(provider) - display_width(separator)
+    model = _shorten_middle(model, max(1, room), marker)
+    room -= display_width(model) + display_width(separator)
+
+    def row(values):
+        painted = " "
+        for index, value in enumerate(values):
+            painted += _dim(separator, stream) if index else ""
+            painted += value
+        return painted
+
+    if display_width(workspace) <= room:
+        facts = [row([provider, model, workspace])]
+    else:
+        # A long Windows path is worth a row of its own before it is worth
+        # shortening, and is shortened only once it has outgrown that too.
+        facts = [row([provider, model]),
+                 " " + _shorten_middle(workspace, width - 1, marker)]
+
+    return _fit_height(["", brand] + facts + [_rule(stream, phase, width)],
+                       rows, keep_tail=1)
+
+
+def task_prompt(stream=None, phase=None):
+    """The prompt the user answers, painted but never carried by colour.
+
+    The word is the message and the gradient only confirms it, so this is
+    still a prompt with the ANSI stripped.
+    """
+    stream = sys.stdout if stream is None else stream
+    phase = gradient_phase() if phase is None else phase
+    return " " + _paint(TASK_PROMPT.rstrip(), stream, phase) + " "
+
+
+def render_status(stream=None, **facts):
+    """Draw the status header and leave the cursor after the task prompt.
+
+    The one call the agent loop makes, run immediately before each read rather
+    than once at launch, and deliberately with no thread behind it. A
+    background ticker would have to repaint the row the reader is sitting on,
+    fighting the input line and the live renderer for the same region, and it
+    would animate something the user is trying to read. Redrawing here keeps
+    the write on the thread that owns the terminal and makes every turn state
+    the time that turn began, which is the fact worth having.
+
+    Returns False when the stream has gone, so a caller can stop drawing to
+    it. Decoration is never allowed to end the run.
+    """
+    stream = sys.stdout if stream is None else stream
+    lines = render_status_lines(stream=stream, **facts)
+    if not safe_write(stream, "\n".join(lines) + "\n"):
+        return False
+    return safe_write(stream, task_prompt(stream))
 
 
 def _context_label(context):

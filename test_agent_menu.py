@@ -12,6 +12,7 @@ that only claims to be a terminal. The developer's own .tmt_model, cwd and
 stdin are restored in a finally in every test.
 """
 
+import datetime
 import io
 import os
 import re
@@ -454,3 +455,162 @@ def test_the_selected_item_is_marked_without_relying_on_colour():
             assert selected == resting[0], (selected, resting[0])
         finally:
             box.close()
+
+
+# --- the running status, redrawn before every task prompt --------------------
+
+class Console(io.StringIO):
+    """A stream that decides for itself whether it has colour and glyphs.
+
+    cp1252 is the encoding a plain Windows console actually reports, and it
+    cannot carry a single one of TMT's decorative characters, so it is the
+    case the ASCII fallbacks exist for.
+    """
+
+    def __init__(self, encoding="utf-8", tty=True):
+        io.StringIO.__init__(self)
+        self._encoding = encoding
+        self._tty = tty
+
+    @property
+    def encoding(self):
+        return self._encoding
+
+    def isatty(self):
+        return self._tty
+
+
+def status(columns=100, rows=24, stream=None, **facts):
+    """The status rows as the terminal shows them, escapes removed."""
+    stream = Console() if stream is None else stream
+    facts.setdefault("phase", 0.25)
+    lines = menu().render_status_lines(stream=stream, size=(columns, rows), **facts)
+    lines.append(menu().task_prompt(stream, phase=facts["phase"]))
+    return [visible(line) for line in lines]
+
+
+def test_the_running_status_states_every_fact_the_next_turn_runs_under():
+    """A session outlives the screen it was started from. Which service, which
+    model, which directory, and when this turn began all have to be answerable
+    at the prompt itself rather than by scrolling back to the launch."""
+    moment = datetime.datetime(2026, 8, 29, 15, 42, 7)
+    probe = Path(os.sep + "tmt_probe" + os.sep + "chosen_workspace")
+    frame = "\n".join(status(provider_id="openrouter", model_id="z-ai/glm-5.2:free",
+                             workspace=probe, moment=moment))
+    assert "TMT" in frame, frame
+    assert "OpenRouter" in frame, frame
+    assert "GLM 5.2" in frame or "z-ai/glm-5.2:free" in frame, frame
+    assert str(probe) in frame, frame
+    assert "29 Aug 2026" in frame, frame
+    assert "15:42:07" in frame, frame
+    assert "Task>" in frame, frame
+    # The name TMT stopped using. It must not come back through this screen.
+    assert "Local File AI" not in frame, frame
+
+
+def test_the_running_status_reads_the_clock_rather_than_keeping_one():
+    """The time on screen is the time the turn began, so it cannot be a value
+    captured at launch and it cannot need a thread to move it."""
+    first = status(moment=datetime.datetime(2026, 8, 29, 9, 5, 1),
+                   provider_id="openrouter", model_id="z-ai/glm-5.2:free")
+    later = status(moment=datetime.datetime(2026, 8, 29, 9, 5, 2),
+                   provider_id="openrouter", model_id="z-ai/glm-5.2:free")
+    assert "09:05:01" in "\n".join(first), first
+    assert "09:05:02" in "\n".join(later), later
+
+    # And with nothing passed, the clock is read from the system on each call.
+    before = datetime.datetime.now()
+    drawn = "\n".join(status(provider_id="openrouter",
+                             model_id="z-ai/glm-5.2:free"))
+    after = datetime.datetime.now()
+    stamps = {before.strftime("%H:%M:%S"), after.strftime("%H:%M:%S")}
+    assert any(stamp in drawn for stamp in stamps), (drawn, sorted(stamps))
+
+
+def test_the_running_status_follows_the_provider_and_model_that_are_in_force():
+    """agent_credentials owns the provider and agent_models owns the model.
+    The status asks them at render time, so a change made in Settings -- or
+    forced by the environment -- reaches the next prompt."""
+    box = Sandbox()
+    previous = os.environ.get("TMT_PROVIDER")
+    try:
+        chosen = agent_models.FREE_MODELS[2]
+        agent_models.set_model(chosen["id"], "openrouter")
+        os.environ["TMT_PROVIDER"] = "openrouter"
+        frame = "\n".join(status(workspace=box.workspace))
+        assert "OpenRouter" in frame, frame
+        assert chosen["label"] in frame or chosen["id"] in frame, frame
+
+        moved = agent_models.FREE_MODELS[1]
+        agent_models.set_model(moved["id"], "openrouter")
+        frame = "\n".join(status(workspace=box.workspace))
+        assert moved["label"] in frame or moved["id"] in frame, frame
+
+        # A different provider brings its own name and its own model with it.
+        os.environ["TMT_PROVIDER"] = "anthropic"
+        frame = "\n".join(status(workspace=box.workspace))
+        assert "Anthropic" in frame, frame
+        assert chosen["label"] not in frame, frame
+    finally:
+        os.environ.pop("TMT_PROVIDER", None)
+        if previous is not None:
+            os.environ["TMT_PROVIDER"] = previous
+        box.close()
+
+
+def test_the_running_status_fits_a_narrow_terminal_and_degrades_to_ascii():
+    """Measured to columns - 1 at every width, on a colour terminal and on a
+    cp1252 console that can encode none of the decoration."""
+    plain_console = Console(encoding="cp1252", tty=False)
+    long_path = "C:\\Users\\Someone\\OneDrive - A Long Organisation Name" \
+                "\\Projects\\2026\\a-deeply-nested\\service\\worker"
+    for stream in (Console(), plain_console):
+        for columns in (100, 60, 40, 24):
+            for workspace in ("C:\\Coding\\TMT", long_path):
+                rows = status(columns=columns, stream=stream,
+                              workspace=workspace,
+                              provider_id="openrouter",
+                              model_id="z-ai/glm-5.2:free")
+                limit = max(24, min(72, columns - 2))
+                for line in rows:
+                    assert menu().display_width(line) <= limit, (
+                        columns, line, menu().display_width(line))
+                joined = "\n".join(rows)
+                assert "TMT" in joined and "Task>" in joined, (columns, joined)
+                assert "OpenRouter" in joined, (columns, joined)
+
+    # The plain console gets the ASCII set rather than replacement marks, and
+    # nothing it was handed can fail to encode.
+    drawn = "\n".join(status(columns=60, stream=plain_console,
+                             workspace=long_path, provider_id="openrouter",
+                             model_id="z-ai/glm-5.2:free"))
+    drawn.encode("cp1252")
+    assert "\u2026" not in drawn and "\u2500" not in drawn and "\u00b7" not in drawn, drawn
+    assert "..." in drawn and "---" in drawn, drawn
+
+
+def test_a_long_path_is_shortened_in_the_middle_and_keeps_both_ends():
+    """A path is recognised by its drive and by the directory being worked in.
+    Shortening it from one end throws away half of that, and shortening it by
+    len() rather than by width puts the row onto a second screen line."""
+    long_path = "C:\\Users\\Someone\\Documents\\Development\\2026" \
+                "\\northwind-replatform\\services\\ingestion-worker"
+    rows = status(columns=60, workspace=long_path, provider_id="openrouter",
+                  model_id="z-ai/glm-5.2:free")
+    path_row = [row for row in rows if row.strip().startswith("C:")]
+    assert path_row, rows
+    shown = path_row[0].strip()
+    assert shown != long_path, shown
+    assert shown.startswith("C:\\Users"), shown
+    assert shown.endswith("ingestion-worker"), shown
+    assert "\u2026" in shown or "..." in shown, shown
+
+    # Wide characters are two columns each, so a row counted rather than
+    # measured would be twice as wide as the terminal it was drawn for.
+    wide = "C:\\Projects\\" + "\u30d7\u30ed\u30b8\u30a7\u30af\u30c8" * 8 + "\\src"
+    for columns in (100, 60, 40):
+        for line in status(columns=columns, workspace=wide,
+                           provider_id="openrouter",
+                           model_id="z-ai/glm-5.2:free"):
+            assert menu().display_width(line) <= max(24, min(72, columns - 2)), (
+                columns, line)

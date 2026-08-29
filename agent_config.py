@@ -361,7 +361,9 @@ def refresh_model():
         pass
     return MODEL
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-APP_TITLE = "Local File AI"
+# The app's own name. It is sent to OpenRouter as X-Title, so it is what
+# requests are attributed to there as well as what TMT calls itself.
+APP_TITLE = "TMT"
 APP_URL = "http://localhost"
 # Ask the provider to constrain the reply to a syntactically valid JSON
 # object: no prose, no markdown fences, no stray text around it. This is a

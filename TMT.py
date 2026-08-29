@@ -1,4 +1,4 @@
-"""Command-line entry point for the local file AI agent."""
+"""Command-line entry point for TMT, the CLI coding agent."""
 
 import argparse
 import json
@@ -21,10 +21,10 @@ if _INSTALL_DIR in sys.path:
 sys.path.insert(0, _INSTALL_DIR)
 
 import agent_config
-from agent_menu import run_startup
+from agent_menu import render_status, run_startup
 from agent_config import (
-    MODEL, MUTATING_ACTIONS, Panel, console, default_workspace,
-    set_workspace_root, workspace_needs_confirmation, workspace_refusal,
+    MUTATING_ACTIONS, console, default_workspace, set_workspace_root,
+    workspace_needs_confirmation, workspace_refusal,
 )
 from agent_config import REQUIRED_KEYS
 from agent_actions import authorizes_push, batch_summary, build_result_message, execute_action, trim_messages
@@ -131,18 +131,24 @@ def main(argv=None):
     # the agent exactly as it did before this screen existed.
     if run_startup(workspace=root) == "exit":
         return 0
-    console.print(Panel.fit(
-        f"[bold green]Local File AI[/bold green] (OpenRouter / {agent_config.MODEL})"))
-    # Stated plainly and before the first prompt: this is the directory about
-    # to be modified, and a run from the wrong place should be obvious here
-    # rather than three edits later.
-    console.print(f"[bold]Workspace:[/bold] {root}")
     # Offered once, and never blocking: a missing co-author address stops
     # commits, not the session, and the refusal explains itself when it happens.
     ensure_git_identity()
     while True:
+        # The header is drawn here, once per turn, immediately before the read
+        # rather than once at launch. Every fact on it -- the provider, the
+        # model, the workspace, the date and the clock -- is read at this
+        # moment, so a provider or model changed in Settings shows up on the
+        # next prompt and the time is the time this turn began. Redrawing is
+        # what makes the clock live: a background thread ticking it would have
+        # to repaint the row the reader is sitting on, and would fight both
+        # the input line and the live renderer for the same terminal region.
+        #
+        # It leaves the cursor after the prompt, so the read below is the same
+        # console.input as before with the prompt already on screen.
+        render_status(workspace=root)
         try:
-            task = console.input("\n[bold cyan]Task> [/bold cyan]").strip()
+            task = console.input("").strip()
         except KeyboardInterrupt:
             console.print("\n[yellow]Use 'quit' or 'exit' to close.[/yellow]")
             continue
