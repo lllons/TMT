@@ -515,6 +515,10 @@ REQUIRED_KEYS = {
     "open_app": ["app"], "list_files": [], "search_files": ["query"],
     "read_lines": ["path"], "replace_lines": ["path", "start", "end", "content"],
     "copy_file": ["path"], "delete_folder": ["path"], "respond": ["message"],
+    # Says what is about to happen and CANNOT end the task. Deliberately its
+    # own verb rather than a flag on respond: a forgotten flag ends the turn
+    # silently, and there is no flag to forget here.
+    "announce": ["message"],
     "done": [],
     "git_status": [], "git_identity": [], "git_diff": [],
     "git_commit": ["message"], "git_push": [],

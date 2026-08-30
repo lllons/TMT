@@ -842,6 +842,55 @@ def test_an_announcement_is_shown_and_the_work_still_happens():
     assert drawn.index("I'll inspect the files first.") < drawn.index("Inspected and written."), drawn
 
 
+def test_announce_says_what_is_coming_and_the_work_still_happens():
+    """The opening sentence, given its own verb. A model that writes "I'll look
+    at the files first" as a respond ends the task there with nothing looked
+    at; the same sentence as an announce is shown and the turn carries on."""
+    drawn, files = run_turn([
+        json.dumps({"action": "announce",
+                    "message": "I'll inspect the files first."}),
+        json.dumps({"action": "write_file", "path": "made.txt", "content": "z"}),
+        json.dumps({"action": "done", "message": "Inspected and written."}),
+    ])
+
+    assert "I'll inspect the files first." in drawn, drawn
+    assert files.get("made.txt") == "z", files
+    assert "Inspected and written." in drawn, drawn
+
+
+def test_announce_cannot_end_the_turn_however_it_is_written():
+    """The reason it is a separate verb rather than a flag. `respond` needs
+    "final": false and forgetting it ends the task silently, in the worst
+    direction. There is nothing to forget here: announce carries the keys that
+    would make a respond terminal and is still not terminal."""
+    drawn, files = run_turn([
+        # "final": true is exactly what would END a respond. It must not end
+        # this, because announce has no terminal meaning to switch on.
+        json.dumps({"action": "announce", "message": "Starting now.",
+                    "final": True}),
+        json.dumps({"action": "write_file", "path": "after.txt", "content": "q"}),
+        json.dumps({"action": "done", "message": "Ran to the end."}),
+    ])
+    assert "Starting now." in drawn, drawn
+    assert files.get("after.txt") == "q", files
+    assert "Ran to the end." in drawn, drawn
+
+
+def test_announce_leads_a_batch_without_finishing_it():
+    """A batch whose first entry speaks must still run the entries after it."""
+    drawn, files = run_turn([
+        json.dumps({"actions": [
+            {"action": "announce", "message": "Writing both files now."},
+            {"action": "write_file", "path": "one.txt", "content": "1"},
+            {"action": "write_file", "path": "two.txt", "content": "2"},
+            {"action": "done", "message": "Both written."},
+        ]}),
+    ])
+    assert "Writing both files now." in drawn, drawn
+    assert files.get("one.txt") == "1" and files.get("two.txt") == "2", files
+    assert "Both written." in drawn, drawn
+
+
 def test_several_announcements_can_come_before_the_answer():
     """Nothing about an announcement is once-only. A model that narrates two
     steps before it finishes is doing what it was asked to do."""

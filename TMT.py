@@ -147,20 +147,31 @@ _ANNOUNCED = ("That was shown to the user as progress. The task is not "
 
 
 def is_announcement(obj):
-    """Whether a `respond` is an announcement rather than the answer.
+    """Whether this is the model saying what it is about to do.
 
-    `respond` ends the task, which is right for an answer and wrong for the
-    sentence a model writes before it starts. "I'll read the parser first"
-    ended the turn with the parser unread, the work undone and nothing to show
-    for it, and the user had to ask again to get any of it.
+    Two shapes mean it, and they are not equally safe.
 
-    `final: false` is how the model says which of the two it means. Absent, it
-    is an answer, so every reply written before this key existed still means
-    exactly what it meant. A string is read as well as a bool because a model
-    that writes "false" means false, and being pedantic about the type here
-    would resurrect the bug this exists to fix.
+    `announce` is the one to reach for: it has no terminal meaning at all, so
+    there is nothing to get wrong. The turn cannot end on it however it is
+    written, whatever other keys ride along, and whatever the model forgets.
+
+    `respond` with `final: false` means the same thing and stays supported,
+    but it is a flag on the action that DOES end the task, so forgetting the
+    flag fails silently in the worst direction -- "I'll read the parser first"
+    ending the turn with the parser unread, the work undone and the user
+    having to ask again. A separate verb cannot be forgotten into a terminal
+    action, which is the whole reason `announce` exists beside it.
+
+    On `respond`, absent means final, so every reply written before that key
+    existed still means exactly what it meant. A string is read as well as a
+    bool, because a model that writes "false" means false and being pedantic
+    about the type here would resurrect the bug this exists to fix.
     """
-    if not (isinstance(obj, dict) and obj.get("action") == "respond"):
+    if not isinstance(obj, dict):
+        return False
+    if obj.get("action") == "announce":
+        return True
+    if obj.get("action") != "respond":
         return False
     value = obj.get("final", True)
     if isinstance(value, str):

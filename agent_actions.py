@@ -243,6 +243,9 @@ def execute_action(obj, context=None):
     if action == "recall":
         return _run_tool("agent_memory", lambda m: m.recall(
             query=obj.get("query"), limit=obj.get("limit"), kind=obj.get("kind")))
+    # Never terminal. The loop shows the message and carries straight on; the
+    # result exists only so the batch report has something to record.
+    if action == "announce": return obj.get("message", "")
     if action in ("respond", "done"): return obj.get("message", "done")
     return f"Unknown action: {action}"
 
@@ -269,7 +272,7 @@ ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     "open_app", "git_status", "git_diff", "git_identity", "git_commit", "git_push",
     "tree", "find_text", "find_symbol", "replace_across", "code_map",
     "related_tests", "remember", "recall",
-    "respond", "done",
+    "announce", "respond", "done",
 )}
 
 def batch_summary(batch):
@@ -382,7 +385,10 @@ def action_event(action, obj, result):
     Called after the action, never before, so the event can report what
     happened rather than what was intended.
     """
-    if action in ("respond", "done"):
+    # These three produce no event of their own. Two are the answer and the
+    # third is drawn as progress by the loop before the work it announces --
+    # an event here would print the same sentence a second time.
+    if action in ("respond", "done", "announce"):
         return None
     kind = _EVENT_KIND_FOR_ACTION.get(action, "tool")
     text = str(result)

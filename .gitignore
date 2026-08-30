@@ -21,5 +21,12 @@ DESIGN_PRINCIPLES.md
 .tmt_model
 .tmt_effort
 
+# The code index and the project notebook. Both live beside the install, and
+# when TMT is run ON TMT the install and the workspace are the same directory,
+# so both land here and would otherwise be committed. Caches keyed by absolute
+# path are worthless to anyone else and the notebook is per-machine.
+.tmt_index/
+.tmt_memory/
+
 # Working notes for the assistant. Per-checkout, not source.
 CLAUDE.local.md
