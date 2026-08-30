@@ -147,6 +147,67 @@ _ACTION_RAISED = (
 _ANNOUNCED = ("That was shown to the user as progress. The task is not "
               "finished. Emit the action you just announced.")
 
+# What the USER is shown when a final answer is refused because the plan is
+# not finished. One line, naming the step being waited on, because the plan
+# itself is on screen a few columns to the right and repeating it here would
+# say the same thing twice.
+_PLAN_HELD = "Plan not finished - %d step%s outstanding, next is %s. Continuing."
+
+
+def plan_block(session, obj):
+    """The refusal for a terminal action the plan will not allow yet, or "".
+
+    THE enforcement point for the planning contract, and the reason it is code
+    in the loop rather than a line in the prompt: a rule the model is merely
+    told about is a rule the model gets to decide it has satisfied. Here, a
+    `respond` that arrives with steps outstanding is not executed at all. It
+    is handed back as the model's own next input, with the outstanding steps
+    named, and the turn carries on -- so a model that has decided it is
+    finished simply finds itself still working.
+
+    It cannot trap a session. Nothing here loops: the refusal costs a round
+    from the turn's existing budget, and a model that keeps sending the same
+    reply meets the identical-reply circuit breaker after three. Both of those
+    end the turn with the reason recorded and the unfinished plan still on
+    screen, which is the honest ending for work that was not finished.
+
+    Three things are exempt, and each for its own reason.
+
+    A turn with NO PLAN is not gated, which is most turns. The gate is a
+    consequence of having made a plan, not a requirement to make one.
+
+    A SYNTHETIC reply is one this program made up to report a failed call.
+    There is no model behind it to send back to, and refusing it would hide a
+    provider failure behind a plan the model never had the chance to finish.
+
+    A PLAN THAT CANNOT ANSWER lets the answer through. Every other guard in
+    this loop fails in that direction, and a broken plan object holding a
+    finished piece of work hostage would be the worst outcome available.
+    """
+    if session is None or not isinstance(obj, dict):
+        return ""
+    action = obj.get("action")
+    if not action or is_synthetic(obj):
+        return ""
+    try:
+        import agent_plan
+        return agent_plan.refusal(getattr(session, "plan", None), action)
+    except Exception:
+        return ""
+
+
+def plan_held_line(session):
+    """The one line the user is shown when an answer was held back."""
+    outstanding = ()
+    try:
+        outstanding = session.plan.outstanding()
+    except Exception:
+        pass
+    if not outstanding:
+        return "Plan not finished. Continuing."
+    return _PLAN_HELD % (len(outstanding), "" if len(outstanding) == 1 else "s",
+                         "%s %s" % (outstanding[0].id, outstanding[0].title))
+
 
 def is_announcement(obj):
     """Whether this is the model saying what it is about to do.
@@ -554,7 +615,14 @@ def _session_loop(root):
         # background agent's own context looks like, so a worker asking to
         # spawn a worker is told it cannot.
         context = {"push_authorized": authorizes_push(task),
-                   "manager": manager}
+                   "manager": manager,
+                   # The plan for THIS task. The session holds one Plan for
+                   # its whole life and empties it in `begin_turn`, which runs
+                   # a few lines below this -- so the object put in here is
+                   # the right one and it is empty by the time the model can
+                   # reach it. That is why the session resets the plan in
+                   # place rather than assigning a new one.
+                   "plan": session.plan}
         # The request the turn starts from: the system prompt, the earlier
         # questions and answers this session has already had, and then the new
         # task. `pinned` is how much of that the loop's own trimming must
@@ -752,6 +820,7 @@ def _session_loop(root):
                     live_ui.intermediate_event("Processing...")
                     results = []
                     invalid = ""
+                    held = ""
                     for sub_obj in batch:
                         invalid = validate_action(sub_obj)
                         if invalid:
@@ -777,6 +846,14 @@ def _session_loop(root):
                             announce(sub_obj, transcript)
                             results.append(f"{sub_action}: shown to the user")
                             continue
+                        # The same gate the single-action path takes, in the
+                        # same place: before the action runs. A batch that
+                        # ends in a refused respond keeps everything it did
+                        # before that entry -- those results are real work and
+                        # are reported below with the refusal.
+                        held = plan_block(session, sub_obj)
+                        if held:
+                            break
                         try:
                             result = execute_action(sub_obj, context)
                         except Exception as error:
@@ -813,6 +890,20 @@ def _session_loop(root):
                         retries = 0
                         messages.extend([{"role": "assistant", "content": raw}, {"role": "user", "content": f"Batch results:\n{chr(10).join(results)}\nOutput your next action."}])
                         continue
+                    if held:
+                        # The batch did its work and was stopped at the
+                        # answer. The results go back with the refusal so the
+                        # model is not asked to redo what already ran.
+                        transcript.emit_kind("warning", plan_held_line(session))
+                        relay.reset()
+                        steps += 1
+                        retries = 0
+                        ran = chr(10).join(results) if results else "Nothing ran."
+                        messages.extend([
+                            {"role": "assistant", "content": raw},
+                            {"role": "user",
+                             "content": "Batch results:\n%s\n%s" % (ran, held)}])
+                        continue
                     if invalid:
                         console.print(f"[red]Invalid action in batch:[/red] {invalid}")
                         ran = chr(10).join(results) if results else "Nothing ran."
@@ -845,6 +936,21 @@ def _session_loop(root):
                     retries = 0
                     messages.extend([{"role": "assistant", "content": raw},
                                      {"role": "user", "content": _ANNOUNCED}])
+                    continue
+                # The plan's gate, and it is taken BEFORE the action runs.
+                # `respond` has no side effect worth avoiding, but running it
+                # would set `acted` and emit an event for work that was
+                # refused -- and an action that is not allowed should not
+                # leave a trace of having happened.
+                held = plan_block(session, obj)
+                if held:
+                    transcript.emit_kind("warning", plan_held_line(session))
+                    relay.reset()
+                    live_ui.intermediate_event("Processing...")
+                    steps += 1
+                    retries = 0
+                    messages.extend([{"role": "assistant", "content": raw},
+                                     {"role": "user", "content": held}])
                     continue
                 try:
                     result = execute_action(obj, context)

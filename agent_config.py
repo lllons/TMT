@@ -526,6 +526,17 @@ REQUIRED_KEYS = {
     # narrowest tool for one question, which is what the prompt tells the
     # model to choose on: the shape of the project, an exact string, a
     # definition, a relationship, what to re-run, what was learned before.
+    # The task's own plan. One verb with an "operation", rather than six
+    # verbs, because every one of them acts on the same single object and a
+    # model choosing between `plan_create` and `plan_update` would be choosing
+    # between two spellings of the same thing.
+    #
+    # Registered here and dispatched in agent_actions, but documented ONLY in
+    # agent_prompt.PLAN_REFERENCE, which get_system_prompt includes and the two
+    # background prompts do not -- the plan is the main agent's contract with
+    # the user, and a worker has no user to make one with. agent_worker
+    # refuses it outright as well, so the isolation is code and not wording.
+    "plan": ["operation"],
     "tree": [], "find_text": ["query"], "find_symbol": ["name"],
     "replace_across": ["search", "replace"], "code_map": ["target"],
     "related_tests": [], "remember": ["note"], "recall": [],

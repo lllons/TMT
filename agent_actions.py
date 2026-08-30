@@ -132,6 +132,69 @@ def _manager(context):
     return (context or {}).get("manager")
 
 
+_NO_PLAN_STATE = (
+    "Planning is not available here, so '%s' did nothing and no plan exists. "
+    "Carry out the work with the ordinary file, search and git actions, and "
+    "say what you did in your final respond."
+)
+
+
+def _plan_state(context):
+    """The plan for this turn, or None when there is not one.
+
+    `(context or {}).get(...)` for the reason `_manager` gives: a background
+    agent's context has no such key at all, and neither has an install where
+    the session never wired one in. Both must come back as words the model can
+    work around rather than as a KeyError that ends the turn.
+    """
+    return (context or {}).get("plan")
+
+
+def _plan(context, obj):
+    """Run one `plan` operation against the turn's plan.
+
+    The operation names are read here rather than in agent_plan so that module
+    stays pure state, and every failure comes back as a sentence: a plan call
+    the model got wrong is a mistake to correct on the next step, exactly like
+    a patch whose search string did not match, and never a reason to stop.
+    """
+    plan = _plan_state(context)
+    operation = str(obj.get("operation", "")).strip().lower()
+    if plan is None:
+        return _NO_PLAN_STATE % (operation or "plan")
+    try:
+        import agent_plan
+    except Exception as error:
+        # The frozen-module-list failure `_run_tool` guards against, answered
+        # in words for the same reason.
+        return "Planning is unavailable: %s" % error
+    if operation not in agent_plan.OPERATIONS:
+        return ("FAILED: '%s' is not a plan operation. Use one of: %s."
+                % (obj.get("operation"), ", ".join(agent_plan.OPERATIONS)))
+    try:
+        if operation == "create":
+            return plan.create(obj.get("steps"))
+        if operation == "update":
+            return plan.update(obj.get("step", obj.get("id")),
+                               obj.get("status"), obj.get("title"),
+                               updates=obj.get("steps"))
+        if operation == "add":
+            return plan.add(obj.get("title"), after=obj.get("after"))
+        if operation == "remove":
+            return plan.remove(obj.get("step", obj.get("id")))
+        if operation == "clear":
+            return plan.clear()
+        return plan.describe()
+    except agent_plan.PlanError as error:
+        return "FAILED: %s" % error
+    except Exception as error:
+        # A plan is a convenience the turn can survive losing. Whatever went
+        # wrong in there, the model is told and the work carries on -- a
+        # corrupted plan must never take the session with it.
+        return "FAILED: the plan could not be updated (%s: %s)." % (
+            type(error).__name__, error)
+
+
 def _agent_modules():
     """(agent_manager, agent_worker), or (None, None) with a sentence.
 
@@ -448,6 +511,10 @@ def execute_action(obj, context=None):
         if not (context or {}).get("push_authorized"):
             return PUSH_BLOCKED
         return _run_git(lambda agent_git: _git_push(agent_git, obj))
+    # The task's own plan. It touches no file and runs nothing, so it is not
+    # in MUTATING_ACTIONS and does not invalidate the cached system prompt --
+    # the workspace is exactly as it was.
+    if action == "plan": return _plan(context, obj)
     # Understanding the repository. Each answers one question and no more, so
     # the model can pick the narrowest tool instead of reading whole files to
     # find one line.
@@ -582,7 +649,7 @@ ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     "delete_folder", "rename_file", "create_folder", "run_python", "run_file",
     "open_app", "git_status", "git_diff", "git_identity", "git_commit", "git_push",
     "tree", "find_text", "find_symbol", "replace_across", "code_map",
-    "related_tests", "remember", "recall",
+    "related_tests", "remember", "recall", "plan",
     "spawn_agent", "agent_status", "agent_result", "wait_for_agent",
     "wait_for_agents", "kill_agent", "internal_response",
     "announce", "respond", "done",
@@ -639,6 +706,11 @@ _EVENT_KIND_FOR_ACTION = {
     "run_python": "command", "run_file": "command", "open_app": "command",
     "git_status": "tool", "git_diff": "tool", "git_identity": "tool",
     "git_commit": "milestone", "git_push": "milestone",
+    # A milestone rather than a tool, and it earns it: a plan step changing
+    # state is the coarsest thing that happens in a turn, it is what the user
+    # is following in the panel, and there are only ever a handful of them --
+    # one per step, plus the one that made the plan.
+    "plan": "milestone",
     # `background_agent` already exists in agent_prompt.EVENT_TYPES, at
     # prominence level 1 and gradient position 40 beside milestone and tool.
     # A new element takes a place on the existing scale; it does not get a
@@ -678,6 +750,11 @@ _REPORTED_ACTIONS = frozenset((
     # tests failed" as a failed action. That is the same false alarm that once
     # called a green test run a failure, arriving by a new route.
     "spawn_agent", "agent_status", "kill_agent",
+    # The plan's result is TMT's own sentence about what the call did --
+    # "S2 (Run the tests) in_progress -> completed." -- so its first line can
+    # be shown, and a refused operation comes back as "FAILED: ..." and is
+    # read as the warning it is by the same markers every other action uses.
+    "plan",
 ))
 
 

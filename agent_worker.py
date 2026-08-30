@@ -71,7 +71,12 @@ NOTE_ACTIONS = frozenset({
 # push needs the user's own words behind it and a worker's task text is
 # written by a model; `respond` and `done` because they are how a turn ends
 # for a user, and a worker has no user to end a turn for.
-WORKER_FORBIDDEN = frozenset({"git_push", "respond", "done"})
+# `plan` because the plan is the MAIN agent's contract with the user: it is
+# what gates that agent's final answer and what the user is reading in the
+# panel. A worker writing to it would be editing the shape of a task it can
+# see only one step of, and a worker completing a step would let the main
+# agent finish on work the worker had merely claimed.
+WORKER_FORBIDDEN = frozenset({"git_push", "respond", "done", "plan"})
 
 # Refused to every background agent, for a different reason from the verbs
 # above: these two are not the wrong shape for a worker, they are unreachable

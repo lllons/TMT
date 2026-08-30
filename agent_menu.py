@@ -2371,7 +2371,7 @@ class PromptBox:
         self.asked_at = None
 
     def panel(self):
-        """The agents panel for this box, or None when there is none.
+        """The right-hand column for this box, or None when there is none.
 
         agent_panel is imported inside the call rather than at module scope,
         the same way agent_credentials is: a menu that cannot draw is worth
@@ -2385,17 +2385,26 @@ class PromptBox:
         the selection and the open state survive from one question to the
         next: the panel is a view onto the manager, and the manager is where
         an agent's state actually lives.
+
+        A box with a SESSION gets one too, because the session is where the
+        task's plan lives and the plan wants the same column. The plan is
+        passed as a callable rather than as the object: the session empties
+        its plan between turns, and a panel holding the object it was built
+        with would go on drawing a task that is over. A box with neither still
+        gets nothing, which is what makes this cost a plain box exactly what
+        it always cost -- no import, no frame change, no extra repaint.
         """
         if self._panel_state is not None:
             return self._panel_state
-        if self.manager is None:
+        if self.manager is None and self.session is None:
             return None
         try:
             import agent_panel
         except Exception:
             return None
-        self._panel_state = agent_panel.PanelState(self.manager,
-                                                   stream=self.stream)
+        self._panel_state = agent_panel.PanelState(
+            self.manager, stream=self.stream,
+            plan=lambda: getattr(self.session, "plan", None))
         return self._panel_state
 
     def _agents_text(self):
@@ -2409,14 +2418,21 @@ class PromptBox:
             return ""
 
     def _panel_frame(self, size=None):
-        """(left columns, join) for an open panel, or None.
+        """(left columns, join) for the right-hand column, or None for none.
 
         Measured against the terminal as it is now, like everything else the
         box draws, so a window narrowed past the panel's floor mid-edit closes
         the panel rather than drawing something unreadable into it.
+
+        Whether there is a column at all is `PanelState.frame`'s decision and
+        not this method's. It used to be asked here, as `state.open`, which
+        was right while the agents panel was the only thing that wanted the
+        column and silently wrong the moment the plan wanted it too: the live
+        relay asks the state directly and would draw the plan while the box
+        beside it did not.
         """
         state = self.panel()
-        if state is None or not state.open:
+        if state is None:
             return None
         columns, rows = _terminal(size)
         try:

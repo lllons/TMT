@@ -440,6 +440,32 @@ def _agents(argument, session, manager=None):
     return Result("Agents", [line for line in report.splitlines()])
 
 
+def _plan(argument, session):
+    """The plan for the task being worked on, as text rather than as a column.
+
+    The unambiguous way in, and the only one on a terminal too narrow to hold
+    two columns -- the plan column is refused below that width rather than
+    swallowing the prompt box, so this is not a convenience there, it is the
+    whole of the access.
+
+    Read-only. The plan is the model's to write; a user editing it from here
+    would be changing a contract the model is being held to without the model
+    ever seeing that it had changed.
+    """
+    try:
+        import agent_panel
+    except Exception as error:
+        # Reported in words for the reason `_agents` gives: an editable
+        # install freezes its module list, and a module that is invisible to
+        # the entry point must not take a slash command down with it.
+        return Result("Plan is unavailable",
+                      ["The panel module could not be loaded.", str(error)],
+                      ok=False)
+    plan = getattr(session, "plan", None) if session is not None else None
+    report = agent_panel.plan_report(plan)
+    return Result("Plan", [line for line in report.splitlines()])
+
+
 def _note(argument, session):
     """Answer one question about the workspace, without disturbing anything.
 
@@ -586,6 +612,7 @@ _HANDLERS = {
     "model": _model,
     "note": _note,
     "agents": _agents,
+    "plan": _plan,
 }
 
 SUMMARY = {
@@ -596,6 +623,7 @@ SUMMARY = {
     "effort": "how much work TMT spends on one task",
     "model": "which model answers",
     "note": "ask about the workspace without changing it",
+    "plan": "the steps TMT is working through for this task",
 }
 
 USAGE = {
@@ -606,4 +634,5 @@ USAGE = {
     "effort": "/effort [low|medium|high]",
     "model": "/model [<model id or name>]",
     "note": "/note <question about this workspace>",
+    "plan": "/plan",
 }

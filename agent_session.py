@@ -31,6 +31,7 @@ import json
 
 import agent_config
 import agent_models
+import agent_plan
 from agent_ui import CHARS_PER_TOKEN
 
 # What one turn is allowed to contribute, and how much of the window all of
@@ -215,6 +216,22 @@ class Session:
         # is on screen is this estimate until the real figure lands and
         # replaces it.
         self._streaming_chars = 0
+        # The plan for the task being worked on now. One per turn, not one per
+        # session: a plan is the contract for a single request, and carrying
+        # one into the next question would gate an unrelated conversation
+        # behind steps nobody had asked for. `begin_turn` retires it, so it
+        # stays on screen after the answer and is gone the moment the next
+        # task starts. It is state and only state -- agent_plan opens no file
+        # and imports nothing from this module, so the rule at the top of this
+        # file still holds.
+        #
+        # Built ONCE and emptied in place, never rebound. Two things hold a
+        # reference to it -- the action context the loop builds for a turn,
+        # and the panel that draws it -- and assigning a new Plan here would
+        # leave either of them pointing at the plan of a task that is over.
+        # The loop builds its context BEFORE it calls `begin_turn`, so that is
+        # not a hypothetical.
+        self.plan = agent_plan.Plan()
 
     # --- what the next request runs under ---------------------------------
 
@@ -300,7 +317,17 @@ class Session:
         the model answering a question nobody asked. Everything the loop adds
         after this point -- an action, its result, the next action -- is
         trimmable and this session never sees it.
+
+        The plan is retired here, and this is the whole of its scoping. A plan
+        belongs to one task: it gates that task's final answer and it is drawn
+        beside it. Left standing, the previous task's unfinished steps would
+        refuse the answer to a question that has nothing to do with them --
+        and the panel would be showing the user a plan for work they had
+        stopped asking about. Retiring it at the START of the next turn rather
+        than at the end of this one is what lets a finished plan stay on
+        screen, all green, for as long as the answer it produced.
         """
+        self.plan.clear()
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": str(system_prompt)})
@@ -432,8 +459,14 @@ class Session:
             self.tokens_out_exact = False
 
     def clear(self):
-        """Forget the conversation. The session's own facts are unaffected."""
+        """Forget the conversation. The session's own facts are unaffected.
+
+        The plan goes with it. It is part of what was being worked on, and a
+        session told to forget the conversation that would still refuse to
+        answer until an invisible plan was finished would be the worst of both.
+        """
         self._turns = []
+        self.plan.clear()
 
     def __len__(self):
         return len(self._turns)
