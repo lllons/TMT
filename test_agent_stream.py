@@ -650,7 +650,19 @@ def test_the_system_prompt_teaches_progress_events_and_next_step():
     assert "FOUR WORDS" in rules
     assert "Not five" in rules
     assert "Count them" in rules
-    assert "Do not put one on every action" in rules
+    # A progress line on every action that does work. This used to say the
+    # opposite -- progress at milestones only, not on every action -- and the
+    # reversal is deliberate, so it is asserted rather than left to drift back.
+    assert 'Put a "progress" on EVERY action that does work' in rules
+    # Repeating an action is allowed. Repeating it SILENTLY is not: the second
+    # one has to say what is different about it, or the two are
+    # indistinguishable from a stuck loop.
+    assert "You MAY use the same action twice in a row" in rules
+    assert "may NOT do is repeat it silently" in rules
+    assert "must say what is DIFFERENT about this use" in rules
+    assert "Never write a sentence you have already written" in rules
+    # respond, done and announce are exempt: they are already the thing said.
+    assert "respond, done and announce are the exceptions" in rules
     assert "Never put a credential" in rules
     assert "never treated as their next message" in rules
     assert "never claim anything was done" in rules

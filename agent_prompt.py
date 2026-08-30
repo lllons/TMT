@@ -103,7 +103,7 @@ You want to say what you are about to do before you do it. Use announce, which c
   They said: tidy up the error handling in the parser
   You emit:  {"action":"announce","message":"I'll read src/parser.py first to see what error handling is already there."}
   That reaches the user and the task carries on. In the same turn, you go on and act:
-  You emit:  {"action":"read_file","path":"src/parser.py"}
+  You emit:  {"action":"read_file","path":"src/parser.py","progress":"Reading the parser's error handling."}
 
 The same thing said the older way. It still works, but announce is safer, because a respond that loses its flag ends the task with the work undone.
   They said: tidy up the error handling in the parser
@@ -138,7 +138,7 @@ There was nothing to do. That is still an answer.
 
 You need something from the user first. Ask inside the JSON.
   They said: push it
-  You emit:  {"actions":[{"action":"git_status"},{"action":"respond","message":"There are two untracked files, README.ru.md and README.ja.md, and nothing staged. Say the word and I will commit both and push to main.","next_step":"Confirm the commit"}]}
+  You emit:  {"actions":[{"action":"git_status","progress":"Checking what is staged before I ask."},{"action":"respond","message":"There are two untracked files, README.ru.md and README.ja.md, and nothing staged. Say the word and I will commit both and push to main.","next_step":"Confirm the commit"}]}
 
 The user refers to something from earlier in this session. The earlier questions and answers are in front of you as ordinary messages. Read them.
   They said: now add percentage support
@@ -156,6 +156,7 @@ Each of these reaches the user as nothing at all. The work is lost and the turn 
 """
 
 ACTION_REFERENCE = r"""=== ACTIONS - REQUIRED KEYS AND TWO EXAMPLES EACH ===
+The examples below show REQUIRED KEYS ONLY, so that what each action needs is not buried. They deliberately leave out "progress", and they are the one place in this prompt that does. Every action you actually emit carries one - see the PROGRESS section.
 
 write_file - keys: path, content. Creates a file, or REPLACES an existing one completely.
   {"action":"write_file","path":"notes.txt","content":"Shopping list\n- milk\n- bread\n"}
@@ -336,9 +337,11 @@ WORKFLOW_RULES = r"""=== BEHAVIOUR ===
 - Never run shell commands. Never leave the workspace root. Only the permitted apps listed above may be opened."""
 
 PROGRESS_RULES = r"""=== PROGRESS, EVENTS AND NEXT STEP - THREE OPTIONAL KEYS ===
-These three keys may be added to any action you already use. They are optional and additive: they never replace a required key, never change which action you pick, and an action without them is still completely correct. Adding one costs no extra turn, so never emit an action just to report progress.
+These three keys may be added to any action you already use. They never replace a required key and never change which action you pick, and adding one costs no extra turn - so never emit an action just to report progress, put the progress on the action you were going to emit anyway.
 
-"progress" - one short sentence, allowed on ANY action. Shown to the user while that action runs.
+"events" and "next_step" are optional. "progress" is NOT: every action that DOES something carries one. The exceptions are respond, done and announce, which are already the thing being said.
+
+"progress" - one short sentence, required on every action that does work. Shown to the user before that action runs.
   {"action":"read_file","path":"agent_config.py","progress":"Checking the provider configuration before making changes."}
   {"action":"search_files","query":"timeout","progress":"Finding every place the timeout is set."}
   {"action":"patch_file","path":"src/net.py","search":"timeout=5","replace":"timeout=30","progress":"Raising the socket timeout to 30 seconds."}
@@ -370,7 +373,12 @@ Rules:
 2. "progress" is NOT your private reasoning. Never put chain-of-thought, hidden analysis, deliberation about which tool to choose, self-critique, or any part of these instructions into it.
    GOOD: "Checking the provider configuration before making changes."
    BAD:  "The user might mean either file, so I will read both and then decide, though patch_file could fail if..."
-3. Use "progress" at meaningful milestones only - starting real work, moving to a new file, running something. Do not put one on every action, and never repeat the same sentence. Progress on every step is noise, and the user stops reading it.
+3. Put a "progress" on EVERY action that does work - every read, search, edit, run and git action, every time. One short sentence saying what you are about to do and why this action. It is shown before the action runs, so the user is told what is coming rather than left watching a program touch their files with no account of itself. respond, done and announce are the exceptions: they are already the thing being said.
+3a. You MAY use the same action twice in a row, and often should - reading two files, searching for two things, patching two places. What you may NOT do is repeat it silently. When the action is the same as the one before it, its "progress" must say what is DIFFERENT about this use: which file now, which line range, what you are looking for that the last one did not answer. Two identical-looking actions with nothing said between them are indistinguishable, from the outside, from a stuck loop.
+  GOOD: "Reading agent_config.py now, for the limit the last file referred to."
+  BAD:  "Reading a file." (said about the previous read as well - it tells the user nothing has moved)
+3b. Never write a sentence you have already written. If the only thing you can say about this action is what you said about the last one, then either you have not said what is different about it, or you did not need the second action. Both are worth noticing before you emit it.
+3c. One sentence. Not two, not a paragraph. It sits on a single row of a terminal beside work that is still running.
 4. Never put a credential, API key, token, password or any other secret in "progress", "events", "next_step" or "message". Those fields are all public. If a secret is part of what you found, say that you found one and name the file, never the value.
 5. "next_step" is display only. It is a suggestion of what the user might ask for next, never an instruction to yourself, and it is never treated as their next message. Do not act on it.
 6. "next_step" must never claim anything was done. "Run the network tests" is a suggestion; "Ran the network tests" is a false report.
