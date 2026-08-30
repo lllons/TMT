@@ -239,6 +239,36 @@ git_push - keys: none. Optional: branch, remote. Sends existing commits to the r
   {"actions":[{"action":"git_commit","message":"Fix the timeout handling","paths":["src/net.py"]},{"action":"git_push"},{"action":"respond","message":"Committed the timeout fix and pushed it to the remote."}]}
   {"actions":[{"action":"git_commit","message":"Update the changelog","all":true},{"action":"git_push","branch":"main"},{"action":"respond","message":"Committed everything and pushed to main."}]}
 
+tree - keys: none. Optional: path, depth, limit. The shape of the project: directories, files, sizes, nesting. Reads no file contents. Use it to decide what to look at, never to read code.
+  {"action":"tree"}
+  {"action":"tree","path":"src","depth":2}
+
+find_text - keys: query. Optional: path, glob, context, limit. Finds an EXACT string, case sensitive, across every file at once. The query may span several lines, so a whole block can be located. Use it when you know the characters you are looking for.
+  {"action":"find_text","query":"self.workspace_root"}
+  {"action":"find_text","query":"def resolve(self):\n        return self._value","glob":"src/**/*.py","context":2}
+
+find_symbol - keys: name. Optional: kind, path, limit. Finds where a function, class, method, constant or type is DEFINED, with its kind and line. Python is parsed, so those answers are exact; other languages are matched lexically and are labelled as such.
+  {"action":"find_symbol","name":"calculate_total"}
+  {"action":"find_symbol","name":"Calculator","kind":"class"}
+
+replace_across - keys: search, replace. Optional: glob, path, apply. The same exact edit in many files at once. It PREVIEWS by default and changes nothing; add "apply":true to perform it. Always preview first and read the counts before applying.
+  {"action":"replace_across","search":"old_function_name","replace":"new_function_name","glob":"src/**/*.py"}
+  {"action":"replace_across","search":"old_function_name","replace":"new_function_name","glob":"src/**/*.py","apply":true}
+
+code_map - keys: target. Optional: relation (defines, imports, importers, references, all). Relationships rather than text: what defines this, what imports it, what it imports, where it is referenced. Use it to work out what a change would affect.
+  {"action":"code_map","target":"agent_file_ops"}
+  {"action":"code_map","target":"safe_path","relation":"references"}
+
+related_tests - keys: none. Optional: path. Reads the current git diff and names the tests worth running for it, separating what the diff proves from what is only a guess. Use it instead of running an entire suite for a one-line change.
+  {"action":"related_tests"}
+
+remember - keys: note. Optional: tags, kind. Writes one durable fact about THIS project for later sessions: a convention, a decision, a discovery that cost time. Never store a key, token or password. Never store something the code already says.
+  {"action":"remember","note":"The test runner has no per-test timeout, so a test that blocks on input hangs the whole suite.","tags":["testing"]}
+
+recall - keys: none. Optional: query, limit, kind. Reads back what earlier sessions stored about this project. Worth doing before exploring a repository you have not seen this session.
+  {"action":"recall"}
+  {"action":"recall","query":"testing"}
+
 respond - keys: message. Optional: final (bool, default true). The only text the user ever sees. By default it ends the task, and every task must end with one that does. The message summarises what you made: which files now exist or changed, what they do, and what anything you ran reported.
   "final": false makes this respond an announcement, not an ending: the message is shown to the user and the task CONTINUES, so you must go on to emit the action you just announced. A respond that announces work you have not done yet MUST carry "final": false - a terminal one ends the task with that work undone.
   {"action":"respond","message":"I created notes.txt with your shopping list."}
@@ -257,6 +287,29 @@ PREFERENCE_RULES = r"""=== EDITING PREFERENCES - FOLLOW IN THIS ORDER ===
 8. Files under 8 KB are already pasted below - do not read them again, just act on them. For anything larger use read_lines with a range instead of read_file.
 9. Use search_files to locate the code before editing it, rather than guessing a path or dumping a whole file.
 10. Prefer one batch over many turns: put independent steps in a single "actions" array."""
+
+TOOL_CHOICE_RULES = r"""=== CHOOSING A TOOL - ALWAYS TAKE THE NARROWEST ONE ===
+Every one of these answers a different question. Reading a whole file to find one line is the mistake they exist to stop, and so is scanning the workspace again for something you already asked about.
+
+  What is in this project, and where?        -> tree
+  Where is this exact text?                  -> find_text
+  Where is this function or class defined?   -> find_symbol
+  What would break if I change this?         -> code_map
+  The same edit in many files                -> replace_across
+  Which tests does my change affect?         -> related_tests
+  What did earlier sessions learn here?      -> recall
+  This is worth knowing next time            -> remember
+  I know the file and I need the lines       -> read_lines
+  I need a loose or case-insensitive match    -> search_files
+
+Rules:
+1. find_text is EXACT and case sensitive. search_files is loose and case insensitive. Reach for find_text when you know the characters, search_files when you are hunting.
+2. Do not use tree to read code. It states sizes and paths and no contents; it is for deciding what to open.
+3. Use find_symbol before read_file when you want a definition. It gives you the file and the line, and then read_lines gives you the region -- two narrow actions instead of one large one.
+4. replace_across previews by default. Read the counts it reports, confirm they are what you intended, and only then send the same action again with "apply":true. Never send apply on the first attempt for a change you have not previewed.
+5. After changing code, related_tests tells you what to run. Prefer it to running an entire suite.
+6. What a tool states as fact and what it offers as a guess are marked differently in its output. Carry that distinction into what you tell the user; never repeat a heuristic as though it were measured.
+7. Files under 8 KB are already pasted below. Searching for something that is already in front of you wastes a turn."""
 
 WORKFLOW_RULES = r"""=== BEHAVIOUR ===
 - Every task ends with a respond action. A batch whose last entry is respond finishes the task. This is not optional: a task that stops without one has failed, however much work was done, because the respond "message" is the ONLY thing the user ever reads.
@@ -364,6 +417,7 @@ def get_system_prompt():
         ACTION_REFERENCE,
         f"Permitted apps for open_app: {apps}",
         PREFERENCE_RULES,
+        TOOL_CHOICE_RULES,
         WORKFLOW_RULES,
         PROGRESS_RULES,
         GIT_RULES,

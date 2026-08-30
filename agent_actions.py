@@ -73,6 +73,30 @@ def _run_git(operation):
             return f"Git error: {error}"
         raise
 
+def _run_tool(module_name, operation):
+    """Run one of the repository-understanding tools and return its result.
+
+    Imported here rather than at module scope for the reason `_run_git` gives:
+    a module that is missing or fails to import must degrade to an action
+    result the model can read and work around, not an exception that ends the
+    session. These tools are the ones most likely to be absent -- an editable
+    install freezes its module list at install time, so a module added to the
+    source tree is invisible to `tmtcode` until pyproject.toml is updated, and
+    the failure that produces should say so rather than crash.
+
+    A ValueError is the sandbox refusing a path outside the workspace, which
+    is a fact the model needs in words rather than a traceback.
+    """
+    try:
+        module = __import__(module_name)
+    except Exception as error:
+        return f"{module_name} is unavailable: {error}"
+    try:
+        return operation(module)
+    except ValueError as error:
+        return f"Refused: {error}"
+
+
 MAX_STATUS_PATHS = 40
 
 def _git_status(agent_git):
@@ -186,6 +210,39 @@ def execute_action(obj, context=None):
         if not (context or {}).get("push_authorized"):
             return PUSH_BLOCKED
         return _run_git(lambda agent_git: _git_push(agent_git, obj))
+    # Understanding the repository. Each answers one question and no more, so
+    # the model can pick the narrowest tool instead of reading whole files to
+    # find one line.
+    if action == "tree":
+        return _run_tool("agent_tree", lambda m: m.tree(
+            obj.get("path"), obj.get("depth"), obj.get("limit")))
+    if action == "find_text":
+        return _run_tool("agent_file_ops", lambda m: m.find_text(
+            obj["query"], path=obj.get("path"), glob=obj.get("glob"),
+            context=obj.get("context", 0), limit=obj.get("limit")))
+    if action == "find_symbol":
+        return _run_tool("agent_symbols", lambda m: m.find_symbol(
+            obj["name"], kind=obj.get("kind"), path=obj.get("path"),
+            limit=obj.get("limit")))
+    if action == "replace_across":
+        # Preview unless the model explicitly asks to apply. A bulk edit it
+        # did not look at first is how a repository gets wrecked, so the
+        # default is the harmless one and saying nothing means changing
+        # nothing.
+        return _run_tool("agent_file_ops", lambda m: m.replace_across(
+            obj["search"], obj["replace"], glob=obj.get("glob"),
+            path=obj.get("path"), apply=bool(obj.get("apply", False))))
+    if action == "code_map":
+        return _run_tool("agent_index", lambda m: m.code_map(
+            obj["target"], relation=obj.get("relation", "all")))
+    if action == "related_tests":
+        return _run_tool("agent_testsel", lambda m: m.related_tests(obj.get("path")))
+    if action == "remember":
+        return _run_tool("agent_memory", lambda m: m.remember(
+            obj["note"], tags=obj.get("tags"), kind=obj.get("kind", "note")))
+    if action == "recall":
+        return _run_tool("agent_memory", lambda m: m.recall(
+            query=obj.get("query"), limit=obj.get("limit"), kind=obj.get("kind")))
     if action in ("respond", "done"): return obj.get("message", "done")
     return f"Unknown action: {action}"
 
@@ -210,6 +267,8 @@ ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     "list_files", "search_files", "read_lines", "replace_lines", "copy_file",
     "delete_folder", "rename_file", "create_folder", "run_python", "run_file",
     "open_app", "git_status", "git_diff", "git_identity", "git_commit", "git_push",
+    "tree", "find_text", "find_symbol", "replace_across", "code_map",
+    "related_tests", "remember", "recall",
     "respond", "done",
 )}
 

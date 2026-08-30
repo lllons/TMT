@@ -38,7 +38,9 @@ py-modules = [
     "agent_execution",
     "agent_file_ops",
     "agent_git",
+    "agent_index",
     "agent_live_renderer",
+    "agent_memory",
     "agent_menu",
     "agent_model",
     "agent_models",
@@ -46,5 +48,8 @@ py-modules = [
     "agent_providers",
     "agent_session",
     "agent_setup",
+    "agent_symbols",
+    "agent_testsel",
+    "agent_tree",
     "agent_ui",
 ]

@@ -218,6 +218,336 @@ def replace_lines(path, start, end, content):
     p.write_text(new_content, encoding="utf-8")
     return f"Replaced lines {start}-{end} in {path}"
 
+# --- exact search, and bulk replace -----------------------------------------
+#
+# search_files above is the fuzzy one: case-insensitive, one line at a time.
+# These two are the exact ones. A model looking for the precise five lines it
+# is about to edit cannot use a case-insensitive line matcher to find them, and
+# it certainly cannot use one to decide what to rewrite.
+
+FIND_TEXT_MAX_HITS = 100        # match blocks rendered before find_text stops
+FIND_TEXT_HARD_MAX = 1000       # ceiling on a caller-supplied limit
+FIND_TEXT_MAX_CONTEXT = 10      # context lines either side, per match
+FIND_TEXT_MAX_LINE = 400        # characters of any one line put in the result
+REPLACE_LIST_MAX = 200          # per-file rows listed; the counts stay whole
+BINARY_SNIFF_BYTES = 4096       # how much of a file is examined for a NUL
+
+
+def _looks_binary(data):
+    """A NUL byte near the front, which is what actually separates the two.
+
+    Cheap and good enough: a .png or a .pyc rendered into a search result is
+    unreadable noise, and one handed to a bulk replace is a corrupted file.
+    """
+    return b"\x00" in data[:BINARY_SNIFF_BYTES]
+
+
+def _to_lf(text):
+    """Newlines flattened so a multi-line needle can be matched at all.
+
+    A block copied out of a CRLF file and pasted into a query arrives with the
+    carriage returns still in it, or with them already gone; either way the
+    match has to happen. Nothing is written from this form -- replace_across
+    re-expresses its needle in the file's own endings before touching it.
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _glob_to_regex(pattern):
+    """A path glob compiled once, with `**` meaning what people expect.
+
+    fnmatch cannot do this: its `*` crosses directory separators, so
+    `src/*.py` would quietly match `src/deep/nested/thing.py`. Here `*` stops
+    at a separator and `**/` is the "any depth, including none" segment, so
+    `src/**/*.py` covers `src/a.py` as well as `src/deep/a.py`.
+    """
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def _glob_filter(pattern):
+    """A predicate over workspace-relative paths, or one that lets all through."""
+    if not pattern:
+        return lambda relative: True
+    matcher = _glob_to_regex(str(pattern).replace("\\", "/"))
+    # A pattern with no separator in it is meant as "anywhere", not "in the
+    # workspace root only" -- `*.py` from a model means every Python file.
+    anywhere = "/" not in str(pattern).replace("\\", "/")
+
+    def keep(relative):
+        text = str(relative).replace("\\", "/")
+        if matcher.match(text):
+            return True
+        return anywhere and bool(matcher.match(text.rsplit("/", 1)[-1]))
+    return keep
+
+
+def _search_targets(path, glob):
+    """(files, hit_the_scan_ceiling) as (relative, absolute) pairs.
+
+    safe_path's ValueError is allowed straight out: a caller that asked for
+    somewhere outside the workspace must be refused, not handed an empty
+    result set that reads as "there is nothing there".
+    """
+    root = safe_path(path) if path else workspace()
+    if not root.exists():
+        return None, False
+    keep = _glob_filter(glob)
+    here = workspace()
+    if root.is_file():
+        found = [root]
+        capped = False
+    else:
+        found = [p for _, p in iter_workspace_files(root)]
+        # iter_workspace_files stops dead at its ceiling, so a full basket is
+        # the only signal that the walk may have been cut short.
+        capped = len(found) >= WORKSPACE_MAX_SCAN
+    targets = []
+    for p in found:
+        try:
+            relative = p.relative_to(here)
+        except ValueError:
+            continue
+        if keep(relative):
+            targets.append((relative, p))
+    return targets, capped
+
+
+def _plural(count, word, plural=None):
+    """Counted noun. `plural` exists because "4 matchs" reads as a bug in the
+    tool rather than as an English mistake, and the header is the first thing
+    anyone reads."""
+    if count == 1:
+        return f"{count} {word}"
+    return f"{count} {plural or word + 's'}"
+
+
+def _posix(relative):
+    """One separator in every result, whatever platform produced the path."""
+    return str(relative).replace("\\", "/")
+
+
+def find_text(query, path=None, glob=None, context=0, limit=None):
+    """Exact, case-SENSITIVE search, including for a block spanning lines.
+
+    The tool for "where is this precise code", where search_files is the tool
+    for "where is something roughly like this". The distinction is the point:
+    a case-insensitive line matcher cannot tell `Path` from `path`, and cannot
+    find a five-line block at all, so a model that only has one of those ends
+    up editing on a guess.
+
+    Totals in the header are counted over every file examined, not over the
+    part that fitted in the result, because a header that reported the shown
+    figure would understate the work still out there every time it capped.
+    """
+    if not query:
+        return "find_text needs a 'query' -- there is nothing to look for."
+    needle = _to_lf(_decode_content(query))
+    if not needle:
+        return "find_text needs a 'query' -- there is nothing to look for."
+    try:
+        context = max(0, min(FIND_TEXT_MAX_CONTEXT, int(context or 0)))
+    except (TypeError, ValueError):
+        return "context must be a whole number of lines"
+    try:
+        cap = FIND_TEXT_MAX_HITS if limit in (None, "") else int(limit)
+    except (TypeError, ValueError):
+        return "limit must be a whole number of matches"
+    cap = max(1, min(FIND_TEXT_HARD_MAX, cap))
+
+    targets, scan_capped = _search_targets(path, glob)
+    if targets is None:
+        return f"Path not found: {path}"
+
+    blocks, total, files_hit, skipped_binary = [], 0, 0, 0
+    for relative, p in targets:
+        if not p.is_file():
+            continue
+        try:
+            data = p.read_bytes()
+        except OSError:
+            continue
+        if _looks_binary(data):
+            skipped_binary += 1
+            continue
+        text = _to_lf(data.decode("utf-8", "replace"))
+        if needle not in text:
+            continue
+        lines = text.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        files_hit += 1
+        at = text.find(needle)
+        while at != -1:
+            total += 1
+            if total <= cap:
+                start = text.count("\n", 0, at) + 1
+                end = text.count("\n", 0, at + len(needle) - 1) + 1
+                blocks.append(_render_match(relative, lines, start, end, context))
+            at = text.find(needle, at + 1)
+
+    if not total:
+        head = f"No exact match for: {needle.splitlines()[0][:120]}"
+        notes = ["Matching here is case-sensitive; search_files is the "
+                 "case-insensitive one."]
+        if glob:
+            notes.append(f"Only paths matching {glob} were examined.")
+        if skipped_binary:
+            notes.append(f"{_plural(skipped_binary, 'binary file')} skipped.")
+        return "\n".join([head] + notes)
+
+    head = f"{_plural(total, 'match', 'matches')} in {_plural(files_hit, 'file')}"
+    if total > cap:
+        head += (f" -- showing the first {cap}, the limit for one result. "
+                 "Narrow the query, or pass a smaller 'glob'.")
+    out = [head, ""] + blocks
+    if skipped_binary:
+        out.append(f"({_plural(skipped_binary, 'binary file')} skipped.)")
+    if scan_capped:
+        out.append(f"(The walk stopped at {WORKSPACE_MAX_SCAN} entries, so "
+                   "files beyond that were never examined.)")
+    return "\n".join(out).rstrip()
+
+
+def _render_match(relative, lines, start, end, context):
+    """One match block: a locator line, then the matched lines and any context.
+
+    `>` marks the match and `|` marks context, so the two read apart with ANSI
+    stripped -- colour is never allowed to be the only thing carrying it.
+    """
+    first = max(1, start - context)
+    last = min(len(lines), end + context)
+    out = [f"{_posix(relative)}:{start}:"]
+    for n in range(first, last + 1):
+        body = lines[n - 1]
+        if len(body) > FIND_TEXT_MAX_LINE:
+            body = body[:FIND_TEXT_MAX_LINE] + " ..."
+        marker = ">" if start <= n <= end else "|"
+        out.append(f"{n:>6} {marker} {body}")
+    out.append("")
+    return "\n".join(out)
+
+
+def replace_across(search, replace, glob=None, path=None, apply=False):
+    """Literal find-and-replace over many files. Preview unless apply is true.
+
+    The asymmetry is deliberate and is the whole safety of the thing: a bulk
+    edit nobody looked at first is how a repository gets wrecked in one action.
+    Preview computes exactly what apply would compute -- including the syntax
+    check that refuses a file -- so the two reports describe the same set of
+    files, and a preview that lists a file is a promise apply will change it.
+    """
+    if not search:
+        return ("replace_across needs a non-empty 'search'. Refusing rather "
+                "than guessing: an empty needle matches between every pair of "
+                "characters in every file.")
+    needle = _to_lf(_decode_content(search))
+    if not needle:
+        return ("replace_across needs a non-empty 'search'. Refusing rather "
+                "than guessing: an empty needle matches between every pair of "
+                "characters in every file.")
+    payload = _to_lf(_decode_content(replace or ""))
+
+    targets, scan_capped = _search_targets(path, glob)
+    if targets is None:
+        return f"Path not found: {path}"
+
+    changed, broken, total, skipped_binary = [], [], 0, 0
+    for relative, p in targets:
+        if not p.is_file():
+            continue
+        try:
+            data = p.read_bytes()
+        except OSError:
+            continue
+        # Bytes in, bytes out. Text mode with universal newlines would rewrite
+        # every line ending in the file on the way through, and this repo has
+        # core.autocrlf set: a whole-file ending flip buries the one real
+        # change under a diff of every line.
+        if _looks_binary(data):
+            skipped_binary += 1
+            continue
+        try:
+            raw = data.decode("utf-8")
+        except UnicodeDecodeError:
+            skipped_binary += 1
+            continue
+
+        # The file's own endings decide the shape of the needle, so everything
+        # outside the replaced span comes back byte for byte -- a mixed file
+        # is left mixed rather than tidied.
+        crlf = raw.count("\r\n")
+        uses_crlf = crlf > 0 and crlf >= raw.count("\n") - crlf
+        wanted = needle.replace("\n", "\r\n") if uses_crlf else needle
+        putting = payload.replace("\n", "\r\n") if uses_crlf else payload
+        count = raw.count(wanted)
+        if not count:
+            continue
+        updated = raw.replace(wanted, putting)
+        if p.suffix == ".py":
+            try:
+                ast.parse(_to_lf(updated))
+            except SyntaxError as error:
+                broken.append((relative, error))
+                continue
+        if apply:
+            # Built whole first, then written in one call: a failure while
+            # working the text out leaves the file exactly as it was, rather
+            # than half rewritten.
+            p.write_bytes(updated.encode("utf-8"))
+        changed.append((relative, count))
+        total += count
+
+    verb = "changed" if apply else "would change"
+    if not changed:
+        head = "0 occurrences: no file was changed."
+        if broken:
+            head = ("0 occurrences changed. Every file that matched was "
+                    "skipped; see below.")
+    else:
+        head = (f"{_plural(total, 'occurrence')} in "
+                f"{_plural(len(changed), 'file')} {verb}.")
+        if not apply:
+            head = "Preview only, nothing written. " + head
+    out = [head]
+    for relative, count in changed[:REPLACE_LIST_MAX]:
+        out.append(f"  {_posix(relative)}: "
+                   f"{_plural(count, 'occurrence')} {verb}")
+    if len(changed) > REPLACE_LIST_MAX:
+        out.append(f"  ... and {len(changed) - REPLACE_LIST_MAX} more files, "
+                   f"listed to the {REPLACE_LIST_MAX}-file limit. The counts "
+                   "above the list cover all of them.")
+    for relative, error in broken:
+        out.append(f"  SKIPPED {_posix(relative)}: the replacement would not "
+                   f"parse ({error}). Not written.")
+    if skipped_binary:
+        out.append(f"  {_plural(skipped_binary, 'binary or non-UTF-8 file')} "
+                   "skipped.")
+    if scan_capped:
+        out.append(f"  The walk stopped at {WORKSPACE_MAX_SCAN} entries, so "
+                   "files beyond that were never examined.")
+    if changed and not apply:
+        out.append('Nothing on disk was touched. Re-run with "apply": true to '
+                   "make these changes.")
+    return "\n".join(out)
+
+
 def copy_file(path, dest):
     if not dest:
         return "copy_file needs a 'to' path"

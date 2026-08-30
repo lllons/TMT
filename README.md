@@ -156,6 +156,47 @@ Editing an existing file uses `patch_file`, not a rewrite, so untouched lines st
 untouched. Python files are syntax-checked before they are written; a broken edit is
 rejected rather than saved.
 
+### Understanding a repository
+
+Eight actions for finding your way around a codebase without reading it all. Each
+answers one question, and TMT is told to pick the narrowest one that fits.
+
+| Action | Purpose | Reach for it when |
+|---|---|---|
+| `tree` | Directories, files, sizes, nesting. Reads no contents | You need the shape of the project |
+| `find_text` | Exact, case-sensitive search across every file at once. The query may span several lines | You know the characters you are looking for |
+| `find_symbol` | Where a function, class, method, constant or type is *defined* | You want a definition, not a mention |
+| `code_map` | What defines this, what imports it, what it imports, where it is referenced | You need to know what a change would affect |
+| `replace_across` | The same exact edit in many files | Renaming something the whole project uses |
+| `related_tests` | Reads the git diff and names the tests worth running | You changed one thing and do not want to run everything |
+| `remember` / `recall` | Durable notes about this project, kept between sessions | Something cost you time to work out |
+
+```
+Task> show me the project structure
+Task> find every place that calls self.workspace_root
+Task> where is calculate_total defined?
+Task> what imports agent_file_ops?
+Task> rename old_function_name to new_function_name across src
+Task> which tests should I run for what I just changed?
+```
+
+`find_text` is exact and case-sensitive; `search_files` is the loose, case-insensitive
+one. Both exist because they answer different questions.
+
+**`replace_across` previews by default.** It reports how many files and occurrences it
+*would* change and writes nothing. Sending the same action again with `"apply": true`
+performs it. Line endings and encoding are preserved, binary files are skipped, and a
+replacement that would leave a Python file unparseable is refused rather than written.
+
+**Facts and guesses are labelled differently.** Python symbols are found by parsing the
+file, so those answers are exact; other languages are matched lexically and say so.
+`related_tests` separates what the diff proves from what it is only guessing. Nothing
+presents a heuristic as a measurement.
+
+**Project memory** is stored beside TMT's own settings, keyed by project, never inside
+your repository — the same rule as every other piece of TMT state. Notes are scanned
+before they are written and anything shaped like a key, token or password is refused.
+
 ### Running code
 
 `run_file` executes and returns the output. Python, JavaScript, TypeScript, Ruby,

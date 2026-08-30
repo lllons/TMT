@@ -500,6 +500,11 @@ LIST_FILES_MAX = 400             # paths returned by list_files
 MUTATING_ACTIONS = {
     "write_file", "append_file", "write_files", "patch_file", "delete_file",
     "rename_file", "replace_lines", "copy_file", "delete_folder",
+    # Only when it is actually applied, but the set is consulted by action
+    # name alone and a preview that needlessly invalidates the cached prompt
+    # costs one rebuild, while an applied replacement that did not would leave
+    # the model reasoning about files it had itself just rewritten.
+    "replace_across",
 }
 
 REQUIRED_KEYS = {
@@ -513,4 +518,11 @@ REQUIRED_KEYS = {
     "done": [],
     "git_status": [], "git_identity": [], "git_diff": [],
     "git_commit": ["message"], "git_push": [],
+    # Understanding a repository before editing it. Each of these is the
+    # narrowest tool for one question, which is what the prompt tells the
+    # model to choose on: the shape of the project, an exact string, a
+    # definition, a relationship, what to re-run, what was learned before.
+    "tree": [], "find_text": ["query"], "find_symbol": ["name"],
+    "replace_across": ["search", "replace"], "code_map": ["target"],
+    "related_tests": [], "remember": ["note"], "recall": [],
 }
