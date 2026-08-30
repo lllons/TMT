@@ -326,8 +326,15 @@ class Session:
         stopped asking about. Retiring it at the START of the next turn rather
         than at the end of this one is what lets a finished plan stay on
         screen, all green, for as long as the answer it produced.
+
+        Retired, not cleared. `Plan.clear` is the model's own guarded verb and
+        it refuses a plan with work against it -- which is every plan a turn
+        that finished its steps leaves behind, because the gate would not have
+        let that turn answer otherwise. Calling it here raised a PlanError out
+        of the one place on the loop's prompt path that catches nothing, and
+        the session died on the next question the user asked.
         """
-        self.plan.clear()
+        self.plan.retire()
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": str(system_prompt)})
@@ -464,9 +471,15 @@ class Session:
         The plan goes with it. It is part of what was being worked on, and a
         session told to forget the conversation that would still refuse to
         answer until an invisible plan was finished would be the worst of both.
+
+        Retired first, and retired rather than cleared. `Plan.clear` refuses a
+        plan with work against it, so `/clear` used to empty the conversation
+        and THEN kill the process -- the worst possible order, and reached by
+        the one gesture a user would use to escape the crash in the first
+        place.
         """
+        self.plan.retire()
         self._turns = []
-        self.plan.clear()
 
     def __len__(self):
         return len(self._turns)

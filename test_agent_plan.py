@@ -52,6 +52,22 @@ def plan_of(*titles):
     return plan
 
 
+def _worked(plan, *positions):
+    """The same plan with these steps completed -- what a turn leaves behind.
+
+    The gate will not let a turn answer until every step is completed, so this
+    is the shape retirement actually meets, not an unusual one.
+    """
+    plan.update(updates=[{"step": n, "status": "completed"} for n in positions])
+    return plan
+
+
+def _blocked(plan, position=1):
+    """The same plan with one step parked. Outstanding, but not completed."""
+    plan.update(position, "blocked")
+    return plan
+
+
 def statuses(plan):
     return [step.status for step in plan.steps]
 
@@ -283,6 +299,53 @@ def test_a_plan_with_work_against_it_cannot_be_cleared():
     assert agent_plan.refusal(plan, "respond") == ""
 
 
+def test_retiring_a_plan_is_unconditional_and_clearing_it_is_not():
+    """The two halves, asserted against each other, because collapsing them
+    into one method is what killed a session.
+
+    `clear` is the model dropping a plan it is still working to, and it is
+    guarded. `retire` is TMT dropping the plan of a task that is over, and
+    there is nothing to refuse -- so it must work for every shape a finished
+    turn can leave behind, including the one the gate itself guarantees:
+    every step completed.
+    """
+    shapes = {
+        "empty": lambda: agent_plan.Plan(),
+        "all pending": lambda: plan_of("One", "Two"),
+        "one completed": lambda: _worked(plan_of("One", "Two"), 1),
+        "all completed": lambda: _worked(plan_of("One", "Two"), 1, 2),
+        "blocked": lambda: _blocked(plan_of("One", "Two")),
+        "completed by create": lambda: agent_plan.Plan(
+            [{"title": "One", "status": "completed"}, "Two"]),
+    }
+    for name, build in shapes.items():
+        plan = build()
+        assert plan.retire() is None, name
+        assert len(plan) == 0 and not plan, name
+        assert plan.is_complete(), name
+        assert agent_plan.refusal(plan, "respond") == "", name
+        # Retiring twice is not a special case either.
+        plan.retire()
+
+    # And the guard it must NOT have taken with it.
+    said = refused(_worked(plan_of("One", "Two"), 1).clear)
+    assert "cannot be cleared" in said, said
+
+
+def test_retiring_is_not_something_the_model_can_ask_for():
+    """A model that could ask for this would have exactly the bypass rule 7
+    of PLANNING_RULES says does not exist. The guarded `clear` would still be
+    refused and an unguarded synonym would sit next to it in the reference."""
+    assert "retire" not in agent_plan.OPERATIONS, agent_plan.OPERATIONS
+    assert len(agent_plan.OPERATIONS) == 6, agent_plan.OPERATIONS
+    plan = _worked(plan_of("One", "Two"), 1)
+    said = run({"operation": "retire"}, context={"plan": plan})
+    assert "not a plan operation" in said, said
+    assert len(plan) == 2, plan.describe()
+    assert "retire" not in agent_prompt.PLAN_REFERENCE
+    assert "retire" not in agent_prompt.PLANNING_RULES
+
+
 def test_a_title_is_trimmed_to_one_line_and_bounded():
     """The column is one row per step. A title carrying its own line breaks
     would draw rows the layout never counted."""
@@ -478,6 +541,43 @@ def test_the_plan_belongs_to_the_task_and_not_to_the_session():
     assert agent_plan.refusal(session.plan, "respond") == ""
 
 
+def test_a_finished_plan_is_retired_by_the_next_question():
+    """The crash. A turn that finished its plan is the ONLY kind the gate lets
+    answer, so every successful planned turn ended with a plan whose every step
+    was completed -- which is precisely the plan the model's own `clear` is
+    written to refuse. `begin_turn` called that guarded verb, nothing on the
+    loop's prompt path catches a PlanError, and the session died on the next
+    question the user asked.
+
+    The plan the test builds is therefore not an edge case. It is what working
+    correctly leaves behind.
+    """
+    session = agent_session.Session()
+    session.begin_turn("add the feature")
+    session.plan.create(["Implement", "Run the tests"])
+    _worked(session.plan, 1, 2)
+    # The gate let this turn answer, which is what makes the state reachable.
+    assert agent_plan.refusal(session.plan, "respond") == ""
+    held = session.plan
+    session.begin_turn("and now something unrelated")
+    assert session.plan is held, "the session rebound its plan"
+    assert len(session.plan) == 0, session.plan.describe()
+    assert agent_plan.refusal(session.plan, "respond") == ""
+
+
+def test_a_half_done_plan_is_retired_too_however_the_turn_ended():
+    """Not only successful turns. A turn stopped by its round budget, by the
+    identical-reply circuit breaker or by Ctrl-C leaves steps completed and
+    steps outstanding, and the next question must still be answerable."""
+    session = agent_session.Session()
+    session.plan.create(["Implement", "Run the tests"])
+    _worked(session.plan, 1)
+    assert agent_plan.refusal(session.plan, "respond"), "not the half-done shape"
+    session.begin_turn("something unrelated")
+    assert len(session.plan) == 0, session.plan.describe()
+    assert agent_plan.refusal(session.plan, "respond") == ""
+
+
 def test_the_session_empties_its_plan_in_place_and_never_rebinds_it():
     """The loop builds its action context BEFORE it calls begin_turn, so a new
     Plan object assigned there would leave the turn writing into the plan of a
@@ -499,6 +599,44 @@ def test_clearing_the_conversation_clears_the_plan():
     session.clear()
     assert len(session.plan) == 0
     assert agent_plan.refusal(session.plan, "respond") == ""
+
+
+def test_clearing_the_conversation_clears_a_plan_that_has_work_against_it():
+    """The second fatal path, and the crueller one: `/clear` is the gesture a
+    user reaches for to escape the crash, and it crashed the same way.
+
+    Worse, it emptied the conversation FIRST and raised afterwards, so the
+    turns were already gone by the time the process died. The assert on
+    `len(session)` is what pins that order: the state has to be torn down
+    completely or not at all, never half way.
+    """
+    session = agent_session.Session()
+    session.record("an earlier question", "an earlier answer")
+    session.plan.create(["Implement", "Run the tests"])
+    _worked(session.plan, 1)
+    held = session.plan
+    session.clear()
+    assert len(session) == 0, len(session)
+    assert session.plan is held, "the session rebound its plan"
+    assert len(session.plan) == 0, session.plan.describe()
+
+
+def test_the_session_retires_its_plan_and_never_asks_for_the_guarded_route():
+    """Read as source, because both call sites have to be right and a test
+    that exercised one would pass while the other still killed the session.
+
+    `Plan.clear` is the model's verb and refuses a plan with work against it.
+    Nothing in the session's own lifecycle may call it -- retiring is not the
+    same operation under another name, and the difference is a live session.
+    """
+    import pathlib
+    source = pathlib.Path(agent_session.__file__).read_text(encoding="utf-8")
+    code = [line for line in source.splitlines()
+            if not line.lstrip().startswith("#")]
+    guarded = [line for line in code if "self.plan.clear()" in line]
+    assert not guarded, guarded
+    retired = [line for line in code if "self.plan.retire()" in line]
+    assert len(retired) == 2, retired
 
 
 # --- the column -------------------------------------------------------------
@@ -720,6 +858,34 @@ def test_the_prompt_box_draws_the_plan_beside_it():
     assert "PLAN" not in text, text
 
 
+def test_the_box_stops_drawing_a_plan_the_moment_its_finished_task_is_over():
+    """Both halves of what a finished plan is for, in the order they happen.
+
+    It stays on screen, all green, beside the answer it produced -- that is
+    why retirement is at the START of the next turn and not at the end of this
+    one. And it goes the instant the next question is asked.
+
+    This is also the test that refuses the easy wrong fix. Wrapping the
+    retirement in a try/except would stop the crash and leave the plan
+    standing, and the user would then be looking at "PLAN 2/2" for work they
+    had stopped asking about, sitting beside an unrelated question.
+    """
+    session = agent_session.Session()
+    session.plan.create(["Implement it", "Run the tests"])
+    _worked(session.plan, 1, 2)
+    box = menu().PromptBox(stream=Terminal(), instream=Stdin(),
+                           session=session)
+    text = "\n".join(visible(row) for row in
+                     box.lines(menu().LineEditor(), size=(100, 24)))
+    assert "PLAN 2/2" in text, text
+    assert "S1 ✓ Implement it" in text, text
+
+    session.begin_turn("something else entirely")
+    text = "\n".join(visible(row) for row in
+                     box.lines(menu().LineEditor(), size=(100, 24)))
+    assert "PLAN" not in text, text
+
+
 def test_the_running_region_draws_exactly_one_plan_column():
     """The plan appeared TWICE on screen while a turn ran, side by side.
 
@@ -915,3 +1081,79 @@ def test_a_batch_that_ends_in_an_early_answer_keeps_the_work_it_did():
     assert "BLOCKED" in handed_back, handed_back
     assert "All done already." not in visible(drawn), visible(drawn)[-2000:]
     assert "Wrote made.txt." in visible(drawn), visible(drawn)[-2000:]
+
+
+# --- asking a second question ----------------------------------------------
+#
+# Every test above this point asks ONE question and then quits, and that is
+# exactly why the crash below shipped. `quit` returns from the loop before it
+# reaches the line that retires the plan, so a suite that always quit after
+# the planned turn never ran the code that killed the session.
+
+def _planned_turn(answer):
+    """The replies for one turn that makes a plan and finishes it.
+
+    The shape the gate guarantees: the plan is created, every step is marked
+    completed, and only then does the answer land. What it leaves behind is a
+    plan whose every step is completed -- the state `Plan.clear` refuses.
+    """
+    return [
+        json.dumps({"action": "plan", "operation": "create",
+                    "steps": ["Implement it", "Run the tests"]}),
+        json.dumps({"action": "plan", "operation": "update", "step": 1,
+                    "status": "completed"}),
+        json.dumps({"action": "plan", "operation": "update", "step": 2,
+                    "status": "completed"}),
+        json.dumps({"action": "respond", "message": answer}),
+    ]
+
+
+def test_the_next_question_is_answered_after_a_turn_that_finished_its_plan():
+    """The reported crash, end to end through TMT.main.
+
+    A user asked a question, TMT planned it, worked through the steps and
+    answered. They typed the next question, pressed Enter, and the process
+    died with a PlanError out of `begin_turn` -- the whole session gone,
+    because the plan that a successful turn leaves behind is the one the
+    model's own `clear` refuses.
+
+    Note the second reply list: `drive_session` indexes replies by GLOBAL
+    model-call count, so the second turn's reply follows the first turn's four
+    in one flat list.
+    """
+    first, second = "Added the feature.", "Second answer."
+    replies = _planned_turn(first) + [
+        json.dumps({"action": "respond", "message": second})]
+    drawn, seen, console = drive_session(
+        ["add the feature", "and now something unrelated", "quit"], replies)
+
+    assert len(seen) == len(replies), len(seen)
+    # The second turn happened at all, which is the whole of the bug.
+    assert [m["role"] for m in seen[-1]] == ["system", "user", "assistant", "user"], \
+        [m["role"] for m in seen[-1]]
+    assert seen[-1][-1]["content"] == "and now something unrelated", seen[-1][-1]
+    # Both answers reached the user.
+    assert first in visible(drawn), visible(drawn)[-3000:]
+    assert second in visible(drawn), visible(drawn)[-3000:]
+
+
+def test_clear_after_a_finished_plan_does_not_end_the_session():
+    """The second fatal path, end to end: `/clear` is what a user reaches for
+    when the session is behaving oddly, and it died the same way -- after
+    throwing the conversation away.
+
+    The roles on the last request are the assertion that matters: `system`
+    and `user` alone means the earlier turn really was forgotten, rather than
+    the command having quietly failed and left the conversation standing.
+    """
+    first, second = "Added the feature.", "Second answer."
+    replies = _planned_turn(first) + [
+        json.dumps({"action": "respond", "message": second})]
+    drawn, seen, console = drive_session(
+        ["add the feature", "/clear", "and now something else", "quit"], replies)
+
+    assert len(seen) == len(replies), len(seen)
+    assert [m["role"] for m in seen[-1]] == ["system", "user"], \
+        [m["role"] for m in seen[-1]]
+    assert "Conversation cleared" in visible(drawn), visible(drawn)[-3000:]
+    assert second in visible(drawn), visible(drawn)[-3000:]

@@ -321,9 +321,43 @@ class Plan:
                 % (len(done), "" if len(done) == 1 else "s",
                    ", ".join(step.id for step in done)))
         had = len(self._steps)
-        self._steps = []
+        self.retire()
         return "Cleared the plan (%d step%s, none completed)." % (
             had, "" if had == 1 else "s")
+
+    # --- retiring it ------------------------------------------------------
+
+    def retire(self):
+        """Empty the plan because its task is over. Never refused.
+
+        The other half of `clear`, and not the same operation under another
+        name. `clear` is the MODEL dropping a plan it is still working to, and
+        it is guarded because dropping a half-done plan is the one route round
+        the gate. This is TMT retiring the plan of a task that is FINISHED --
+        `Session.begin_turn` at the start of the next question, and
+        `Session.clear` when the conversation is forgotten -- and there is
+        nothing to refuse: the plan is not a contract any more, it is a
+        leftover.
+
+        One method serving both is what killed a session. The gate only lets a
+        turn answer once every step is completed, so a planned turn that
+        SUCCEEDED left behind exactly the plan `clear` refuses; the PlanError
+        came out of `begin_turn`, which nothing on the loop's prompt path
+        catches, and the whole session went with it.
+
+        It must not be able to fail, and must not be merely swallowed either:
+        a retirement that raised would take the session again, and one that
+        was caught and ignored would leave the previous task's plan standing
+        to gate an unrelated question and to be drawn beside it. So it is one
+        statement and no conditions. It empties the list IN PLACE -- the loop
+        puts `session.plan` in the action context before it calls
+        `begin_turn`, so a new object here would leave the model writing into
+        a plan the gate is no longer reading.
+
+        Not an OPERATION and not in the prompt. A model that could ask for
+        this would have the bypass PLANNING_RULES rule 7 says does not exist.
+        """
+        self._steps = []
 
     # --- the rules --------------------------------------------------------
 
