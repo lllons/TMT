@@ -23,7 +23,7 @@ sys.path.insert(0, _INSTALL_DIR)
 
 import agent_config
 from agent_menu import (
-    BottomPad, PromptBox, clear_screen, opening_pad, render_command,
+    BottomPad, PromptBox, TypeAhead, clear_screen, opening_pad, render_command,
     render_status, render_task, run_startup,
 )
 from agent_config import (
@@ -43,6 +43,7 @@ from agent_ui import (
 )
 import agent_commands
 import agent_manager
+import agent_panel
 from agent_session import Session
 from agent_live_renderer import LiveRelay
 from agent_setup import ensure_api_key, ensure_git_identity
@@ -339,7 +340,47 @@ def main(argv=None):
 NOTE_PLACEHOLDER = "Ask one question about this workspace"
 
 
-def _dispatch_command(task, session, manager):
+# What the status row says while a note is being answered. The note agent is a
+# whole model round trip, so this row stands for seconds; it names what is
+# happening rather than animating, because nothing about it is measurable.
+_NOTE_STATUS = "Answering your note..."
+
+
+def _blocking_command(run, prompt_box, pad, agent_rows=None):
+    """Run a slow command with the screen still looking like a screen.
+
+    `PromptBox.ask` clears its region the moment it returns, and for the five
+    commands that only read settings that is invisible -- the answer is
+    printed within a millisecond and the box is drawn again under it. `/note`
+    is a model round trip, so the same code left the user looking at a
+    terminal with no prompt box in it for several seconds, which reads as TMT
+    having exited rather than as TMT thinking.
+
+    An ordinary turn already solves this: it builds a `LiveRelay` whose footer
+    is the box, so the bottom of the screen keeps its shape while the work
+    happens. This gives a blocking command the same treatment. The region is
+    taken down before the answer is printed, because `render_command` writes
+    straight to the stream and printing past a live region leaves its repaint
+    arithmetic pointing at rows that have moved.
+    """
+    # Drawn to the box's own stream rather than to sys.stdout. They are the
+    # same thing in a session and are not in a test, and a live region
+    # painting to a different terminal from the box it is drawing is a bug
+    # waiting for the first person who redirects one of them.
+    relay = LiveRelay(stream=getattr(prompt_box, "stream", None),
+                      footer=lambda size=None: prompt_box.running_lines(
+                          RUNNING_HINT, size=size),
+                      pad=pad, agent_rows=agent_rows)
+    try:
+        relay.set_status(_NOTE_STATUS)
+        return run()
+    finally:
+        # Whatever happened -- an answer, a timeout, or Ctrl-C -- the terminal
+        # goes back before anything else is written to it.
+        relay.abort()
+
+
+def _dispatch_command(task, session, manager, slow=None):
     """Answer a slash command, giving the ones that need it the register.
 
     `agent_commands.dispatch` takes a session and no more, which is right for
@@ -352,11 +393,18 @@ def _dispatch_command(task, session, manager):
     task -- including one that merely begins with a path -- goes to the model
     exactly as it always did.
     """
+    # With no wrapper supplied a slow command is simply called, so this stays
+    # drivable with no terminal at all -- which is what the tests do.
+    if slow is None:
+        slow = lambda run: run()
     parsed = agent_commands.parse(task)
     if parsed is not None:
         name, argument = parsed
         if name == "note" and argument:
-            return agent_commands.run_note(argument, session, manager)
+            # The one command that blocks long enough to be noticed. `slow`
+            # keeps the box on screen while it runs.
+            return slow(lambda: agent_commands.run_note(argument, session,
+                                                        manager))
         if name == "agents" and not argument:
             return agent_commands._agents(argument, session, manager)
     return agent_commands.dispatch(task, session)
@@ -414,6 +462,18 @@ def _session_loop(root):
     # down at the end of it. `refresh` only marks the region dirty, so this
     # stays a notification and never becomes a paint from a worker thread,
     # which is the rule the whole live surface depends on.
+    # One builder for the rows drawn under the main progress bar, shared by
+    # the turn's own live region and by any blocking command that has to
+    # hold the screen. `visible_agents` rather than `list`, so a finished
+    # agent's row stays for the retention window and then goes, exactly as
+    # its card does -- the two are the same fact drawn twice and they must
+    # disappear together.
+    agent_rows = lambda columns: agent_panel.agent_status_rows(
+        manager.visible_agents(), columns, stream=sys.stdout)
+    # Lines the user typed while a turn was running. They are taken from
+    # the reader when the turn ends and answered before the next question
+    # is asked, in the order they were entered.
+    queued = []
     live_panel = {"relay": None}
 
     def _panel_changed(name, record):
@@ -424,16 +484,25 @@ def _session_loop(root):
     manager.subscribe(_panel_changed)
     placeholder = OPENING_SUGGESTION
     while True:
-        # Shadow text, and nowhere else. The opening line on the first
-        # question and the last turn's hint after that: `ask` returns what was
-        # typed, and an untouched box returns the empty line it actually
-        # holds, never the line drawn in it.
-        answer = prompt_box.ask(placeholder)
-        if answer is None:
-            break
-        if prompt_box.cancelled:
-            console.print("[yellow]Use 'quit' or 'exit' to close.[/yellow]")
-            continue
+        if queued:
+            # Something the user typed while the last turn was running. It is
+            # taken before the box is drawn, so a queued line is answered
+            # rather than sitting behind a prompt nobody is looking at, and it
+            # is echoed into the scrollback by `render_task` below exactly as
+            # a typed one is -- the record must not be able to tell them
+            # apart, because the user cannot either.
+            answer = queued.pop(0)
+        else:
+            # Shadow text, and nowhere else. The opening line on the first
+            # question and the last turn's hint after that: `ask` returns what
+            # was typed, and an untouched box returns the empty line it
+            # actually holds, never the line drawn in it.
+            answer = prompt_box.ask(placeholder)
+            if answer is None:
+                break
+            if prompt_box.cancelled:
+                console.print("[yellow]Use 'quit' or 'exit' to close.[/yellow]")
+                continue
         task = answer.strip()
         if task.lower() in {"quit", "exit"}:
             break
@@ -443,7 +512,10 @@ def _session_loop(root):
         # test is the parser's, not a prefix check: a task that happens to
         # start with a path is not a command and goes to the model exactly as
         # it always did.
-        answered = _dispatch_command(task, session, manager)
+        # Slow commands keep the prompt box on screen while they run.
+        slow = lambda run: _blocking_command(run, prompt_box, pad,
+                                             agent_rows=agent_rows)
+        answered = _dispatch_command(task, session, manager, slow=slow)
         if answered is not None:
             render_task(task, moment=prompt_box.asked_at)
             # The rows just printed take blank rows from the pad, the same
@@ -462,9 +534,9 @@ def _session_loop(root):
                 asked = prompt_box.ask(NOTE_PLACEHOLDER)
                 if asked is not None and asked.strip() and not prompt_box.cancelled:
                     render_task(asked.strip(), moment=prompt_box.asked_at)
-                    pad.take(2 + (render_command(
-                        agent_commands.run_note(asked.strip(), session,
-                                                manager)) or 0))
+                    answer = slow(lambda: agent_commands.run_note(
+                        asked.strip(), session, manager))
+                    pad.take(2 + (render_command(answer) or 0))
             continue
         # The question, into scrollback. The box that collected it is a live
         # region and has already been taken down, so this is the only record
@@ -507,7 +579,9 @@ def _session_loop(root):
                                                               size=size),
             pad=pad,
             panel=lambda columns, rows: (prompt_box.panel().frame(columns, rows)
-                                         if prompt_box.panel() else None))
+                                         if prompt_box.panel() else None),
+            # One row per background agent, drawn under the main progress bar.
+            agent_rows=agent_rows)
         # The one subscriber built before the loop is pointed at this turn's
         # relay. Assigned rather than subscribed again: a subscription per
         # turn would stack a listener for every question ever asked, and each
@@ -537,6 +611,14 @@ def _session_loop(root):
         # something has.
         turn_state = {"next_step": "", "progress_seen": set(), "acted": False}
         suggestion = ""
+        # Keys taken while this turn runs. The box stops being inert: the
+        # user can write the next question, and Enter puts it on the queue
+        # instead of interrupting the work. It reads nothing at all on a
+        # run that has no raw keys to read, so a piped or scripted run is
+        # exactly as it was.
+        typeahead = TypeAhead(on_change=relay.refresh)
+        prompt_box.typeahead = typeahead
+        typeahead.start()
         live_ui.attach_sink(relay.set_status)
         live_ui.start()
         try:
@@ -717,7 +799,12 @@ def _session_loop(root):
                                                          transcript, turn_state,
                                                          pad)
                             break
-                        results.append(f"{sub_action}: {result}")
+                        # The same reminder a single action gets, so a
+                        # model that hides three silent reads inside a
+                        # batch is told exactly as plainly as one that
+                        # emits them one at a time.
+                        results.append(build_result_message(
+                            sub_action, f"{sub_action}: {result}", sub_obj))
                     else:
                         relay.reset()
                         # The batch ran and the model is asked what is next, so
@@ -799,7 +886,7 @@ def _session_loop(root):
                     invalidate_prompt()
                 if action in ("done", "respond"):
                     break
-                messages.extend([{"role": "assistant", "content": raw}, {"role": "user", "content": build_result_message(action, result)}])
+                messages.extend([{"role": "assistant", "content": raw}, {"role": "user", "content": build_result_message(action, result, obj)}])
             else:
                 # Thirty-five rounds and no final action. The work that did
                 # happen is on screen; what is missing is the answer, and the
@@ -829,6 +916,13 @@ def _session_loop(root):
         # "it has no context between prompts" looked like from outside. A turn
         # with no answer says so, in words, rather than being left out.
         answer = "" if turn_state.get("outcome") else turn_state.get("answer", "")
+        # The reader is stopped BEFORE anything else reads stdin, and it is
+        # waited on rather than abandoned: the next thing this loop does is
+        # read keys on the main thread, and two readers on one stdin would
+        # take it in turns to swallow the user's characters.
+        typeahead.stop()
+        prompt_box.typeahead = None
+        queued.extend(typeahead.take())
         session.record(task, answer, history, turn_state.get("outcome", ""))
         # Carried to the next prompt as shadow text only. It is drawn in the
         # box and never put in the buffer, so pressing Enter on an untouched

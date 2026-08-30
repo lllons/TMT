@@ -176,6 +176,17 @@ class AgentRecord:
         # inside `tokens_out`, and subtracting to recover the fourth would
         # need a fourth number anyway. Zero between requests.
         self.tokens_out_pending = 0
+        # How much of its step budget this agent has spent, and how large that
+        # budget is. This is what the per-agent bar fills with, and it is
+        # deliberately NOT a completion estimate: nothing can know how close a
+        # worker is to finishing, and a bar that claimed to would be inventing
+        # the one figure nobody has. What it does show is real and measured --
+        # the allowance used so far -- so it climbs while work happens and it
+        # is full when the allowance is gone. A finished agent is drawn full
+        # whatever its step count, because it is done, and that is the one
+        # moment completion IS known.
+        self.steps = 0
+        self.max_steps = 0
         self.created_at = created_at
         self.started_at = None
         self.finished_at = None
@@ -187,6 +198,17 @@ class AgentRecord:
         self.result = ""
         self.error = ""
         self.paths = ()
+        # What this agent measurably changed, in lines, and only where both
+        # halves are actually known. They come off the same `action_event`
+        # detail the main loop's own counter reads, so a worker's work is
+        # counted by exactly the rule the session already counts by: a patch
+        # knows what it added and what it removed, a `write_file` over an
+        # existing file knows only what it wrote, because what it replaced was
+        # gone before anyone could count it. A missing half contributes
+        # nothing rather than a zero, which would read as "removed none" when
+        # the truth is "nobody knows".
+        self.lines_added = 0
+        self.lines_removed = 0
         self.conversation = []
         # The daemon thread running it, once `start` has made one. Held so a
         # caller that needs to know the thread has actually unwound -- a test,
@@ -604,6 +626,76 @@ class AgentManager:
                     seen.append(path)
             record.paths = tuple(seen)
             return record
+
+    def set_steps(self, agent_id, steps=None, max_steps=None):
+        """Record how much of its step budget an agent has spent.
+
+        Set rather than added, because the worker knows its own count and a
+        second tally here could only drift from it.
+        """
+        with self._lock:
+            record = self._by_id.get(str(agent_id))
+            if record is None:
+                return None
+            for value, name in ((steps, "steps"), (max_steps, "max_steps")):
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    setattr(record, name, value)
+        self._emit([(AGENT_TOKEN_UPDATE, record)])
+        return record
+
+    def add_lines(self, agent_id, added=None, removed=None):
+        """Add one action's measured line counts to an agent's totals.
+
+        Each half is taken only when the action could count it, for the reason
+        `Session.count_event` gives: a half nobody measured is left out rather
+        than sent in as a zero.
+
+        Emitted as a token update rather than a kind of its own. The event bus
+        exists so the interface knows something on a card changed, and a line
+        count and a token count change the same row for the same reason; a
+        second event name would mean two subscriptions and two repaints to say
+        one thing.
+        """
+        with self._lock:
+            record = self._by_id.get(str(agent_id))
+            if record is None:
+                return None
+            for value, name in ((added, "lines_added"), (removed, "lines_removed")):
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    setattr(record, name, getattr(record, name) + value)
+        self._emit([(AGENT_TOKEN_UPDATE, record)])
+        return record
+
+    def totals(self, now=None):
+        """What every agent together has cost and changed, as a dict.
+
+        `(agents, tokens, lines_added, lines_removed, exact)`, keyed by those
+        names. `agents` counts only the ones still running, because that is
+        what a "2 agents" readout means to somebody watching; the other
+        figures cover every agent this session has had, including the ones
+        whose cards have aged out, because the work they did did not age out
+        with the card.
+
+        `exact` is False when any figure in the total was estimated, and the
+        interface marks the whole readout `~` when it is. A total mixing one
+        measured number with one guessed number is a guess.
+        """
+        agents = 0
+        tokens = added = removed = 0
+        exact = True
+        with self._lock:
+            records = [r for r in self._records if r.kind == "worker"]
+        for record in records:
+            if not record.is_terminal():
+                agents += 1
+            tokens += record.total_tokens()
+            added += record.lines_added
+            removed += record.lines_removed
+            if record.total_tokens() and not (record.tokens_in_exact
+                                              and record.tokens_out_exact):
+                exact = False
+        return {"agents": agents, "tokens": tokens, "lines_added": added,
+                "lines_removed": removed, "exact": exact}
 
     def conflicts(self):
         """Paths more than one worker wrote, as ((path, (id, id)), ...).

@@ -284,13 +284,23 @@ def _result_message(action, result):
             "the task is done." % text)
 
 
-def _record_paths(manager, record, action, obj):
-    """Tell the manager which files this action wrote, if it wrote any.
+def _record_paths(manager, record, action, obj, result=None):
+    """Tell the manager what this action wrote: which files, and how much.
 
-    Only for mutating actions, and taken from the request rather than parsed
-    back out of the result, because the request is where a path is a fact.
-    This is what lets the main AI be told that two workers wrote the same
-    file -- the whole of the concurrent-write story, and enough of it.
+    Only for mutating actions, and the paths are taken from the request rather
+    than parsed back out of the result, because the request is where a path is
+    a fact. This is what lets the main AI be told that two workers wrote the
+    same file -- the whole of the concurrent-write story, and enough of it.
+
+    The line counts go through `agent_actions.action_event`, which is the same
+    function the main loop's own counter reads. That matters more than saving
+    the call would: it means a line a worker wrote is counted by exactly the
+    rule a line the main agent wrote is counted by, including the awkward
+    cases -- a `write_file` over an existing file reports only what it wrote,
+    because what it replaced was gone before anyone could count it, and an
+    event with nothing certain to report contributes nothing rather than a
+    zero. Two counters with two rules would drift, and the meter would be
+    adding up numbers that did not mean the same thing.
     """
     try:
         import agent_actions
@@ -302,6 +312,15 @@ def _record_paths(manager, record, action, obj):
         return
     if paths:
         manager.note_paths(record.id, paths)
+    try:
+        event = agent_actions.action_event(action, obj, result)
+        detail = (getattr(event, "detail", None) or {}) if event is not None else {}
+    except Exception:
+        # Counting is a readout, never the work. An action that ran must not
+        # be undone by a failure to measure it.
+        return
+    if detail.get("added") is not None or detail.get("removed") is not None:
+        manager.add_lines(record.id, detail.get("added"), detail.get("removed"))
 
 
 def _invalidate_prompt():
@@ -456,12 +475,16 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden):
         manager.set_activity(record.id, _activity_label(action, obj))
         _guard(record)
         result = execute(obj, _context(record))
-        _record_paths(manager, record, action, obj)
+        _record_paths(manager, record, action, obj, result)
         _invalidate_prompt()
         return result
 
     while steps < rounds:
         _guard(record)
+        # Reported at the top of the step rather than at the end of it, so the
+        # bar on this agent's row moves when the work starts rather than once
+        # it is already over.
+        manager.set_steps(record.id, steps, rounds)
         # The request about to go, not the run's total spend. The API is
         # stateless, so every step resends the whole conversation, and adding
         # those up would report a context that had quadrupled when the same

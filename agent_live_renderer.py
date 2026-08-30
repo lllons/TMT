@@ -328,7 +328,7 @@ class LiveRelay:
 
     def __init__(self, stream=None, ansi=None, symbols=None,
                  body_lines=LIVE_BODY_LINES, footer=None, pad=None,
-                 panel=None):
+                 panel=None, agent_rows=None):
         self.region = LiveRegion(stream, ansi)
         if symbols is None:
             symbols = SYMBOL_POOL if symbols_supported(self.region.stream) else ASCII_SYMBOL_POOL
@@ -362,6 +362,17 @@ class LiveRelay:
         # accepting input while the panel has focus, and one that looked ready
         # for input would be a lie about what the program is doing.
         self.panel = panel
+        # agent_rows(columns) -> the rows drawn immediately UNDER the status
+        # row, one per background agent. A callable rather than a list for the
+        # reason `footer` is one: they are built at the width the terminal has
+        # now, and they change on their own thread while the region stands.
+        #
+        # Under the status row rather than above it because that row is the
+        # main agent's own bar, and these are subordinate to it: the thing the
+        # user asked for first, then the things it delegated. They are the
+        # last rows of the region, so a terminal too short to hold them all
+        # gives them up before it gives up the reply.
+        self.agent_rows = agent_rows
         self.streamed = False
         self._status = ""
         self._lock = threading.Lock()
@@ -487,6 +498,21 @@ class LiveRelay:
             body = self.glitch.display_text() if self.streamed else ""
         self.region.paint(self._compose(status, body))
 
+    def _agent_rows(self, columns):
+        """The per-agent rows under the status row, or none at all.
+
+        Guarded like every other decoration here: a register that cannot
+        answer costs the region its extra rows, never the turn. With no
+        callable supplied this returns nothing and the region is exactly the
+        region it was before background agents existed.
+        """
+        if self.agent_rows is None:
+            return []
+        try:
+            return [row for row in (self.agent_rows(columns) or ()) if row]
+        except Exception:
+            return []
+
     def _footer_rows(self, size=None):
         """The rows between the reply and the status row, or none.
 
@@ -567,7 +593,7 @@ class LiveRelay:
         if panel is not None:
             return self._compose_with_panel(status, body, size, width, panel)
         footer = self._footer_rows()
-        tail = footer + ([status] if status else [])
+        tail = footer + ([status] if status else []) + self._agent_rows(width)
         if not body:
             return self._lead(len(tail)) + tail
         # Keep the whole region on screen: a region taller than the terminal

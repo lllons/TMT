@@ -21,6 +21,7 @@ import datetime
 import re
 import shutil
 import sys
+import threading
 import time
 
 import agent_config
@@ -718,7 +719,7 @@ def render_status_lines(stream=None, size=None, phase=None, moment=None,
 
 
 def prompt_caption(stream=None, width=None, moment=None, provider_id=None,
-                   model_id=None, session=None, agents=""):
+                   model_id=None, session=None, agents="", manager=None):
     """The dim line above the prompt box: when, what will answer, what it cost.
 
     These are the three facts that can be different from one question to the
@@ -770,7 +771,8 @@ def prompt_caption(stream=None, width=None, moment=None, provider_id=None,
     # `is not None`, not truthiness: a Session defines __len__, so one with no
     # turns recorded yet is falsy -- which is every session for the whole of
     # its first question, exactly when the meter is wanted most.
-    meter = meter_text(session, stream, columns=right - 1) if session is not None else ""
+    meter = (meter_text(session, stream, columns=right - 1, manager=manager)
+             if session is not None else "")
     if meter and visible_width(meter) < right - 1:
         return " " + meter + " " * (right - visible_width(meter) - 1) + _dim(text, stream)
     return " " * right + _dim(text, stream)
@@ -835,7 +837,25 @@ def _short_count(value):
     return str(value)
 
 
-def meter_text(session, stream=None, columns=None):
+def _agent_totals(manager):
+    """Every background agent's spend, or None when there is nothing to add.
+
+    Guarded, because the meter is a readout: a register that cannot answer
+    must cost the row its extra figures, never the row itself.
+    """
+    if manager is None:
+        return None
+    try:
+        totals = manager.totals()
+    except Exception:
+        return None
+    if not (totals.get("tokens") or totals.get("lines_added")
+            or totals.get("lines_removed") or totals.get("agents")):
+        return None
+    return totals
+
+
+def meter_text(session, stream=None, columns=None, manager=None):
     """The corner readout for a session, painted, or "" when it says nothing.
 
     Green for what arrived and red for what left -- the two ends of the one
@@ -859,10 +879,24 @@ def meter_text(session, stream=None, columns=None):
     stream = sys.stdout if stream is None else stream
     if session is None:
         return ""
+    # Lines a background agent wrote are lines this session wrote. The user
+    # asked for one file and got one file; which thread held the pen is an
+    # implementation detail of how TMT went about it, and a meter that
+    # reported +0 while five workers rewrote the project would be telling the
+    # truth about the main thread and a lie about the session.
+    #
+    # Tokens are kept apart, and that is a different judgement rather than an
+    # inconsistency. `context` is how full the window of the request in
+    # flight is -- one request, on one thread -- and adding five workers'
+    # spend into it would describe a context that does not exist. What the
+    # agents cost is real and is reported, next to how many are running,
+    # where it reads as their spend rather than as the session's context.
+    agents = _agent_totals(manager)
+    lines_added = session.lines_added + (agents["lines_added"] if agents else 0)
+    lines_removed = session.lines_removed + (agents["lines_removed"] if agents else 0)
     added, removed, sent, back = _meter_counts(
-        session.lines_added, session.lines_removed,
-        session.tokens_in, session.tokens_out)
-    if not (session.lines_added or session.lines_removed
+        lines_added, lines_removed, session.tokens_in, session.tokens_out)
+    if not (lines_added or lines_removed
             or session.tokens_in or session.tokens_out):
         return ""
     columns = _terminal()[0] if columns is None else int(columns)
@@ -870,10 +904,23 @@ def meter_text(session, stream=None, columns=None):
     # the provider never gave a figure: part of what is on screen is then a
     # guess about text that has not finished being generated.
     out_mark = "" if (session.tokens_out_exact and not session.streaming) else "~"
+    # What the background agents cost, as its own group. Marked `~` whenever
+    # any figure inside it was estimated rather than reported, because a total
+    # that mixes one measured number with one guessed number is a guess.
+    spend = ""
+    if agents and agents["tokens"]:
+        # "agents" leads, because the figure trails it in both forms and
+        # "22k agent" -- the other way round, shortened -- reads as a count of
+        # agents rather than as what they cost.
+        spend = "agents %s%s" % ("" if agents["exact"] else "~",
+                                 _short_count(agents["tokens"]))
     full = "%s lines, %s lines, ~%s context, %s%s out" % (
         added, removed, sent, out_mark, back)
     short = "%s %s  ~%s ctx  %s%s out" % (added, removed, sent, out_mark, back)
     tiny = "%s %s" % (added, removed)
+    if spend:
+        full += ", %s tokens" % spend
+        short += "  %s" % spend
     for text in (full, short, tiny):
         if display_width(text) <= max(0, columns - 2):
             break
@@ -1841,6 +1888,220 @@ class LineEditor:
         self.cursor = cut + 1
 
 
+# What the box says while a turn runs and something has been typed into it.
+# It replaces the "how to stop it" hint, because at that moment the line being
+# written is the thing the user is looking at and the thing they need told
+# about: it is not going to the model now.
+QUEUED_HINT = "Enter queues this for when the current task finishes"
+
+# And what it says when it is empty and can be typed into. It names both
+# things the user can do from here, which is one more than it used to.
+TYPING_HINT = "Working. Type to queue the next task. Ctrl-C to stop."
+
+
+def _interrupt_main():
+    """Raise KeyboardInterrupt in the main thread, as the console would have.
+
+    Reading keys during a turn takes the Ctrl-C that used to reach the console
+    directly: a raw read hands back "\\x03" as an ordinary character and no
+    signal is ever raised. Without this, adding type-ahead would have silently
+    removed the only way to stop a running task.
+    """
+    try:
+        import _thread
+        _thread.interrupt_main()
+    except Exception:
+        pass
+
+
+def _queued_hint(count):
+    """Shadow text for a box with lines waiting behind it.
+
+    It states the number, for the reason the folded-paste token states its
+    size: a placeholder that hid the amount would be worse than no placeholder
+    at all, and "queued" alone leaves the user guessing whether the thing they
+    typed twenty seconds ago actually landed.
+    """
+    count = max(0, int(count))
+    if not count:
+        return ""
+    return "%d queued, and will run when this task finishes" % count
+
+
+class TypeAhead:
+    """Keystrokes taken while the main agent is working.
+
+    The prompt box used to be inert for the whole of a turn: it was drawn with
+    a hint in it and nothing typed into it was read, which is honest but means
+    the user has to sit and wait to say the next thing. This reads keys on a
+    background thread while the turn runs, so the box can be typed into, and
+    holds finished lines until the loop is somewhere it can take one.
+
+    **It never dispatches anything itself.** Pressing Enter puts the line on a
+    list and nothing else happens; the session loop drains that list when the
+    turn is over. That is what keeps this safe: a queued task cannot interrupt
+    a turn, cannot reorder itself past one, and cannot reach the model from a
+    thread that has no business talking to it.
+
+    Two rules make the threading sound:
+
+    **Only one reader at a time.** The main thread is inside `ask_model` for
+    the whole of a turn and reads no keys, and this is stopped before
+    `PromptBox.ask` runs, so stdin never has two readers. `stop()` waits for
+    the thread to actually leave the read before returning.
+
+    **Only when there are raw keys to read.** `is_interactive` gates it, so
+    every piped, redirected and scripted run gets exactly the inert box it
+    always had -- the same gate, for the same reason, as everywhere else in
+    this module: a wrong "yes" here hangs the process on a read that can never
+    be answered.
+    """
+
+    def __init__(self, stream=None, instream=None, reader=None, on_change=None,
+                 interrupt=None):
+        self.stream = sys.stdout if stream is None else stream
+        self.instream = sys.stdin if instream is None else instream
+        self.reader = reader
+        # How a Ctrl-C read here is put back into the main thread. Injectable
+        # only so it can be tested: firing a real asynchronous
+        # KeyboardInterrupt into a suite with no isolation between tests lands
+        # it in whatever happens to be running a moment later, which is a
+        # flake nobody could reproduce.
+        self.interrupt = interrupt if interrupt is not None else _interrupt_main
+        # Called whenever the buffer changes, so the region holding the box
+        # repaints. Without it the box would only redraw when the reply moved,
+        # and typing would appear in bursts.
+        self.on_change = on_change
+        self.editor = LineEditor()
+        self._queued = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._cancelled = False
+
+    @property
+    def active(self):
+        return bool(self._thread and self._thread.is_alive())
+
+    @property
+    def cancelled(self):
+        """Whether Ctrl-C or Esc was pressed at the box during the turn."""
+        with self._lock:
+            return self._cancelled
+
+    def start(self):
+        """Begin reading, or do nothing at all where reading is impossible."""
+        if self.active:
+            return False
+        if self.reader is None and not is_interactive(self.stream, self.instream):
+            return False
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._read, name="tmt-typeahead",
+                                        daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self, timeout=1.0):
+        """Stop reading and wait for the thread to leave the read.
+
+        Waited on rather than abandoned: the next thing the loop does is read
+        keys on the main thread, and two readers on one stdin would take it in
+        turns to swallow the user's characters.
+        """
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout)
+        return not (thread is not None and thread.is_alive())
+
+    def _read(self):
+        reader = self.reader if self.reader is not None else _default_text_reader()
+        while not self._stop.is_set():
+            try:
+                kind, value = _next_text_key(reader, allow_multiline=True)
+            except Exception:
+                return
+            if kind == "end":
+                return
+            if self._stop.is_set():
+                # Checked again after the read: a key that arrived while the
+                # turn was ending belongs to the box the main thread is about
+                # to draw, not to this one.
+                return
+            if kind == "" :
+                continue          # an animation tick, or a key with no meaning
+            if self._apply(kind, value):
+                if self.on_change is not None:
+                    try:
+                        self.on_change()
+                    except Exception:
+                        pass      # a repaint must never end the reader
+
+    def _apply(self, kind, value):
+        """Apply one keystroke. Returns whether anything visible changed."""
+        if kind == "key" and value == "interrupt":
+            # Ctrl-C, and it must still stop the turn.
+            #
+            # This is the one thing reading keys during a turn could quietly
+            # break. Nothing read stdin while the agent worked before, so a
+            # Ctrl-C reached the console and Python raised KeyboardInterrupt
+            # in the main thread, which the loop catches and turns into
+            # "Task cancelled". A raw read consumes the keystroke instead --
+            # msvcrt hands back "\x03" as an ordinary character and no signal
+            # is ever raised -- so the reader has to put the exception back
+            # where it would have landed.
+            #
+            # Not handled here: this thread cannot cancel a turn, and swapping
+            # a working Ctrl-C for a cleared input line would be a bad trade
+            # nobody asked for.
+            self._stop.set()
+            try:
+                self.interrupt()
+            except Exception:
+                pass
+            return False
+        with self._lock:
+            if kind == "char" and len(value) > 1:
+                self.editor.insert(value, pasted=True)
+                return True
+            if kind == "key" and value == "tab":
+                return False      # completion is the asking box's, not this one's
+            outcome = self.editor.handle(kind, value)
+            if outcome == "submit":
+                line = self.editor.expanded().strip()
+                if line:
+                    self._queued.append(line)
+                self.editor = LineEditor()
+                return True
+            if outcome == "cancel":
+                # Esc clears what has been typed; Ctrl-C is the turn's to
+                # handle and reaches the main thread as a KeyboardInterrupt of
+                # its own, so nothing here tries to stop the work.
+                self._cancelled = True
+                self.editor = LineEditor()
+                return True
+            if outcome == "end":
+                self._stop.set()
+                return False
+            return True
+
+    def text(self):
+        """What is currently typed, for the box to draw."""
+        with self._lock:
+            return self.editor.value, self.editor.cursor
+
+    def take(self):
+        """Every finished line, in order, and clear the queue."""
+        with self._lock:
+            queued, self._queued = list(self._queued), []
+            return queued
+
+    def pending(self):
+        """How many lines are waiting, without taking them."""
+        with self._lock:
+            return len(self._queued)
+
+
 class PromptBox:
     """The bordered task prompt, repainted in place while it is typed.
 
@@ -1896,6 +2157,11 @@ class PromptBox:
         # change, no extra key, no extra repaint.
         self.manager = manager
         self._panel_state = panel
+        # The reader that takes keys while a turn is running, or None for a
+        # box that is only ever typed into between turns. The session loop
+        # attaches one; nothing else needs to, and with none attached this
+        # class behaves exactly as it did before type-ahead existed.
+        self.typeahead = None
         self.cancelled = False
         # When the box last asked something. The caller writes the question
         # into scrollback afterwards and stamps it with this, so the record
@@ -2130,9 +2396,34 @@ class PromptBox:
         No blank rows above it either: the relay pads that region as a whole,
         and a pad here would be counted twice and push the box off the bottom.
         """
-        rows = self.lines(LineEditor(hint), size=size, caption=False, pad=False)
+        # What is being typed into it, when anything is. The box stays inert
+        # in every run that cannot read raw keys, so a piped or scripted run
+        # draws exactly the hint it always drew.
+        editor = LineEditor(hint)
+        typed = self.typeahead
+        if typed is not None and typed.active:
+            value, cursor = typed.text()
+            if not value and not typed.pending():
+                # The box can be typed into now, and nothing else on screen
+                # says so. The old hint said only how to stop the work, which
+                # was the whole truth when the box was inert and is half of it
+                # now.
+                editor = LineEditor(TYPING_HINT)
+            if value:
+                # A real editor rather than a placeholder, so the text is
+                # drawn plain instead of dim and wraps like any other line.
+                editor = LineEditor()
+                editor.value, editor.cursor = value, cursor
+                editor.placeholder_visible = False
+            elif typed.pending():
+                # Nothing on the line, but lines are waiting. Say so, because
+                # the alternative is a box that looks untouched while the user
+                # has already queued three questions into it.
+                editor = LineEditor(_queued_hint(typed.pending()))
+        rows = self.lines(editor, size=size, caption=False, pad=False)
         width = _content_width(_terminal(size)[0])
-        meter = meter_text(self.session, self.stream, columns=width)
+        meter = meter_text(self.session, self.stream, columns=width,
+                           manager=self.manager)
         # The agent counter shares the meter's row rather than taking one of
         # its own. Both are running totals of what this session is spending,
         # they are read in the same glance, and a second row here would push
@@ -2196,7 +2487,8 @@ class PromptBox:
         inner = max(1, width - _PROMPT_PREFIX)
 
         head = [prompt_caption(stream, width, moment, session=self.session,
-                               agents=self._agents_text())] if caption else []
+                               agents=self._agents_text(),
+                               manager=self.manager)] if caption else []
         rule = " " + _glyphs(stream)["rule"] * (width - 1)
         field, caret_row, caret = self._field(editor, inner)
         # The marker belongs to the question, not to every row of it, so the

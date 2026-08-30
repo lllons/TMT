@@ -514,7 +514,48 @@ def execute_action(obj, context=None):
 
 READ_ONLY_ACTIONS = ("list_files", "read_file", "search_files", "read_lines", "git_diff")
 
-def build_result_message(action, result):
+# What the model is told when it did work without saying what the work was.
+#
+# Deliberately a reminder attached to the result rather than a validation
+# failure. `validate_action` still does not require "progress", and must not:
+# an action without one is a valid action that ran and did its job, and
+# rejecting it would turn a presentation rule into a failed turn and throw the
+# work away over a missing sentence.
+#
+# But teaching it in the prompt alone was not enough. Models skip it exactly
+# where it matters most -- three reads in a row with nothing said between them,
+# which from outside is indistinguishable from a stuck loop. This closes the
+# gap the only way that costs nothing: the model is told, at the moment it
+# happened, about the specific action that went unnarrated, and it carries on.
+_MISSING_PROGRESS = (
+    "\n[No \"progress\" was sent with that %s, so the user saw a tool run and no "
+    "reason for it. Put a one-sentence \"progress\" on the next action.]"
+)
+
+# The actions that ARE the thing being said, and so need nothing said about
+# them. Kept beside the reminder rather than inferred, so adding an action
+# cannot silently make it exempt.
+_SPEAKS_FOR_ITSELF = frozenset(("respond", "done", "announce"))
+
+
+def _said_something(obj):
+    """Whether an action object carried a public sentence about itself."""
+    if not isinstance(obj, dict):
+        return True          # nothing to judge; never nag about a non-object
+    progress = obj.get("progress")
+    if isinstance(progress, str) and progress.strip():
+        return True
+    # An `events` entry is a public record too. A model that reported its work
+    # that way said what it was doing, in the place the prompt also offers.
+    declared = obj.get("events")
+    if isinstance(declared, list):
+        for entry in declared:
+            if isinstance(entry, dict) and str(entry.get("message", "")).strip():
+                return True
+    return False
+
+
+def build_result_message(action, result, obj=None):
     result_str = str(result)
     if "SyntaxError" in result_str:
         return f"FAILED with SyntaxError: {result_str}\nOutput a corrected action that fixes the exact syntax error above."
@@ -525,8 +566,15 @@ def build_result_message(action, result):
     if "not found" in result_str.lower() and action in ("read_file", "run_python", "patch_file", "read_lines", "copy_file"):
         return f"FAILED: {result_str}\nCheck the file path with list_files and retry."
     if action in READ_ONLY_ACTIONS:
-        return f"Result:\n{result_str}\nNow output a respond action that naturally answers the user's question using this data."
-    return f"Result: {result_str}"
+        message = f"Result:\n{result_str}\nNow output a respond action that naturally answers the user's question using this data."
+    else:
+        message = f"Result: {result_str}"
+    # Appended to the end, after whatever the result had to say, so it is the
+    # last thing read before the next action is written and never displaces
+    # the correction a failed action needs.
+    if action not in _SPEAKS_FOR_ITSELF and not _said_something(obj):
+        message += _MISSING_PROGRESS % action
+    return message
 
 ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     "write_file", "append_file", "write_files", "patch_file", "delete_file", "read_file",

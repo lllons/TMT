@@ -360,6 +360,50 @@ the note agent. A sixth request is refused with a sentence saying so, not ignore
 `/agents` prints what they are doing. In a real terminal, Right Arrow at the end of an
 empty line opens the same thing as a live panel, and Left closes it.
 
+### Watching them work
+
+While agents are running, each one gets a row of its own directly under the main
+progress bar:
+
+```
+██████████  60% Working                      <- the main agent, in colour
+██░░░░░░ #1  +45 -3  4k out  47s  running    <- one row per agent, in grey
+██████░░ #2  +0 -0  ~900 out  1m34s  running
+████████ #3  +7 -120  ~15k out  2m21s  done
+```
+
+Each row carries the agent's number, the lines it has added and removed, the tokens it
+has generated, how long it has been working, and its state. Everything on it is
+measured rather than estimated, except where a figure is marked `~` — that means the
+provider did not report it and TMT worked it out from the text, and it is marked
+everywhere it happens.
+
+**The agent bars are grey and the main bar is coloured, and that is the whole point of
+the difference.** The colour gradient means "the main agent is working, and this is how
+far along it is". Five coloured bars would read at a glance as one process reported five
+times. The agents get the absence of a colour rather than a colour of their own.
+
+**An agent's bar shows the share of its step budget it has spent, not how close it is to
+being done.** Nothing can know the second — a bar that implied it would be inventing the
+one figure nobody has. A finished agent's bar is full because it is over, which is the
+one moment completion actually is known.
+
+A finished agent's row and card stay for five seconds and then go. Its result does not:
+the main agent can still ask for it long afterwards.
+
+The counter above the input box counts agent work into the session's own totals:
+
+```
++55 lines, -5 lines, ~12k context, 433 out, agents ~22k tokens
+```
+
+The lines include everything the agents wrote — a line a worker wrote is a line the
+session wrote, and a counter reading `+0` while five workers rewrote the project would
+be telling the truth about one thread and a lie about the session. The agents' token
+spend is reported separately from `context`, because that one is how full the window of
+the request in flight is, and adding five workers into it would describe a context that
+does not exist.
+
 ### `/note` — ask about the workspace without disturbing anything
 
 ```
@@ -398,6 +442,21 @@ These are limits of the design, not things left unfinished:
 - **Workers do not coordinate their writes.** Any single write is atomic, and if two
   workers touch the same file the main agent is told which. There is no locking beyond
   that, so give concurrent workers separate files.
+- **You never see a worker's own actions.** The interface shows a bar and a short label
+  for each one, not the reads and edits it is making. What it did comes back in the main
+  agent's summary, which is why the main agent is told to say what it delegated.
+- **A card shows no elapsed time; the row under the progress bar does.** The panel
+  repaints only when its content changes, and a duration drawn there would either go
+  stale or force a repaint on every tick, which is what used to make the cursor flicker.
+
+### What the agents cost
+
+Every worker carries its own system prompt on every request, because the API is
+stateless. That prompt is about 14k estimated tokens against the main agent's 19k: it
+carries a `tree` of the project rather than the file contents the main prompt inlines,
+which saves roughly 1,500 tokens per request. Five workers each carry a copy, so
+delegation is not free — it buys parallelism with tokens. Delegate work that is
+genuinely separable, not work you could do in two steps yourself.
 
 ## Interface
 
@@ -419,6 +478,23 @@ On a terminal under 45 columns the panel takes the whole width of the live regio
 the prompt box is not drawn while it is open; under 30 columns it refuses to open and
 says why. Cards drop their activity line before their token line, and truncate rather
 than wrap.
+
+### Typing while it works
+
+The prompt box stays live for the whole of a turn. You can write the next question
+while the agent is still working on the last one, editing keys and all.
+
+**Enter queues the line rather than interrupting.** It is answered as soon as the
+current task finishes, and lines are answered in the order you entered them — so you
+can stack up three follow-ups and walk away. The box says how many are waiting.
+
+`/note` can be typed there too, which is the point of it: it answers from the workspace
+without disturbing the work in progress.
+
+Ctrl-C still stops the running task, exactly as before.
+
+This needs a real terminal. A piped or redirected run reads one task per line and the
+box is inert, which is what every scripted run and the test suite get.
 
 Set `TMT_STREAM=0` to disable streaming. Streaming also needs `requests`; without it
 TMT runs unstreamed.
@@ -510,7 +586,7 @@ environment is active.
 python run_tests.py
 ```
 
-629 tests, about a minute. Eight of them read the API key from `.tmt_key`, so on a
+667 tests, about a minute. Eight of them read the API key from `.tmt_key`, so on a
 fresh clone with no key configured those eight fail and the rest pass.
 
 ## License

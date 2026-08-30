@@ -45,6 +45,7 @@ about.
 """
 
 import sys
+import time
 
 from agent_manager import Status
 from agent_ui import (
@@ -262,6 +263,148 @@ def counter_text(count):
     if not count:
         return ""
     return "%d agent%s" % (count, "" if count == 1 else "s")
+
+
+# The per-agent bars that sit under the main one, and the whole of why they
+# look different.
+#
+# The colour gradient means "the main agent is working, and this is how far
+# along it is". Painting a worker's bar with it would say the same thing about
+# a different thing on the row below, and at a glance the eye would read five
+# gradient bars as one process reported five times. So the agent bars are the
+# NEUTRAL ramp -- black through grey to white -- and the gradient stays the
+# main agent's alone. That is the rule "one gradient, one neutral" spent on
+# its most useful distinction rather than a new palette invented for a new
+# feature: the agents get no colour of their own, they get the absence of one.
+#
+# It also survives having the escapes stripped, like everything else here: the
+# row says `#1` and a state word whatever the terminal can draw.
+NEUTRAL_STEPS = ((90, 90, 90), (140, 140, 140), (190, 190, 190), (235, 235, 235))
+
+# The width of an agent's bar. Narrower than the main one on purpose -- it is
+# subordinate to it, and the row has four other figures to carry.
+AGENT_BAR_WIDTH = 8
+
+
+def _neutral(index, span):
+    """A step along the black-grey-white ramp, as an (r, g, b)."""
+    if span <= 0:
+        return NEUTRAL_STEPS[-1]
+    position = min(1.0, max(0.0, index / float(span)))
+    slot = int(position * (len(NEUTRAL_STEPS) - 1))
+    return NEUTRAL_STEPS[slot]
+
+
+def neutral_bar(progress, stream, width=AGENT_BAR_WIDTH, plain=None):
+    """A progress bar in the neutral ramp rather than in the gradient.
+
+    The same shape as `agent_ui.cycle_bar` and deliberately not the same
+    colour. It does not ride the animation cycle either: a worker's bar that
+    shimmered would pull the eye away from the main one, which is the row that
+    is actually about what the user asked for.
+    """
+    plain = plain_output(stream) if plain is None else plain
+    full, empty = ("#", "-") if plain else ("█", "░")
+    width = max(1, int(width))
+    progress = min(100, max(0, int(progress)))
+    filled = round(width * progress / 100.0)
+    if not _supports_color(stream):
+        return full * filled + empty * (width - filled)
+    cells = []
+    for index in range(width):
+        if index < filled:
+            red, green, blue = _neutral(index, max(1, width - 1))
+            cells.append("\033[38;2;%d;%d;%dm%s" % (red, green, blue, full))
+        else:
+            cells.append(DIM + empty)
+    cells.append(RESET)
+    return "".join(cells)
+
+
+def agent_progress(record):
+    """How full an agent's bar is, 0-100.
+
+    The step budget it has spent, NOT a guess at how close it is to finishing.
+    Nothing can know the second, and a bar that implied it would be inventing
+    the one figure nobody has. A terminal agent is drawn full whatever its
+    step count, because it is over -- which is the one moment completion is
+    actually known.
+    """
+    if getattr(record, "is_terminal", None) and record.is_terminal():
+        return 100
+    budget = int(getattr(record, "max_steps", 0) or 0)
+    if budget <= 0:
+        return 0
+    spent = int(getattr(record, "steps", 0) or 0)
+    return min(99, max(0, int(round(100.0 * spent / budget))))
+
+
+def _elapsed_text(record, now=None):
+    """How long an agent has been working, as a compact string.
+
+    `now` is read here when the caller did not supply one. It has to be: the
+    records measure against `time.monotonic`, and passing None straight
+    through made every row report 0s -- a clock that never moved, on the one
+    figure whose whole job is to move.
+    """
+    try:
+        moment = time.monotonic() if now is None else now
+        seconds = int(max(0, round(record.elapsed(moment))))
+    except Exception:
+        return ""
+    if seconds < 60:
+        return "%ds" % seconds
+    if seconds < 3600:
+        return "%dm%02ds" % (seconds // 60, seconds % 60)
+    return "%dh%02dm" % (seconds // 3600, (seconds % 3600) // 60)
+
+
+def agent_status_row(record, columns, stream=None, now=None):
+    """One agent's row for under the main progress bar.
+
+    `bar #1  +12 -3  ~1.2k out  8s  running`. Everything on it is measured:
+    the lines come off the same `action_event` detail the session's own meter
+    reads, the tokens are the provider's figure where it gave one and marked
+    `~` where it did not, and the elapsed time stops when the agent does.
+
+    The row gives up its parts from the right as the terminal narrows, so a
+    narrow window loses the state word before the tokens and the tokens before
+    the identity. What it never loses is which agent it is: a row that cannot
+    say that is not worth drawing.
+    """
+    stream = sys.stdout if stream is None else stream
+    bar = neutral_bar(agent_progress(record), stream)
+    name = "#%s" % getattr(record, "id", "?")
+    lines = "+%d -%d" % (int(getattr(record, "lines_added", 0) or 0),
+                         int(getattr(record, "lines_removed", 0) or 0))
+    out = int(getattr(record, "tokens_out", 0) or 0)
+    mark = "" if getattr(record, "tokens_out_exact", False) else "~"
+    tokens = ("%s%s out" % (mark, _short_count(out))) if out else ""
+    elapsed = _elapsed_text(record, now)
+    state = _state_word(record)
+    # Widest first, then each shorter form drops the least useful thing left.
+    for parts in ((name, lines, tokens, elapsed, state),
+                  (name, lines, tokens, elapsed),
+                  (name, lines, elapsed),
+                  (name, lines),
+                  (name,)):
+        text = "  ".join(part for part in parts if part)
+        # The bar is measured as drawn rather than as painted: it carries
+        # escapes, and counting those would shrink the row for characters the
+        # terminal never puts on screen.
+        if display_width(text) + AGENT_BAR_WIDTH + 2 <= max(1, int(columns) - 1):
+            return bar + " " + fit_to_width(text, max(1, int(columns) - AGENT_BAR_WIDTH - 2))
+    return bar
+
+
+def agent_status_rows(records, columns, stream=None, now=None):
+    """A row per agent, for the strip under the main progress bar.
+
+    Nothing at all when there are no agents, so a session that never
+    delegates draws exactly the screen it drew before any of this existed.
+    """
+    return [agent_status_row(record, columns, stream, now)
+            for record in (records or ())]
 
 
 def _state_word(record):
