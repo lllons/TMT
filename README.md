@@ -657,7 +657,7 @@ environment is active.
 python run_tests.py
 ```
 
-727 tests, about a minute. Eight of them read the API key from `.tmt_key`, so on a
+728 tests, about a minute. Eight of them read the API key from `.tmt_key`, so on a
 fresh clone with no key configured those eight fail and the rest pass.
 
 ## License

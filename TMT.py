@@ -431,6 +431,14 @@ def _blocking_command(run, prompt_box, pad, agent_rows=None):
     relay = LiveRelay(stream=getattr(prompt_box, "stream", None),
                       footer=lambda size=None: prompt_box.running_lines(
                           RUNNING_HINT, size=size),
+                      # The same column a turn's region draws. The box itself
+                      # no longer composes one when it is a footer -- the
+                      # relay owns it -- so a region built without this hook
+                      # would take the plan off the screen for the length of
+                      # the command.
+                      panel=lambda columns, rows: (
+                          prompt_box.panel().frame(columns, rows)
+                          if prompt_box.panel() else None),
                       pad=pad, agent_rows=agent_rows)
     try:
         relay.set_status(_NOTE_STATUS)

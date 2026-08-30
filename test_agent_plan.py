@@ -720,6 +720,46 @@ def test_the_prompt_box_draws_the_plan_beside_it():
     assert "PLAN" not in text, text
 
 
+def test_the_running_region_draws_exactly_one_plan_column():
+    """The plan appeared TWICE on screen while a turn ran, side by side.
+
+    The relay composes the column around its whole region, and it narrows the
+    size it hands the footer to the left column's width. The footer is the
+    prompt box, and the box was composing a column of its own inside that
+    already-narrowed width -- so the plan was drawn once by the relay at the
+    right-hand edge and once by the box a few columns further in.
+
+    The box only composes the column when it IS the live region, which is
+    `ask`. As somebody's footer it draws a bare box at the width it was given.
+    """
+    session = agent_session.Session()
+    session.plan.create(["Inspect the repository", "Draft it", "Write it"])
+    box = menu().PromptBox(stream=Terminal(), instream=Stdin(), session=session)
+
+    # The relay's own composition, at the widths it would really use.
+    for columns in (80, 100, 140):
+        left, join = box.panel().frame(columns, 30)
+        footer = box.running_lines("Working. Ctrl-C to stop.",
+                                   size=(left + 1, 30))
+        region = "\n".join(visible(row) for row in join(footer))
+        assert region.count("PLAN 0/3") == 1, (columns, region)
+        assert region.count("S1 ● ") == 1, (columns, region)
+        for row in region.splitlines():
+            assert menu().display_width(row) <= columns - 1, (columns, repr(row))
+
+    # And the footer on its own carries no column at all -- that is the fix,
+    # rather than the relay learning to strip one out afterwards.
+    bare = "\n".join(visible(row) for row in
+                     box.running_lines("Working. Ctrl-C to stop.", size=(60, 30)))
+    assert "PLAN" not in bare, bare
+
+    # The box that IS the live region still draws its own, because there is
+    # nothing else to draw it.
+    asked = "\n".join(visible(row) for row in
+                      box.lines(menu().LineEditor(), size=(100, 24)))
+    assert asked.count("PLAN 0/3") == 1, asked
+
+
 def test_a_box_with_neither_a_manager_nor_a_session_is_the_box_it_always_was():
     """The rule the panel was built under and this must not break: a session
     without any of this costs exactly nothing -- no import, no frame change,

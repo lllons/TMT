@@ -2587,9 +2587,9 @@ class PromptBox:
             _restore_terminal(self.stream)
 
     def lines(self, editor, size=None, phase=None, moment=None, caption=True,
-              pad=True):
+              pad=True, column=True):
         """The painted box, as a list of rows."""
-        return self._frame(editor, size, phase, moment, caption, pad)[0]
+        return self._frame(editor, size, phase, moment, caption, pad, column)[0]
 
     def running_lines(self, hint="", size=None):
         """The box as it stands while the turn it asked for is running.
@@ -2637,7 +2637,13 @@ class PromptBox:
                 # the alternative is a box that looks untouched while the user
                 # has already queued three questions into it.
                 editor = LineEditor(_queued_hint(typed.pending()))
-        rows = self.lines(editor, size=size, caption=False, pad=False)
+        # `column=False`: this box is the RELAY's footer, and the relay draws
+        # the right-hand column around the whole region -- it has already
+        # narrowed the `size` handed in here to the left column's width. A
+        # column composed here as well would sit inside that one, and the plan
+        # would be on screen twice, side by side.
+        rows = self.lines(editor, size=size, caption=False, pad=False,
+                          column=False)
         width = _content_width(_terminal(size)[0])
         meter = meter_text(self.session, self.stream, columns=width,
                            manager=self.manager)
@@ -2652,8 +2658,14 @@ class PromptBox:
         return ([" " + left] if left else []) + rows
 
     def _frame(self, editor, size=None, phase=None, moment=None, caption=True,
-               pad=True):
+               pad=True, column=True):
         """(rows, caret column) for the box as it stands.
+
+        `column` is whether this box composes the right-hand column ITSELF.
+        True when the box is the live region -- `ask` -- and False when it is
+        somebody else's footer, because then that somebody owns the column and
+        has already narrowed the width being passed in. Drawing one here as
+        well puts a second copy of the plan inside the first one's left column.
 
         The terminal is measured here rather than remembered, so a window
         resized between two keystrokes is drawn at its new width.
@@ -2679,7 +2691,7 @@ class PromptBox:
         # costs this method: `_frame` already re-measures the terminal on
         # every paint, so a narrower box is a width argument rather than a
         # rewrite.
-        panel = self._panel_frame(size)
+        panel = self._panel_frame(size) if column else None
         if panel is not None:
             left, join = panel
             if not left:
