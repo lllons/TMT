@@ -1455,7 +1455,12 @@ def normalize_text_key(key, allow_multiline=False):
     if allow_multiline and key and len(key) > 1:
         # Printable once the breaks and tabs it is allowed to carry are set
         # aside. Anything else in there is a control sequence, not a paste.
-        body = key.replace("\r\n", "\n")
+        #
+        # A BARE carriage return counts as a break here. The console reports
+        # the Enter inside a pasted block as "\r" and nothing else, so a run
+        # that only knew about "\r\n" found an unprintable character in every
+        # Windows paste and threw the whole block away.
+        body = key.replace("\r\n", "\n").replace("\r", "\n")
         if body.replace("\n", "").replace("\t", "").isprintable():
             return ("char", body)
     return ("", "")
@@ -1465,6 +1470,107 @@ def normalize_text_key(key, allow_multiline=False):
 # character of their own, so a name is the only thing either caller can act on.
 _WINDOWS_EXTENDED = {"H": "up", "P": "down", "K": "left", "M": "right",
                      "G": "home", "O": "end", "S": "delete"}
+
+
+# ---------------------------------------------------------------------------
+# Bursts, and why a paste is not a keystroke.
+#
+# A terminal does not announce a paste. It delivers the characters the paste
+# is made of, as fast as the program will take them, through exactly the call
+# that delivers a typed character -- `msvcrt.getwch` here, one byte off the
+# descriptor there. So nothing above this layer had ever seen a paste at all:
+# it saw somebody typing very quickly, and the carriage return in the middle
+# of a pasted block was read as Enter and submitted the line. A block of six
+# lines was six tasks, each run against a workspace the one before it had
+# already changed.
+#
+# The fix is where the misreading is: whatever is ALREADY waiting behind a
+# character is read out and handed up as one read. Only what is already
+# buffered is taken -- `kbhit`, or a select with no timeout, never a wait --
+# so this cannot glue two keystrokes a human made into one paste. It would
+# need them to arrive with no measurable gap between them.
+
+# A ceiling on one coalesced read. Nothing is lost when it is reached: the
+# rest of the paste is still on the console and arrives as the next burst.
+# It exists so a console that reports input as always-ready cannot hold the
+# reader inside one call forever.
+_PASTE_DRAIN_MAX = 100000
+
+# How long a burst already in progress waits for the rest of itself to arrive.
+# Spent only after two characters have arrived with no gap between them, so a
+# keystroke never pays it.
+_PASTE_GRACE = 0.02
+
+# Keystrokes read out while draining and not part of the burst. Draining is
+# reading, so a Ctrl-C or an arrow key sitting behind a paste has already been
+# taken off the console by the time it is recognised as not belonging to it.
+# Queueing it here delivers it, in order, on the next read instead of
+# dropping it.
+_pending_keys = []
+
+# One key from a run of pushed-back input: a full escape sequence where there
+# is one, otherwise a single character.
+_ESCAPE_RUN = re.compile(r"\x1b\[[0-9;]*[~A-Za-z]|\x1bO[A-Za-z]|\x1b|.", re.S)
+
+
+def _paste_safe(char):
+    """Whether `char` can be part of a pasted run rather than ending it."""
+    return char in ("\r", "\n", "\t") or char.isprintable()
+
+
+def _split_run(run):
+    """A coalesced burst, as (what to deliver now, what to deliver next).
+
+    The drain stops at the first character a paste cannot contain, and that
+    character has already been read, so it is handed back rather than lost.
+    At least one character is always delivered: a run that begins with a
+    control character IS that control character, and returning nothing would
+    lose the keystroke the caller is waiting on.
+    """
+    for index, char in enumerate(run):
+        if not _paste_safe(char):
+            index = index or 1
+            return run[:index], _ESCAPE_RUN.findall(run[index:])
+    return run, []
+
+
+def _drain_burst(next_char, first, grace=_PASTE_GRACE, sleep=time.sleep):
+    """Coalesce whatever is already waiting behind `first` into one read.
+
+    `next_char` returns the next character with no waiting, "" when nothing
+    is pending, and a key NAME (more than one character) for a key that has
+    no character of its own. A name ends the run and is queued, because it is
+    a keystroke rather than part of the paste.
+
+    The grace is spent only ONCE A BURST IS ALREADY ESTABLISHED -- two
+    characters with no gap at all between them, which is not something a
+    person does. A single keystroke never waits for anything, so nothing here
+    is felt while typing. What it buys is the boundary: a large paste does not
+    always arrive in the console buffer in one piece, and without the pause
+    the tail of it comes back as a second burst and goes into the field as a
+    second paste. That is the same misreading as before, only smaller.
+    """
+    run, queued, total, waited = [first], [], len(first), False
+    while total < _PASTE_DRAIN_MAX:
+        char = next_char()
+        if not char:
+            if len(run) < 2 or waited or grace <= 0:
+                break
+            waited = True
+            sleep(grace)
+            continue
+        waited = False
+        if len(char) > 1:
+            queued.append(char)
+            break
+        run.append(char)
+        total += 1
+        if not _paste_safe(char):
+            break
+    delivered, rest = _split_run("".join(run))
+    _pending_keys.extend(rest)
+    _pending_keys.extend(queued)
+    return delivered
 
 
 def _read_key_windows(msvcrt, timeout, raw=False):
@@ -1480,7 +1586,19 @@ def _read_key_windows(msvcrt, timeout, raw=False):
         # the rest; a text field acts on the editing keys, and there is no
         # character it could type in their place.
         return _WINDOWS_EXTENDED.get(msvcrt.getwch(), "")
-    return char if raw else normalize_key(char)
+    if not raw:
+        # The menu reads one key at a time and has no field to paste into.
+        return normalize_key(char)
+
+    def more():
+        if not msvcrt.kbhit():
+            return ""
+        following = msvcrt.getwch()
+        if following in ("\x00", "\xe0"):
+            return _WINDOWS_EXTENDED.get(msvcrt.getwch(), "")
+        return following
+
+    return _drain_burst(more, char)
 
 
 def _read_key_posix(stream, timeout, raw=False):
@@ -1498,7 +1616,55 @@ def _read_key_posix(stream, timeout, raw=False):
     def take():
         # Read the descriptor directly: select knows about the descriptor,
         # not about anything a text wrapper may already have buffered.
-        return os.read(fd, 1).decode("utf-8", "replace")
+        #
+        # One CHARACTER, which is not one byte. A byte at a time decoded on
+        # its own turns every accented letter and every box-drawing character
+        # of a pasted block into a replacement character, so the continuation
+        # bytes the lead byte promises are read out with it.
+        data = os.read(fd, 1)
+        if not data:
+            return ""
+        lead = data[0] if isinstance(data[0], int) else ord(data[0])
+        extra = 0
+        if 0xF0 <= lead:
+            extra = 3
+        elif 0xE0 <= lead:
+            extra = 2
+        elif 0xC0 <= lead:
+            extra = 1
+        while extra and pending(0.05):
+            data += os.read(fd, 1)
+            extra -= 1
+        return data.decode("utf-8", "replace")
+
+    def escape_sequence():
+        # An escape on its own is Esc; an escape with more behind it is an
+        # arrow. Only pending bytes are read, so Esc never waits long.
+        if not pending(0.05):
+            return "\x1b"
+        sequence = "\x1b" + take()
+        if sequence[-1] in "[O":
+            sequence += take()
+            # Delete, Home and End arrive as ESC [ number ~. The parameter
+            # bytes are read out here so the terminating '~' is not left
+            # behind to be read next as a printable character and typed.
+            while (sequence[-1].isdigit() or sequence[-1] == ";") and pending(0.05):
+                sequence += take()
+        return sequence
+
+    def more():
+        """The next character already waiting, for the burst drain."""
+        if not pending(0):
+            return ""
+        char = take()
+        if char != "\x1b":
+            return char
+        # Read the whole sequence out rather than leaving its tail on the
+        # descriptor to be typed as "[D" a moment later. It comes back longer
+        # than one character, which is how the drain knows it is a keystroke
+        # rather than part of the paste.
+        sequence = escape_sequence()
+        return sequence if len(sequence) > 1 else "\x1b"
 
     _saved_termios = termios.tcgetattr(fd)
     try:
@@ -1509,19 +1675,10 @@ def _read_key_posix(stream, timeout, raw=False):
         if not char:
             return None
         if char != "\x1b":
-            return char if raw else normalize_key(char)
-        # An escape on its own is Esc; an escape with more behind it is an
-        # arrow. Only pending bytes are read, so Esc never waits long.
-        if not pending(0.05):
-            return "esc"
-        sequence = "\x1b" + take()
-        if sequence[-1] in "[O":
-            sequence += take()
-            # Delete, Home and End arrive as ESC [ number ~. The parameter
-            # bytes are read out here so the terminating '~' is not left
-            # behind to be read next as a printable character and typed.
-            while (sequence[-1].isdigit() or sequence[-1] == ";") and pending(0.05):
-                sequence += take()
+            if not raw:
+                return normalize_key(char)
+            return _drain_burst(more, char)
+        sequence = escape_sequence()
         # Raw callers get the sequence itself; it carries an escape, which is
         # not printable, so a field that does not know the sequence drops it
         # rather than typing it.
@@ -1544,6 +1701,12 @@ def read_key(stream=None, timeout=None, raw=False):
     exactly the characters an API key is made of.
     """
     stream = sys.stdin if stream is None else stream
+    if _pending_keys:
+        # Read out behind a paste and queued rather than dropped. It is
+        # answered before the console is asked for anything new, so the
+        # keystroke keeps the place in the order the user made it in.
+        key = _pending_keys.pop(0)
+        return key if raw else normalize_key(key)
     backend = _key_backend()
     if backend is None:
         return None
@@ -1663,10 +1826,17 @@ _WORD_BREAK = " \t"
 # conversation it sits under, which is the thing the screen is actually for.
 INPUT_MAX_ROWS = 5
 
-# A paste longer than this many words is folded to a token rather than typed
-# into the field. The number is a judgement, not a measurement: fifteen words
-# is about the point where a line stops being something you read at a glance.
-PASTE_WORD_THRESHOLD = 15
+# A paste of more than this many lines is folded to a token rather than typed
+# into the field. One, so the rule is simply: if it is a line, it goes in as a
+# line; if it is a block, it goes in as a token.
+#
+# It used to be a word count, and the word count was the wrong measurement.
+# Length is not what makes a paste unreadable in a one-line field -- shape is.
+# A four-hundred-character URL is still one line and the field wraps it, shows
+# it and scrolls it perfectly well; a six-line traceback is six rows of a box
+# five rows tall whether it is fifteen words or five hundred, and it is the
+# one the user pasted to ask about rather than to read.
+PASTE_LINE_THRESHOLD = 1
 
 # What a folded paste looks like in the field. It states the size of what it
 # stands for, because a placeholder that hid the amount would be worse than
@@ -1675,12 +1845,34 @@ _PASTE_TOKEN = "[Pasted text #%d %s]"
 _PASTE_PATTERN = re.compile(r"\[Pasted text #(\d+) [^\]]*\]")
 
 
+def normalize_paste(text):
+    """A pasted block as the field should hold it.
+
+    Two things, both about line endings and neither of them cosmetic.
+
+    The breaks are made uniform first. A console hands back a bare carriage
+    return for the Enter inside a pasted block, a file dragged from Windows
+    carries CRLF, and a heredoc carries LF; counting lines has to see all
+    three the same way or the same paste folds or does not fold depending on
+    where it was copied from.
+
+    Then the trailing ones go. Selecting a line in an editor takes the newline
+    at the end of it with you, and that one invisible character is the whole
+    difference between a line and a block. It would fold a single line to a
+    token that said "+2 lines", one of which is empty -- and a paste is text
+    to put in the field, never an instruction to submit it.
+    """
+    return str(text).replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+
+
+def paste_lines(text):
+    """How many lines a pasted block occupies once its breaks are settled."""
+    return normalize_paste(text).count("\n") + 1
+
+
 def _paste_summary(text):
-    """How much was pasted, in whichever unit says the most about it."""
-    lines = text.count("\n") + 1
-    if lines > 1:
-        return "+%d lines" % lines
-    return "+%d words" % len(text.split())
+    """How much was pasted. Lines, because lines are what folded it."""
+    return "+%d lines" % paste_lines(text)
 
 
 def layout_field(text, inner):
@@ -1775,19 +1967,28 @@ class LineEditor:
         splitting it would let anything applied per keystroke -- a limit, a
         repaint, a cursor move -- land in the middle of it.
 
-        A long paste is folded to a token instead of being typed in. Dropping
-        several hundred words into a field redraws every row of it on every
-        later keystroke, and the user cannot read what they pasted anyway. The
-        text is kept exactly and put back on submit; nothing is truncated and
-        nothing is retyped.
+        A paste of more than one line is folded to a token instead of being
+        typed in. The field is one row that may grow to five, so a block put
+        into it verbatim either fills the box or scrolls most of itself out of
+        sight, and every break in it is a row the conversation underneath does
+        not get. A single line is left exactly as it was pasted, however long
+        it is: the field wraps and scrolls, and text you can read has no
+        business being hidden behind a placeholder.
+
+        The text is kept exactly and put back on submit; nothing is truncated
+        and nothing is retyped.
         """
         if not text:
             return
+        if pasted:
+            text = normalize_paste(text)
+            if not text:
+                return
         # Same keystroke, not the next one: the placeholder stops being drawn
         # at the moment the first character exists, so there is no frame in
         # which both are on screen and none in which they are concatenated.
         self.placeholder_visible = False
-        if pasted and len(text.split()) > PASTE_WORD_THRESHOLD:
+        if pasted and paste_lines(text) > PASTE_LINE_THRESHOLD:
             self.pastes.append(text)
             text = _PASTE_TOKEN % (len(self.pastes), _paste_summary(text))
         self.value = self.value[:self.cursor] + text + self.value[self.cursor:]

@@ -1248,18 +1248,18 @@ def test_the_editing_keys_arrive_however_the_terminal_sends_them():
     assert menu().normalize_text_key("down") == ("", "")
 
 
-def test_a_long_paste_is_folded_to_a_token_and_restored_on_submit():
-    """Dropping several hundred words into the field redraws every row of it
-    on every later keystroke, and the user cannot read it there anyway. The
-    text is kept exactly and put back on submit -- nothing is truncated and
-    nothing has to be retyped."""
-    block = " ".join("word%d" % number for number in range(200))
+def test_a_multi_line_paste_is_folded_to_a_token_and_restored_on_submit():
+    """A block of lines put into the field verbatim either fills the box or
+    scrolls most of itself out of sight, and every break in it is a row the
+    conversation underneath does not get. The text is kept exactly and put
+    back on submit -- nothing is truncated and nothing has to be retyped."""
+    block = "\n".join("line %d of a traceback" % number for number in range(30))
     state = menu().LineEditor()
     state.insert(block, pasted=True)
 
     assert block not in state.value, state.value
     assert "Pasted text #1" in state.value, state.value
-    assert "+200 words" in state.value, state.value
+    assert "+30 lines" in state.value, state.value
     # One short row, whatever was pasted.
     assert len(menu().layout_field(state.value, 60)) == 1, state.value
     # And what the user actually said is what comes back.
@@ -1269,35 +1269,169 @@ def test_a_long_paste_is_folded_to_a_token_and_restored_on_submit():
     assert state.expanded() == block + " and then this"
 
 
-def test_a_multi_line_paste_reports_lines_rather_than_words():
-    block = "\n".join("line %d of a traceback" % number for number in range(30))
+def test_two_lines_are_already_a_block():
+    """The threshold is one line, so the fold starts at the first break rather
+    than at some length nobody can see."""
     state = menu().LineEditor()
-    state.insert(block, pasted=True)
-    assert "+30 lines" in state.value, state.value
-    assert state.expanded() == block
+    state.insert("first\nsecond", pasted=True)
+    assert "Pasted text #1" in state.value, state.value
+    assert "+2 lines" in state.value, state.value
+    assert state.expanded() == "first\nsecond"
 
 
-def test_a_short_paste_is_left_exactly_as_it_was_pasted():
-    """The fold is for text too long to read in a small box. Anything a user
-    can see at a glance must arrive unchanged, or the field is lying about
-    what is in it."""
-    short = "fix the timeout in net.py"
+def test_a_paste_that_fits_on_one_line_is_left_exactly_as_it_was_pasted():
+    """Length is not what makes a paste unreadable in the field -- shape is.
+    A single line wraps, scrolls and can be read and edited, so hiding it
+    behind a placeholder would take away text the user can see."""
+    for text in ("fix the timeout in net.py",
+                 " ".join("word%d" % number for number in range(200)),
+                 "https://example.invalid/" + "segment/" * 60):
+        state = menu().LineEditor()
+        state.insert(text, pasted=True)
+        assert state.value == text, state.value[:80]
+        assert state.pastes == [], state.pastes
+        assert state.expanded() == text
+
+
+def test_the_newline_taken_along_with_a_copied_line_does_not_make_it_a_block():
+    """Selecting a line in an editor takes the break at the end of it with
+    you. That one invisible character used to be the whole difference between
+    a line and a block -- and it would have folded to a token claiming two
+    lines, one of which is empty."""
+    for stroke in ("copied from a file\n", "copied from a file\r\n",
+                   "copied from a file\r", "copied from a file\n\n\n"):
+        state = menu().LineEditor()
+        state.insert(stroke, pasted=True)
+        assert state.value == "copied from a file", repr(state.value)
+        assert state.pastes == [], state.pastes
+
+
+def test_a_windows_paste_counts_its_bare_carriage_returns_as_lines():
+    """The console reports the Enter inside a pasted block as "\\r" and
+    nothing else. Counted the same as every other break, or the same paste
+    folds or does not fold depending on where it was copied from."""
+    assert menu().paste_lines("a\rb\rc") == 3
+    assert menu().paste_lines("a\r\nb\r\nc") == 3
+    assert menu().paste_lines("a\nb\nc") == 3
     state = menu().LineEditor()
-    state.insert(short, pasted=True)
-    assert state.value == short, state.value
-    assert state.pastes == [], state.pastes
-    assert state.expanded() == short
+    state.insert("a\rb\rc", pasted=True)
+    assert "+3 lines" in state.value, state.value
+    assert state.expanded() == "a\nb\nc", repr(state.expanded())
 
 
 def test_two_pastes_are_folded_separately_and_both_come_back():
-    first = " ".join("alpha%d" % number for number in range(40))
-    second = " ".join("beta%d" % number for number in range(40))
+    first = "\n".join("alpha%d" % number for number in range(40))
+    second = "\n".join("beta%d" % number for number in range(40))
     state = menu().LineEditor()
     state.insert(first, pasted=True)
     state.insert(" then ", pasted=False)
     state.insert(second, pasted=True)
     assert "Pasted text #1" in state.value and "Pasted text #2" in state.value
     assert state.expanded() == first + " then " + second
+
+
+class _FakeConsole:
+    """A console that delivers a paste the way a real one does.
+
+    One character per read, all of it already waiting. This is the shape the
+    bug lived in: nothing above the reader ever saw a paste, it saw somebody
+    typing very fast, and the carriage return in the middle of a pasted block
+    was read as Enter.
+    """
+
+    def __init__(self, text):
+        self.chars = list(text)
+
+    def kbhit(self):
+        return bool(self.chars)
+
+    def getwch(self):
+        return self.chars.pop(0)
+
+
+def test_a_pasted_block_arrives_as_one_read_rather_than_a_line_at_a_time():
+    """The regression this whole change is about. Each carriage return in a
+    pasted block used to come back on its own, and _TEXT_KEYS reads a lone
+    carriage return as Enter -- so a block of three lines submitted three
+    separate tasks, each against a workspace the one before it had changed."""
+    m = menu()
+    m._pending_keys[:] = []
+    block = "first line\rsecond line\rthird line"
+    console = _FakeConsole(block)
+
+    key = m._read_key_windows(console, None, raw=True)
+    assert key == block, repr(key)
+    assert console.chars == [], console.chars
+    assert m._pending_keys == [], m._pending_keys
+
+    # Which is a paste, not three keystrokes, all the way through.
+    kind, value = m.normalize_text_key(key, allow_multiline=True)
+    assert (kind, value) == ("char", "first line\nsecond line\nthird line")
+    state = m.LineEditor()
+    state.insert(value, pasted=True)
+    assert "+3 lines" in state.value, state.value
+    assert state.expanded() == "first line\nsecond line\nthird line"
+    # And what each of those characters used to be on its own.
+    assert m.normalize_text_key("\r") == ("key", "enter")
+
+
+def test_a_keystroke_behind_a_paste_is_delivered_next_rather_than_dropped():
+    """Draining is reading: anything sitting behind the paste has already been
+    taken off the console by the time it is recognised as not part of it."""
+    m = menu()
+    for tail, expected in (("\x03", "\x03"), ("\x00K", "left"), ("\x1b", "\x1b")):
+        m._pending_keys[:] = []
+        console = _FakeConsole("pasted text" + tail)
+        assert m._read_key_windows(console, None, raw=True) == "pasted text"
+        assert m._pending_keys == [expected], m._pending_keys
+        # And it is answered before the console is asked for anything new.
+        # `timeout=0` deliberately: with the queue empty this falls through to
+        # a real console, and a read with no deadline there would hang the
+        # whole suite, which has no per-test timeout to rescue it.
+        assert m.read_key(timeout=0, raw=True) == expected, tail
+        assert m._pending_keys == [], m._pending_keys
+
+
+def test_the_menu_reads_one_key_at_a_time_and_never_coalesces():
+    """It has no field to paste into, and "jj" would be two moves down."""
+    m = menu()
+    m._pending_keys[:] = []
+    console = _FakeConsole("jj")
+    assert m._read_key_windows(console, None, raw=False) == "down"
+    assert console.chars == ["j"], console.chars
+    assert m._pending_keys == [], m._pending_keys
+
+
+def test_a_burst_waits_for_the_rest_of_itself_and_a_keystroke_does_not():
+    """The grace is spent only once two characters have arrived with no gap
+    at all between them, which is not something a person does. So a large
+    paste split across two console buffers still arrives as one paste, and
+    typing never pays for it."""
+    m = menu()
+    m._pending_keys[:] = []
+    slept = []
+    assert m._drain_burst(lambda: "", "a", sleep=slept.append) == "a"
+    assert slept == [], slept
+
+    parts = ["b", "", "c", ""]
+    reader = lambda: parts.pop(0) if parts else ""
+    assert m._drain_burst(reader, "a", sleep=slept.append) == "abc"
+    assert slept and set(slept) == {m._PASTE_GRACE}, slept
+
+    # And with the grace turned off it stops at the gap, which is the whole
+    # of what the pause is buying.
+    parts = ["b", "", "c", ""]
+    assert m._drain_burst(reader, "a", grace=0) == "ab"
+    m._pending_keys[:] = []
+
+
+def test_a_run_hands_back_what_it_cannot_carry_and_never_delivers_nothing():
+    m = menu()
+    assert m._split_run("abc") == ("abc", [])
+    assert m._split_run("ab\x1b[Dc") == ("ab", ["\x1b[D", "c"])
+    # A run that begins with a control character IS that control character;
+    # returning nothing would lose the keystroke the caller is waiting on.
+    assert m._split_run("\x03abc") == ("\x03", ["a", "b", "c"])
 
 
 def test_a_token_whose_paste_is_gone_is_left_alone():
