@@ -11,6 +11,28 @@ import agent_config as _config
 
 JSON_MODE_REJECTIONS = ("response_format", "json_object", "structured output")
 
+# _json_mode_ok is a module-level flag that any thread may flip, and it is
+# deliberately NOT behind a lock. Three facts together are why:
+#
+#   It only ever travels one way. It starts True and the single write anywhere
+#   in this module sets it False, so there is no lost update to lose: two
+#   threads racing both write False and both then retry without the
+#   constraint, which is exactly what one thread alone would have done.
+#
+#   The write is not part of a larger invariant. Nothing else has to change
+#   with it, so there is no window in which a reader could see half a change.
+#
+#   A lock would misdescribe it. Wrapping a monotonic flag in a mutex reads as
+#   a promise that the read-then-write around it is atomic, and it is not --
+#   the read happens when the request is built and the write when the reply
+#   fails, with a whole network round trip in between. No lock can close that,
+#   and pretending otherwise would send the next reader looking for a
+#   guarantee that was never there.
+#
+# The flag is shared across threads on purpose: whether a provider accepts
+# JSON mode is a property of the provider, not of whoever asked. A worker that
+# discovers the rejection saves the main session from rediscovering it.
+
 def clean_model_json(raw):
     return re.sub(r'"(\w+)"=(?!")', r'"\1":', raw)
 
@@ -82,11 +104,15 @@ def _post_chat(payload, spinner=True):
         )
 
     try:
+        # spinner=False is how a caller says "print nothing". A background
+        # worker passes it because console.status opens a live rich spinner,
+        # and a spinner painted from a worker thread lands on top of the
+        # session's own live region and destroys the repaint arithmetic.
         if spinner:
             with console.status("[bold cyan]Thinking...[/bold cyan]", spinner="dots"):
-                text, tokens = call()
+                text, tokens, prompt_tokens = call()
         else:
-            text, tokens = call()
+            text, tokens, prompt_tokens = call()
     except agent_providers.ProviderError as error:
         return None, str(error)
     except Exception as error:
@@ -94,8 +120,16 @@ def _post_chat(payload, spinner=True):
     # Re-shaped into the single internal form ask_model reads, so no provider's
     # own response layout escapes this module.
     data = {"choices": [{"message": {"content": text}}]}
+    usage = {}
     if tokens is not None:
-        data["usage"] = {"completion_tokens": tokens}
+        usage["completion_tokens"] = tokens
+    # The provider's own prompt count travels in the same usage record rather
+    # than beside it, so there is one internal shape and _prompt_tokens can
+    # read a streamed reply and a blocking one the same way.
+    if prompt_tokens is not None:
+        usage["prompt_tokens"] = prompt_tokens
+    if usage:
+        data["usage"] = usage
     return data, None
 
 class StreamError(RuntimeError):
@@ -114,7 +148,25 @@ def _completion_tokens(data):
             return value
     return None
 
-def stream_chat(payload, on_usage=None):
+def _prompt_tokens(data):
+    """The provider's own count of the tokens it READ, if it reports one.
+
+    The counterpart of _completion_tokens, and the thing that lets the meter
+    stop marking its input figure `~`: until the adapters learned to parse
+    this, the only input number available was an estimate of the text sent.
+
+    None means the provider said nothing, and it stays None rather than
+    becoming 0 -- a request always has a prompt, so a zero here would be a
+    fabricated figure rather than a small one.
+    """
+    usage = (data or {}).get("usage") or {}
+    for key in ("prompt_tokens", "input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int) and value >= 0:
+            return value
+    return None
+
+def stream_chat(payload, on_usage=None, on_input_usage=None):
     """Yield content fragments from the selected provider's stream.
 
     The payload is TMT's own shape rather than any provider's; the adapter
@@ -132,6 +184,7 @@ def stream_chat(payload, on_usage=None):
             max_tokens=payload.get("max_tokens", 4096),
             on_usage=on_usage,
             json_mode="response_format" in payload,
+            on_input_usage=on_input_usage,
         ):
             yield fragment
     except agent_providers.ProviderError as error:
@@ -503,17 +556,47 @@ def _error_reply(message):
     label = getattr(provider, "label", "") or "The provider"
     return _made_up(f"{label} error — {message}", reason=PROVIDER_FAILURE)
 
-def _ask_model_streaming(messages, on_event):
+def _open_stream(payload, on_usage, on_input_usage):
+    """Start stream_chat, tolerating a stand-in that predates on_input_usage.
+
+    stream_chat is replaced wholesale by several tests and by anything else
+    that wants to script a reply, and those stand-ins were written against the
+    (payload, on_usage) signature that existed before input tokens were
+    parsed. Arguments are bound when a generator function is CALLED, not at the
+    first next(), so an older two-argument form raises TypeError here rather
+    than somewhere in the middle of a stream where it would be unrecognisable.
+
+    Falling back costs the input-token figure for that one call and nothing
+    else, which is the right trade: an unreported count is already the case
+    this module is built to survive.
+    """
+    try:
+        return stream_chat(payload, on_usage=on_usage, on_input_usage=on_input_usage)
+    except TypeError:
+        return stream_chat(payload, on_usage=on_usage)
+
+
+def _ask_model_streaming(messages, on_event, model=None, max_tokens=None,
+                         quiet=False):
     """Consume the reply as a stream, reporting events as they arrive.
 
     Returns (reply_text, fall_back). ``fall_back`` is True only when the stream
     failed before any content was generated, so a non-streaming retry can never
     duplicate output the user has already seen.
+
+    ``model`` and ``max_tokens`` override what the session-wide settings would
+    supply. They exist for callers that are not the session -- a background
+    worker on its own model or its own reply ceiling has nowhere else to say
+    so, because everything here otherwise reads a module-level global at call
+    time. Left at None, both read those globals exactly as before.
+
+    ``quiet`` is carried rather than used: nothing on this path prints, and it
+    is passed on so a single flag governs the whole call.
     """
     global _json_mode_ok
     for attempt in (0, 1):
-        payload = {"model": _model_for_request(),
-                   "max_tokens": _config.max_tokens_for_effort(),
+        payload = {"model": model or _model_for_request(),
+                   "max_tokens": max_tokens or _config.max_tokens_for_effort(),
                    "messages": messages, "stream": True}
         if _json_mode_ok:
             payload["response_format"] = {"type": "json_object"}
@@ -521,7 +604,8 @@ def _ask_model_streaming(messages, on_event):
         seen_content = False
         try:
             usage_sink = lambda tokens: on_event(("usage", tokens))
-            for content in stream_chat(payload, on_usage=usage_sink):
+            input_sink = lambda tokens: on_event(("input_usage", tokens))
+            for content in _open_stream(payload, usage_sink, input_sink):
                 if not content:
                     continue
                 if not seen_content:
@@ -555,37 +639,55 @@ def _ask_model_streaming(messages, on_event):
         return _extract_json(parser.raw), False
     return None, True
 
-def ask_model(messages, on_event=None):
+def ask_model(messages, on_event=None, model=None, max_tokens=None, quiet=False):
     """Return the model's JSON reply as text.
 
     With ``on_event`` supplied and streaming available, the reply is consumed
     from the provider's stream and events are reported as they arrive:
     ("first_content", ""), ("text", str), ("action", str), ("progress", str),
-    ("next_step", str), ("object", str), ("output", int), ("usage", int) and
-    ("error", str). Without it — or when the provider or transport cannot
-    stream — a single blocking request is used instead.
+    ("next_step", str), ("object", str), ("output", int), ("usage", int),
+    ("input_usage", int) and ("error", str). Without it — or when the provider
+    or transport cannot stream — a single blocking request is used instead.
+
+    ``model`` and ``max_tokens`` override the session-wide settings for this
+    one call. Both are read from module-level globals when left at None, which
+    is what every existing caller does and what it has always done; they exist
+    so a caller that is not the session — a background worker on its own model
+    or its own reply ceiling — has somewhere to say so.
+
+    ``quiet=True`` means this call prints nothing at all. It is what makes the
+    function safe to invoke off the main thread: the two things here that write
+    to the terminal are the "Thinking..." spinner in _post_chat and the
+    JSON-mode notice below, and either one painted from a background thread
+    lands on top of the session's live region and moves the rows its next
+    repaint is aiming at.
     """
     global _json_mode_ok
     streaming = on_event is not None and STREAM_ENABLED
     if streaming:
-        raw, fall_back = _ask_model_streaming(messages, on_event)
+        raw, fall_back = _ask_model_streaming(messages, on_event, model=model,
+                                              max_tokens=max_tokens, quiet=quiet)
         if raw is not None:
             return raw
         if not fall_back:
             return _error_reply("stream ended without a reply")
     # The reply length the effort setting asks for, read now rather than
-    # bound at import: /effort changes it between one turn and the next.
-    base = {"model": _model_for_request(),
-            "max_tokens": _config.max_tokens_for_effort(),
+    # bound at import: /effort changes it between one turn and the next. An
+    # explicit max_tokens overrides it for this call only.
+    base = {"model": model or _model_for_request(),
+            "max_tokens": max_tokens or _config.max_tokens_for_effort(),
             "messages": messages}
     payload = dict(base)
     if _json_mode_ok:
         payload["response_format"] = {"type": "json_object"}
-    data, error = _post_chat(payload, spinner=not streaming)
+    # A quiet caller never gets the spinner, whether or not it streamed.
+    show_spinner = not streaming and not quiet
+    data, error = _post_chat(payload, spinner=show_spinner)
     if error and _json_mode_ok and any(token in error.lower() for token in JSON_MODE_REJECTIONS):
-        console.print("[yellow]Model rejected JSON mode — retrying without it.[/yellow]")
+        if not quiet:
+            console.print("[yellow]Model rejected JSON mode — retrying without it.[/yellow]")
         _json_mode_ok = False
-        data, error = _post_chat(dict(base), spinner=not streaming)
+        data, error = _post_chat(dict(base), spinner=show_spinner)
     if error:
         return _error_reply(error)
     try:
@@ -599,4 +701,9 @@ def ask_model(messages, on_event=None):
         tokens = _completion_tokens(data)
         if tokens is not None:
             on_event(("usage", tokens))
+        prompt_tokens = _prompt_tokens(data)
+        if prompt_tokens is not None:
+            # Reported only when the provider actually sent it. A caller that
+            # hears nothing keeps its estimate, and keeps the `~` that says so.
+            on_event(("input_usage", prompt_tokens))
     return _extract_json(full)

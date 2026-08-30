@@ -32,7 +32,13 @@ _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
 # What a command may be given after its name. Held here rather than parsed by
 # each handler so the error for a stray argument reads the same everywhere.
-_TAKES_ARGUMENT = ("effort", "model")
+_TAKES_ARGUMENT = ("effort", "model", "note")
+
+# How long /note waits for its answer before giving up and saying so. Shorter
+# than a delegated worker's ten minutes because a note is a question somebody
+# is sitting and waiting for: after five minutes of a blank screen the honest
+# thing is to say it is still going, not to keep the prompt hostage.
+NOTE_TIMEOUT = 300.0
 
 
 class Result:
@@ -41,15 +47,24 @@ class Result:
     `rows` are (label, value) pairs for a fact, or a bare string for a line of
     prose. The renderer decides how they are drawn; a handler decides only what
     is true.
+
+    `prompt_for` is the one thing here the session loop acts on rather than
+    draws: a command that needs a second line of input names what it is asking
+    for, and the loop asks again with a placeholder that says so. It is a
+    convenience for an interactive run and never the only path -- `dispatch`
+    returns a Result and never reads input, and the piped reader takes one task
+    per line, so a command that could ONLY be reached by prompting twice would
+    be unreachable from a pipe and from the test suite.
     """
 
-    __slots__ = ("title", "rows", "ok", "note")
+    __slots__ = ("title", "rows", "ok", "note", "prompt_for")
 
-    def __init__(self, title, rows=(), ok=True, note=""):
+    def __init__(self, title, rows=(), ok=True, note="", prompt_for=""):
         self.title = str(title)
         self.rows = list(rows)
         self.ok = bool(ok)
         self.note = str(note or "")
+        self.prompt_for = str(prompt_for or "")
 
     def __repr__(self):
         return "Result(title=%r, rows=%d, ok=%s)" % (self.title, len(self.rows), self.ok)
@@ -397,6 +412,150 @@ def _resolve(argument, catalogue):
     return typed
 
 
+def _agents(argument, session, manager=None):
+    """What the background agents are doing, as text rather than as a panel.
+
+    The unambiguous way in. The panel opens on Right Arrow at the end of the
+    line, which is a gesture with nowhere to open into on a terminal too
+    narrow to hold two columns -- and a gesture nobody has been told about is
+    not a way in at all. This is the same information printed once into the
+    scrollback, so it also survives being scrolled back to, which the panel
+    deliberately does not.
+
+    `manager` is passed by the session loop. Without one this still answers,
+    because `agents_report` handles a missing register itself and saying "none
+    are running" is the truth on an install where none can.
+    """
+    try:
+        import agent_panel
+    except Exception as error:
+        # Reported in words for the reason agent_actions._run_tool gives: an
+        # editable install freezes its module list, so a module sitting in the
+        # source tree can be invisible to the installed entry point, and that
+        # must not take a slash command down with it.
+        return Result("Agents are unavailable",
+                      ["The panel module could not be loaded.", str(error)],
+                      ok=False)
+    report = agent_panel.agents_report(manager)
+    return Result("Agents", [line for line in report.splitlines()])
+
+
+def _note(argument, session):
+    """Answer one question about the workspace, without disturbing anything.
+
+    The question comes on the same line: `/note where is the retry limit set`.
+    Bare `/note` asks for it, which only an interactive run can do, so the
+    inline form is the one that works everywhere and the one the tests drive.
+    """
+    if not argument:
+        return Result(
+            "Note",
+            ["A note answers one question about this workspace by reading it.",
+             "Nothing is created, changed or deleted, and whatever is already "
+             "running carries on untouched.",
+             "",
+             "Usage: %s" % USAGE["note"],
+             "Example: /note which module owns the prompt box?"],
+            prompt_for="note")
+    return run_note(argument, session)
+
+
+def run_note(question, session=None, manager=None, timeout=None):
+    """Run the note agent on one question and return its answer as a Result.
+
+    The public entry point for `/note`, exposed for the session loop to call
+    again with a question collected on a second prompt. `manager` is the
+    session's own register when there is one; without one a private register
+    is made for this question alone, so `/note` works in a piped run that
+    never wired background agents in at all. Either way the note agent does
+    not count against the five-worker cap and does not touch the main agent.
+
+    It blocks -- somebody typed a question and is waiting for the answer --
+    but never forever: `timeout` seconds and it says the note is still running
+    rather than holding the prompt.
+    """
+    text = " ".join(str(question or "").split())
+    if not text:
+        return Result("Note", ["Ask a question: %s" % USAGE["note"]], ok=False)
+    try:
+        import agent_manager
+        import agent_worker
+    except Exception as error:
+        # Imported at call time and reported in words, for the reason
+        # agent_actions._run_tool gives: an editable install freezes its module
+        # list, so a module in the source tree can be invisible to the
+        # installed entry point, and that must degrade to a message rather
+        # than an exception out of a slash command.
+        return Result("Notes are unavailable",
+                      ["The background-agent modules could not be loaded.",
+                       str(error)], ok=False)
+    register = manager if manager is not None else agent_manager.AgentManager()
+    record = register.spawn(text, kind="note")
+    if register.start(record, lambda rec, mgr: agent_worker.run_note(rec, mgr)) is None:
+        return Result("Note", ["The note agent could not be started."], ok=False)
+    seconds = NOTE_TIMEOUT if timeout is None else float(timeout)
+    finished = register.wait([record.id], timeout=seconds)
+    if record.id not in finished:
+        return Result(
+            "Note still running",
+            ["It has been %d seconds and the answer has not come back." % int(seconds),
+             "Its last activity was %r." % (record.activity or "none",),
+             "Nothing was changed; ask again, or carry on."], ok=False)
+    if record.status != agent_manager.Status.COMPLETED:
+        return Result("The note did not finish",
+                      [record.error or "It stopped without saying why."],
+                      ok=False)
+    answer = register.result(record.id).strip()
+    if not answer:
+        return Result("The note came back empty",
+                      ["The note agent finished without writing an answer."],
+                      ok=False)
+    # Prose rows, not (label, value) pairs: this is an answer to a question,
+    # and the renderer draws a bare string as a line of text.
+    #
+    # Wrapped here, and it has to be. `render_command` fits every row to the
+    # terminal with `fit_to_width`, which TRUNCATES -- exactly right for the
+    # settled facts every other command returns, where a row is a short label
+    # and a short value, and exactly wrong for a paragraph. An unwrapped
+    # answer lost everything past the right-hand edge, so the one command
+    # whose whole output is prose was the one command that could not show it.
+    # This is the same failure the transcript's "never fabricate" rule guards
+    # against from the other side: half an answer presented as the answer.
+    #
+    # The agent's own line breaks are kept and each line is wrapped inside
+    # them, so a paragraph it meant to break stays broken.
+    return Result("Note", _wrapped_rows(answer),
+                  note="Nothing in the workspace was changed.")
+
+
+def _wrapped_rows(text, columns=None):
+    """An answer as rows that fit, keeping the breaks the agent wrote.
+
+    Six columns are held back for the three-space indent `render_command`
+    adds, the margin either side, and the spare column every row in TMT
+    leaves so a full line cannot reach the terminal's auto-wrap.
+    """
+    import shutil
+    import agent_menu
+    width = columns if columns else shutil.get_terminal_size((80, 24)).columns
+    inner = max(20, int(width) - 6)
+    rows = []
+    for line in str(text).splitlines():
+        if not line.strip():
+            rows.append("")
+            continue
+        # Broken on spaces, not at the column. `agent_ui.wrap_lines` clips by
+        # measured width wherever the width runs out, which is right for the
+        # streaming reply box -- that one must not reflow content it is
+        # relaying -- and wrong for an answer somebody is reading: it split
+        # "1844" across two rows and cut "clear_screen" in half. `_wrap_words`
+        # is the same measurement with a word boundary preferred, and it
+        # still falls back to the clipper for a single word too long to fit,
+        # so nothing can overflow the row either way.
+        rows.extend(agent_menu._wrap_words(line, inner))
+    return rows
+
+
 # --- small helpers ---------------------------------------------------------
 
 def _count(value):
@@ -415,26 +574,36 @@ def _one_line(text, limit):
     return flat if len(flat) <= limit else flat[:limit - 1].rstrip() + "…"
 
 
+# The order commands are offered in, and it is deliberate rather than
+# alphabetical: the five that read the session come first, then the two that
+# reach the background agents, which are the newest and the least often
+# wanted. `/agents` sits beside `/note` because they are the same subject.
 _HANDLERS = {
     "context": _context,
     "config": _config,
     "clear": _clear,
     "effort": _effort,
     "model": _model,
+    "note": _note,
+    "agents": _agents,
 }
 
 SUMMARY = {
+    "agents": "what the background agents are doing",
     "context": "what the conversation looks like now",
     "config": "the settings a request runs under",
     "clear": "forget the conversation, keep everything else",
     "effort": "how much work TMT spends on one task",
     "model": "which model answers",
+    "note": "ask about the workspace without changing it",
 }
 
 USAGE = {
+    "agents": "/agents",
     "context": "/context",
     "config": "/config",
     "clear": "/clear",
     "effort": "/effort [low|medium|high]",
     "model": "/model [<model id or name>]",
+    "note": "/note <question about this workspace>",
 }

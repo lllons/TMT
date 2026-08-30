@@ -97,6 +97,244 @@ def _run_tool(module_name, operation):
         return f"Refused: {error}"
 
 
+# --- background agents ------------------------------------------------------
+#
+# Six verbs the main agent uses to delegate, and one a background agent ends
+# on. Everything they touch lives behind `context["manager"]`, which the
+# session loop puts there and a background agent's own context deliberately
+# does not have. So every branch below starts from the same question -- is
+# there a manager? -- and answers a missing one in words rather than raising:
+# a worker that asked to spawn a worker must be told it cannot, and an
+# AttributeError on None would end the whole run instead.
+
+# How long a wait blocks before it gives up and says so. Ten minutes: long
+# enough for a real delegated task, short enough that a session cannot be
+# hung forever by a worker stuck on a socket that will never answer. It
+# returns "still running" rather than a failure, because a worker that has
+# not finished has not failed.
+DEFAULT_WAIT_TIMEOUT = 600.0
+
+_NO_MANAGER = (
+    "Background agents are not available here, so '%s' did nothing. Nothing was "
+    "started, nothing was stopped, and no agent state changed. Carry out the work "
+    "yourself with the ordinary file, search and git actions."
+)
+
+
+def _manager(context):
+    """The agent register for this call, or None when there is not one.
+
+    `(context or {}).get(...)` rather than `context["manager"]` because a
+    background agent's context has no such key AT ALL -- not a None under it
+    -- and the main loop's may not either on an install where the manager was
+    never wired in.
+    """
+    return (context or {}).get("manager")
+
+
+def _agent_modules():
+    """(agent_manager, agent_worker), or (None, None) with a sentence.
+
+    Imported at call time for the reason `_run_tool` gives: an editable
+    install freezes its module list, so a module present in the source tree
+    is invisible to the installed entry point until pyproject.toml catches
+    up. That has to come back as an action result the model can work around,
+    not an ImportError at the top of this file that stops TMT starting at all.
+    """
+    try:
+        import agent_manager
+        import agent_worker
+        return agent_manager, agent_worker, ""
+    except Exception as error:
+        return None, None, "Background agents are unavailable: %s" % error
+
+
+def _agent_id(obj):
+    """The id key as a string. Models write 2 as often as they write "2"."""
+    value = obj.get("id")
+    if isinstance(value, bool) or value is None:
+        return ""
+    return str(value).strip()
+
+
+def _timeout(obj):
+    """The wait timeout, defaulting and refusing nonsense rather than raising."""
+    value = obj.get("timeout", None)
+    if value is None:
+        return DEFAULT_WAIT_TIMEOUT
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_WAIT_TIMEOUT
+    # A zero or negative timeout is a poll, which is a legitimate thing to
+    # ask for; an enormous one is not, and would hang a session on a typo.
+    return max(0.0, min(seconds, DEFAULT_WAIT_TIMEOUT))
+
+
+def _agent_line(record, now=None):
+    """One agent's state, as a line. Every figure is one the record holds.
+
+    Token counts are marked `~` unless the provider reported them, which is
+    what `tokens_in_exact` and `tokens_out_exact` record. An unmarked estimate
+    would be TMT stating a number it guessed.
+    """
+    marks = ("" if record.tokens_in_exact else "~",
+             "" if record.tokens_out_exact else "~")
+    line = ("#%s %s -- %s (%s%d tokens in, %s%d out)"
+            % (record.id, record.status, record.activity or "no activity yet",
+               marks[0], record.tokens_in, marks[1], record.tokens_out))
+    if record.paths:
+        line += "\n    wrote: %s" % ", ".join(record.paths)
+    if record.error:
+        line += "\n    error: %s" % record.error
+    return line
+
+
+def _spawn_agent(manager, obj):
+    """Create a background worker and start it. Returns a sentence."""
+    agent_manager, agent_worker, problem = _agent_modules()
+    if problem:
+        return problem
+    task = obj.get("task")
+    if not isinstance(task, str) or not task.strip():
+        return ("spawn_agent needs a 'task': the instruction the background "
+                "agent is to carry out, written as a whole piece of work it can "
+                "finish on its own without asking anyone anything.")
+    try:
+        record = manager.spawn(task.strip(), model=obj.get("model"),
+                               effort=obj.get("effort"))
+    except agent_manager.CapacityError as error:
+        # A structured refusal, not silence. The sentence names the cap and
+        # says what to do about it, because the party reading it is a model
+        # and a bare failure is something it will simply retry.
+        return str(error)
+    if manager.start(record, lambda rec, mgr: agent_worker.run_worker(rec, mgr)) is None:
+        return ("Background agent #%s could not be started; it is %s."
+                % (record.id, record.status))
+    return ("Started background agent #%s on: %s\nIt runs on its own from here. "
+            "Carry on with other work, then use wait_for_agents to collect what "
+            "it produced, or agent_status to see how it is getting on."
+            % (record.id, record.task))
+
+
+def _agent_status(manager, obj):
+    """One agent's state, or every worker's."""
+    agent_id = _agent_id(obj)
+    if agent_id:
+        record = manager.inspect(agent_id)
+        if record is None:
+            return "There is no background agent with id %r." % agent_id
+        return _agent_line(record)
+    records = manager.list()
+    if not records:
+        return ("No background agents have been started in this session. Use "
+                "spawn_agent to delegate a piece of work.")
+    running = manager.active_count()
+    header = ("%d background agent(s), %d still running:"
+              % (len(records), running))
+    return "\n".join([header] + [_agent_line(record) for record in records])
+
+
+def _agent_result(manager, obj):
+    """What one agent produced, or why there is nothing yet."""
+    agent_id = _agent_id(obj)
+    record = manager.inspect(agent_id)
+    if record is None:
+        return "There is no background agent with id %r." % agent_id
+    if not record.is_terminal():
+        return ("Background agent #%s has not finished; it is %s and its last "
+                "activity was %r. Use wait_for_agent to block until it does."
+                % (record.id, record.status, record.activity))
+    result = manager.result(record.id)
+    if not result:
+        return ("Background agent #%s is %s and produced no report."
+                % (record.id, record.status))
+    return "Background agent #%s (%s) reported:\n%s" % (record.id, record.status, result)
+
+
+def _wait_report(manager, records, finished):
+    """What a wait returned: each finished agent verbatim, each one still out.
+
+    The response is quoted rather than summarised. It is the whole of what a
+    worker produced and the only thing it produced, and a paraphrase here
+    would be TMT restating a report it did not write.
+    """
+    lines, waiting = [], []
+    for record in records:
+        if record.id not in finished:
+            waiting.append(record)
+            continue
+        result = manager.result(record.id) or "(no report)"
+        lines.append("Background agent #%s (%s) reported:\n%s"
+                     % (record.id, record.status, result))
+    if waiting:
+        lines.append("Still running after the wait: %s. Their work is not lost "
+                     "-- wait for them again, or collect them later with "
+                     "agent_result."
+                     % ", ".join("#%s (%s)" % (record.id, record.activity or record.status)
+                                 for record in waiting))
+    # Two agents that wrote the same file is the one concurrency fact the main
+    # agent cannot work out for itself and does need to know. There is no lock
+    # manager and no transaction; this is the whole of that story, and it is
+    # enough to send someone to look.
+    clashes = manager.conflicts()
+    if clashes:
+        lines.append("Two or more agents wrote the same file:\n" + "\n".join(
+            "    %s -- agents %s" % (path, ", ".join("#" + one for one in ids))
+            for path, ids in clashes))
+    return "\n\n".join(lines) if lines else "Nothing to report."
+
+
+def _wait_for_agent(manager, obj):
+    agent_id = _agent_id(obj)
+    record = manager.inspect(agent_id)
+    if record is None:
+        return "There is no background agent with id %r." % agent_id
+    finished = manager.wait([record.id], timeout=_timeout(obj))
+    return _wait_report(manager, [record], finished)
+
+
+def _wait_for_agents(manager, obj):
+    ids = obj.get("ids")
+    if isinstance(ids, (list, tuple)) and ids:
+        wanted = [str(one).strip() for one in ids if str(one).strip()]
+        records = [record for record in (manager.inspect(one) for one in wanted)
+                   if record is not None]
+        missing = [one for one in wanted if manager.inspect(one) is None]
+    else:
+        # No ids named means every worker this session started. Finished ones
+        # return at once, so this is also how a main agent collects results it
+        # never got round to reading.
+        records, missing = list(manager.list()), []
+    if not records:
+        if missing:
+            return "None of those ids is a background agent: %s." % ", ".join(missing)
+        return ("No background agents have been started in this session, so "
+                "there was nothing to wait for.")
+    finished = manager.wait([record.id for record in records], timeout=_timeout(obj))
+    report = _wait_report(manager, records, finished)
+    if missing:
+        report += "\n\nNo agent has the id(s): %s." % ", ".join(missing)
+    return report
+
+
+def _kill_agent(manager, obj):
+    agent_id = _agent_id(obj)
+    record = manager.inspect(agent_id)
+    if record is None:
+        return "There is no background agent with id %r." % agent_id
+    if not manager.kill(record.id):
+        return ("Background agent #%s was already %s; nothing was stopped."
+                % (record.id, record.status))
+    # Said exactly, because the guarantee is exact and a larger claim would be
+    # false: a thread cannot be terminated and a stream has no abort, so a
+    # request already in flight still finishes arriving.
+    return ("Stopped background agent #%s. It will run no further action. A "
+            "request already in flight may still complete, and anything it had "
+            "already written is still written -- it wrote: %s."
+            % (record.id, ", ".join(record.paths) if record.paths else "nothing"))
+
+
 MAX_STATUS_PATHS = 40
 
 def _git_status(agent_git):
@@ -243,6 +481,31 @@ def execute_action(obj, context=None):
     if action == "recall":
         return _run_tool("agent_memory", lambda m: m.recall(
             query=obj.get("query"), limit=obj.get("limit"), kind=obj.get("kind")))
+    # Delegating to background agents. Every one of these needs the register
+    # the session loop holds; without it they say so and change nothing.
+    if action in ("spawn_agent", "agent_status", "agent_result",
+                  "wait_for_agent", "wait_for_agents", "kill_agent"):
+        manager = _manager(context)
+        if manager is None:
+            return _NO_MANAGER % action
+        if action == "spawn_agent": return _spawn_agent(manager, obj)
+        if action == "agent_status": return _agent_status(manager, obj)
+        if action == "agent_result": return _agent_result(manager, obj)
+        # These two BLOCK, here, inside the action, for as long as the timeout
+        # allows. The session loop is synchronous and has no event loop to
+        # suspend into, so waiting is an action that takes a while rather than
+        # a state the loop enters. The screen stays alive because LiveRelay
+        # repaints from its own thread, and a KeyboardInterrupt is deliberately
+        # not caught anywhere on this path: Ctrl-C during a wait must abort it
+        # and return to the prompt, which TMT.py already arranges.
+        if action == "wait_for_agent": return _wait_for_agent(manager, obj)
+        if action == "wait_for_agents": return _wait_for_agents(manager, obj)
+        return _kill_agent(manager, obj)
+    # A background agent's ending, and NOT a terminal action here. The main
+    # loop ends a turn on `done` and `respond` only, so a main model that
+    # somehow emitted this one gets an ordinary result and carries on -- which
+    # is the whole point of it being a separate verb rather than a flag.
+    if action == "internal_response": return obj.get("response", "")
     # Never terminal. The loop shows the message and carries straight on; the
     # result exists only so the batch report has something to record.
     if action == "announce": return obj.get("message", "")
@@ -272,6 +535,8 @@ ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     "open_app", "git_status", "git_diff", "git_identity", "git_commit", "git_push",
     "tree", "find_text", "find_symbol", "replace_across", "code_map",
     "related_tests", "remember", "recall",
+    "spawn_agent", "agent_status", "agent_result", "wait_for_agent",
+    "wait_for_agents", "kill_agent", "internal_response",
     "announce", "respond", "done",
 )}
 
@@ -326,6 +591,14 @@ _EVENT_KIND_FOR_ACTION = {
     "run_python": "command", "run_file": "command", "open_app": "command",
     "git_status": "tool", "git_diff": "tool", "git_identity": "tool",
     "git_commit": "milestone", "git_push": "milestone",
+    # `background_agent` already exists in agent_prompt.EVENT_TYPES, at
+    # prominence level 1 and gradient position 40 beside milestone and tool.
+    # A new element takes a place on the existing scale; it does not get a
+    # colour or a kind of its own, so these use the one that is already there.
+    "spawn_agent": "background_agent", "agent_status": "background_agent",
+    "agent_result": "background_agent", "wait_for_agent": "background_agent",
+    "wait_for_agents": "background_agent", "kill_agent": "background_agent",
+    "internal_response": "background_agent",
 }
 
 # Only ever matched against a short sentence an action wrote about itself.
@@ -345,6 +618,18 @@ _REPORTED_ACTIONS = frozenset((
     "write_file", "write_files", "append_file", "patch_file", "replace_lines",
     "delete_file", "delete_folder", "create_folder", "copy_file", "rename_file",
     "git_status", "git_diff", "git_identity", "git_commit", "git_push",
+    # These three report on themselves: "Started background agent #2 on ...",
+    # "Stopped background agent #2", the status listing. Their first line is
+    # TMT's own sentence about what happened, so it can be shown and it can be
+    # read for whether it worked.
+    #
+    # agent_result, wait_for_agent, wait_for_agents and internal_response are
+    # deliberately NOT here. Their result is a worker's own report, quoted
+    # verbatim -- it is data in exactly the way a program's output is data, and
+    # scanning it for "failed" would label a worker that truthfully said "two
+    # tests failed" as a failed action. That is the same false alarm that once
+    # called a green test run a failure, arriving by a new route.
+    "spawn_agent", "agent_status", "kill_agent",
 ))
 
 

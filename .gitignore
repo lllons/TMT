@@ -30,3 +30,10 @@ DESIGN_PRINCIPLES.md
 
 # Working notes for the assistant. Per-checkout, not source.
 CLAUDE.local.md
+
+# Recon notes for the multi-agent work: machine-generated subsystem maps, kept
+# beside CLAUDE.local.md as working material rather than source.
+MULTIAGENT_RECON.md
+
+# The brief for the next session on the multi-agent work. Working material.
+multiagent_promt_*.md

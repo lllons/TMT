@@ -718,7 +718,7 @@ def render_status_lines(stream=None, size=None, phase=None, moment=None,
 
 
 def prompt_caption(stream=None, width=None, moment=None, provider_id=None,
-                   model_id=None, session=None):
+                   model_id=None, session=None, agents=""):
     """The dim line above the prompt box: when, what will answer, what it cost.
 
     These are the three facts that can be different from one question to the
@@ -748,7 +748,16 @@ def prompt_caption(stream=None, width=None, moment=None, provider_id=None,
 
     clock = moment.strftime("%H:%M:%S")
     text = clock
-    for parts in ((clock, provider, model), (clock, model), (clock,)):
+    # `agents` is how many background agents are running, and it is the first
+    # fact on this end to be given up as the terminal narrows: an agent count
+    # is a thing that is true for a while, where the clock and the model are
+    # what this question is about to run under. With none running the string
+    # is empty and the candidates below are exactly the three this row has
+    # always had, so a session with no agents draws the row it always drew.
+    groups = [(clock, provider, model), (clock, model), (clock,)]
+    if agents:
+        groups.insert(0, (agents, clock, provider, model))
+    for parts in groups:
         text = separator.join(parts)
         if display_width(text) <= max(0, width - 1):
             break
@@ -1542,6 +1551,28 @@ def _next_text_key(key_reader, allow_multiline=False):
         return ("key", "interrupt")
 
 
+def _next_raw_key(key_reader):
+    """One keystroke, exactly as the reader gave it.
+
+    The seam the panel opens on. A keystroke has to be looked at twice now --
+    once to ask whether the agents panel wants it, and once as text -- and
+    `normalize_text_key` throws away the difference between the arrow keys and
+    a tick, which is the difference the panel is asking about. So the raw
+    stroke is taken here and each caller normalises it for itself.
+
+    An exhausted reader comes back as None, which `normalize_text_key` already
+    reads as the end of the input, and a KeyboardInterrupt comes back as the
+    character the terminal would have sent for it. Both keep the caller's
+    behaviour exactly what `_next_text_key` gave it.
+    """
+    try:
+        return key_reader()
+    except (StopIteration, IndexError):
+        return None
+    except KeyboardInterrupt:
+        return "\x03"
+
+
 def _default_reader():
     return lambda: read_key(timeout=GRADIENT_TICK)
 
@@ -1824,7 +1855,8 @@ class PromptBox:
     """
 
     def __init__(self, stream=None, instream=None, reader=None, line_reader=None,
-                 session=None, pad=None, completer=None, completed=None):
+                 session=None, pad=None, completer=None, completed=None,
+                 manager=None, panel=None):
         self.stream = sys.stdout if stream is None else stream
         self.instream = sys.stdin if instream is None else instream
         # The blank rows that hold the box against the foot of the window, or
@@ -1852,12 +1884,108 @@ class PromptBox:
         # with its own encoding and history handling -- keeps it rather than
         # having a second one grow up beside it.
         self.line_reader = line_reader
+        # The register of background agents, and the panel that draws it. The
+        # panel is a column inside this box's own frame, because the frame is
+        # a live region and the rows above it are not: everything higher up
+        # the screen is already in the terminal's scrollback and is the
+        # permanent record of the session.
+        #
+        # Both default to None and both are None for every box built the way
+        # they were built before this existed, which is what makes the panel
+        # cost a session without agents exactly nothing: no import, no frame
+        # change, no extra key, no extra repaint.
+        self.manager = manager
+        self._panel_state = panel
         self.cancelled = False
         # When the box last asked something. The caller writes the question
         # into scrollback afterwards and stamps it with this, so the record
         # carries the time the user actually saw rather than a second one read
         # a moment later.
         self.asked_at = None
+
+    def panel(self):
+        """The agents panel for this box, or None when there is none.
+
+        agent_panel is imported inside the call rather than at module scope,
+        the same way agent_credentials is: a menu that cannot draw is worth
+        less than an agent that still starts, and the panel is the newest and
+        least essential thing on the screen. It is also what keeps the import
+        direction one way -- agent_menu reaches for agent_panel, and
+        agent_panel reaches back for two formatters at call time, so neither
+        module needs the other to load.
+
+        A box built with a manager and no panel gets one made here, once, so
+        the selection and the open state survive from one question to the
+        next: the panel is a view onto the manager, and the manager is where
+        an agent's state actually lives.
+        """
+        if self._panel_state is not None:
+            return self._panel_state
+        if self.manager is None:
+            return None
+        try:
+            import agent_panel
+        except Exception:
+            return None
+        self._panel_state = agent_panel.PanelState(self.manager,
+                                                   stream=self.stream)
+        return self._panel_state
+
+    def _agents_text(self):
+        """The agent counter for the caption, or "" when there are none."""
+        state = self.panel()
+        if state is None:
+            return ""
+        try:
+            return state.counter()
+        except Exception:
+            return ""
+
+    def _panel_frame(self, size=None):
+        """(left columns, join) for an open panel, or None.
+
+        Measured against the terminal as it is now, like everything else the
+        box draws, so a window narrowed past the panel's floor mid-edit closes
+        the panel rather than drawing something unreadable into it.
+        """
+        state = self.panel()
+        if state is None or not state.open:
+            return None
+        columns, rows = _terminal(size)
+        try:
+            return state.frame(columns, rows)
+        except Exception:
+            return None
+
+    def _panel_key(self, raw):
+        """Give the open panel first refusal on a keystroke.
+
+        Returns whether the panel took it. Everything the panel does not take
+        falls through to the field, which is why a character typed while the
+        panel is open is still a character.
+        """
+        state = self.panel()
+        if state is None or not state.open:
+            return False
+        try:
+            import agent_panel
+        except Exception:
+            return False
+        return bool(state.handle(agent_panel.panel_key(raw)))
+
+    def _open_panel(self, size=None):
+        """Right Arrow at the end of the line. Returns whether it opened.
+
+        Right Arrow already moves the caret, and binding it outright would
+        break editing and several tests that describe it. At the END of the
+        buffer it is a no-op -- there is nothing to its right to move onto --
+        and that is the only place it is taken. Nothing that works today
+        changes.
+        """
+        state = self.panel()
+        if state is None:
+            return False
+        return state.open_panel(_terminal(size)[0])
 
     def ask(self, placeholder=""):
         """Take one line. Returns the text, or None when the input ended.
@@ -1910,7 +2038,30 @@ class PromptBox:
                     placed = self._place(frame[0], frame[1], frame[2])
                     region.show_cursor()
                     shown = frame
-                kind, value = _next_text_key(reader, allow_multiline=True)
+                raw = _next_raw_key(reader)
+                # A refusal answers one gesture and stops being true at the
+                # next. It is drawn by the frame above, so it has been on
+                # screen for exactly as long as the user has been looking at
+                # it, and clearing it here is what takes it down.
+                if self._panel_state is not None:
+                    self._panel_state.message = ""
+                # The panel gets first refusal on a keystroke, and only while
+                # it is open. It takes Up, Down, Enter and Left and hands back
+                # everything else, so a character typed while it is on screen
+                # is still typed into the line behind it. Up and Down reach
+                # the field as a tick today and Left is a caret move, so
+                # nothing that works with the panel shut is touched.
+                if self._panel_key(raw):
+                    continue
+                kind, value = normalize_text_key(raw, allow_multiline=True)
+                # Right Arrow at the end of the line, where it moves nothing.
+                # Taken before the editor sees it, and only when this box was
+                # given a panel at all.
+                if (kind == "key" and value == "right"
+                        and self.panel() is not None
+                        and editor.cursor >= len(editor.value)):
+                    self._open_panel()
+                    continue
                 if kind == "char" and len(value) > 1:
                     # More than one character in a single read is a paste --
                     # no keystroke produces two. Only the editor is told, and
@@ -1980,9 +2131,17 @@ class PromptBox:
         and a pad here would be counted twice and push the box off the bottom.
         """
         rows = self.lines(LineEditor(hint), size=size, caption=False, pad=False)
-        meter = meter_text(self.session, self.stream,
-                           columns=_content_width(_terminal(size)[0]))
-        return ([" " + meter] if meter else []) + rows
+        width = _content_width(_terminal(size)[0])
+        meter = meter_text(self.session, self.stream, columns=width)
+        # The agent counter shares the meter's row rather than taking one of
+        # its own. Both are running totals of what this session is spending,
+        # they are read in the same glance, and a second row here would push
+        # the box up the window every time an agent was spawned. With no
+        # agents the string is empty and the row is exactly the meter's, as it
+        # was before the counter existed.
+        agents = self._agents_text()
+        left = "  ".join(part for part in (meter, agents) if part)
+        return ([" " + left] if left else []) + rows
 
     def _frame(self, editor, size=None, phase=None, moment=None, caption=True,
                pad=True):
@@ -2006,6 +2165,27 @@ class PromptBox:
         """
         stream = self.stream
         columns = _terminal(size)[0]
+        # The panel, if one is open, takes its column out of the width before
+        # anything else is measured. Everything below then draws the box at
+        # the width that is left, which is the whole of what a second column
+        # costs this method: `_frame` already re-measures the terminal on
+        # every paint, so a narrower box is a width argument rather than a
+        # rewrite.
+        panel = self._panel_frame(size)
+        if panel is not None:
+            left, join = panel
+            if not left:
+                # Panel-only: too narrow for two columns. No box is drawn at
+                # all. It is not accepting input while the panel has focus,
+                # and one that looked ready for input would be a lie about
+                # what the program is doing -- the rule `running_lines`
+                # already follows. A caret distance of zero says the same
+                # thing to `_place`: there is no input row to move into.
+                rows = list(join([]))
+                holding = self.pad if (pad and self.pad is not None) else None
+                lead = [""] * (holding.above(len(rows), size) if holding else 0)
+                return lead + rows, 0, 0
+            columns = left + 1
         # A spare column, always: a row drawn to the last one wraps on the
         # terminals that auto-wrap, and costs a screen line the repaint
         # arithmetic does not know about.
@@ -2015,8 +2195,8 @@ class PromptBox:
         width = min(_content_width(columns), limit)
         inner = max(1, width - _PROMPT_PREFIX)
 
-        head = [prompt_caption(stream, width, moment,
-                               session=self.session)] if caption else []
+        head = [prompt_caption(stream, width, moment, session=self.session,
+                               agents=self._agents_text())] if caption else []
         rule = " " + _glyphs(stream)["rule"] * (width - 1)
         field, caret_row, caret = self._field(editor, inner)
         # The marker belongs to the question, not to every row of it, so the
@@ -2027,8 +2207,18 @@ class PromptBox:
             body = _dim(body, stream) if editor.placeholder_visible else body
             lead = " " + PROMPT_MARKER + " " if index == 0 else " " * _PROMPT_PREFIX
             typed.append(lead + body)
-        offered = self._offered(editor, width)
+        offered = self._offered(editor, width) + self._refusal(width)
         rows = head + [rule] + typed + offered + [rule]
+        # How far the caret sits above the foot of the frame: the bottom rule,
+        # then anything offered under the field, then however many field rows
+        # are below the one being typed on. With one row and nothing offered
+        # this is _INPUT_ROW, which is what it always was.
+        up = 1 + len(offered) + (len(typed) - caret_row)
+        # The panel is composed last, against the finished box. The box rows
+        # are flush with the BOTTOM of the composed block, so the caret is
+        # still `up` rows above its foot and `_place` is unchanged.
+        if panel is not None:
+            rows = list(panel[1](rows))
         # Blank rows above, so the box sits at the foot of the window from the
         # moment the session opens rather than wherever the last reply
         # stopped. They are part of the region, so the repaint arithmetic
@@ -2036,12 +2226,23 @@ class PromptBox:
         # as permanent output fills the window from the top.
         holding = self.pad if (pad and self.pad is not None) else None
         lead = [""] * (holding.above(len(rows), size) if holding else 0)
-        # How far the caret sits above the foot of the frame: the bottom rule,
-        # then anything offered under the field, then however many field rows
-        # are below the one being typed on. With one row and nothing offered
-        # this is _INPUT_ROW, which is what it always was.
-        up = 1 + len(offered) + (len(typed) - caret_row)
         return lead + rows, _PROMPT_PREFIX + caret, up
+
+    def _refusal(self, width):
+        """The reason the panel would not open, as one row inside the box.
+
+        It answers a gesture the user just made, it stops being true the
+        moment anything else happens, and it is one line -- so it belongs on
+        the temporary surface, drawn where the offered commands are drawn and
+        gone with the next repaint that has something else to say. Printing it
+        permanently would leave a sentence about a terminal width in the
+        scrollback for the rest of the session.
+        """
+        state = self._panel_state
+        message = getattr(state, "message", "") if state is not None else ""
+        if not message:
+            return []
+        return [_dim(fit_to_width("   " + message, width), self.stream)]
 
     def _accept_completion(self, editor):
         """Take the completion Tab offers, through the buffer.
@@ -2146,9 +2347,13 @@ class PromptBox:
 
         `up` is how far the input row sits above the foot of the frame, which
         `_frame` works out: two ordinarily, and more when commands are being
-        offered under the line.
+        offered under the line, and zero when no box was drawn at all --
+        which is what a terminal too narrow for two columns does while the
+        agents panel is open. Zero means there is no input row to move into,
+        so the caret is left where the region put it rather than being sent
+        up nowhere.
         """
-        if not self._ansi():
+        if up <= 0 or not self._ansi():
             return 0
         parts = ["\033[%dA" % up, "\r"]
         if column:

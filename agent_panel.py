@@ -1,0 +1,641 @@
+"""The AGENTS panel: a column inside the live region at the foot of the screen.
+
+What this is not, and why. The panel was asked for as a full-height column
+down the right-hand quarter of the terminal, beside everything already on
+screen. TMT cannot hold those rows. The scrollback above the live region is
+already printed and is the permanent surface -- the only record a finished
+session leaves -- and the two escapes that would let a program own the whole
+window are both banned here for the same reason: narrowing the scrolling
+region *discards* the lines that scroll out of it rather than pushing them
+into the terminal's history, and the alternate screen buffer throws the
+history away wholesale. Both were tried. Both destroyed the session record,
+and a test greps the modules to keep them out.
+
+So the panel is a column inside the region that is already alive: the block
+at the foot of the window that holds the reply, the prompt box and the status
+row, and that already repaints in place on its own thread. Each row of that
+region composes as `left content + gutter + panel column`. The scrollback
+above it stays full width and is never redrawn. That is the honest version of
+the picture in this architecture, and it gets the described layout for the
+part of the screen that is actually moving.
+
+Everything here is a pure function of a record list and a width. Nothing in
+this module writes to a stream, reads a key, takes a lock or asks the clock:
+the two callers -- the prompt box and the live relay -- own all of that, and
+that is what makes every rule below testable by comparing strings.
+
+Three rules it obeys, all of them from DESIGN_PRINCIPLES.md:
+
+**No colour of its own.** `background_agent` is already an event kind, at
+prominence 1 and gradient position 40, and that is the position a running
+agent takes here. A finished one takes 95, a failed one 10 and a killed one
+60 -- the positions `success`, `error` and `warning` already hold. A new
+element takes a place on the one gradient; it never gets a palette.
+
+**Colour is never the message.** Every state is a word, every selection is a
+`>` in the first column, and the destructive entry is marked `!` and set off
+by a blank row. Read the panel with the escapes stripped and nothing has been
+lost but confirmation.
+
+**Measured, never counted.** `display_width` for plain text and
+`visible_width` for anything already painted, and the composed row is drawn to
+`columns - 1`, because a row filled to the last column wraps on the terminals
+that auto-wrap and costs a screen line the repaint arithmetic does not know
+about.
+"""
+
+import sys
+
+from agent_manager import Status
+from agent_ui import (
+    DIM, RESET, _color, _supports_color, display_width, fit_to_width,
+    plain_output, strip_ansi, visible_width,
+)
+
+# How much of the content width the panel takes, and the range it is allowed
+# to take it in. Twenty-eight percent of a wide terminal is a readable column
+# without the conversation becoming a strip; the floor is the narrowest column
+# a card still fits in (`> #1: 42k T +4120` is seventeen columns) and the
+# ceiling stops a very wide window handing the panel half the screen for three
+# short cards.
+PANEL_SHARE = 0.28
+PANEL_MIN = 18
+PANEL_MAX = 34
+
+# Blank columns between the two. Two rather than one: a single column between
+# a padded left cell and a panel row reads as a space inside a sentence.
+GUTTER = 2
+
+# The two degradation thresholds, in REAL terminal columns rather than content
+# columns. `_MIN_CONTENT` in agent_menu is 24 and the panel floor is 18, so
+# two columns need 24 + 2 + 18 = 44 content columns, which is 45 real ones
+# once the spare column at the right is given up.
+TWO_COLUMN_MIN = 45
+
+# Below this the panel does not open at all. Thirty columns is the narrowest
+# window in which a card is still a sentence rather than an ellipsis, and a
+# panel that opened into something unreadable would be worse than the line
+# saying it cannot.
+PANEL_ONLY_MIN = 30
+
+TITLE = "AGENTS"
+
+# The one destructive entry, and the id it answers to. It is the last entry in
+# the list, set off by a blank row, and marked `!` rather than by colour --
+# with the escapes stripped it is still the only row on the panel wearing a
+# mark that is not a selection.
+KILL_ALL_LABEL = "Kill All Agents"
+KILL_ALL = "kill_all"
+
+# What the two keys do, said in the panel rather than left to be discovered.
+# Enter is destructive and the panel is the only place that can say so before
+# it is pressed, which is why this row exists at all and why it is the first
+# thing given up when the region is short of rows.
+#
+# Three of them, longest first, and the first that FITS is the one drawn. An
+# instruction is the one row on the panel that must not be elided: a card cut
+# in the middle still says which agent it is, while "Enter kil...t closes"
+# says nothing and looks like a fault.
+HINTS = ("Enter kills, Left closes", "Enter kills", "")
+HINT = HINTS[0]
+
+# Positions on the one gradient. Every one of these is a place an existing
+# event kind already holds: a running agent is `background_agent` (40), a
+# finished one is `success` (95), a failed one is `error` (10), a killed one
+# is `warning` (60), and killing everything is the red end of the scale.
+AGENT_POSITION = 40
+DONE_POSITION = 95
+KILLED_POSITION = 60
+FAILED_POSITION = 10
+DANGER_POSITION = 10
+
+# The word each status is drawn as. Short because the column is narrow, and a
+# word rather than a glyph because the state has to survive the escapes being
+# stripped.
+_STATE_WORDS = {
+    Status.CREATED: "starting",
+    Status.STARTING: "starting",
+    Status.RUNNING: "running",
+    Status.WAITING: "waiting",
+    Status.COMPLETED: "done",
+    Status.KILLED: "killed",
+    Status.FAILED: "failed",
+}
+
+_STATE_POSITIONS = {
+    Status.COMPLETED: DONE_POSITION,
+    Status.KILLED: KILLED_POSITION,
+    Status.FAILED: FAILED_POSITION,
+}
+
+# Every spelling of the four keys the panel takes while it has focus, as both
+# the raw sequence a POSIX terminal sends and the name the Windows console
+# reader hands back for a key with no character of its own. Both, because
+# `read_key(raw=True)` returns the sequence on one platform and the name on
+# the other, and a panel that only knew one of them would be dead on the
+# other.
+#
+# `j` and `k` are deliberately absent. They are up and down on the menus,
+# where every key is a command; here they are letters in a task the user is
+# still typing.
+_PANEL_KEYS = {
+    "up": "up", "\x1b[A": "up", "\x1bOA": "up",
+    "down": "down", "\x1b[B": "down", "\x1bOB": "down",
+    "left": "left", "\x1b[D": "left", "\x1bOD": "left",
+    "right": "right", "\x1b[C": "right", "\x1bOC": "right",
+    "enter": "enter", "\r": "enter", "\n": "enter", "\r\n": "enter",
+    "esc": "esc", "\x1b": "esc",
+}
+
+
+def _menu():
+    """agent_menu, imported at call time.
+
+    The import direction is agent_menu -> agent_panel: the prompt box draws
+    the panel beside itself and reaches for this module inside the call, the
+    same way it reaches for agent_credentials, so a panel that cannot be built
+    never stops a session opening. Importing agent_menu back at module scope
+    from here would close that into a cycle, so the two formatters this module
+    borrows -- the compact token count and the middle-eliding truncator -- are
+    fetched when they are used rather than when this module loads.
+
+    They are borrowed rather than reimplemented on purpose. A second token
+    formatter would drift from the corner meter's, and two readouts of the
+    same number in two shapes is worse than either of them.
+    """
+    import agent_menu
+    return agent_menu
+
+
+def _short_count(value):
+    """A token figure at the size a narrow column can carry."""
+    return _menu()._short_count(value)
+
+
+def _elide(text, columns):
+    """`text`, cut to fit, with the marker the rest of TMT already cuts with.
+
+    Middle-elided rather than tail-cut: the two ends of a card row are the
+    agent's number and its state, and those are the two facts a reader is
+    scanning the column for. Cutting the tail would take the state off every
+    card at once.
+    """
+    text = str(text)
+    if columns <= 0:
+        return ""
+    if display_width(text) <= columns:
+        return text
+    return _menu()._shorten_middle(text, columns)
+
+
+def _row(text, columns, stream, position=None, dim=False):
+    """One panel row: fitted first, painted second.
+
+    That order is not a preference. Painting first and fitting afterwards cuts
+    through an escape sequence and leaves half of one on the row, which the
+    terminal then swallows along with whatever followed it.
+    """
+    text = _elide(text, columns)
+    if not _supports_color(stream):
+        return text
+    if dim:
+        return DIM + text + RESET
+    if position is None:
+        return text
+    return _color(text, position, stream)
+
+
+def panel_width(content_width):
+    """How many columns the panel takes of a content width this wide."""
+    share = int(round(max(0, int(content_width)) * PANEL_SHARE))
+    return max(PANEL_MIN, min(PANEL_MAX, share))
+
+
+def can_open(columns):
+    """"" when the panel may open in a terminal this wide, else the reason.
+
+    A sentence rather than a False, because the only thing that can act on it
+    is a person: it names the width they have and the width they need, which
+    is the whole of what they can do about it.
+    """
+    columns = int(columns)
+    if columns >= PANEL_ONLY_MIN:
+        return ""
+    return ("The terminal is %d columns wide and the agents panel needs %d. "
+            "Widen the window, or use /agents." % (columns, PANEL_ONLY_MIN))
+
+
+def layout(columns):
+    """(mode, left columns, panel columns) for a terminal this wide.
+
+    Three modes, and the two thresholds between them are the whole of the
+    narrow-terminal behaviour:
+
+    "two_column"  -- 45 columns and up. The conversation on the left, the
+                     panel on the right, as designed.
+    "panel_only"  -- 30 to 44. The panel takes the whole width of the live
+                     region and the prompt box is not drawn while it is open.
+                     Nothing is lost: the box is not accepting input at that
+                     moment, and a box that looked ready for input while the
+                     panel had focus would be a lie about what the program is
+                     doing. That is the rule `running_lines` already follows.
+    "refused"     -- under 30. `can_open` says so and the panel stays shut.
+    """
+    columns = int(columns)
+    if columns < PANEL_ONLY_MIN:
+        return ("refused", 0, 0)
+    content = max(1, columns - 1)
+    if columns < TWO_COLUMN_MIN:
+        return ("panel_only", 0, content)
+    width = panel_width(content)
+    return ("two_column", content - GUTTER - width, width)
+
+
+def counter_text(count):
+    """The agent counter for the main screen, or "" when there are none.
+
+    Nothing to report means nothing drawn, exactly as the corner meter does
+    it: a row reading "0 agents" is a readout of an absence, and the absence
+    is already on screen as the panel not being there.
+    """
+    count = max(0, int(count))
+    if not count:
+        return ""
+    return "%d agent%s" % (count, "" if count == 1 else "s")
+
+
+def _state_word(record):
+    return _STATE_WORDS.get(getattr(record, "status", ""), "running")
+
+
+def _state_position(record):
+    return _STATE_POSITIONS.get(getattr(record, "status", ""), AGENT_POSITION)
+
+
+def _token_text(record):
+    """`42k T +4120`: the running total, then the request in flight.
+
+    Two figures rather than one because the total has to stay a total. An
+    agent on its fourth request has three earlier replies inside `tokens_out`,
+    so the reply arriving now cannot be recovered from it by subtraction.
+
+    A leading `~` on either half means the figure was estimated rather than
+    reported, which is the rule everywhere in TMT: a guessed number says it is
+    guessed. `tokens_in_exact` and `tokens_out_exact` are that signal, and
+    they start False because nothing has been reported yet -- an unmarked zero
+    would be a claim that the provider said zero.
+
+    When nothing is in flight the state word takes the slot instead, so the
+    row that is never dropped always carries the agent's state.
+    """
+    counted = max(0, int(record.total_tokens()))
+    pending = max(0, int(getattr(record, "tokens_out_pending", 0) or 0))
+    if not counted and not pending:
+        # Nothing has been reported and nothing is in flight. The state word
+        # stands alone rather than beside a `~0 T`, which is a readout of an
+        # absence: the same rule that leaves the corner meter blank instead of
+        # drawing a row of zeroes.
+        return _state_word(record)
+    exact = (bool(getattr(record, "tokens_in_exact", False))
+             and bool(getattr(record, "tokens_out_exact", False)))
+    total = ("" if exact else "~") + _short_count(counted)
+    if pending and not record.is_terminal():
+        mark = "" if getattr(record, "tokens_out_exact", False) else "~"
+        # The total is abbreviated and this one is not, which is a deliberate
+        # difference rather than an oversight. The total is large, historical
+        # and only read for its order of magnitude, so `42k` says everything
+        # it needs to. The figure beside it is the reply arriving right now:
+        # it is the only number on the card that moves, it is bounded by the
+        # effort setting's max_tokens so it never grows wide, and rounding a
+        # live counter to `+4k` would hold it still for a thousand tokens at
+        # a time -- which reads as a worker that has stopped.
+        return "%s T +%s%d" % (total, mark, pending)
+    return "%s T %s" % (total, _state_word(record))
+
+
+def card_lines(record, width, selected=False, now=None, stream=None,
+               activity=True):
+    """One agent's card, painted, every row at most `width` columns.
+
+    Two rows. The first carries the number, the token figures and the state,
+    and is never dropped. The second carries the activity label and is the
+    first thing given up when the region is short of rows -- an agent whose
+    label has gone is still identifiably running, while an agent whose numbers
+    have gone is a row of prose.
+
+    `now` is accepted so a caller with a clock has somewhere to put it, and
+    deliberately reaches nothing: no card reports elapsed time. The live
+    region repaints when its composed frame CHANGES and at no other time --
+    that is the flicker fix, and it is why the relay stopped repainting on a
+    timer -- so a duration drawn here would either not be repainted, and be a
+    stale number presented as a live one, or force back the per-tick repaint
+    that was removed. A wrong clock is worse than no clock.
+    """
+    stream = sys.stdout if stream is None else stream
+    width = max(1, int(width))
+    marker = ">" if selected else " "
+    head = "%s #%s: %s" % (marker, record.id, _token_text(record))
+    rows = [_row(head, width, stream, position=_state_position(record))]
+    if activity:
+        label = str(getattr(record, "activity", "") or "").strip()
+        if label:
+            # Indented under the number and dim: it is the detail on the card,
+            # and the one neutral is where detail that must recede lives.
+            rows.append(_row("   " + label, width, stream, dim=True))
+    return rows
+
+
+def _fitting_hint(width):
+    """The longest form of the hint that fits, or "" when none does."""
+    for text in HINTS:
+        if display_width(text) <= width:
+            return text
+    return ""
+
+
+def entry_count(records):
+    """Selectable entries: one per agent, plus the Kill All Agents row."""
+    return len(list(records)) + 1
+
+
+def panel_rows(records, width, height=None, selected=0, now=None, stream=None):
+    """The panel column, painted, every row at most `width` columns.
+
+    A header naming the panel and counting the agents, one rule under it, a
+    card per agent, a blank row, the Kill All Agents entry and a hint saying
+    what Enter and Left do.
+
+    One rule, not two. The rule under the header marks that boundary; the
+    boundary above the destructive entry is marked by the blank row, because
+    two rules a blank line apart are not a boundary, they are a box with
+    nothing in it.
+
+    `height` is how many rows the region can spare. What is given up, in
+    order: the hint, which is teaching and can be learned once; then every
+    activity label, which is the rule the brief fixes -- the activity line
+    goes before the token line; then cards themselves. The window follows the
+    selection, so the row the user is on is never the row that was trimmed.
+
+    Trimming is never silent, and it costs no row to say so: the header counts
+    every agent the manager can see, not the ones that fit, so a header
+    reading AGENTS 5 above one card has already said that four are not drawn.
+    A "+4 more" row would have cost exactly the row that would have shown
+    another card, which is a worse trade than the count that is there anyway.
+    """
+    stream = sys.stdout if stream is None else stream
+    width = max(1, int(width))
+    records = list(records)
+    total = len(records)
+    selected = max(0, min(entry_count(records) - 1, int(selected)))
+
+    def build(shown, first, activity, hint):
+        rows = [_row("%s %d" % (TITLE, total), width, stream,
+                     position=AGENT_POSITION),
+                ("-" if plain_output(stream) else "─") * width]
+        for offset, record in enumerate(shown):
+            rows.extend(card_lines(record, width,
+                                   selected=(first + offset) == selected,
+                                   now=now, stream=stream, activity=activity))
+        if records:
+            rows.append("")
+        killing = selected >= total
+        rows.append(_row(("%s %s" % (">" if killing else "!", KILL_ALL_LABEL)),
+                         width, stream, position=DANGER_POSITION))
+        if hint:
+            said = _fitting_hint(width)
+            if said:
+                rows.append(_row(said, width, stream, dim=True))
+        return rows
+
+    for activity, hint in ((True, True), (True, False), (False, False)):
+        rows = build(records, 0, activity, hint)
+        if height is None or len(rows) <= int(height):
+            return rows
+
+    # Still too tall: show fewer cards, keeping the selected one in view.
+    # `first` slides only as far as it must, so the list scrolls rather than
+    # jumping to centre on the selection -- and a selection that had been
+    # trimmed away would leave the user driving something they cannot see.
+    count = total
+    while count > 0:
+        count -= 1
+        first = 0
+        if selected < total:
+            first = max(0, min(selected - count + 1, total - count))
+        rows = build(records[first:first + count], first, False, False)
+        if len(rows) <= int(height):
+            return rows
+    return build([], 0, False, False)[:max(1, int(height))]
+
+
+def _pad(text, columns):
+    """Pad painted text out to `columns`, measuring past the escapes.
+
+    A row that has already been painted is mostly characters that occupy no
+    columns at all, so padding it by `display_width` puts the panel several
+    columns too far right and the whole region wraps.
+    """
+    return text + " " * max(0, columns - visible_width(text))
+
+
+def compose(left_rows, right_rows, width, gutter=GUTTER):
+    """One region row per row of the taller column.
+
+    The left column is flush with the BOTTOM of the block and the right column
+    flush with the TOP, and neither is a matter of taste. The prompt box is
+    the last thing in the left column and it has to stay at the foot of the
+    window, so the blank rows a short left column needs go above it. The panel
+    is read downward from its header, so the blank rows a short panel needs go
+    below it.
+
+    A left row wider than the column it was built for would push the panel
+    right and wrap the region, so one is stripped of its colour and cut to
+    fit. Losing the paint on an overflowing row is a visible degradation; a
+    region that wraps is a frame that marches down the screen on every
+    repaint, and that one is not recoverable.
+    """
+    width = max(1, int(width))
+    gutter = max(0, int(gutter))
+    left_rows = list(left_rows or [])
+    right_rows = list(right_rows or [])
+    panel = max([visible_width(row) for row in right_rows] or [0])
+    left_width = max(0, width - gutter - panel)
+    height = max(len(left_rows), len(right_rows))
+    left_rows = [""] * (height - len(left_rows)) + left_rows
+    right_rows = right_rows + [""] * (height - len(right_rows))
+    rows = []
+    for left, right in zip(left_rows, right_rows):
+        if visible_width(left) > left_width:
+            left = fit_to_width(strip_ansi(left), left_width)
+        rows.append(_pad(left, left_width) + " " * gutter + right)
+    return rows
+
+
+def panel_key(raw):
+    """The panel's name for a keystroke, or "" for one it does not take.
+
+    Only the four keys the panel captures while it has focus, plus Esc.
+    Everything else comes back "" and is handed on to the field, so a
+    character typed while the panel is open is still typed.
+    """
+    if not isinstance(raw, str):
+        return ""
+    return _PANEL_KEYS.get(raw, "")
+
+
+def agents_report(manager, now=None):
+    """What `/agents` prints: the visible agents, as permanent text.
+
+    The unambiguous alternate to the arrow gesture, and the only way in on a
+    terminal too narrow for the panel to open into. It goes to the permanent
+    surface like any other command result, so it is a record rather than a
+    frame, and it says the same things the cards do in the same words.
+    """
+    if manager is None:
+        return "Background agents are unavailable in this session."
+    try:
+        records = tuple(manager.visible_agents(now))
+    except Exception:
+        return "Background agents are unavailable in this session."
+    if not records:
+        return "No background agents are running."
+    lines = ["%s %d" % (TITLE, len(records))]
+    for record in records:
+        lines.append("#%s: %s" % (record.id, _token_text(record)))
+        label = str(getattr(record, "activity", "") or "").strip()
+        if label:
+            lines.append("   " + label)
+        task = str(getattr(record, "task", "") or "").strip()
+        if task:
+            lines.append("   " + _elide(task, 68))
+    return "\n".join(lines)
+
+
+class PanelState:
+    """Whether the panel is open, which entry is selected, and what it draws.
+
+    Held by the prompt box for the life of a session, so the selection and the
+    open state survive a turn: the panel is a view onto the manager, and the
+    manager is the only place an agent's state lives. Nothing here caches a
+    record.
+    """
+
+    def __init__(self, manager=None, stream=None):
+        self.manager = manager
+        self.stream = sys.stdout if stream is None else stream
+        self.open = False
+        self.selected = 0
+        # The reason the panel could not open, shown once and cleared by the
+        # next thing that happens. It is a live message about a live gesture,
+        # so it belongs on the temporary surface with the box that carries it.
+        self.message = ""
+
+    def records(self, now=None):
+        """The agents a panel should draw right now.
+
+        `visible_agents` filters the five-second retention on read, so a
+        finished agent leaves the panel and the counter together and without
+        a timer anywhere. A manager that raises is treated as no agents:
+        decoration is never allowed to end a turn.
+        """
+        if self.manager is None:
+            return ()
+        try:
+            return tuple(self.manager.visible_agents(now))
+        except Exception:
+            return ()
+
+    def count(self, now=None):
+        return len(self.records(now))
+
+    def counter(self, now=None):
+        return counter_text(self.count(now))
+
+    def open_panel(self, columns):
+        """Open it, or record why it cannot. Returns whether it opened."""
+        refusal = can_open(columns)
+        if refusal:
+            self.open = False
+            self.message = refusal
+            return False
+        self.message = ""
+        self.open = True
+        self.selected = 0
+        return True
+
+    def close(self):
+        self.open = False
+        self.message = ""
+
+    def handle(self, intent, now=None):
+        """One panel keystroke. "" for a key the panel does not take.
+
+        Returns "moved", "closed", "killed", "killed_all" or "" -- the caller
+        only has to know whether the key was taken, and the words say what
+        happened for anything that wants to report it.
+        """
+        if not self.open or not intent:
+            return ""
+        entries = entry_count(self.records(now))
+        if intent == "up":
+            self.selected = max(0, self.selected - 1)
+            return "moved"
+        if intent == "down":
+            self.selected = min(entries - 1, self.selected + 1)
+            return "moved"
+        if intent in ("left", "esc"):
+            self.close()
+            return "closed"
+        if intent == "enter":
+            return self.activate(now)
+        return ""
+
+    def activate(self, now=None):
+        """Act on the selected entry: kill that agent, or kill them all.
+
+        Killing is what a panel of running agents is for, and it is the only
+        thing this one does. The hint row says so before Enter is pressed,
+        which is the whole reason that row exists.
+        """
+        if self.manager is None:
+            return ""
+        records = self.records(now)
+        if self.selected >= len(records):
+            self.manager.kill_all()
+            return "killed_all"
+        self.manager.kill(records[self.selected].id)
+        return "killed"
+
+    def frame(self, columns, rows=None):
+        """(left columns, join) for a region this wide, or None when shut.
+
+        `join(left_rows)` turns the caller's own rows into the composed
+        region. The caller therefore needs to know only one number -- how wide
+        its column is -- and every rule about widths, gutters, padding and
+        which column is flush with which edge stays in this module.
+
+        `left columns` is 0 in panel-only mode, which is the caller's signal
+        to draw no box at all.
+
+        A window narrowed past the floor while the panel is open closes it and
+        leaves the reason behind, rather than drawing something unreadable.
+        """
+        if not self.open:
+            return None
+        columns = int(columns)
+        mode, left, width = layout(columns)
+        if mode == "refused":
+            self.open = False
+            self.message = can_open(columns)
+            return None
+        # Two rows kept back for the status row under the region and the spare
+        # row a region never draws on.
+        height = None if rows is None else max(1, int(rows) - 2)
+        body = panel_rows(self.records(), width, height=height,
+                          selected=self.selected, stream=self.stream)
+        content = max(1, columns - 1)
+
+        def join(left_rows):
+            return compose(left_rows, body, content)
+
+        return (left, join)

@@ -454,6 +454,22 @@ class Provider:
         """
         return None
 
+    def parse_stream_input(self, event):
+        """The provider's own INPUT/prompt-token count, or None.
+
+        The counterpart of parse_stream_usage, and the reason TMT's meter had
+        to mark its input figure `~`: nothing here read a prompt-token count,
+        so the only number available was an estimate of the text sent. Every
+        provider does report one; each of them reports it under a different
+        name and at a different point in the stream, which is why it belongs in
+        the adapters rather than in a single guess made upstream.
+
+        None means "this event did not carry one", and it is deliberately not
+        0: a zero would be a claim that the request had no prompt, which is
+        never true, and it would settle the meter on a number nobody sent.
+        """
+        return None
+
     def parse_stream_error(self, event):
         """A ProviderError for an error event, or None.
 
@@ -609,6 +625,21 @@ class _OpenAICompatible(Provider):
     def parse_stream_usage(self, event):
         usage = (event or {}).get("usage") or {}
         for field in ("completion_tokens", "output_tokens"):
+            value = usage.get(field)
+            if isinstance(value, int) and value >= 0:
+                return value
+        return None
+
+    def parse_stream_input(self, event):
+        """Prompt tokens from a usage record, streamed or whole.
+
+        "prompt_tokens" is the chat-completions name and is tried first;
+        "input_tokens" is what the newer OpenAI shapes and several
+        OpenAI-compatible gateways send instead, and OpenRouter has been seen
+        to pass through whichever name the upstream model used.
+        """
+        usage = (event or {}).get("usage") or {}
+        for field in ("prompt_tokens", "input_tokens"):
             value = usage.get(field)
             if isinstance(value, int) and value >= 0:
                 return value
@@ -854,6 +885,26 @@ class AnthropicProvider(Provider):
                     return value
         return None
 
+    def parse_stream_input(self, event):
+        """Input tokens, which this API reports once and early.
+
+        message_start carries the whole prompt count under "message"."usage"
+        before a single character of the reply exists; message_delta then
+        reports output tokens at the end and does NOT repeat the input figure.
+        So the nested form is the one that actually fires on a stream, and the
+        top-level form is what a complete non-streamed body looks like. Both
+        are read here for the same reason parse_stream_usage reads both: one
+        method has to answer for both transports.
+        """
+        event = event or {}
+        nested = event.get("message")
+        for usage in (event.get("usage"), nested.get("usage") if isinstance(nested, dict) else None):
+            if isinstance(usage, dict):
+                value = usage.get("input_tokens")
+                if isinstance(value, int) and value >= 0:
+                    return value
+        return None
+
     def parse_response(self, data):
         blocks = (data or {}).get("content")
         if not isinstance(blocks, list):
@@ -955,6 +1006,18 @@ class GeminiProvider(Provider):
         value = usage.get("candidatesTokenCount")
         return value if isinstance(value, int) and value >= 0 else None
 
+    def parse_stream_input(self, event):
+        """Prompt tokens from usageMetadata.
+
+        Gemini repeats usageMetadata on every streamed chunk rather than
+        sending it once, so this fires repeatedly with the same figure. That is
+        harmless because the caller settles on the value rather than adding it
+        up -- an input count is a property of the request, not a running total.
+        """
+        usage = (event or {}).get("usageMetadata") or {}
+        value = usage.get("promptTokenCount")
+        return value if isinstance(value, int) and value >= 0 else None
+
     def parse_response(self, data):
         if not isinstance(data, dict) or "candidates" not in data:
             raise self._malformed(data)
@@ -998,12 +1061,20 @@ def all_providers():
 
 
 def stream_completion(provider, key, messages, model=None,
-                      max_tokens=DEFAULT_MAX_TOKENS, on_usage=None, json_mode=None):
+                      max_tokens=DEFAULT_MAX_TOKENS, on_usage=None, json_mode=None,
+                      on_input_usage=None):
     """Yield generated text fragments from the provider's stream.
 
     Only generated content is yielded, so the fragments feed
     StreamingActionParser unchanged whichever provider produced them. A usage
-    record goes to ``on_usage`` rather than into the text.
+    record goes to ``on_usage`` rather than into the text, and the request's
+    own prompt-token count to ``on_input_usage``.
+
+    The two sinks are separate because the numbers behave differently: output
+    tokens arrive at the end and supersede an estimate, while input tokens
+    arrive at the start (Anthropic) or on every chunk (Gemini) and describe a
+    request that has already been sent. Merging them would make the caller
+    guess which it had just been handed.
     """
     url, payload = provider.chat_payload(messages, model, stream=True,
                                          max_tokens=max_tokens, json_mode=json_mode)
@@ -1018,6 +1089,10 @@ def stream_completion(provider, key, messages, model=None,
                 tokens = provider.parse_stream_usage(event)
                 if tokens is not None:
                     on_usage(tokens)
+            if on_input_usage is not None:
+                prompt_tokens = provider.parse_stream_input(event)
+                if prompt_tokens is not None:
+                    on_input_usage(prompt_tokens)
             text = provider.parse_stream_chunk(event)
             if text:
                 yield text
@@ -1031,7 +1106,13 @@ def stream_completion(provider, key, messages, model=None,
 
 def complete(provider, key, messages, model=None,
              max_tokens=DEFAULT_MAX_TOKENS, json_mode=None):
-    """One blocking completion. Returns (text, output_tokens_or_None).
+    """One blocking completion.
+
+    Returns (text, output_tokens_or_None, input_tokens_or_None). The third
+    member was added when the adapters learned to read prompt tokens; either
+    count is None when the provider did not report it, and None is not 0 --
+    the caller must be able to tell "no figure" from "a figure of nothing", or
+    it will print a number the provider never sent.
 
     A provider that rejects JSON mode has the constraint dropped and the call
     retried once, which is how TMT has always handled it: the constraint is
@@ -1063,5 +1144,7 @@ def complete(provider, key, messages, model=None,
                 json_mode = False
                 continue
             raise error
-        return provider.parse_response(data), provider.parse_stream_usage(data)
+        return (provider.parse_response(data),
+                provider.parse_stream_usage(data),
+                provider.parse_stream_input(data))
     raise ProviderError(f"{provider.label} did not return a reply", kind="unknown")

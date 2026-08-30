@@ -327,7 +327,8 @@ class LiveRelay:
     """
 
     def __init__(self, stream=None, ansi=None, symbols=None,
-                 body_lines=LIVE_BODY_LINES, footer=None, pad=None):
+                 body_lines=LIVE_BODY_LINES, footer=None, pad=None,
+                 panel=None):
         self.region = LiveRegion(stream, ansi)
         if symbols is None:
             symbols = SYMBOL_POOL if symbols_supported(self.region.stream) else ASCII_SYMBOL_POOL
@@ -343,6 +344,24 @@ class LiveRelay:
         # a region of this height needs, so a taller one -- a long reply -- is
         # given fewer and the bottom edge does not move.
         self.pad = pad
+        # panel(columns, rows) -> (left columns, join(left_rows) -> rows), or
+        # None for a region with no panel in it. The agents panel is a column
+        # inside THIS region, because this is the only part of the screen that
+        # may be redrawn: everything above it is already in the terminal's own
+        # scrollback and is the permanent record of the session.
+        #
+        # The hook hands back a width and a function rather than rows, so this
+        # module needs to know only how wide its own column is. Every rule
+        # about panel widths, gutters, which column is flush with which edge
+        # and what a narrow terminal does stays in agent_panel, and this
+        # module still has no idea what an agent is.
+        #
+        # `left columns` of 0 means the panel has taken the whole region,
+        # which is what a terminal too narrow for two columns does. The reply
+        # box and the prompt box are then not drawn at all -- the box is not
+        # accepting input while the panel has focus, and one that looked ready
+        # for input would be a lie about what the program is doing.
+        self.panel = panel
         self.streamed = False
         self._status = ""
         self._lock = threading.Lock()
@@ -372,6 +391,30 @@ class LiveRelay:
             if text == self._status:
                 return
             self._status = text
+        self._dirty.set()
+        if not self.running:
+            self._repaint()
+
+    def refresh(self):
+        """Ask for one repaint because something outside this region changed.
+
+        The loop repaints when the reply has moved on and when the status row
+        has changed, and at no other time -- that is the repaint-on-a-timer
+        this module deliberately gave up, and it is half the cursor fix. It
+        also means a region whose FOOTER changed on another thread would sit
+        there stale: an agent's activity label, a card ageing out, an agent
+        finishing. None of those are things this module can see.
+
+        So a caller that knows something changed says so, once, here. It is
+        the manager's event bus that calls it in a session, which is why this
+        takes no argument and reports nothing: it is a nudge, not a message.
+
+        Nothing is painted from this thread. The flag is set and the region's
+        own worker picks it up, because printing from a background thread on
+        top of a live region is the one thing that must never happen.
+        """
+        if self._closed:
+            return
         self._dirty.set()
         if not self.running:
             self._repaint()
@@ -444,18 +487,69 @@ class LiveRelay:
             body = self.glitch.display_text() if self.streamed else ""
         self.region.paint(self._compose(status, body))
 
-    def _footer_rows(self):
+    def _footer_rows(self, size=None):
         """The rows between the reply and the status row, or none.
 
         Decoration is never allowed to end a turn, so a footer that raises is
         simply not drawn.
+
+        `size` is `(columns, rows)` -- the same shape the prompt box already
+        takes -- and it is passed only when a panel has narrowed the column
+        the footer is drawn in. With no panel the footer is called with no
+        arguments at all, exactly as it always was, so a caller that passed a
+        zero-argument callable keeps working unchanged. A footer that does not
+        accept the argument is called again without it, which degrades to a
+        full-width box beside the panel rather than to no box at all.
         """
         if self.footer is None:
             return []
         try:
-            return list(self.footer() or ())
+            if size is None:
+                return list(self.footer() or ())
+            try:
+                return list(self.footer(size) or ())
+            except TypeError:
+                return list(self.footer() or ())
         except Exception:
             return []
+
+    def _panel_frame(self, columns, rows):
+        """(left columns, join) from the panel hook, or None for no panel."""
+        if self.panel is None:
+            return None
+        try:
+            return self.panel(columns, rows)
+        except Exception:
+            return None
+
+    def _body_rows(self, body, columns, visible):
+        """The reply box, `columns` wide, showing the last `visible` rows.
+
+        `columns` is the box's outer width, spare column already given up by
+        whoever worked it out: with no panel that is the window less one, and
+        with one it is the left column the panel left behind.
+        """
+        # BODY_LEFT and BODY_RIGHT are East Asian wide: two columns each, not
+        # one. Measure the chrome instead of assuming it. A row that reached
+        # the terminal's auto-wrap would silently cost a second screen line,
+        # which the cursor moves in LiveRegion.paint do not count, so every
+        # repaint would land too high and march the frame down the screen.
+        frame = ASCII_FRAME if plain_output(self.region.stream) else FRAME
+        chrome = display_width(frame["left"]) + display_width(frame["right"]) + 2
+        inner = max(10, columns - chrome)
+        wrapped = wrap_lines(body, inner)[-max(1, visible):]
+        # Undecorated on purpose. This box holds the reply as it arrives, and
+        # a reply is read rather than watched: the gradient belongs on the
+        # instruments -- the bar, the thinking word -- not on the border of
+        # the thing being read. Plain also means two consecutive frames of an
+        # unchanged reply are identical, which is what lets the repaint be
+        # skipped entirely.
+        rule = frame["rule"] * (inner + chrome - 2)
+        left, right = frame["left"], frame["right"]
+        lines = [frame["top"] + rule + frame["top_end"]]
+        lines.extend(f"{left} {pad_to_width(line, inner)} {right}" for line in wrapped)
+        lines.append(frame["bottom"] + rule + frame["bottom_end"])
+        return lines
 
     def _lead(self, height):
         """The blank rows that hold a region this tall against the foot."""
@@ -469,38 +563,48 @@ class LiveRelay:
     def _compose(self, status, body):
         size = shutil.get_terminal_size((80, 24))
         width = max(24, size.columns)
+        panel = self._panel_frame(width, size.lines)
+        if panel is not None:
+            return self._compose_with_panel(status, body, size, width, panel)
         footer = self._footer_rows()
         tail = footer + ([status] if status else [])
         if not body:
             return self._lead(len(tail)) + tail
-        # BODY_LEFT and BODY_RIGHT are East Asian wide: two columns each, not
-        # one. Measure the chrome instead of assuming it, and leave a spare
-        # column so a full row never reaches the terminal's auto-wrap. A
-        # wrapped row silently costs a second screen line, which the cursor
-        # moves in LiveRegion.paint do not count, so every repaint would land
-        # too high and march the frame down the screen.
-        frame = ASCII_FRAME if plain_output(self.region.stream) else FRAME
-        chrome = display_width(frame["left"]) + display_width(frame["right"]) + 2
-        inner = max(10, width - chrome - 1)
         # Keep the whole region on screen: a region taller than the terminal
         # would scroll away from the cursor moves that repaint it. The reply is
         # what gives up rows for the footer, because the footer is the box the
         # user is looking at and the status row is one line.
         room = size.lines - 3 - len(tail)
         visible = max(1, min(self.body_lines, room))
-        wrapped = wrap_lines(body, inner)[-visible:]
-        # Undecorated on purpose. This box holds the reply as it arrives, and
-        # a reply is read rather than watched: the gradient belongs on the
-        # instruments -- the bar, the thinking word -- not on the border of
-        # the thing being read. Plain also means two consecutive frames of an
-        # unchanged reply are identical, which is what lets the repaint be
-        # skipped entirely.
-        rule = frame["rule"] * (inner + chrome - 2)
-        left, right = frame["left"], frame["right"]
-        lines = [frame["top"] + rule + frame["top_end"]]
-        lines.extend(f"{left} {pad_to_width(line, inner)} {right}" for line in wrapped)
-        lines.append(frame["bottom"] + rule + frame["bottom_end"])
+        lines = self._body_rows(body, width - 1, visible)
         return self._lead(len(lines) + len(tail)) + lines + tail
+
+    def _compose_with_panel(self, status, body, size, width, panel):
+        """The region with the agents panel as its right-hand column.
+
+        The status row is the one thing left full width and below both
+        columns. It is the instrument measuring the turn, and an instrument
+        belongs under the thing it is measuring rather than beside it -- and
+        squeezing it into the left column would cost the bar and the token
+        readout the room they need to say anything.
+
+        Only the panel is composed against the LEFT column here. Everything
+        above this region is untouched: it is already printed, it is the
+        session's permanent record, and repainting it is the one thing this
+        module may never do.
+        """
+        left_columns, join = panel
+        tail = [status] if status else []
+        left = []
+        if left_columns:
+            footer = self._footer_rows((left_columns + 1, size.lines))
+            room = size.lines - 3 - len(tail) - len(footer)
+            if body:
+                left = self._body_rows(body, left_columns,
+                                       max(1, min(self.body_lines, room)))
+            left = left + footer
+        rows = list(join(left))
+        return self._lead(len(rows) + len(tail)) + rows + tail
 
     def wait_for_reveal(self, timeout=FINALIZE_TIMEOUT):
         """Block until every queued symbol has resolved to its character."""

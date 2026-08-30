@@ -4,10 +4,33 @@ import ast
 import os
 import re
 import shutil
+import threading
 from pathlib import Path
 
 import agent_config
 from agent_config import LIST_FILES_MAX, WORKSPACE_MAX_SCAN
+
+# One lock for every write this module performs, so that a single write is
+# atomic however many threads are working at once. Background workers run the
+# same primitives the main agent does, and several of them are read-modify-
+# write -- patch_file and replace_lines read a file, work out the new text and
+# write it back, and two workers interleaving there produce a file in which
+# one of the two edits has silently vanished.
+#
+# It is deliberately ONE lock rather than one per path. A lock manager keyed by
+# file is a transaction system in miniature, and it buys nothing here: writes
+# are short, and the case it would speed up -- many workers writing many
+# different files at the same instant -- is not a case that happens. What the
+# system needs instead is to be told afterwards that two workers wrote the same
+# file, and the manager records the paths for that.
+#
+# RLock, not Lock, because write_files calls write_file for each entry and
+# would otherwise deadlock against itself on the second one.
+#
+# It guards writes only. It is NOT a substitute for safe_path, which still
+# refuses an escape from the workspace for every caller, and it makes no claim
+# about a file being unchanged between two separate actions.
+WRITE_LOCK = threading.RLock()
 
 # Directories that are machinery rather than work. Pruned during the walk, not
 # filtered afterwards, so a node_modules or a .git is never descended into at
@@ -61,61 +84,79 @@ def _decode_content(content):
     return content.replace("\\n", "\n").replace("\\t", "\t")
 
 def write_file(path, content):
-    p = safe_path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    content = _decode_content(content)
-    if p.suffix == ".py":
-        try:
-            ast.parse(content)
-        except SyntaxError as error:
-            return f"SyntaxError in generated code: {error}. File NOT written. Please fix."
-    # Asked before the write, because afterwards there is no way to tell. The
-    # two cases are genuinely different facts and the interface reports them
-    # differently: a file that did not exist gained every line it now has and
-    # lost none, and both halves of that are known. A file that did exist lost
-    # a number of lines nobody can count any more, so only what was written is
-    # ever claimed for it.
-    existed = p.exists()
-    p.write_text(content, encoding="utf-8")
-    return f"Wrote file: {path}" if existed else f"Created file: {path}"
+    # The whole body is inside the lock, not just the write call: the
+    # existence check below is read back out in the answer, and a concurrent
+    # writer between the check and the write would make that answer wrong.
+    with WRITE_LOCK:
+        p = safe_path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        content = _decode_content(content)
+        if p.suffix == ".py":
+            try:
+                ast.parse(content)
+            except SyntaxError as error:
+                return f"SyntaxError in generated code: {error}. File NOT written. Please fix."
+        # Asked before the write, because afterwards there is no way to tell.
+        # The two cases are genuinely different facts and the interface reports
+        # them differently: a file that did not exist gained every line it now
+        # has and lost none, and both halves of that are known. A file that did
+        # exist lost a number of lines nobody can count any more, so only what
+        # was written is ever claimed for it.
+        existed = p.exists()
+        p.write_text(content, encoding="utf-8")
+        return f"Wrote file: {path}" if existed else f"Created file: {path}"
 
 def append_file(path, content):
-    p = safe_path(path)
-    if not p.exists():
-        return f"File not found: {path}"
-    existing = p.read_text(encoding="utf-8")
-    separator = "\n" if existing and not existing.endswith("\n") else ""
-    p.write_text(existing + separator + _decode_content(content), encoding="utf-8")
-    return f"Appended to: {path}"
+    # Read-modify-write, so the read and the write have to be one step. Two
+    # appends interleaving here would each read the same original text and the
+    # second would write over the first's addition.
+    with WRITE_LOCK:
+        p = safe_path(path)
+        if not p.exists():
+            return f"File not found: {path}"
+        existing = p.read_text(encoding="utf-8")
+        separator = "\n" if existing and not existing.endswith("\n") else ""
+        p.write_text(existing + separator + _decode_content(content), encoding="utf-8")
+        return f"Appended to: {path}"
 
 def write_files(files):
     if not isinstance(files, list):
         return "Error: 'files' must be a list of {path, content} objects"
-    results = []
-    for entry in files:
-        path = entry.get("path", "")
-        if path:
-            results.append(write_file(path, entry.get("content", "")))
-        else:
-            results.append("Skipped entry with no path")
-    return "\n".join(results)
+    # Held across the whole batch so a multi-file write lands as one set rather
+    # than as several that another worker can be interleaved between. This is
+    # the re-entrant case WRITE_LOCK is an RLock for: write_file takes it again
+    # on every entry.
+    with WRITE_LOCK:
+        results = []
+        for entry in files:
+            path = entry.get("path", "")
+            if path:
+                results.append(write_file(path, entry.get("content", "")))
+            else:
+                results.append("Skipped entry with no path")
+        return "\n".join(results)
 
 def patch_file(path, search_text, replace_text):
-    p = safe_path(path)
-    if not p.exists():
-        return f"File not found: {path}"
-    content = p.read_text(encoding="utf-8")
-    search_text, replace_text = _decode_content(search_text), _decode_content(replace_text)
-    if search_text not in content:
-        return f"Search text not found in {path}"
-    new_content = content.replace(search_text, replace_text, 1)
-    if p.suffix == ".py":
-        try:
-            ast.parse(new_content)
-        except SyntaxError as error:
-            return f"SyntaxError introduced by patch: {error}. Patch aborted."
-    p.write_text(new_content, encoding="utf-8")
-    return f"Patched file: {path}"
+    # Read-modify-write again, and the one where a race is least visible: the
+    # search text is found in a version of the file that a concurrent write
+    # may already have replaced, and the patch then rewrites the whole file
+    # from that stale copy.
+    with WRITE_LOCK:
+        p = safe_path(path)
+        if not p.exists():
+            return f"File not found: {path}"
+        content = p.read_text(encoding="utf-8")
+        search_text, replace_text = _decode_content(search_text), _decode_content(replace_text)
+        if search_text not in content:
+            return f"Search text not found in {path}"
+        new_content = content.replace(search_text, replace_text, 1)
+        if p.suffix == ".py":
+            try:
+                ast.parse(new_content)
+            except SyntaxError as error:
+                return f"SyntaxError introduced by patch: {error}. Patch aborted."
+        p.write_text(new_content, encoding="utf-8")
+        return f"Patched file: {path}"
 
 def delete_file(path):
     p = safe_path(path)
@@ -125,8 +166,13 @@ def delete_file(path):
         return f"Refusing to delete directory: {path}"
     if input(f"Delete {path}? (y/N): ").strip().lower() != "y":
         return "Delete cancelled"
-    p.unlink()
-    return f"Deleted file: {path}"
+    # The lock is taken for the removal and deliberately not for the
+    # confirmation above. A lock held across a read of stdin is a lock held
+    # until a human answers it, and every other write in the process would
+    # queue behind that prompt.
+    with WRITE_LOCK:
+        p.unlink()
+        return f"Deleted file: {path}"
 
 def read_file(path):
     p = safe_path(path)
@@ -199,24 +245,28 @@ def read_lines(path, start=1, end=None):
     return "\n".join(f"{i:>5} | {lines[i - 1]}" for i in range(start, end + 1))
 
 def replace_lines(path, start, end, content):
-    p = safe_path(path)
-    if not p.exists():
-        return f"File not found: {path}"
-    lines = p.read_text(encoding="utf-8").splitlines()
-    try:
-        start, end = int(start), int(end)
-    except (TypeError, ValueError):
-        return "start and end must be whole numbers"
-    if start < 1 or start > end or end > len(lines):
-        return f"Invalid range {start}-{end}; {path} has {len(lines)} lines"
-    new_content = "\n".join(lines[:start - 1] + _decode_content(content).splitlines() + lines[end:]) + "\n"
-    if p.suffix == ".py":
+    # The line numbers are only meaningful against the version of the file
+    # that was read, so the read and the write have to be one step. A write
+    # landing in between would move every line the range names.
+    with WRITE_LOCK:
+        p = safe_path(path)
+        if not p.exists():
+            return f"File not found: {path}"
+        lines = p.read_text(encoding="utf-8").splitlines()
         try:
-            ast.parse(new_content)
-        except SyntaxError as error:
-            return f"SyntaxError introduced by replace_lines: {error}. Aborted."
-    p.write_text(new_content, encoding="utf-8")
-    return f"Replaced lines {start}-{end} in {path}"
+            start, end = int(start), int(end)
+        except (TypeError, ValueError):
+            return "start and end must be whole numbers"
+        if start < 1 or start > end or end > len(lines):
+            return f"Invalid range {start}-{end}; {path} has {len(lines)} lines"
+        new_content = "\n".join(lines[:start - 1] + _decode_content(content).splitlines() + lines[end:]) + "\n"
+        if p.suffix == ".py":
+            try:
+                ast.parse(new_content)
+            except SyntaxError as error:
+                return f"SyntaxError introduced by replace_lines: {error}. Aborted."
+        p.write_text(new_content, encoding="utf-8")
+        return f"Replaced lines {start}-{end} in {path}"
 
 # --- exact search, and bulk replace -----------------------------------------
 #
@@ -510,7 +560,16 @@ def replace_across(search, replace, glob=None, path=None, apply=False):
             # Built whole first, then written in one call: a failure while
             # working the text out leaves the file exactly as it was, rather
             # than half rewritten.
-            p.write_bytes(updated.encode("utf-8"))
+            #
+            # The lock is taken per file rather than around the whole walk.
+            # A bulk replace can touch hundreds of files, and holding the one
+            # process-wide write lock for the length of that would stall every
+            # other worker for as long as the scan takes. Each individual file
+            # is still written atomically, which is the guarantee that matters:
+            # nobody sees a half-written file, and the count reported is the
+            # count written.
+            with WRITE_LOCK:
+                p.write_bytes(updated.encode("utf-8"))
         changed.append((relative, count))
         total += count
 
@@ -551,16 +610,21 @@ def replace_across(search, replace, glob=None, path=None, apply=False):
 def copy_file(path, dest):
     if not dest:
         return "copy_file needs a 'to' path"
-    src, dst = safe_path(path), safe_path(dest)
-    if not src.exists():
-        return f"File not found: {path}"
-    if src.is_dir():
-        return f"Refusing to copy a directory: {path}"
-    if dst.exists():
-        return f"Refusing to overwrite existing file: {dest}"
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
-    return f"Copied {path} to {dest}"
+    # The refusal to overwrite is the reason the whole body is locked: checked
+    # outside, it is a promise another thread can break between the check and
+    # the copy, and the one thing this function says it will never do is
+    # overwrite a file that already existed.
+    with WRITE_LOCK:
+        src, dst = safe_path(path), safe_path(dest)
+        if not src.exists():
+            return f"File not found: {path}"
+        if src.is_dir():
+            return f"Refusing to copy a directory: {path}"
+        if dst.exists():
+            return f"Refusing to overwrite existing file: {dest}"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        return f"Copied {path} to {dest}"
 
 def delete_folder(path, recursive=False):
     p = safe_path(path)
@@ -576,5 +640,8 @@ def delete_folder(path, recursive=False):
     label = f"{path} and {len(contents)} items inside" if contents else path
     if input(f"Delete {label}? (y/N): ").strip().lower() != "y":
         return "Delete cancelled"
-    shutil.rmtree(p)
-    return f"Deleted folder: {path}"
+    # Same reasoning as delete_file: the removal is locked, the confirmation
+    # is not, because a lock held across a prompt is held until it is answered.
+    with WRITE_LOCK:
+        shutil.rmtree(p)
+        return f"Deleted folder: {path}"

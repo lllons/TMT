@@ -529,4 +529,21 @@ REQUIRED_KEYS = {
     "tree": [], "find_text": ["query"], "find_symbol": ["name"],
     "replace_across": ["search", "replace"], "code_map": ["target"],
     "related_tests": [], "remember": ["note"], "recall": [],
+    # Delegating work to background agents. Only the main agent is taught
+    # these -- they are documented in agent_prompt.ORCHESTRATION_REFERENCE,
+    # which get_system_prompt includes and the two background prompts do not.
+    # A background agent's action context carries no manager, so each of them
+    # reports itself unavailable there rather than letting a worker spawn
+    # workers of its own.
+    "spawn_agent": ["task"], "agent_status": [], "agent_result": ["id"],
+    "wait_for_agent": ["id"], "wait_for_agents": [], "kill_agent": ["id"],
+    # The verb a background agent ends on, and the one place the isolation is
+    # deliberately asymmetric: it is registered here, so validate_action knows
+    # it exists and the dispatcher has somewhere to send it, but it is
+    # documented ONLY in agent_subprompts. The main agent's prompt never
+    # mentions it, and the main loop's terminal check is
+    # `action in ("done", "respond")` -- which this is not -- so a main model
+    # that somehow emitted one gets an ordinary action result and the turn
+    # carries on rather than ending on a worker's private report.
+    "internal_response": ["response"],
 }

@@ -42,6 +42,7 @@ from agent_ui import (
     wrap_lines,
 )
 import agent_commands
+import agent_manager
 from agent_session import Session
 from agent_live_renderer import LiveRelay
 from agent_setup import ensure_api_key, ensure_git_identity
@@ -332,6 +333,35 @@ def main(argv=None):
     return _session_loop(root)
 
 
+# Shadow text for the second prompt a bare `/note` asks for. It states what
+# the line is for, because the box it is drawn in looks exactly like the one
+# that takes a task and nothing else on screen would say otherwise.
+NOTE_PLACEHOLDER = "Ask one question about this workspace"
+
+
+def _dispatch_command(task, session, manager):
+    """Answer a slash command, giving the ones that need it the register.
+
+    `agent_commands.dispatch` takes a session and no more, which is right for
+    the five commands that only read settings. `/note` needs the session's own
+    register instead of the private one it would otherwise build, so that the
+    note it starts is the same note the panel and `/agents` can see, and so
+    its events reach the live region like any other agent's.
+
+    Anything that is not a command still returns None here, so an ordinary
+    task -- including one that merely begins with a path -- goes to the model
+    exactly as it always did.
+    """
+    parsed = agent_commands.parse(task)
+    if parsed is not None:
+        name, argument = parsed
+        if name == "note" and argument:
+            return agent_commands.run_note(argument, session, manager)
+        if name == "agents" and not argument:
+            return agent_commands._agents(argument, session, manager)
+    return agent_commands.dispatch(task, session)
+
+
 def _session_loop(root):
     """Ask, answer, repeat, until the user leaves."""
     # The header is drawn once, as the session opens: the wordmark, the date,
@@ -355,13 +385,43 @@ def _session_loop(root):
     # lives. It is created here and dropped when this function returns, so
     # nothing it holds can reach the next launch.
     session = Session(workspace=root)
+    # One register of background agents for the run, beside the session and
+    # with the same lifetime. It is built here rather than lazily because two
+    # separate things read it -- the delegation actions, through the context,
+    # and the panel, through the prompt box -- and a register created on first
+    # use would give them one each, so the panel would draw an empty list
+    # while workers ran.
+    #
+    # Its threads are daemons, so a session that ends with workers still
+    # running cannot hold the process open.
+    manager = agent_manager.AgentManager()
     # One box for the session. It draws its own frame each time it is asked,
     # so nothing needs redrawing between turns, and the console keeps being
     # the line reader on any run that cannot take raw keys -- a pipe, a
     # redirect, the test suite -- so a scripted run behaves as it always did.
     prompt_box = PromptBox(line_reader=_console_line, session=session, pad=pad,
                            completer=agent_commands.completions,
-                           completed=agent_commands.completed)
+                           completed=agent_commands.completed,
+                           manager=manager)
+    # Which live region the panel currently belongs to. A worker changing its
+    # activity label happens on its own thread, and the relay repaints only
+    # when the reply or the status row moves -- so without a nudge the panel
+    # would sit still through everything the workers actually did and catch up
+    # only when something else forced a frame.
+    #
+    # One subscription for the whole session, holding the CURRENT relay rather
+    # than closing over one: a relay belongs to a single turn and is taken
+    # down at the end of it. `refresh` only marks the region dirty, so this
+    # stays a notification and never becomes a paint from a worker thread,
+    # which is the rule the whole live surface depends on.
+    live_panel = {"relay": None}
+
+    def _panel_changed(name, record):
+        relay = live_panel.get("relay")
+        if relay is not None:
+            relay.refresh()
+
+    manager.subscribe(_panel_changed)
     placeholder = OPENING_SUGGESTION
     while True:
         # Shadow text, and nowhere else. The opening line on the first
@@ -383,7 +443,7 @@ def _session_loop(root):
         # test is the parser's, not a prefix check: a task that happens to
         # start with a path is not a command and goes to the model exactly as
         # it always did.
-        answered = agent_commands.dispatch(task, session)
+        answered = _dispatch_command(task, session, manager)
         if answered is not None:
             render_task(task, moment=prompt_box.asked_at)
             # The rows just printed take blank rows from the pad, the same
@@ -391,6 +451,20 @@ def _session_loop(root):
             # placeholder is left alone: asking what the model is does not
             # change what the last turn suggested doing next.
             pad.take(2 + (render_command(answered) or 0))
+            # A command that needs a second line asks for it here, on the
+            # same box, and its answer is printed like any other command's.
+            # Only an interactive run can reach this: the piped reader takes
+            # one task per line, so a two-stage prompt is unreachable from a
+            # pipe or from the test suite -- which is exactly why the inline
+            # `/note <question>` form is the one that works everywhere and
+            # this is only the convenience on top of it.
+            if answered.prompt_for == "note":
+                asked = prompt_box.ask(NOTE_PLACEHOLDER)
+                if asked is not None and asked.strip() and not prompt_box.cancelled:
+                    render_task(asked.strip(), moment=prompt_box.asked_at)
+                    pad.take(2 + (render_command(
+                        agent_commands.run_note(asked.strip(), session,
+                                                manager)) or 0))
             continue
         # The question, into scrollback. The box that collected it is a live
         # region and has already been taken down, so this is the only record
@@ -400,7 +474,15 @@ def _session_loop(root):
         pad.take(2)              # the caption and the marker row it just wrote
         # Authority to push comes from this task's wording alone, decided once
         # here so nothing the model later writes can widen it.
-        context = {"push_authorized": authorizes_push(task)}
+        # The register goes in the context beside the push authority, because
+        # that is how the delegation actions reach it. A context without the
+        # key is the honest state of an install where background agents are
+        # not available, and every one of those actions answers a missing
+        # manager in words rather than raising -- which is also what a
+        # background agent's own context looks like, so a worker asking to
+        # spawn a worker is told it cannot.
+        context = {"push_authorized": authorizes_push(task),
+                   "manager": manager}
         # The request the turn starts from: the system prompt, the earlier
         # questions and answers this session has already had, and then the new
         # task. `pinned` is how much of that the loop's own trimming must
@@ -413,8 +495,25 @@ def _session_loop(root):
         # status row. The box is in the region rather than left behind above
         # it, so the whole of the bottom of the screen holds still while the
         # turn's permanent output scrolls past over it.
-        relay = LiveRelay(footer=lambda: prompt_box.running_lines(RUNNING_HINT),
-                          pad=pad)
+        # The panel rides in this region rather than owning a column of the
+        # whole window, and it has to: the rows above are the terminal's own
+        # scrollback, which is TMT's only permanent surface, and the two
+        # escapes that would let a program take the whole screen (DECSTBM and
+        # the alternate buffer) both destroy it. So the live area composes as
+        # left content, a gutter, and the panel -- and the scrollback above
+        # stays full width and is never redrawn.
+        relay = LiveRelay(
+            footer=lambda size=None: prompt_box.running_lines(RUNNING_HINT,
+                                                              size=size),
+            pad=pad,
+            panel=lambda columns, rows: (prompt_box.panel().frame(columns, rows)
+                                         if prompt_box.panel() else None))
+        # The one subscriber built before the loop is pointed at this turn's
+        # relay. Assigned rather than subscribed again: a subscription per
+        # turn would stack a listener for every question ever asked, and each
+        # dead one would keep refreshing a region that had already been taken
+        # down.
+        live_panel["relay"] = relay
         # The turn's permanent record. It is written through the live region
         # rather than straight to the stream: the region is repainted in place
         # a few rows further down, and printing past it without telling it

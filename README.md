@@ -338,11 +338,87 @@ Four separate things, only one of which TMT decides:
 - **Authentication** — who may push. Stays yours: your SSH key, credential manager,
   or `gh` login. TMT stores no credentials and implements no login.
 
+## Background agents
+
+TMT can delegate. The main agent spawns background workers, they do real work through
+the same actions and the same models it uses itself, and it waits for them and reports
+what they did.
+
+```
+Task> spawn three agents to write multiply.py, divide.py and power.py, then wait for them
+```
+
+| | Runs | May edit | May push | Talks to you | Ends with |
+|---|---|---|---|---|---|
+| main agent | the session loop | yes | yes | yes | `respond` / `done` |
+| worker | a background thread | yes | **no** | no | `internal_response` |
+| note agent | a background thread | **no** | no | answer only | `internal_response` |
+
+**Five workers at once.** The main agent does not count against that and neither does
+the note agent. A sixth request is refused with a sentence saying so, not ignored.
+
+`/agents` prints what they are doing. In a real terminal, Right Arrow at the end of an
+empty line opens the same thing as a live panel, and Left closes it.
+
+### `/note` — ask about the workspace without disturbing anything
+
+```
+Task> /note which module owns the prompt box?
+```
+
+A read-only agent answers from the workspace while everything else carries on. It may
+search, read and inspect structure; it cannot create, edit, delete or push, and that is
+enforced by a whitelist checked before every action rather than by asking it nicely.
+
+The question goes on the same line. That form works everywhere, including a piped run —
+the piped reader takes one task per line, so a two-stage prompt cannot be reached from a
+pipe at all. In a real terminal a bare `/note` will ask for the question separately.
+
+### What background agents deliberately cannot do
+
+These are limits of the design, not things left unfinished:
+
+- **A worker cannot push.** It may read `git status`, `diff`, `log` and `branch`, and it
+  may commit; reaching a remote stays with the main agent, which needs your own words in
+  the task before it can.
+- **A worker cannot delete a file or a folder.** Both wait for a human to confirm at the
+  terminal, and a background thread has no terminal to be asked at. A worker reports the
+  path instead and the main agent does it.
+- **A worker cannot run the test suite.** `run_file` gives up after 10 seconds and a real
+  suite takes longer, so a worker asked to verify tests says it could not and what it did
+  instead. It will not report a result it never saw.
+- **"Kill" is cooperative, not instant.** Python cannot forcibly stop a thread. What is
+  guaranteed, and what is tested, is that **no further tool call runs once an agent is
+  killed** — cancellation takes effect at the next chunk or the next action boundary. An
+  agent stuck on a stalled connection is marked killed and abandoned; its thread is a
+  daemon and can never hold TMT open.
+- **Waiting blocks the main agent.** It is an ordinary action, not a suspend. The
+  interface stays alive while it waits because the live region repaints on its own
+  thread, and Ctrl-C returns you to the prompt.
+- **Workers do not coordinate their writes.** Any single write is atomic, and if two
+  workers touch the same file the main agent is told which. There is no locking beyond
+  that, so give concurrent workers separate files.
+
 ## Interface
 
 While a task runs: a THINKING animation until the first output, then a progress bar,
 elapsed time and a live token count. Model text is revealed character by character as
-it streams. The final answer is boxed.
+it streams. The final answer is boxed. A count of running agents appears beside the
+meter whenever there are any.
+
+**The agents panel is a column at the foot of the screen, not a full-height sidebar.**
+It shares the live region with the reply and the prompt box; the conversation above it
+keeps the full width and is never redrawn. That is a deliberate limit rather than an
+unfinished one: the scrollback is TMT's only permanent record of a session, and both
+escapes that would let a program own the whole window — narrowing the scrolling region,
+and the alternate screen buffer — destroy it. Lines scrolled out of a narrowed region
+are discarded rather than kept, so scrolling up would stop reaching the session's own
+history. A test greps the modules to keep either from coming back.
+
+On a terminal under 45 columns the panel takes the whole width of the live region and
+the prompt box is not drawn while it is open; under 30 columns it refuses to open and
+says why. Cards drop their activity line before their token line, and truncate rather
+than wrap.
 
 Set `TMT_STREAM=0` to disable streaming. Streaming also needs `requests`; without it
 TMT runs unstreamed.
@@ -363,6 +439,8 @@ model exactly as before — including a line that merely starts with a path, suc
 | `/effort low\|medium\|high` | set it |
 | `/model` | show the current model and the ones this provider offers |
 | `/model <name>` | switch to one, by id or by the name shown in Settings |
+| `/note <question>` | answer one question about the workspace, changing nothing |
+| `/agents` | what the background agents are doing |
 
 **Effort** is how much work TMT will spend on one task. It changes two things, and
 only things that are real on every provider: how long a reply is asked for, and how
@@ -380,7 +458,7 @@ make the model terser — it cuts the object off mid-string and the write never
 happens. The setting is stored in `.tmt_effort` beside the installation and survives
 a restart, like the model choice.
 
-**Completion.** In a real terminal, typing `/` lists the five commands under the
+**Completion.** In a real terminal, typing `/` lists the seven commands under the
 line you are typing, and it narrows as you go: `/mo` leaves `/model`. Tab completes
 as far as the candidates agree — `/mo` becomes `/model `, `/co` becomes `/con`,
 because `/context` and `/config` still both apply. A piped or redirected run reads a
@@ -431,6 +509,9 @@ environment is active.
 ```bash
 python run_tests.py
 ```
+
+629 tests, about a minute. Eight of them read the API key from `.tmt_key`, so on a
+fresh clone with no key configured those eight fail and the rest pass.
 
 ## License
 

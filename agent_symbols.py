@@ -14,6 +14,7 @@ next language does not get added.
 
 import ast
 import re
+import warnings
 from pathlib import Path
 
 import agent_config
@@ -369,7 +370,27 @@ def scan_file(path):
     if is_structural(language):
         source = "\n".join(lines)
         try:
-            tree = ast.parse(source)
+            # Warnings suppressed around the parse, not errors. Reading a file
+            # must not comment on it: `ast.parse` raises SyntaxWarning through
+            # Python's warning machinery for things like an invalid escape in
+            # a string literal, and that machinery writes STRAIGHT TO STDERR,
+            # past everything TMT knows about what is on screen. A workspace
+            # holding one such file made every symbol lookup print a warning
+            # about somebody else's source in the middle of the interface.
+            #
+            # It became serious when background agents arrived. A worker runs
+            # on its own thread, and anything printed from there lands on top
+            # of the live region and corrupts the repaint arithmetic -- the
+            # one rule the whole live surface depends on. The worker itself
+            # never prints; this was the interpreter printing on its behalf.
+            #
+            # A real SyntaxError still raises and is still caught below, so a
+            # file that cannot be parsed is still reported as unparsed and
+            # still falls back to the lexical reader. Nothing is hidden except
+            # commentary about a file TMT was only asked to read.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                tree = ast.parse(source)
         except (SyntaxError, ValueError) as parse_error:
             return {"path": relative, "language": language,
                     "tier": TIER_HEURISTIC,
