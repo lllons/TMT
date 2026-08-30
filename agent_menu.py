@@ -18,6 +18,7 @@ there would hang the process rather than fail.
 """
 
 import datetime
+import re
 import shutil
 import sys
 import time
@@ -1367,13 +1368,25 @@ _TEXT_KEYS = {
 _TEXT_IGNORED = ("up", "down")
 
 
-def normalize_text_key(key):
+def normalize_text_key(key, allow_multiline=False):
     """One keystroke for a text field, as (kind, value).
 
     ("end", None) when the input has ended, ("key", name) for the keys that
     edit rather than type, ("char", text) for characters, and ("", "") for a
     tick or anything unprintable. A multi-character run is accepted whole, so
     a paste that arrives in one read is not split or dropped.
+
+    `allow_multiline` decides what happens to a run with a line break in it.
+    Off, the whole paste is dropped, because `str.isprintable` is false for
+    any string containing a newline -- which is why pasting a block into the
+    API key field has always done nothing, and is right there: a key has no
+    line breaks and half of one would be worse than none.
+
+    On, the run is taken whole, newlines and all. The task box wants it: a
+    pasted error message or file is exactly the thing worth asking about, and
+    dropping it silently is the least helpful answer available. A single
+    newline is still Enter -- that is _TEXT_KEYS, checked first -- so this
+    only ever applies to a run the terminal delivered in one read.
     """
     if key is None:
         return ("end", None)
@@ -1383,6 +1396,12 @@ def normalize_text_key(key):
         return ("", "")
     if key and key.isprintable():
         return ("char", key)
+    if allow_multiline and key and len(key) > 1:
+        # Printable once the breaks and tabs it is allowed to carry are set
+        # aside. Anything else in there is a control sequence, not a paste.
+        body = key.replace("\r\n", "\n")
+        if body.replace("\n", "").replace("\t", "").isprintable():
+            return ("char", body)
     return ("", "")
 
 
@@ -1513,10 +1532,10 @@ def _next_key(key_reader):
         return "interrupt"
 
 
-def _next_text_key(key_reader):
+def _next_text_key(key_reader, allow_multiline=False):
     """One keystroke from the reader, read as text rather than as a menu key."""
     try:
-        return normalize_text_key(key_reader())
+        return normalize_text_key(key_reader(), allow_multiline=allow_multiline)
     except (StopIteration, IndexError):
         return ("end", None)
     except KeyboardInterrupt:
@@ -1561,6 +1580,98 @@ _PROMPT_PREFIX = 3       # columns before the field: a margin, the marker, a gap
 _WORD_BREAK = " \t"
 
 
+# How tall the input may grow before it scrolls instead. Five rows is enough
+# to see a short paragraph whole; past that the box would be eating the
+# conversation it sits under, which is the thing the screen is actually for.
+INPUT_MAX_ROWS = 5
+
+# A paste longer than this many words is folded to a token rather than typed
+# into the field. The number is a judgement, not a measurement: fifteen words
+# is about the point where a line stops being something you read at a glance.
+PASTE_WORD_THRESHOLD = 15
+
+# What a folded paste looks like in the field. It states the size of what it
+# stands for, because a placeholder that hid the amount would be worse than
+# the wrapped text it replaced.
+_PASTE_TOKEN = "[Pasted text #%d %s]"
+_PASTE_PATTERN = re.compile(r"\[Pasted text #(\d+) [^\]]*\]")
+
+
+def _paste_summary(text):
+    """How much was pasted, in whichever unit says the most about it."""
+    lines = text.count("\n") + 1
+    if lines > 1:
+        return "+%d lines" % lines
+    return "+%d words" % len(text.split())
+
+
+def layout_field(text, inner):
+    """Every visual row of `text`, as (start index, row text).
+
+    The field wraps now rather than scrolling sideways. A long task used to
+    run off the right-hand edge on one line, which made it unreadable while it
+    was being written and made the terminal redraw the whole row for every
+    keystroke -- the lag was the horizontal scroll, not the length.
+
+    Measured in columns, never characters: a wide character occupies two, and
+    breaking on a character count puts half of one past the edge and wraps the
+    row a second time behind the arithmetic's back.
+
+    One column is left for the caret, which sits after the last character
+    rather than on it.
+    """
+    usable = max(1, int(inner) - 1)
+    rows, start, used, index = [], 0, 0, 0
+    for grapheme in iter_graphemes(text):
+        if "\n" in grapheme:
+            # An explicit break from a pasted block. It ends the row wherever
+            # the row had got to.
+            rows.append((start, text[start:index]))
+            index += len(grapheme)
+            start, used = index, 0
+            continue
+        step = display_width(grapheme)
+        if used and used + step > usable:
+            rows.append((start, text[start:index]))
+            start, used = index, 0
+        used += step
+        index += len(grapheme)
+    rows.append((start, text[start:index]))
+    return rows
+
+
+def caret_in(rows, text, cursor):
+    """Which row the caret is on, and how many columns into it.
+
+    Searched from the bottom so a cursor sitting exactly on a row boundary
+    belongs to the row it is about to type into, not the one it just left.
+    """
+    for index in range(len(rows) - 1, -1, -1):
+        start, _ = rows[index]
+        if cursor >= start:
+            return index, display_width(text[start:cursor])
+    return 0, 0
+
+
+def visible_field(text, cursor, inner, max_rows=INPUT_MAX_ROWS):
+    """The rows to draw, and where the caret is among them.
+
+    Returns (rows, caret row, caret column, hidden above, hidden below). Past
+    `max_rows` the field scrolls: the window follows the caret, because the
+    one row that must always be on screen is the one being typed into.
+    """
+    rows = layout_field(text, inner)
+    caret_row, caret_column = caret_in(rows, text, cursor)
+    max_rows = max(1, int(max_rows))
+    top = 0
+    if caret_row >= max_rows:
+        top = caret_row - max_rows + 1
+    top = min(top, max(0, len(rows) - max_rows))
+    shown = rows[top:top + max_rows]
+    return ([body for _, body in shown], caret_row - top, caret_column,
+            top, max(0, len(rows) - top - len(shown)))
+
+
 class LineEditor:
     """Pure editing logic for one line. No terminal, no I/O.
 
@@ -1574,13 +1685,23 @@ class LineEditor:
         self.value = ""
         self.cursor = 0
         self.placeholder_visible = bool(self.placeholder)
+        # Pasted blocks, kept whole, in the order they were pasted. `value`
+        # holds a token where each one went, so the field stays readable and
+        # the text is not lost -- `expanded()` puts them back.
+        self.pastes = []
 
-    def insert(self, text):
+    def insert(self, text, pasted=False):
         """Insert text at the cursor, and dismiss the placeholder.
 
         Whole rather than per character: a paste arrives as one read, and
         splitting it would let anything applied per keystroke -- a limit, a
         repaint, a cursor move -- land in the middle of it.
+
+        A long paste is folded to a token instead of being typed in. Dropping
+        several hundred words into a field redraws every row of it on every
+        later keystroke, and the user cannot read what they pasted anyway. The
+        text is kept exactly and put back on submit; nothing is truncated and
+        nothing is retyped.
         """
         if not text:
             return
@@ -1588,8 +1709,29 @@ class LineEditor:
         # at the moment the first character exists, so there is no frame in
         # which both are on screen and none in which they are concatenated.
         self.placeholder_visible = False
+        if pasted and len(text.split()) > PASTE_WORD_THRESHOLD:
+            self.pastes.append(text)
+            text = _PASTE_TOKEN % (len(self.pastes), _paste_summary(text))
         self.value = self.value[:self.cursor] + text + self.value[self.cursor:]
         self.cursor += len(text)
+
+    def expanded(self):
+        """The line as the user meant it, with every folded paste put back.
+
+        A token whose paste is missing is left exactly as it stands. It was
+        typed by hand or edited past recognition, and inventing text for it
+        would put words in the user's mouth.
+        """
+        if not self.pastes:
+            return self.value
+
+        def restore(match):
+            index = int(match.group(1))
+            if 1 <= index <= len(self.pastes):
+                return self.pastes[index - 1]
+            return match.group(0)
+
+        return _PASTE_PATTERN.sub(restore, self.value)
 
     def handle(self, kind, value):
         """Apply one (kind, value) keystroke from `normalize_text_key`.
@@ -1768,7 +1910,14 @@ class PromptBox:
                     placed = self._place(frame[0], frame[1], frame[2])
                     region.show_cursor()
                     shown = frame
-                kind, value = _next_text_key(reader)
+                kind, value = _next_text_key(reader, allow_multiline=True)
+                if kind == "char" and len(value) > 1:
+                    # More than one character in a single read is a paste --
+                    # no keystroke produces two. Only the editor is told, and
+                    # only so it can decide whether the block is long enough
+                    # to be worth folding.
+                    editor.insert(value, pasted=True)
+                    continue
                 if kind == "key" and value == "tab":
                     # Taken before the editor sees it. Accepting a completion
                     # is an edit the user asked for, so it goes through the
@@ -1791,7 +1940,10 @@ class PromptBox:
                 # stack an empty box each time it was answered.
                 region.clear()
                 if outcome == "submit":
-                    return editor.value
+                    # Expanded, not as displayed: the token was a way of
+                    # showing a long paste in a small box, never a way of
+                    # shortening what the user actually said.
+                    return editor.expanded()
                 if outcome == "cancel":
                     self.cancelled = True
                     return ""
@@ -1866,11 +2018,17 @@ class PromptBox:
         head = [prompt_caption(stream, width, moment,
                                session=self.session)] if caption else []
         rule = " " + _glyphs(stream)["rule"] * (width - 1)
-        text, caret = self._field(editor, inner)
-        body = _dim(text, stream) if editor.placeholder_visible else text
-        row = " " + PROMPT_MARKER + " " + body
+        field, caret_row, caret = self._field(editor, inner)
+        # The marker belongs to the question, not to every row of it, so the
+        # rows below the first are indented to line up under the text rather
+        # than repeating a second ">" the user never typed.
+        typed = []
+        for index, body in enumerate(field):
+            body = _dim(body, stream) if editor.placeholder_visible else body
+            lead = " " + PROMPT_MARKER + " " if index == 0 else " " * _PROMPT_PREFIX
+            typed.append(lead + body)
         offered = self._offered(editor, width)
-        rows = head + [rule, row] + offered + [rule]
+        rows = head + [rule] + typed + offered + [rule]
         # Blank rows above, so the box sits at the foot of the window from the
         # moment the session opens rather than wherever the last reply
         # stopped. They are part of the region, so the repaint arithmetic
@@ -1878,7 +2036,12 @@ class PromptBox:
         # as permanent output fills the window from the top.
         holding = self.pad if (pad and self.pad is not None) else None
         lead = [""] * (holding.above(len(rows), size) if holding else 0)
-        return lead + rows, _PROMPT_PREFIX + caret, _INPUT_ROW + len(offered)
+        # How far the caret sits above the foot of the frame: the bottom rule,
+        # then anything offered under the field, then however many field rows
+        # are below the one being typed on. With one row and nothing offered
+        # this is _INPUT_ROW, which is what it always was.
+        up = 1 + len(offered) + (len(typed) - caret_row)
+        return lead + rows, _PROMPT_PREFIX + caret, up
 
     def _accept_completion(self, editor):
         """Take the completion Tab offers, through the buffer.
@@ -1935,26 +2098,23 @@ class PromptBox:
                              self.stream))
         return rows
 
-    def _field(self, editor, inner):
-        """The visible slice of the line, and where the caret sits in it.
+    def _field(self, editor, inner, max_rows=INPUT_MAX_ROWS):
+        """The visible rows of the line, and where the caret sits in them.
 
-        The row scrolls sideways rather than wrapping, so a long task stays on
-        one line with the caret in view. Both ends are measured in columns:
-        an offset counted in characters puts a wide one half off the edge.
+        Returns (rows, caret row, caret column). The field wraps down the
+        screen instead of scrolling sideways, up to `max_rows`, and scrolls
+        vertically past that. The caret row is what `_frame` turns into the
+        distance the caret has to be moved up from the foot of the box.
+
+        The placeholder never wraps. It is one line of shadow text standing in
+        for an empty field, and a hint that grew the box would be a suggestion
+        rearranging the screen before it had been taken.
         """
         if editor.placeholder_visible:
-            return fit_to_width(editor.placeholder, inner), 0
-        text, cursor = editor.value, editor.cursor
-        start = 0
-        # One column is kept for the caret itself, which sits after the last
-        # character rather than on it.
-        while display_width(text[start:cursor]) > inner - 1:
-            head, _ = clip_to_width(text[start:], 1)
-            if not head:
-                break
-            start += len(head)
-        visible, _ = clip_to_width(text[start:], inner)
-        return fit_to_width(visible, inner), display_width(text[start:cursor])
+            return [fit_to_width(editor.placeholder, inner)], 0, 0
+        rows, caret_row, caret_column, _, _ = visible_field(
+            editor.value, editor.cursor, inner, max_rows)
+        return [fit_to_width(row, inner) for row in rows], caret_row, caret_column
 
     def _read_line(self, editor, moment=None):
         """Draw the box once, then take a whole line from the input.

@@ -1248,6 +1248,81 @@ def test_the_editing_keys_arrive_however_the_terminal_sends_them():
     assert menu().normalize_text_key("down") == ("", "")
 
 
+def test_a_long_paste_is_folded_to_a_token_and_restored_on_submit():
+    """Dropping several hundred words into the field redraws every row of it
+    on every later keystroke, and the user cannot read it there anyway. The
+    text is kept exactly and put back on submit -- nothing is truncated and
+    nothing has to be retyped."""
+    block = " ".join("word%d" % number for number in range(200))
+    state = menu().LineEditor()
+    state.insert(block, pasted=True)
+
+    assert block not in state.value, state.value
+    assert "Pasted text #1" in state.value, state.value
+    assert "+200 words" in state.value, state.value
+    # One short row, whatever was pasted.
+    assert len(menu().layout_field(state.value, 60)) == 1, state.value
+    # And what the user actually said is what comes back.
+    assert state.expanded() == block
+
+    state.insert(" and then this", pasted=False)
+    assert state.expanded() == block + " and then this"
+
+
+def test_a_multi_line_paste_reports_lines_rather_than_words():
+    block = "\n".join("line %d of a traceback" % number for number in range(30))
+    state = menu().LineEditor()
+    state.insert(block, pasted=True)
+    assert "+30 lines" in state.value, state.value
+    assert state.expanded() == block
+
+
+def test_a_short_paste_is_left_exactly_as_it_was_pasted():
+    """The fold is for text too long to read in a small box. Anything a user
+    can see at a glance must arrive unchanged, or the field is lying about
+    what is in it."""
+    short = "fix the timeout in net.py"
+    state = menu().LineEditor()
+    state.insert(short, pasted=True)
+    assert state.value == short, state.value
+    assert state.pastes == [], state.pastes
+    assert state.expanded() == short
+
+
+def test_two_pastes_are_folded_separately_and_both_come_back():
+    first = " ".join("alpha%d" % number for number in range(40))
+    second = " ".join("beta%d" % number for number in range(40))
+    state = menu().LineEditor()
+    state.insert(first, pasted=True)
+    state.insert(" then ", pasted=False)
+    state.insert(second, pasted=True)
+    assert "Pasted text #1" in state.value and "Pasted text #2" in state.value
+    assert state.expanded() == first + " then " + second
+
+
+def test_a_token_whose_paste_is_gone_is_left_alone():
+    """Typed by hand, or edited past recognition. Inventing text for it would
+    put words in the user's mouth."""
+    state = menu().LineEditor()
+    state.insert("see [Pasted text #7 +9 lines] above", pasted=False)
+    assert state.expanded() == "see [Pasted text #7 +9 lines] above"
+
+
+def test_a_pasted_block_with_newlines_is_taken_whole_only_where_it_is_wanted():
+    """`str.isprintable` is false for anything containing a newline, which is
+    why pasting a block has always done nothing. The task box wants it -- a
+    pasted error message is exactly the thing worth asking about -- and the
+    API key field does not, because a key has no line breaks and half of one
+    would be worse than none."""
+    block = "line one\nline two"
+    assert menu().normalize_text_key(block) == ("", "")
+    assert menu().normalize_text_key(block, allow_multiline=True) == ("char", block)
+    # A lone newline is still Enter, whichever way it is read.
+    assert menu().normalize_text_key("\n", allow_multiline=True) == ("key", "enter")
+    # And a control sequence is still not a paste.
+    assert menu().normalize_text_key("\x1b[A", allow_multiline=True) == ("", "")
+
+
 def test_the_prompt_box_borders_stay_well_formed_at_every_width():
     """Measured to columns - 1 at every width, empty and full. A row drawn to
     the last column wraps on the terminals that auto-wrap, which costs a
@@ -1258,33 +1333,77 @@ def test_the_prompt_box_borders_stay_well_formed_at_every_width():
     for columns in (20, 24, 40, 80, 100, 200):
         for state in states:
             rows = prompt_rows(state, columns=columns)
-            assert len(rows) == 4, rows
+            # A caption, a rule, one to INPUT_MAX_ROWS rows of field, a rule.
+            # The field grows downward now rather than running off the side.
+            assert 4 <= len(rows) <= 3 + menu().INPUT_MAX_ROWS, rows
             for row in rows:
                 assert menu().display_width(row) <= columns - 1, (
                     columns, row, menu().display_width(row))
-            assert prompt_input_row(rows).strip().startswith(">"), (columns, rows)
+            assert rows[2].strip().startswith(">"), (columns, rows)
             # The rules are a single repeated glyph, and the same rule twice.
             assert set(rows[1].strip()) <= {"-", "\u2500"}, rows[1]
-            assert rows[1] == rows[3], rows
+            assert rows[1] == rows[-1], rows
+            # Only the first row of the field carries the marker; the rest are
+            # indented under it rather than repeating a ">" nobody typed.
+            for row in rows[3:-1]:
+                assert not row.strip().startswith(">"), (columns, rows)
             # The caption is the caption and nothing else: it carries no rule
             # glyph, so the box never reads as three dividers.
             assert not set(rows[0].strip()) & {"-", "\u2500"}, rows[0]
 
 
-def test_a_long_line_scrolls_sideways_to_keep_the_cursor_in_view():
-    """The line is one row however long it gets, so the row moves under the
-    cursor rather than the text wrapping out of the box."""
-    text = " ".join("word%d" % number for number in range(40))
-    state = editor(typed=text)
-    row = prompt_input_row(prompt_rows(state, columns=40))
-    assert menu().display_width(row) <= 39, row
-    assert row.rstrip().endswith(text[-6:]), row      # the cursor end is shown
-    assert text[:6] not in row, row                   # the far end has scrolled
+def test_a_long_line_wraps_down_the_box_instead_of_running_off_the_side():
+    """It used to be one row however long it got, so the text scrolled
+    sideways under the caret. A task being written was then unreadable, and
+    the terminal redrew the whole row for every keystroke -- the lag was the
+    horizontal scroll, not the length."""
+    text = " ".join("word%d" % number for number in range(12))
+    rows = prompt_rows(editor(typed=text), columns=40)
+    field = rows[2:-1]
+    assert len(field) > 1, rows                      # it really did wrap
+    assert len(field) <= menu().INPUT_MAX_ROWS, rows
+    # Every word survives the wrap, in order and without duplication.
+    joined = "".join(row[menu()._PROMPT_PREFIX:] for row in field)
+    assert "".join(joined.split()) == "".join(text.split()), joined
 
+
+def test_the_field_stops_growing_and_scrolls_to_follow_the_caret():
+    """Five rows is the ceiling. Past it the box would be eating the
+    conversation it sits under, so the window follows the caret instead: the
+    one row that must always be on screen is the one being typed into."""
+    text = "\n".join("line %d of the pasted block" % number for number in range(30))
+    state = editor(typed=text)
+    rows = prompt_rows(state, columns=60)
+    field = rows[2:-1]
+    assert len(field) == menu().INPUT_MAX_ROWS, rows
+    # The caret is at the end, so the end is what is shown.
+    assert "line 29" in "".join(field), field
+    assert "line 0 " not in "".join(field), field
+
+    # And Home scrolls back to the top, because that is where the caret went.
     state.handle("key", "home")
-    row = prompt_input_row(prompt_rows(state, columns=40))
-    assert row.strip().startswith("> " + text[:6]), row
-    assert not row.rstrip().endswith(text[-6:]), row
+    field = prompt_rows(state, columns=60)[2:-1]
+    assert "line 0 " in "".join(field), field
+    assert "line 29" not in "".join(field), field
+
+
+def test_the_caret_is_placed_on_the_row_it_is_actually_typing_on():
+    """`_place` counts up from the foot of the frame. With the field one row
+    tall that distance is _INPUT_ROW, as it always was; with the caret three
+    rows up inside a wrapped field it has to be three further."""
+    box = menu().PromptBox(stream=Terminal())
+    _rows, _column, up = box._frame(editor(typed="short"), size=(60, 30))
+    assert up == menu()._INPUT_ROW, up
+
+    text = "\n".join("row %d" % number for number in range(4))
+    state = editor(typed=text)
+    _rows, _column, bottom = box._frame(state, size=(60, 30))
+    assert bottom == menu()._INPUT_ROW, bottom      # caret on the last row
+    state.handle("key", "home")
+    _rows, _column, top = box._frame(state, size=(60, 30))
+    # Four rows of field, caret on the first, so the caret is three rows
+    # further from the foot than it was on the last.
+    assert top == menu()._INPUT_ROW + 3, (top, bottom)
 
 
 def test_the_prompt_box_degrades_to_ascii_where_it_cannot_be_drawn():
