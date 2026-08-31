@@ -395,7 +395,7 @@ def test_the_session_opens_at_the_top_of_the_window_once():
     # A pipe has no screen to clear, so a captured run gets no escape -- the
     # real one clears, this one just proves it asked.
     assert "\033[2J" not in drawn, repr(drawn[:40])
-    assert drawn.lstrip("\n").startswith(" TMT"), repr(drawn[:60])
+    assert starts_with_wordmark(drawn), repr(drawn[:60])
 
 
 def test_the_session_header_is_drawn_once_however_many_turns_are_taken():
@@ -409,9 +409,43 @@ def test_the_session_header_is_drawn_once_however_many_turns_are_taken():
     drawn = run_session(["", "", "", "quit"])
     assert prompt_boxes(drawn) == 4, (prompt_boxes(drawn), drawn)
     # The wordmark belongs to the header, so one of it across four turns says
-    # the header was drawn once.
-    assert drawn.count("TMT") == 1, drawn
+    # the header was drawn once. Counted by its TOP ROW rather than by the
+    # word: on a window with room the header draws the five-row block, and
+    # the letters are then glyphs rather than characters.
+    assert wordmarks(drawn) == 1, drawn
     assert len(re.findall(r"\d\d:\d\d:\d\d", drawn)) == 4, drawn
+
+
+def wordmark_rows():
+    """The first row of the wordmark, in each form a terminal can show it in.
+
+    The header signs the screen with the five-row block where there is room
+    for it and with the plain word where there is not, and a plain console
+    gets the same block in `#`. Counting the literal string "TMT" stopped
+    being the same question the day the block arrived.
+    """
+    import agent_menu
+    # The leading space is part of it: every row TMT draws leaves the first
+    # column clear for the markers and the '>', so `render_banner` indents the
+    # block by one and the plain wordmark by one. Without it `startswith`
+    # misses a header that is on screen and correct.
+    top = " " + agent_menu.LOGO[0]
+    return (top, top.replace("█", "#"), " TMT")
+
+
+def wordmarks(drawn):
+    """How many times the header signed this output, in any of its forms."""
+    for form in wordmark_rows():
+        count = drawn.count(form)
+        if count:
+            return count
+    return 0
+
+
+def starts_with_wordmark(drawn):
+    """Whether the output opens on the wordmark, whichever form it took."""
+    head = drawn.lstrip("\n")
+    return any(head.startswith(form) for form in wordmark_rows())
 
 
 def prompt_boxes(drawn):

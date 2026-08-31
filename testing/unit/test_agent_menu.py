@@ -482,6 +482,22 @@ class Console(io.StringIO):
         return self._tty
 
 
+def has_wordmark(text):
+    """Whether TMT signed the screen, in whichever form the window allowed.
+
+    Three forms, and asserting on the word alone stopped being right when the
+    session header started drawing the block. A wide, tall window gets the
+    five-row block letterform; a narrow or short one gets the plain word; a
+    console that cannot encode the block glyph gets the same block in `#`.
+    All three say TMT to somebody looking at the screen, which is what every
+    caller of this actually means to ask.
+    """
+    if "TMT" in text:
+        return True
+    first = menu().LOGO[0]
+    return first in text or first.replace("█", "#") in text
+
+
 def status(columns=100, rows=24, stream=None, **facts):
     """The whole status presentation as the terminal shows it, escapes removed.
 
@@ -511,7 +527,7 @@ def test_the_running_status_states_every_fact_the_next_turn_runs_under():
     probe = Path(os.sep + "tmt_probe" + os.sep + "chosen_workspace")
     frame = "\n".join(status(provider_id="openrouter", model_id="z-ai/glm-5.2:free",
                              workspace=probe, moment=moment))
-    assert "TMT" in frame, frame
+    assert has_wordmark(frame), frame
     assert "OpenRouter" in frame, frame
     assert "GLM 5.2" in frame or "z-ai/glm-5.2:free" in frame, frame
     assert str(probe) in frame, frame
@@ -645,9 +661,14 @@ def test_the_header_is_one_component_and_draws_no_rule_of_its_own():
                                            workspace=probe, phase=0.25)]
     assert lines[0] == "", lines            # a blank line above, as structure
     body = [line for line in lines if line.strip()]
-    assert len(body) == 2, body
-    assert body[0].startswith(" TMT"), body
-    assert body[1].startswith("   ") and body[1].strip() == str(probe), body
+    # The wordmark first, then exactly two rows hanging under it at the
+    # indent: the date and the directory. The wordmark's own height is the
+    # window's business and not this test's -- what is asserted is the
+    # GROUPING, which is the indent and nothing else.
+    assert has_wordmark("\n".join(body)), body
+    assert body[-2].startswith("   ") and body[-2].strip(), body
+    assert body[-1].startswith("   ") and body[-1].strip() == str(probe), body
+    assert not body[0].startswith("   "), body
     # No rule anywhere in it, in either character set.
     joined = "\n".join(lines)
     assert "─" not in joined and "---" not in joined, joined
@@ -753,7 +774,8 @@ def test_the_running_status_fits_a_narrow_terminal_and_degrades_to_ascii():
                     assert menu().display_width(line) <= limit, (
                         columns, line, menu().display_width(line))
                 joined = "\n".join(rows)
-                assert "TMT" in joined and "Task>" in joined, (columns, joined)
+                assert has_wordmark(joined), (columns, joined)
+                assert "Task>" in joined, (columns, joined)
                 # What survives a narrow terminal is decided rather than
                 # incidental. The clock and which model answers are the last
                 # two facts standing; the provider's name is given up before

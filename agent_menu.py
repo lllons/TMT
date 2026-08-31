@@ -679,15 +679,53 @@ def status_facts(provider_id=None, model_id=None, workspace=None):
             str(workspace))
 
 
+# The smallest window the session header will spend five rows on a wordmark
+# in. Both halves are needed and they guard different things.
+#
+# The width is `render_banner`'s own threshold restated: below it that
+# function falls back to a spaced word, which is a different fallback from the
+# one this header wants -- it wants the date back on the same row.
+#
+# The height is the one that had to be chosen. The header is permanent
+# scrollback and it scrolls away, so its cost is only ever on the first
+# screen; but eight rows of it on a twelve-row window is most of the window
+# spent before a question has been asked. Eighteen rows leaves ten for the
+# session underneath, which is enough to be working in.
+HEADER_LOGO_MIN_ROWS = 18
+
+
+def _header_logo_fits(columns, rows):
+    """Whether the session header has room to draw the block wordmark."""
+    return (int(columns) >= LOGO_WIDTH + 3
+            and int(rows) >= HEADER_LOGO_MIN_ROWS)
+
+
 def render_status_lines(stream=None, size=None, phase=None, moment=None,
                         provider_id=None, model_id=None, workspace=None):
     """The session header, as a list of ready-to-paint lines.
 
-    Two rows and no border. The wordmark and the date are the heading; the
-    workspace hangs under them at the indent the prominence ladder already
-    uses for detail belonging to the row above. That indent is the whole of
-    the grouping -- one element, not two strings that happen to be adjacent --
-    and it costs nothing that a reader has to look past.
+    The block wordmark, and under it the date and the workspace, each at the
+    indent the prominence ladder already uses for detail belonging to the row
+    above. That indent is the whole of the grouping -- one element, not three
+    strings that happen to be adjacent -- and it costs nothing that a reader
+    has to look past.
+
+    **The wordmark is the same block the startup menu draws**, at the same
+    size, through `render_banner` itself rather than a second copy of it. The
+    session used to open on the word "TMT" in a single row, which is the
+    smallest thing TMT ever wrote about itself and sat directly under a launch
+    screen that had just filled the terminal with the same three letters.
+    There are now exactly three sizes of the one wordmark and they descend in
+    the order the user meets them: the launch screen doubles it, the startup
+    menu and this header draw it as it is, and a terminal too narrow for
+    either falls back to the plain word.
+
+    It takes `BRAND_PHASE` and not the colour cycle, which is the difference
+    between this and the menu's banner: **this is printed once, into
+    scrollback, and never repainted.** A fixed phase is the rule for anything
+    printed once -- a wordmark that is a different colour every launch is not
+    a wordmark -- and the menu animates only because the menu is a live region
+    that is being watched rather than read.
 
     There is deliberately no rule at the bottom. There used to be, and the
     prompt box draws one of its own two lines below it, so the screen opened
@@ -714,20 +752,30 @@ def render_status_lines(stream=None, size=None, phase=None, moment=None,
 
     workspace = status_facts(provider_id, model_id, workspace)[2]
 
-    # The heading: whose interface this is, and what day the session opened
-    # on. The date is context, so it recedes to the one neutral; the wordmark
-    # carries the gradient at a fixed point on it, so TMT is the same colour
-    # every launch instead of whatever the colour cycle happened to be on.
+    # Hanging under the wordmark: what day the session opened on, and the
+    # directory it may write to. The date is context, so it recedes to the one
+    # neutral; the workspace is the one fact here with real consequences, so
+    # it is not dimmed.
+    room = max(1, width - _HEADER_INDENT)
+    place = " " * _HEADER_INDENT + _shorten_middle(workspace, room, marker)
+
+    if _header_logo_fits(columns, rows):
+        # The block wordmark, at a FIXED phase. `render_banner` is the one
+        # thing that knows how to draw it -- the ASCII degradation and the
+        # per-row gradient offset both live there -- so it is called rather
+        # than copied.
+        date = _dim(" " * _HEADER_INDENT
+                    + _date_text(moment, max(1, room)), stream)
+        lines = [""] + render_banner(stream, phase, columns) + [date, place]
+        return _fit_height(lines, rows, keep_tail=1)
+
+    # Too narrow or too short for the block. The date rejoins the wordmark on
+    # one row, which is what this header was before the block arrived: on a
+    # window this size the rows are worth more than the size of the letters.
     spent = display_width(" TMT" + separator)
     date = _date_text(moment, max(0, width - spent))
     brand = (" " + _paint("TMT", stream, phase, spread=BRAND_SPREAD)
              + _dim(separator + date, stream))
-
-    # Hanging under it: the directory this session may write to. It is the
-    # one fact here with real consequences, so it is not dimmed.
-    room = max(1, width - _HEADER_INDENT)
-    place = " " * _HEADER_INDENT + _shorten_middle(workspace, room, marker)
-
     return _fit_height(["", brand, place], rows, keep_tail=1)
 
 
