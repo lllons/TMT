@@ -52,6 +52,7 @@ import agent_panel
 from agent_session import Session
 from agent_live_renderer import LiveRelay
 from agent_setup import ensure_api_key, ensure_git_identity
+from agent_splash import run_splash
 from agent_prompt import get_system_prompt, invalidate_prompt, validate_action
 from agent_execution import APP_REGISTRY, RUNNERS, open_app, run_file, run_python
 from agent_file_ops import (
@@ -675,6 +676,26 @@ def main(argv=None):
     root = resolve_workspace(args.directory)
     if root is None:
         return
+    # The launch screen, and it is the first thing on screen on every launch.
+    # It comes AFTER the workspace is settled and before everything else:
+    # `resolve_workspace` can refuse, and can ask the user a question, and a
+    # splash drawn in front of a run that is not going to start would be a
+    # welcome to a program that then exits.
+    #
+    # It may not return. A successful update replaces this process with a
+    # fresh one running the code it just pulled, which comes back through
+    # here and draws the same screen again -- see agent_update for why that
+    # cannot loop.
+    #
+    # It draws nothing at all and returns "start" when the terminal cannot be
+    # driven, so every piped run, every script and the whole test suite reach
+    # the agent exactly as they did before this screen existed.
+    if run_splash() == "exit":
+        return 0
+    # Only now: the API credential. That order is the routing the launch
+    # sequence asks for -- splash, then the optional update, and only then the
+    # question of whether this installation has been configured at all. A
+    # first-time user meets the wordmark before they meet a form.
     if not ensure_api_key():
         return
     # Settings may have moved the model since import, and a request built from
@@ -684,6 +705,10 @@ def main(argv=None):
     # and would otherwise be written but never read, so /effort would last a
     # session and quietly revert on the next launch.
     agent_config.refresh_effort()
+    # And whether TMT checks itself for updates. Read here beside the other
+    # two so a setting toggled in the menu is live on the next launch rather
+    # than written and never read -- the exact bug refresh_effort exists for.
+    agent_config.refresh_auto_update()
     # Once per launch, and never again in this session. It returns immediately
     # when the terminal cannot drive a menu, so a piped or scripted run reaches
     # the agent exactly as it did before this screen existed.

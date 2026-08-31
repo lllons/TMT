@@ -437,6 +437,85 @@ def set_effort(level):
     return level
 
 
+# Whether TMT checks its own checkout for a newer version when it launches.
+#
+# Kept beside the model and the effort level in INSTALL_DIR, and for exactly
+# the same reason: it belongs to the installation rather than to whichever
+# project happens to be open, and a user who turns it off has turned it off
+# for TMT, not for one directory.
+#
+# **It does NOT control the launch screen.** The splash is shown on every
+# launch whatever this says; this decides only what happens after Enter. That
+# distinction is the one thing about this setting that is easy to get wrong,
+# so it is written here as well as in the menu that toggles it.
+AUTO_UPDATE_FILE = INSTALL_DIR / ".tmt_autoupdate"
+
+# On. TMT updates itself from the checkout it is running from, and a coding
+# agent that silently runs an old version of itself is a worse default than
+# one that keeps current -- especially as every path through the updater is
+# non-destructive and refuses rather than risks anything. An installation that
+# is not a git checkout, has no upstream or has local changes is refused
+# safely, so the default costs those users nothing but one fetch they can turn
+# off here.
+DEFAULT_AUTO_UPDATE = True
+
+AUTO_UPDATE = DEFAULT_AUTO_UPDATE
+
+# What counts as off and as on in the file. Written as one word so the file is
+# readable and editable by hand, and read forgivingly for the same reason.
+_AUTO_UPDATE_OFF = ("off", "0", "false", "no", "disabled")
+_AUTO_UPDATE_ON = ("on", "1", "true", "yes", "enabled")
+
+
+def read_saved_auto_update():
+    """Whether auto-update is on, from disk, defaulting to on.
+
+    Every failure is the default, which is the rule `read_saved_effort`
+    already follows: a missing file is a fresh installation, an unreadable one
+    is somebody's permissions, and a file edited by hand into nonsense is a
+    typo. None of the three is a reason to stop TMT starting, and none of them
+    is evidence that the user wanted the feature off -- so an unrecognised
+    value reads as the default rather than as "off".
+    """
+    try:
+        stored = AUTO_UPDATE_FILE.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return DEFAULT_AUTO_UPDATE
+    if stored in _AUTO_UPDATE_OFF:
+        return False
+    if stored in _AUTO_UPDATE_ON:
+        return True
+    return DEFAULT_AUTO_UPDATE
+
+
+def refresh_auto_update():
+    """Re-read the stored setting. Called at startup, beside refresh_effort."""
+    global AUTO_UPDATE
+    AUTO_UPDATE = read_saved_auto_update()
+    return AUTO_UPDATE
+
+
+def set_auto_update(enabled):
+    """Persist the setting and make it live. Returns what was stored.
+
+    Takes anything truthy rather than validating a vocabulary, because unlike
+    the effort level there is no wrong value here: a boolean has two states
+    and both of them are offered.
+
+    A write that fails is reported by raising, not swallowed. Every OTHER path
+    through this setting defaults quietly, and that is right for a read -- but
+    a toggle the user just pressed that silently did not persist would show ON
+    in the menu and be OFF on the next launch, which is worse than an error
+    they can see.
+    """
+    global AUTO_UPDATE
+    value = bool(enabled)
+    AUTO_UPDATE_FILE.write_text(("on" if value else "off") + "\n",
+                                encoding="utf-8")
+    AUTO_UPDATE = value
+    return value
+
+
 def effort_names():
     """The levels, in the order they escalate rather than alphabetically."""
     return sorted(EFFORT_LEVELS,

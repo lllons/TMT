@@ -20,6 +20,7 @@ dist/
 DESIGN_PRINCIPLES.md
 .tmt_model
 .tmt_effort
+.tmt_autoupdate
 
 # The code index and the project notebook. Both live beside the install, and
 # when TMT is run ON TMT the install and the workspace are the same directory,

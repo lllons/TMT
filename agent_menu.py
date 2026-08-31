@@ -108,8 +108,20 @@ SETTINGS_ITEMS = (
     ("provider", "AI Provider", "Which service answers a request"),
     ("key", "API Key", "The credential that service is given"),
     ("model", "Model", "Which model TMT runs on"),
+    # The one entry here that is a switch rather than a screen: Enter toggles
+    # it in place and there is nothing further in. Its detail names what it
+    # does NOT control, because that is the thing about it that is easy to get
+    # wrong -- the launch screen is shown on every launch whatever this says,
+    # and a user turning this off to stop seeing the splash would be turning
+    # off the wrong thing.
+    ("autoupdate", "Auto Update on Launch",
+     "Check for a newer TMT after the launch screen"),
     ("back", "Back", "Return to the menu"),
 )
+
+# What the toggle reads as. Words rather than a glyph, so the row survives the
+# escapes being stripped -- the rule every state in TMT is drawn by.
+AUTO_UPDATE_LABELS = ("OFF", "ON")
 
 # One per keystroke, and the only thing the key screen ever echoes. ASCII on
 # purpose: it is drawn on every terminal, including the ones that cannot carry
@@ -1286,6 +1298,34 @@ def render_key_frame(provider_id, typed=0, message="", stream=None, size=None,
     return _fit_height(lines, rows, keep_tail=1)
 
 
+def auto_update_text():
+    """"ON" or "OFF" for the launch updater, read from disk each time.
+
+    Read rather than cached so the row is right after a toggle without
+    anything having to invalidate anything, and guarded to the default so a
+    settings file that cannot be read draws a menu rather than stopping one.
+    """
+    try:
+        return AUTO_UPDATE_LABELS[bool(agent_config.read_saved_auto_update())]
+    except Exception:
+        return AUTO_UPDATE_LABELS[bool(agent_config.DEFAULT_AUTO_UPDATE)]
+
+
+def toggle_auto_update():
+    """Flip the setting and return what it now says. Never raises.
+
+    A failed write is reported by leaving the row where it was rather than by
+    stopping the menu: the user is standing in Settings and the honest signal
+    that nothing happened is that nothing changed on the row they are looking
+    at.
+    """
+    try:
+        agent_config.set_auto_update(not agent_config.read_saved_auto_update())
+    except Exception:
+        pass
+    return auto_update_text()
+
+
 def render_settings_menu_frame(selected=0, stream=None, model_id=None, size=None, phase=None):
     """Settings: what TMT talks to, with which key, as which model."""
     stream = sys.stdout if stream is None else stream
@@ -1307,7 +1347,16 @@ def render_settings_menu_frame(selected=0, stream=None, model_id=None, size=None
         _rule(stream, phase, width),
     ]
     lines.extend(
-        _option_row(index == selected, item[1], item[2], stream, phase, width, label_width)
+        # The toggle carries its state on its OWN row, in the slot the model
+        # picker uses to mark the active model, and deliberately not in the
+        # field block above. The three fields up there each summarise a screen
+        # you have to go into to see the value; this one has no screen, so its
+        # value belongs where the thing you press is -- and stating it twice
+        # would make a reader look in two places to find out what Enter does.
+        _option_row(index == selected, item[1], item[2], stream, phase, width,
+                    label_width,
+                    suffix=("  " + auto_update_text()
+                            if item[0] == "autoupdate" else ""))
         for index, item in enumerate(SETTINGS_ITEMS)
     )
     lines.append("")
@@ -3267,7 +3316,13 @@ def settings_screen(stream=None, key_reader=None, region=None, active_id=None,
             entry = SETTINGS_ITEMS[state["selected"]][0]
             if entry == "back":
                 return "done"
-            if entry == "provider":
+            if entry == "autoupdate":
+                # Toggled in place: it is a switch, not a screen, and it is
+                # the only entry here that does not open one. The frame is
+                # rebuilt on the next pass of `_drive`, which re-reads the
+                # setting, so the row shows the new value immediately.
+                toggle_auto_update()
+            elif entry == "provider":
                 provider_setup(stream=stream, key_reader=key_reader, region=region,
                                text_reader=text_reader)
             elif entry == "key":
