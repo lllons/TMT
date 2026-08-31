@@ -18,6 +18,7 @@ import subprocess
 from pathlib import Path
 
 import agent_actions
+import agent_capabilities
 import agent_config
 import agent_execution
 import agent_plan
@@ -456,7 +457,8 @@ def test_verify_runs_for_real_through_execute_action():
         state = V.VerificationState()
         state.note_change("write_file", ("good.py",))
         out = agent_actions.execute_action(
-            {"action": "verify", "level": 1}, {"verify": state})
+            {"action": "verify", "level": 1},
+            {"verify": state, "capabilities": agent_capabilities.Capabilities("/verify")})
         assert out.startswith("VERIFY PASSED"), out
         assert state.passed
         event = agent_actions.action_event("verify", {"action": "verify"}, out)
@@ -473,7 +475,8 @@ def test_a_file_that_does_not_compile_fails_verification_for_real():
         state = V.VerificationState()
         state.note_change("write_file", ("broken.py",))
         out = agent_actions.execute_action(
-            {"action": "verify", "level": 1}, {"verify": state})
+            {"action": "verify", "level": 1},
+            {"verify": state, "capabilities": agent_capabilities.Capabilities("/verify")})
         assert out.startswith("VERIFY FAILED"), out
         assert state.state == V.FAILED
         assert not state.passed
@@ -486,7 +489,7 @@ def test_a_file_that_does_not_compile_fails_verification_for_real():
 
 def test_the_action_refuses_arguments_it_cannot_act_on():
     state = V.VerificationState()
-    context = {"verify": state}
+    context = {"verify": state, "capabilities": agent_capabilities.Capabilities("/verify")}
     for obj, expected in (
             ({"action": "verify", "scope": "changed_files"}, "not a verification scope"),
             ({"action": "verify", "level": "high"}, "whole number from 1 to 6"),
@@ -498,7 +501,8 @@ def test_the_action_refuses_arguments_it_cannot_act_on():
 
 
 def test_verify_without_a_state_says_so_and_claims_nothing():
-    out = agent_actions.execute_action({"action": "verify"}, {})
+    out = agent_actions.execute_action({"action": "verify"},
+                                       {"capabilities": agent_capabilities.Capabilities("/verify")})
     assert "not available" in out
     assert "Do not claim the work was verified" in out
 
@@ -513,7 +517,8 @@ def test_what_verification_ran_reaches_the_reviewers_brief():
         state.note_change("write_file", ("good.py",))
         review = agent_review.ReviewState()
         agent_actions.execute_action({"action": "verify", "level": 1},
-                                     {"verify": state, "review": review})
+                                     {"verify": state, "review": review,
+                                      "capabilities": agent_capabilities.Capabilities("/verify")})
         assert review.verification, review.verification
         recorded = " ".join(review.verification)
         assert "verification #1 passed" in recorded, recorded
@@ -530,7 +535,8 @@ def test_a_verification_step_is_vetoed_through_the_plan_action():
     out = agent_actions.execute_action(
         {"action": "plan", "operation": "update", "step": 2,
          "status": "completed"},
-        {"plan": plan, "verify": state})
+        {"plan": plan, "verify": state,
+         "capabilities": agent_capabilities.Capabilities("/plan /verify")})
     assert out.startswith("FAILED"), out
     assert "is the verification step" in out
     assert plan.find(2).status != "completed", "the veto left no trace"
@@ -552,7 +558,10 @@ def test_a_background_agent_is_refused_verify_in_code_and_in_its_prompt():
 
 def test_the_main_prompt_teaches_verify_and_nothing_else_does():
     import agent_prompt
-    prompt = agent_prompt.get_system_prompt()
+    # Authorised, because the question is WHO is taught verification and not
+    # WHETHER this turn may use it. Both isolations are real and separate.
+    prompt = agent_prompt.get_system_prompt(
+        agent_capabilities.Capabilities("/verify"))
     assert "VERIFICATION - ONE ACTION" in prompt
     assert "WHEN VERIFICATION IS REQUIRED" in prompt
     assert "{\"action\":\"verify\"" in prompt
@@ -604,7 +613,7 @@ def test_an_answer_is_held_until_verification_has_actually_run():
     answer = "Added the feature."
     replies = [plan_created(), wrote(), completed(1, 2, 3),
                answered("Too early."), VERIFY, answered(answer)]
-    drawn, seen, console = drive_session(["add the feature, no review needed", "quit"], replies)
+    drawn, seen, console = drive_session(["add the feature /plan /verify", "quit"], replies)
     assert len(seen) == len(replies), len(seen)
     text = drawn
     assert answer in text, text[-2000:]
@@ -631,7 +640,7 @@ def test_a_failing_verification_holds_the_answer_until_it_is_fixed():
                wrote("broken.py", "VALUE = 1\n"),   # the fix
                VERIFY,                          # passes
                answered(answer)]
-    drawn, seen, console = drive_session(["add the feature, no review needed", "quit"], replies)
+    drawn, seen, console = drive_session(["add the feature /plan /verify", "quit"], replies)
     assert len(seen) == len(replies), len(seen)
     assert answer in drawn, drawn[-2000:]
     assert "Done anyway." not in drawn
@@ -651,7 +660,7 @@ def test_editing_after_a_pass_makes_the_answer_unverified_again():
                answered("Still fine?"),         # refused: stale
                VERIFY,                          # passes again
                answered(answer)]
-    drawn, seen, console = drive_session(["add the feature, no review needed", "quit"], replies)
+    drawn, seen, console = drive_session(["add the feature /plan /verify", "quit"], replies)
     assert len(seen) == len(replies), len(seen)
     assert answer in drawn, drawn[-2000:]
     said = user_messages(seen)
@@ -672,14 +681,23 @@ def test_a_conversational_turn_is_not_gated_at_all():
     del console
 
 
-def test_the_user_can_decline_verification_in_their_own_words():
+def test_a_task_that_does_not_ask_for_verification_is_not_gated_by_it():
+    """Declining is now the DEFAULT rather than a form of words.
+
+    This task plans real work and writes a real file -- the evidence that used
+    to turn verification on by itself -- and answers without ever running a
+    check, because the user did not write /verify. That reversal is the whole
+    feature: the engine is theirs to spend, and TMT no longer decides it is
+    owed one because the work looked substantial.
+    """
     answer = "Added it."
     replies = [plan_created(), wrote(), completed(1, 2, 3), answered(answer)]
-    drawn, seen, console = drive_session(
-        ["add the feature, no verification needed and no review needed",
-         "quit"], replies)
+    drawn, seen, console = drive_session(["add the feature /plan", "quit"],
+                                         replies)
     assert len(seen) == len(replies), len(seen)
     assert answer in drawn, drawn[-2000:]
+    # Nothing was verified and nothing pretended otherwise.
+    assert "must be verified" not in drawn, drawn[-2000:]
     del console
 
 
@@ -690,7 +708,7 @@ def test_verification_is_asked_for_before_review():
     # The one end-to-end test here that declines NEITHER gate, because what is
     # being measured is which of the two speaks first.
     replies = [plan_created(), wrote(), completed(1, 2, 3), answered("Done.")]
-    drawn, seen, console = drive_session(["add the feature", "quit"], replies)
+    drawn, seen, console = drive_session(["add the feature /plan /verify /review", "quit"], replies)
     said = user_messages(seen)
     assert "it must be verified" in said, said[-2000:]
     assert "it needs an independent review" not in said, \
@@ -705,7 +723,7 @@ def test_a_second_question_starts_with_no_verification_of_its_own():
     replies = [plan_created(), wrote(), completed(1, 2, 3), VERIFY,
                answered("Added it."), answered("zip pairs two sequences.")]
     drawn, seen, console = drive_session(
-        ["add the feature, no review needed", "what does zip do?", "quit"],
+        ["add the feature /plan /verify", "what does zip do?", "quit"],
         replies)
     assert len(seen) == len(replies), len(seen)
     assert "zip pairs two sequences." in drawn, drawn[-2000:]
@@ -742,14 +760,40 @@ def test_note_work_tells_verification_about_a_write_and_not_about_a_read():
 
 
 def test_the_choice_is_read_after_begin_turn_and_never_before():
+    """Read from the capability command, once, after the retirement.
+
+    Before, never after, would be wiped: `begin_turn` resets every field on
+    the state. And the second turn is the half that matters -- a capability
+    authorised for one question must not still be authorised for the next.
+    """
     import agent_session
     session = agent_session.Session()
-    session.begin_turn("add it and run the tests", "prompt")
-    TMT.note_verify_choice(session, "add it and run the tests")
+    session.begin_turn("add it and run the tests /verify", "prompt")
+    TMT.note_capability_choices(session)
+    assert session.capabilities.verify is True
     assert session.verify.user_choice is True
+    # A new question, no command in it: the authorisation does not carry.
     session.begin_turn("what does zip do?", "prompt")
-    TMT.note_verify_choice(session, "what does zip do?")
-    assert session.verify.user_choice is None
+    TMT.note_capability_choices(session)
+    assert session.capabilities.verify is False
+    assert session.verify.user_choice is False
+
+
+def test_the_word_verify_without_a_slash_authorises_nothing_end_to_end():
+    """The sharpest requirement of the feature, at the seam it matters.
+
+    "run the tests" and "verify this" are things people say while asking for
+    ordinary work. Under the old rule either turned the engine on; under this
+    one only the command does.
+    """
+    import agent_session
+    session = agent_session.Session()
+    for said in ("verify this code", "please verify this", "run the tests",
+                 "verification", "verified", "myverify", "/verification"):
+        session.begin_turn(said, "prompt")
+        TMT.note_capability_choices(session)
+        assert session.capabilities.verify is False, said
+        assert session.verify.user_choice is False, said
 
 
 def test_the_release_warning_reaches_the_user_only_when_something_was_released():

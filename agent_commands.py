@@ -34,6 +34,23 @@ _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 # each handler so the error for a stray argument reads the same everywhere.
 _TAKES_ARGUMENT = ("effort", "model", "note")
 
+# The three commands that are also capability authorisations. Alone on a line
+# each is the read-only report it has always been; followed by anything else
+# the line is a task that turned that capability on, and `dispatch` hands it
+# back to the model rather than refusing it.
+#
+# Taken from agent_capabilities rather than spelled out again, so the set the
+# input box highlights, the set the runtime authorises and the set this module
+# steps out of the way for cannot disagree. Guarded because an editable
+# install freezes its module list and a module that is invisible to the entry
+# point must not take the whole command table down with it -- without
+# agent_capabilities these three simply behave as they did before.
+try:
+    import agent_capabilities as _capabilities_module
+    _CAPABILITY_COMMANDS = frozenset(_capabilities_module.CAPABILITIES)
+except Exception:
+    _CAPABILITY_COMMANDS = frozenset()
+
 # How long /note waits for its answer before giving up and saying so. Shorter
 # than a delegated worker's ten minutes because a note is a question somebody
 # is sitting and waiting for: after five minutes of a blank screen the honest
@@ -201,6 +218,27 @@ def dispatch(text, session=None):
     handler = _HANDLERS.get(name)
     if handler is None:
         return _unknown(name)
+    if argument and name in _CAPABILITY_COMMANDS:
+        # `/plan` is two things and the difference is whether anything follows
+        # it. Alone on the line it is the report below -- what TMT is working
+        # through, printed as text -- and it has meant that since the plan
+        # column existed. With a task after it, `/plan Build the login page`,
+        # it is the user authorising planning FOR that task, and the line is
+        # an ordinary task that happens to open with the command.
+        #
+        # Returning None hands it back to the loop as a task, which is exactly
+        # what the same words further along the line already were:
+        # "Build the login page /plan" never reached this module at all,
+        # because `parse` only looks at a leading slash. So this makes the two
+        # orderings mean the same thing, which is what the user would expect
+        # and what the command being positionless requires.
+        #
+        # Nothing that worked before behaves differently. This shape was an
+        # ERROR until now -- "/plan takes no argument" -- so no line that
+        # previously did something useful has changed its meaning, and the
+        # three commands that take an argument, the ones that do not, and
+        # every unknown name are all untouched below.
+        return None
     if argument and name not in _TAKES_ARGUMENT:
         return Result("/%s takes no argument" % name,
                       ["It was given %r." % argument,

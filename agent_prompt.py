@@ -8,7 +8,19 @@ from agent_config import (
 from agent_execution import APP_REGISTRY
 from agent_file_ops import iter_workspace_files
 
-_cached_prompt = None
+# The prompt is cached per AUTHORISATION rather than as one string, because
+# the three capability sections are included only for a turn that may use
+# them. The key is the tuple of gated verbs, so there are at most eight
+# entries and the common ones -- nothing authorised, and all three -- are hit
+# on almost every request.
+#
+# The workspace snapshot is cached BESIDE it and shared by every key. It is
+# the expensive half by a wide margin (~8k tokens of inlined file bodies, and
+# a walk of the tree to build them), and it does not vary with authorisation:
+# rebuilding it per key would make a task that changed its capabilities pay
+# for the whole workspace again to say the same thing about it.
+_cached_prompts = {}
+_cached_snapshot = None
 _prompt_dirty = True
 
 def invalidate_prompt():
@@ -506,7 +518,6 @@ PREFERENCE_RULES = r"""=== EDITING PREFERENCES - FOLLOW IN THIS ORDER ===
 TOOL_CHOICE_RULES = r"""=== CHOOSING A TOOL - ALWAYS TAKE THE NARROWEST ONE ===
 Every one of these answers a different question. Reading a whole file to find one line is the mistake they exist to stop, and so is scanning the workspace again for something you already asked about.
 
-  This task has several stages               -> plan, before anything else
   What is in this project, and where?        -> tree
   Where is this exact text?                  -> find_text
   Where is this function or class defined?   -> find_symbol
@@ -528,7 +539,6 @@ Rules:
 7. Files under 8 KB are already pasted below. Searching for something that is already in front of you wastes a turn."""
 
 WORKFLOW_RULES = r"""=== BEHAVIOUR ===
-- A substantial task STARTS with a plan and cannot end until every step of it is completed. That is enforced by the program: a respond sent with steps outstanding is refused and handed back to you. See THE PLAN below.
 - Every task ends with a respond action. A batch whose last entry is respond finishes the task. This is not optional: a task that stops without one has failed, however much work was done, because the respond "message" is the ONLY thing the user ever reads.
 - A respond marked "final": false does not end anything - it is an announcement, and the task still has to go on and reach a final respond before it is finished.
 - YOU MUST FINISH BY SUMMARISING WHAT YOU MADE, INSIDE THE JSON. The summary is the value of the "message" key of a respond action - it is never loose prose, and a reply that is not one JSON object is not a reply at all. Rule 1 still holds for this message and for every other: the first character you emit is { and the last is }.
@@ -541,6 +551,36 @@ WORKFLOW_RULES = r"""=== BEHAVIOUR ===
 - Leave respond out of a batch only when you need results first (a read or a run). Those results come back to you, and you must then finish with respond.
 - Only perform file actions the user actually asked for. Never create, edit, delete or rename anything unprompted, and never touch a file outside the task.
 - Never run shell commands. Never leave the workspace root. Only the permitted apps listed above may be opened."""
+
+# The two lines that tell the model to plan, held apart from the rules they
+# belong to because those rules go everywhere and this instruction must not.
+#
+# `TOOL_CHOICE_RULES` and `WORKFLOW_RULES` are on every main prompt AND are
+# reused by agent_subprompts for the worker, the note agent and the reviewer.
+# Left inline, these two lines told a turn with no /plan to plan -- and had
+# always told background agents to, which `WORKER_FORBIDDEN` refuses outright.
+# `get_system_prompt` puts them back when, and only when, planning was
+# authorised. `_with_plan_rules` asserts its own anchors, so an edit that moved
+# them fails loudly instead of quietly dropping the instruction.
+PLAN_TOOL_ROW = '  This task has several stages               -> plan, before anything else\n'
+PLAN_BEHAVIOUR_RULE = '- A substantial task STARTS with a plan and cannot end until every step of it is completed. That is enforced by the program: a respond sent with steps outstanding is refused and handed back to you. See THE PLAN below.\n'
+_TOOL_ROW_ANCHOR = '  What is in this project, and where?        -> tree\n'
+_BEHAVIOUR_ANCHOR = "=== BEHAVIOUR ===\n"
+
+
+def _with_plan_rules(tool_choice, workflow):
+    """The two rule blocks with the planning instructions put back in place."""
+    if _TOOL_ROW_ANCHOR not in tool_choice:
+        raise AssertionError("the tool-choice table has moved; PLAN_TOOL_ROW "
+                             "has nowhere to go and would be silently dropped")
+    if _BEHAVIOUR_ANCHOR not in workflow:
+        raise AssertionError("the BEHAVIOUR heading has moved; "
+                             "PLAN_BEHAVIOUR_RULE would be silently dropped")
+    return (tool_choice.replace(_TOOL_ROW_ANCHOR,
+                                PLAN_TOOL_ROW + _TOOL_ROW_ANCHOR, 1),
+            workflow.replace(_BEHAVIOUR_ANCHOR,
+                             _BEHAVIOUR_ANCHOR + PLAN_BEHAVIOUR_RULE, 1))
+
 
 PROGRESS_RULES = r"""=== PROGRESS, EVENTS AND NEXT STEP - THREE OPTIONAL KEYS ===
 These three keys may be added to any action you already use. They never replace a required key and never change which action you pick, and adding one costs no extra turn - so never emit an action just to report progress, put the progress on the action you were going to emit anyway.
@@ -645,56 +685,129 @@ def repository_root():
         return ""
 
 
-def get_system_prompt():
-    global _cached_prompt, _prompt_dirty
-    if not _prompt_dirty and _cached_prompt is not None:
-        return _cached_prompt
-    snapshot = _workspace_snapshot()
-    apps = ", ".join(f"{key} ({value['description']})" for key, value in APP_REGISTRY.items()) or "none"
-    _cached_prompt = "\n\n".join([
+def get_system_prompt(capabilities=None):
+    """The main agent's prompt, teaching only the capabilities it may use.
+
+    `capabilities` is the turn's `agent_capabilities.Capabilities`, and None
+    means nothing is authorised. That is the same direction
+    `agent_capabilities.refusal` fails in and it is chosen for the same
+    reason: a prompt built without knowing what the user allowed must not be
+    the one that teaches all three. A caller that wants the whole prompt says
+    so by passing a Capabilities with the three flags on.
+
+    This is the FIRST of the two authorisation layers -- an unauthorised verb
+    is never described, so a model is not being asked to resist a tool it can
+    see. It is not the guarantee. `agent_actions.execute_action` asks
+    `agent_capabilities.refusal` again at dispatch, and that is what holds if
+    a verb is reached for anyway.
+    """
+    global _cached_snapshot, _prompt_dirty
+    import agent_capabilities
+    if _prompt_dirty:
+        # One invalidation empties both caches. The workspace has moved, so
+        # every authorisation's prompt is stale for the same reason and the
+        # snapshot they share is stale first.
+        _cached_prompts.clear()
+        _cached_snapshot = None
+        _prompt_dirty = False
+    allowed = agent_capabilities.allowed_actions(capabilities)
+    key = tuple(allowed)
+    if key in _cached_prompts:
+        return _cached_prompts[key]
+    if _cached_snapshot is None:
+        _cached_snapshot = _workspace_snapshot()
+    snapshot = _cached_snapshot
+    apps = ", ".join(f"{key_} ({value['description']})" for key_, value in APP_REGISTRY.items()) or "none"
+    sections = [
         HEADER,
         OUTPUT_RULES,
         ANSWERING_EXAMPLES,
         ACTION_REFERENCE,
         f"Permitted apps for open_app: {apps}",
-        # Only here. agent_subprompts reuses the constants above and not these
-        # four, which is what keeps a worker from learning to spawn workers or
-        # to write the main agent's plan. A worker has no user to make a
-        # contract with, and agent_worker refuses `plan` outright as well, so
-        # the isolation is code rather than wording either way.
-        PLAN_REFERENCE,
-        PLANNING_RULES,
-        # Between the plan and the review, which is where verification sits in
-        # the pipeline and how the three read together: the plan says what
-        # will be done, verification says whether it works, and the review
-        # says whether it is the right thing. Included HERE and by nothing
-        # else, the same isolation the other two have -- agent_worker refuses
-        # the verb outright as well, so a background agent can neither learn
-        # it nor use it.
-        VERIFY_REFERENCE,
-        VERIFY_RULES,
-        # Directly after the plan, because the review is the other half of the
-        # same contract: the plan says what will be done and the review says
-        # whether doing it worked. Both are included HERE and by nothing else,
-        # which is what keeps a background agent from learning to review -- a
-        # reviewer that could start a review would be auditing its own audit,
-        # and agent_worker refuses the verb outright as well.
-        REVIEW_REFERENCE,
-        REVIEW_RULES,
+    ]
+    # The three capability sections, each included only when the user's own
+    # words authorised that capability for this task. Two isolations are at
+    # work here and they are different questions.
+    #
+    # WHO may be taught it: only the main agent. agent_subprompts reuses the
+    # constants above and not these six, which is what keeps a worker from
+    # learning to plan, to verify or to review -- a reviewer that could start
+    # a review would be auditing its own audit. That isolation is by module
+    # and is unchanged.
+    #
+    # WHETHER this turn may be taught it: only when it was asked for. Teaching
+    # a verb the runtime will refuse costs about 1.3k tokens on every request
+    # of every step and invites exactly the reach the guard then has to turn
+    # down, so the honest prompt for a turn with no `/plan` in it is one that
+    # never mentions planning.
+    if agent_capabilities.PLAN in allowed:
+        sections.extend([PLAN_REFERENCE, PLANNING_RULES])
+    # Between the plan and the review, which is where verification sits in the
+    # pipeline and how the three read together: the plan says what will be
+    # done, verification says whether it works, and the review says whether it
+    # is the right thing. The order holds however many of them are in.
+    if agent_capabilities.VERIFY in allowed:
+        sections.extend([VERIFY_REFERENCE, VERIFY_RULES])
+    if agent_capabilities.REVIEW in allowed:
+        sections.extend([REVIEW_REFERENCE, REVIEW_RULES])
+    # What the user did NOT authorise, said once and plainly. Without this a
+    # model that has planned in an earlier session, or that simply expects to,
+    # reaches for a verb the prompt is silent about and spends a round finding
+    # out it cannot -- and the refusal it then reads is the first it has heard
+    # of the rule. Naming the three commands here is also the only way the
+    # model can tell the user what to type to turn one on.
+    withheld = agent_capabilities.gated_actions(capabilities)
+    if withheld:
+        sections.append(_withheld_section(agent_capabilities, withheld))
+    # The two planning instructions live outside the rule blocks that carry
+    # them, and are put back only for a turn that may actually plan.
+    tool_choice, workflow = TOOL_CHOICE_RULES, WORKFLOW_RULES
+    if agent_capabilities.PLAN in allowed:
+        tool_choice, workflow = _with_plan_rules(tool_choice, workflow)
+    sections.extend([
         ORCHESTRATION_REFERENCE,
         DELEGATION_RULES,
         PREFERENCE_RULES,
-        TOOL_CHOICE_RULES,
-        WORKFLOW_RULES,
+        tool_choice,
+        workflow,
         PROGRESS_RULES,
         GIT_RULES,
         f"Workspace root: {agent_config.ROOT_DIR}",
         _repository_line(),
         f"=== CURRENT WORKSPACE FILES AND CONTENTS ===\n{snapshot}",
         "Reminder: reply with one JSON object only. Start with { and end with }.",
-    ]).strip()
-    _prompt_dirty = False
-    return _cached_prompt
+    ])
+    _cached_prompts[key] = "\n\n".join(sections).strip()
+    return _cached_prompts[key]
+
+
+# What a turn is told about the capabilities it was not given. Deliberately
+# short: it is on every request of every step, and its whole job is to stop a
+# model spending a round discovering the rule. It states the mechanism the way
+# the runtime actually works -- the user's line authorises, nothing else does
+# -- because a model that thinks it is being asked politely will try again.
+_WITHHELD = """=== CAPABILITIES YOU WERE NOT GIVEN ===
+The user did not enable these for this task, and the runtime will refuse them:
+%s
+These are turned on by the USER writing the command in their own prompt, and
+by nothing else. You cannot enable one. Writing the command yourself, asking
+for it, or deciding the task is big enough does not enable it -- the
+authorisation is read from the user's typed line only.
+Do the work with the ordinary actions. If one of these would genuinely have
+helped, say so in your final respond and name the command the user would add.
+Do NOT describe an internal checklist of yours as a plan, do NOT call reading
+your own diff a review, and do NOT call running a command a verification --
+those are the words for the gated capabilities and using them for something
+else tells the user work happened that did not."""
+
+
+def _withheld_section(agent_capabilities, withheld):
+    """The withheld-capability notice, naming each command and what it does."""
+    listed = "\n".join(
+        "  %s - would enable %s"
+        % (agent_capabilities.command(name), agent_capabilities.SUMMARY[name])
+        for name in withheld)
+    return _WITHHELD % listed
 
 def _workspace_snapshot():
     """The workspace as the model sees it, within fixed limits.

@@ -385,41 +385,59 @@ def _panel_refresh(live_panel):
     return refresh
 
 
-def note_review_choice(session, task):
-    """Record whether the user's own words asked for a review, or for none.
+def note_capability_choices(session):
+    """Turn this turn's authorisation into the two states' completion rules.
 
-    The user's wording is authority in both directions and the model's is not,
-    which is why this is read from the task text once, here, exactly as
-    `authorizes_push` is. Silence is the usual case and is left as silence:
-    the runtime evidence decides then.
+    The one place a capability becomes a REQUIREMENT, and the reason it is one
+    place is that the rule is one rule: a capability the user asked for must
+    be satisfied before the answer goes out, and a capability they did not ask
+    for must never hold an answer up.
+
+    Both states already had exactly the right mechanism for this.
+    `user_choice` is consulted first by `is_required` and is final in both
+    directions, so setting it True means "this turn cannot end without one"
+    and False means "nothing here can hold the answer". What changes is only
+    where the answer comes from: it used to be read out of the task's PROSE --
+    "please review this", "no need to run the tests" -- and it is now read
+    from the capability commands, which are unambiguous and cannot be arrived
+    at by accident. `agent_review.requests_review` and
+    `agent_verify.requests_verification` still exist and still answer the
+    question they always answered; they are simply no longer what authorises.
+    That is the point of the feature: "verify this code" is a request to look
+    at some code, and `/verify` is a request for the verification engine.
+
+    Never None here, which is the other half of the change. Silence used to
+    fall through to the runtime evidence -- enough changed files and a long
+    enough plan turned a review on by itself -- and that is precisely the
+    automatic activation the user is taking back. Silence now means no.
+
+    The plan needs no equivalent. Its gate fires on a plan EXISTING with steps
+    outstanding, and a plan can only exist if the `plan` action ran, which the
+    runtime guard refuses without `/plan`. So an unauthorised plan cannot gate
+    anything because it cannot be created in the first place.
+
+    Called after `begin_turn`, never before, for the reason the two functions
+    it replaces were: the retirement inside `begin_turn` resets every field on
+    both states, so a choice recorded before it would be wiped by it. That is
+    also where the capabilities themselves are adopted.
     """
-    review = getattr(session, "review", None) if session is not None else None
-    if review is None:
+    if session is None:
         return
-    try:
-        import agent_review
-        review.note_user_choice(agent_review.requests_review(task))
-    except Exception:
-        pass
-
-
-def note_verify_choice(session, task):
-    """Record whether the user's own words asked for verification, or for none.
-
-    Read from the task text once, after `begin_turn`, for exactly the reasons
-    `note_review_choice` is: the user's wording is authority in both
-    directions, the model's is not, and the retirement that runs inside
-    `begin_turn` resets every field on the state -- so a choice recorded
-    before it would be wiped by it.
-    """
-    verify = getattr(session, "verify", None) if session is not None else None
-    if verify is None:
-        return
-    try:
-        import agent_verify
-        verify.note_user_choice(agent_verify.requests_verification(task))
-    except Exception:
-        pass
+    capabilities = getattr(session, "capabilities", None)
+    review = getattr(session, "review", None)
+    if review is not None:
+        try:
+            review.note_user_choice(
+                bool(capabilities is not None and capabilities.review))
+        except Exception:
+            pass
+    verify = getattr(session, "verify", None)
+    if verify is not None:
+        try:
+            verify.note_user_choice(
+                bool(capabilities is not None and capabilities.verify))
+        except Exception:
+            pass
 
 
 def review_release_warning(session):
@@ -941,25 +959,46 @@ def _session_loop(root):
                    # take, and without this the column would stand still for
                    # the whole of it.
                    "refresh": _panel_refresh(live_panel),
+                   # Which of the three higher-level capabilities this task's
+                   # own wording authorised. Put here for the same reason and
+                   # with the same warning as the three states above: the
+                   # session holds one Capabilities for its whole life and
+                   # re-reads it in `begin_turn`, a few lines below. Rebinding
+                   # it there would leave `execute_action` asking a set of
+                   # flags nothing writes to -- authorisation switched off,
+                   # with no error and nothing on screen to notice it by.
+                   #
+                   # This is the object the runtime guard reads. It is filled
+                   # from the user's typed line and from nothing the model,
+                   # a worker or a tool result produced.
+                   "capabilities": session.capabilities,
                    # The user's own words, verbatim. The reviewer treats this
                    # as the source of truth and checks the implementation
                    # against it, so it must be what was actually asked rather
                    # than the model's account of what was asked.
                    "task": task}
+        # The authorisation is read BEFORE the prompt is built, because the
+        # prompt is built out of it: an unauthorised capability is not
+        # described at all. `begin_turn` adopts it as well, which is where it
+        # belongs -- the capability's whole lifetime is one turn and that is
+        # the turn boundary -- and doing it here too is not two sources of
+        # truth but the same parser over the same line twice. It has to be
+        # here because Python evaluates `get_system_prompt(...)` before the
+        # call it is an argument to, so waiting for `begin_turn` would build
+        # this turn's prompt from the LAST turn's permissions.
+        session.capabilities.adopt(task)
         # The request the turn starts from: the system prompt, the earlier
         # questions and answers this session has already had, and then the new
         # task. `pinned` is how much of that the loop's own trimming must
         # leave alone -- everything up to and including the task.
-        messages, pinned = session.begin_turn(task, get_system_prompt())
+        messages, pinned = session.begin_turn(
+            task, get_system_prompt(session.capabilities))
         # After `begin_turn`, never before: retiring the review resets every
         # field on it, so a choice recorded a few lines earlier -- where the
         # push authority is decided -- would be wiped by the retirement that
         # runs between. Decided once from this task's wording alone, so
         # nothing the model later writes can turn a required review off.
-        note_review_choice(session, task)
-        # And the verification choice, in the same place and for the same
-        # reason: after the retirement, from the user's own words, once.
-        note_verify_choice(session, task)
+        note_capability_choices(session)
         last_raw, identical_count = "", 0
         live_ui = LiveUI()
         # The live area for this turn, drawn as one block at the foot of the
@@ -1060,7 +1099,10 @@ def _session_loop(root):
                 return True
 
             while steps < rounds:
-                messages[0]["content"] = get_system_prompt()
+                # Rebuilt from THIS turn's authorisation every round, so a
+                # prompt dropped by a mutating action comes back teaching the
+                # same capabilities it taught before rather than all of them.
+                messages[0]["content"] = get_system_prompt(session.capabilities)
                 messages = trim_messages(messages, pinned)
                 state = {"error": None, "next_step": turn_state["next_step"],
                          "progress_seen": turn_state["progress_seen"],

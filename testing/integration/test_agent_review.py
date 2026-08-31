@@ -45,6 +45,7 @@ import json
 import threading
 
 import agent_actions
+import agent_capabilities
 import agent_config
 import agent_manager
 import agent_panel
@@ -154,15 +155,23 @@ class Reviewer:
         return False
 
 
-def run_review(review, plan=None, manager=None, obj=None, task="Do the thing."):
+def run_review(review, plan=None, manager=None, obj=None, task="Do the thing.",
+               capabilities="/review"):
     """One `review` action through `execute_action`, which is the only path.
 
     Through the dispatcher rather than through `_review` directly, for the
     reason `test_agent_toolflow` gives: an action that works perfectly and is
     not registered is an action that does not exist.
+
+    `capabilities` authorises review by default, because that is what almost
+    every test here is about: how the reviewer behaves once it has been asked
+    for. It is kept apart from `task` deliberately -- the reviewer reads the
+    task as the request to check the work against, and authorisation is a
+    different question about the same line. Pass "" to drive it unauthorised.
     """
     context = {"manager": manager if manager is not None else agent_manager.AgentManager(),
-               "plan": plan, "review": review, "task": task}
+               "plan": plan, "review": review, "task": task,
+               "capabilities": agent_capabilities.Capabilities(capabilities)}
     return agent_actions.execute_action(dict(obj or {"action": "review"}), context)
 
 
@@ -928,7 +937,8 @@ def test_the_veto_reaches_the_model_through_the_plan_action():
     out = agent_actions.execute_action(
         {"action": "plan", "operation": "update", "step": 3,
          "status": "completed"},
-        {"plan": plan, "review": review, "manager": None})
+        {"plan": plan, "review": review, "manager": None,
+         "capabilities": agent_capabilities.Capabilities("/plan /review")})
     assert out.startswith("FAILED:")
     assert plan.steps[2].status != "completed"
 
@@ -941,7 +951,8 @@ def test_the_veto_catches_a_review_step_inside_a_batched_update():
         {"action": "plan", "operation": "update",
          "steps": [{"step": 2, "status": "completed"},
                    {"step": 3, "status": "completed"}]},
-        {"plan": plan, "review": review, "manager": None})
+        {"plan": plan, "review": review, "manager": None,
+         "capabilities": agent_capabilities.Capabilities("/plan /review")})
     assert out.startswith("FAILED:")
     # All or nothing: neither step moved.
     assert plan.steps[1].status != "completed"
@@ -958,7 +969,8 @@ def test_the_veto_lifts_once_the_review_passes():
     out = agent_actions.execute_action(
         {"action": "plan", "operation": "update", "step": 3,
          "status": "completed"},
-        {"plan": plan, "review": review, "manager": None})
+        {"plan": plan, "review": review, "manager": None,
+         "capabilities": agent_capabilities.Capabilities("/plan /review")})
     assert not out.startswith("FAILED:"), out
     assert plan.steps[2].status == "completed"
 
@@ -970,7 +982,8 @@ def test_the_veto_does_not_touch_an_ordinary_step():
     out = agent_actions.execute_action(
         {"action": "plan", "operation": "update", "step": 1,
          "status": "completed"},
-        {"plan": plan, "review": review, "manager": None})
+        {"plan": plan, "review": review, "manager": None,
+         "capabilities": agent_capabilities.Capabilities("/plan /review")})
     assert not out.startswith("FAILED:"), out
     assert plan.steps[0].status == "completed"
 
@@ -986,7 +999,8 @@ def test_the_veto_is_a_refinement_and_the_gate_is_the_guarantee():
     out = agent_actions.execute_action(
         {"action": "plan", "operation": "update",
          "steps": [{"step": n, "status": "completed"} for n in (1, 2, 3)]},
-        {"plan": plan, "review": review, "manager": None})
+        {"plan": plan, "review": review, "manager": None,
+         "capabilities": agent_capabilities.Capabilities("/plan /review")})
     assert not out.startswith("FAILED:"), out
     assert plan.is_complete()
     assert agent_plan.refusal(plan, "respond") == ""
@@ -998,7 +1012,8 @@ def test_a_plan_action_still_works_with_no_review_state_at_all():
     plan = worked_plan()
     out = agent_actions.execute_action(
         {"action": "plan", "operation": "update", "step": 1,
-         "status": "completed"}, {"plan": plan})
+         "status": "completed"},
+        {"plan": plan, "capabilities": agent_capabilities.Capabilities("/plan /review")})
     assert not out.startswith("FAILED:"), out
 
 
@@ -1104,7 +1119,9 @@ def test_the_documented_scope_is_accepted():
 
 
 def test_a_review_with_no_state_reports_it_and_never_claims_a_pass():
-    out = agent_actions.execute_action({"action": "review"}, {"manager": None})
+    out = agent_actions.execute_action(
+        {"action": "review"},
+        {"manager": None, "capabilities": agent_capabilities.Capabilities("/plan /review")})
     assert "not available" in out
     assert "Do not claim the work was reviewed" in out
 
@@ -1113,7 +1130,8 @@ def test_a_review_with_no_manager_reports_it_and_never_claims_a_pass():
     review = state_after_work()
     out = agent_actions.execute_action(
         {"action": "review"},
-        {"review": review, "plan": worked_plan(), "task": "x"})
+        {"review": review, "plan": worked_plan(), "task": "x",
+         "capabilities": agent_capabilities.Capabilities("/plan /review")})
     assert "needs background agents" in out
     assert "Do not claim the work was reviewed" in out
     assert review.state == agent_review.IDLE
@@ -1121,13 +1139,23 @@ def test_a_review_with_no_manager_reports_it_and_never_claims_a_pass():
 
 
 def test_a_background_agents_context_cannot_reach_the_review():
-    """A worker's context has no review key at all, so a worker that somehow
-    emitted the verb is told it changed nothing rather than raising."""
+    """A worker's context has no review key at all AND no capabilities key, so
+    a worker that somehow emitted the verb is told it changed nothing rather
+    than raising.
+
+    The capability guard is what answers now, and it answers first. That is
+    strictly the safer of the two: a worker is not authorised by anybody, so
+    it is refused before the missing state is even reached. `WORKER_FORBIDDEN`
+    refuses the verb ahead of both, so this is the third of three.
+    """
     out = agent_actions.execute_action({"action": "review"},
                                        agent_worker._context(
                                            agent_manager.AgentRecord(
                                                "1", 1, "worker", "t")))
-    assert "not available" in out
+    assert out.startswith("REFUSED:"), out
+    assert "/review" in out, out
+    assert "not enabled" in out, out
+    assert "review" in agent_worker.WORKER_FORBIDDEN
 
 
 def test_a_review_is_refused_while_background_workers_are_running():
@@ -1426,7 +1454,10 @@ def test_the_reviewer_is_not_taught_to_plan_to_spawn_or_to_review():
 
 
 def test_the_main_agent_alone_is_taught_the_review_lifecycle():
-    main = agent_prompt.get_system_prompt()
+    # Authorised, because the question is WHO is taught the review and not
+    # WHETHER this turn may use it. Both isolations are real and separate.
+    main = agent_prompt.get_system_prompt(
+        agent_capabilities.Capabilities("/review"))
     assert agent_prompt.REVIEW_REFERENCE in main
     assert agent_prompt.REVIEW_RULES in main
     for other in (agent_subprompts.worker_prompt(),
@@ -1901,15 +1932,40 @@ def test_the_gate_is_silent_with_no_session_or_a_non_object():
 def test_the_users_own_words_are_read_once_after_the_turn_begins():
     """After begin_turn and never before: retiring the review resets every
     field on it, so a choice recorded earlier would be wiped by the retirement
-    that runs between."""
+    that runs between.
+
+    The words are the COMMAND now rather than a phrase. "review the changes"
+    is a thing somebody says while asking for an opinion; `/review` is a
+    request for the gated, independent, cycle-limited reviewer, and only the
+    second one buys it.
+    """
     session = agent_session.Session()
-    session.begin_turn("add the feature and review the changes", "prompt")
-    TMT.note_review_choice(session, "add the feature and review the changes")
+    session.begin_turn("add the feature /review", "prompt")
+    TMT.note_capability_choices(session)
+    assert session.capabilities.review is True
     assert session.review.user_choice is True
     assert session.review.is_required(None)
+    # A new question with no command in it: nothing carries over.
     session.begin_turn("what does zip do?", "prompt")
-    TMT.note_review_choice(session, "what does zip do?")
-    assert session.review.user_choice is None
+    TMT.note_capability_choices(session)
+    assert session.capabilities.review is False
+    assert session.review.user_choice is False
+    assert not session.review.is_required(None)
+
+
+def test_asking_for_a_review_in_prose_no_longer_buys_one():
+    """The reversal, stated where somebody will look for it. Every phrase here
+    used to turn an independent review on; none of them does now, because the
+    capability is the user's to spend and spending it is a command.
+    """
+    session = agent_session.Session()
+    for said in ("add the feature and review the changes",
+                 "please review my code", "do a code review afterwards",
+                 "reviewing", "/reviewing", "peer review this"):
+        session.begin_turn(said, "prompt")
+        TMT.note_capability_choices(session)
+        assert session.capabilities.review is False, said
+        assert session.review.user_choice is False, said
 
 
 def test_the_release_warning_reaches_the_user_only_at_the_limit():
@@ -1923,17 +1979,17 @@ def test_the_release_warning_reaches_the_user_only_at_the_limit():
 
 # --- end to end through TMT.main -------------------------------------------
 #
-# Every task text here declines verification, and that is deliberate rather
-# than incidental. Verification is required on exactly the evidence a review
-# is -- three plan steps and a file actually written -- so without the
-# decline every one of these would be held by the verify gate first and would
-# be testing two gates at once. Each test below is about the REVIEW gate, and
-# the interaction between the two is tested where it belongs, in
-# test_agent_verify_engine.test_verification_is_asked_for_before_review.
+# Every task text here asks for `/plan /review` and deliberately does NOT ask
+# for `/verify`. Each test below is about the REVIEW gate, and a turn that had
+# authorised verification too would be held by the verify gate first and would
+# be testing two gates at once. The interaction between them is tested where it
+# belongs, in test_agent_verify_engine.test_verification_is_asked_for_before_review.
 #
-# It also exercises the decline path through the real loop, which is worth
-# having: `agent_verify.requests_verification` answers False here, and the
-# user's own words are the only thing that can turn a required gate off.
+# This used to read "no verification needed", declining in prose, because
+# verification was required on exactly the evidence a review was and had to be
+# turned off. Not asking is the whole of it now: a capability nobody wrote the
+# command for was never on, so these tests also stand as the plainest statement
+# of the reversal -- three plan steps and a written file, and no verification.
 
 PLAN_STEPS = ["Implement it", "Run the tests", "Independent review"]
 
@@ -1991,7 +2047,7 @@ def test_an_answer_is_held_until_a_review_has_actually_passed():
                                          file="feature.py", line=1)]),
             reviewer_reply(status="PASS", summary="The fix is right.")):
         drawn, seen, console = drive_session(
-            ["add the feature, no verification needed", "quit"], replies)
+            ["add the feature /plan /review", "quit"], replies)
 
     assert len(seen) == len(replies), len(seen)
     text = visible(drawn)
@@ -2029,7 +2085,7 @@ def test_the_review_gate_holds_an_answer_a_complete_plan_would_have_let_out():
                            issues=[issue(title="Expiry is not enforced")]),
             reviewer_reply(status="PASS", summary="The fix is right.")):
         drawn, seen, console = drive_session(
-            ["add the feature, no verification needed", "quit"], replies)
+            ["add the feature /plan /review", "quit"], replies)
 
     assert len(seen) == len(replies), len(seen)
     text = visible(drawn)
@@ -2080,7 +2136,7 @@ def test_a_review_that_errors_holds_the_answer_and_says_so():
                               "response": "Looks fine to me."}),
                   reviewer_reply(status="PASS", summary="Read it properly.")):
         drawn, seen, console = drive_session(
-            ["add the feature, no verification needed", "quit"], replies)
+            ["add the feature /plan /review", "quit"], replies)
 
     assert len(seen) == len(replies), len(seen)
     text = visible(drawn)
@@ -2103,7 +2159,7 @@ def test_the_cycle_limit_releases_the_answer_and_tells_the_user():
     with Reviewer(reviewer_reply(status="FAIL", summary="Still wrong.",
                                  issues=[issue(title="Still wrong")])):
         drawn, seen, console = drive_session(
-            ["add the feature, no verification needed", "quit"], replies)
+            ["add the feature /plan /review", "quit"], replies)
     assert len(seen) == len(replies), len(seen)
     text = visible(drawn)
     assert "Done what I could." in text, text[-2500:]
@@ -2123,7 +2179,8 @@ def test_the_next_question_is_not_gated_by_the_last_ones_review():
     ]
     with Reviewer(reviewer_reply(status="PASS", summary="Fine.")):
         drawn, seen, console = drive_session(
-            ["add the feature, no verification needed", "and now something unrelated", "quit"], replies)
+            ["add the feature /plan /review", "and now something unrelated",
+             "quit"], replies)
     assert len(seen) == len(replies), len(seen)
     text = visible(drawn)
     assert "First answer." in text and "Second answer." in text
@@ -2142,7 +2199,8 @@ def test_clear_after_a_failed_review_does_not_end_the_session():
     with Reviewer(reviewer_reply(status="FAIL", summary="No.",
                                  issues=[issue()])):
         drawn, seen, console = drive_session(
-            ["add the feature, no verification needed", "/clear", "a fresh question", "quit"], replies)
+            ["add the feature /plan /review", "/clear", "a fresh question",
+             "quit"], replies)
     text = visible(drawn)
     assert "after the clear" in text, text[-2000:]
     assert [m["role"] for m in seen[-1]] == ["system", "user"], seen[-1]

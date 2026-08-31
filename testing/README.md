@@ -5,8 +5,8 @@ beside the modules at the repository root any more — the root is for the progr
 
 ```
 testing/
-    unit/           16 files
-    integration/     9 files
+    unit/           19 files
+    integration/    11 files
 ```
 
 ## Running it
@@ -29,8 +29,8 @@ make the interpreter load the previous one's bytecode.
 
 The suite takes a couple of minutes. Most of that is real sleeping in the live-renderer
 tests. TMT's own `run_file` gives up at ten seconds, so TMT cannot verify its own suite
-and will correctly refuse to commit unverified work — run it yourself and tell it the
-result in the task text.
+*through that action* — but `verify` can, through `agent_execution.run_command`, which
+allows a check five minutes. Ask it to verify with `/verify` in the task text.
 
 There is no per-test timeout. A test that blocks on input hangs the whole run.
 

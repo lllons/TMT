@@ -30,6 +30,17 @@ GRADIENT_TICK = 0.08     # repaint period while a surface is animating
 DIM = "\033[38;2;88;88;88m"
 RESET = "\033[0m"
 
+# Weight and rule, for the one case where something must stand out on a
+# terminal that has ANSI but no colour -- NO_COLOR set, or a palette the user
+# has deliberately turned off. They are not part of the gradient and they are
+# not an alternative to it: the only caller uses them as the fallback for a
+# surface whose colour it has just been refused, so that what the colour was
+# distinguishing is still distinguished. Everything here still reads correctly
+# with every escape stripped, which is the rule these must not become an
+# exception to.
+BOLD = "\033[1m"
+UNDERLINE = "\033[4m"
+
 # The activity readout drawn hard against the right edge of the status row,
 # opposite the progress bar: a turning glyph, elapsed time and token count.
 ACTIVITY_GLYPHS = ("✻", "✽", "✻")

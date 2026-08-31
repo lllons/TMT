@@ -33,6 +33,7 @@ import json
 import re
 
 import agent_actions
+import agent_capabilities
 import agent_config
 import agent_panel
 import agent_plan
@@ -406,10 +407,20 @@ def test_the_gate_only_ever_holds_the_two_terminal_actions():
 
 # --- the action -------------------------------------------------------------
 
-def run(obj, plan=None, context=None):
-    """One plan action through the real dispatcher, as the loop runs it."""
+def run(obj, plan=None, context=None, capabilities="/plan"):
+    """One plan action through the real dispatcher, as the loop runs it.
+
+    `capabilities` is the user's line as far as authorisation goes, and it
+    authorises planning by default because that is what almost every test here
+    is about: how the plan behaves once it has been asked for. Pass "" to
+    drive the same action with nothing authorised, which is what the tests
+    under "the authorisation" do.
+    """
     if context is None:
         context = {"plan": agent_plan.Plan() if plan is None else plan}
+    context = dict(context)
+    context.setdefault("capabilities",
+                       agent_capabilities.Capabilities(capabilities))
     return agent_actions.execute_action(dict(obj, action="plan"), context)
 
 
@@ -475,8 +486,16 @@ def test_every_way_of_getting_it_wrong_comes_back_as_words():
 def test_an_action_context_with_no_plan_answers_in_words():
     """A background agent's context has no plan key AT ALL, and neither has an
     install where the session never wired one in. Both must come back as a
-    sentence rather than a KeyError that ends the turn."""
-    for context in ({}, None, {"push_authorized": True}):
+    sentence rather than a KeyError that ends the turn.
+
+    Authorised here, so it is the missing STATE being tested rather than the
+    missing permission -- those are two different sentences now and the one
+    that arrives first is the capability guard. The unauthorised half of this
+    is `test_a_context_with_no_capabilities_refuses_all_three` below.
+    """
+    granted = agent_capabilities.Capabilities("/plan")
+    for context in ({"capabilities": granted},
+                    {"push_authorized": True, "capabilities": granted}):
         result = agent_actions.execute_action(
             {"action": "plan", "operation": "create", "steps": ["One"]}, context)
         assert "not available" in result, result
@@ -988,7 +1007,12 @@ def test_the_plan_is_taught_to_the_main_agent_only():
     WORKER_FORBIDDEN -- and the prompts agree with the code rather than being
     the only thing holding it."""
     import agent_subprompts
-    main = agent_prompt.get_system_prompt()
+    # Authorised, because the question here is WHO is taught the plan and not
+    # WHETHER this turn may use it. Both isolations are real and they are
+    # different: the capability decides whether the main agent is told, and
+    # the module boundary decides that a worker never is either way.
+    main = agent_prompt.get_system_prompt(
+        agent_capabilities.Capabilities("/plan"))
     assert "=== THE PLAN" in main
     assert "WHEN TO PLAN" in main
     for prompt in (agent_subprompts.worker_prompt(), agent_subprompts.note_prompt()):
@@ -1022,7 +1046,7 @@ def test_a_final_answer_is_refused_while_the_plan_is_unfinished():
                            "steps": ["Inspect the repository", "Run the tests"]})]
     replies += [json.dumps({"action": "respond", "message": "%s (%d)" % (early, n)})
                 for n in range(agent_config.rounds_for_effort() + 2)]
-    drawn, seen, console = drive_session(["add the feature", "quit"], replies)
+    drawn, seen, console = drive_session(["add the feature /plan", "quit"], replies)
 
     # It was refused, and the refusal named the work rather than scolding.
     handed_back = seen[-1][-1]["content"]
@@ -1049,7 +1073,7 @@ def test_the_answer_lands_once_every_step_is_complete():
                     "status": "completed"}),
         json.dumps({"action": "respond", "message": answer}),
     ]
-    drawn, seen, console = drive_session(["add the feature", "quit"], replies)
+    drawn, seen, console = drive_session(["add the feature /plan", "quit"], replies)
 
     assert len(seen) == len(replies), len(seen)
     assert answer in visible(drawn), visible(drawn)[-3000:]
@@ -1073,7 +1097,7 @@ def test_a_batch_that_ends_in_an_early_answer_keeps_the_work_it_did():
                               {"step": 2, "status": "completed"}]}),
         json.dumps({"action": "respond", "message": "Wrote made.txt."}),
     ]
-    drawn, seen, console = drive_session(["make a file", "quit"], replies)
+    drawn, seen, console = drive_session(["make a file /plan", "quit"], replies)
 
     handed_back = seen[1][-1]["content"]
     assert "Batch results:" in handed_back, handed_back
@@ -1125,7 +1149,7 @@ def test_the_next_question_is_answered_after_a_turn_that_finished_its_plan():
     replies = _planned_turn(first) + [
         json.dumps({"action": "respond", "message": second})]
     drawn, seen, console = drive_session(
-        ["add the feature", "and now something unrelated", "quit"], replies)
+        ["add the feature /plan", "and now something unrelated", "quit"], replies)
 
     assert len(seen) == len(replies), len(seen)
     # The second turn happened at all, which is the whole of the bug.
@@ -1150,7 +1174,7 @@ def test_clear_after_a_finished_plan_does_not_end_the_session():
     replies = _planned_turn(first) + [
         json.dumps({"action": "respond", "message": second})]
     drawn, seen, console = drive_session(
-        ["add the feature", "/clear", "and now something else", "quit"], replies)
+        ["add the feature /plan", "/clear", "and now something else", "quit"], replies)
 
     assert len(seen) == len(replies), len(seen)
     assert [m["role"] for m in seen[-1]] == ["system", "user"], \

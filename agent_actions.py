@@ -132,6 +132,48 @@ def _manager(context):
     return (context or {}).get("manager")
 
 
+# The three verbs the user has to authorise before the model may use them.
+# Named here rather than derived at the call site so the dispatcher's own list
+# and `agent_capabilities.CAPABILITIES` can be asserted equal by a test: two
+# spellings of the same set are two chances for one to grow a member the other
+# does not know about, and the member that went missing would be a capability
+# running unauthorised.
+_CAPABILITY_ACTIONS = frozenset(("plan", "review", "verify"))
+
+
+def _capability_refusal(context, action):
+    """The refusal for an unauthorised capability, or "" when it may run.
+
+    Reads the authorisation out of the action context, which is where the
+    session put its own `Capabilities` object -- the one it adopts from the
+    user's typed line at `begin_turn` and from nothing else.
+
+    A context with NO capabilities key refuses all three, and that direction
+    is deliberate. It is what a background agent's context looks like, so a
+    worker cannot verify its own work even if it were somehow handed the verb;
+    it is what an install that never wired the session in looks like; and it
+    is what a caller that forgot the key looks like. In every one of those the
+    honest answer is that nobody authorised anything, and the cost of being
+    wrong is a task done with the ordinary actions.
+
+    Guarded to a refusal rather than to an exception for the reason every
+    other check in this module is: a capability the model asked for wrongly is
+    a mistake to correct on the next step, never a reason to end the turn.
+    """
+    try:
+        import agent_capabilities
+    except Exception:
+        # The frozen-module-list failure `_run_tool` guards against. A
+        # capability whose authorisation cannot be READ has not been granted,
+        # so this fails closed -- the one guard in this file that does, and it
+        # is the one where an open failure would be a permission nobody gave.
+        return ("Capability authorisation is unavailable, so '%s' did not "
+                "run. Carry out the work with the ordinary file, search and "
+                "git actions." % action)
+    return agent_capabilities.refusal((context or {}).get("capabilities"),
+                                      action)
+
+
 _NO_PLAN_STATE = (
     "Planning is not available here, so '%s' did nothing and no plan exists. "
     "Carry out the work with the ordinary file, search and git actions, and "
@@ -867,6 +909,30 @@ def execute_action(obj, context=None):
         if not (context or {}).get("push_authorized"):
             return PUSH_BLOCKED
         return _run_git(lambda agent_git: _git_push(agent_git, obj))
+    # The three higher-level capabilities, and the one gate that stands in
+    # front of all of them. Asked HERE, once, before any of the three
+    # branches, because this is the only path a capability can be reached by:
+    # the loop dispatches through this function on both its single and its
+    # batch site, and a worker's own loop dispatches through it too.
+    #
+    # This is the second of the two layers, and it is the load-bearing one.
+    # The first -- leaving the verb out of the system prompt -- makes an
+    # unauthorised capability invisible, which is worth having and is not a
+    # guarantee: a model can emit a verb it was never taught, a prompt can
+    # fail to rebuild, and a later edit can leak a reference back in. This
+    # one makes it unavailable, and it reads the flags the USER's own words
+    # set rather than anything the model wrote.
+    #
+    # It is the `git_push` shape a few lines above, deliberately: a returned
+    # sentence rather than a raised error, so a model that reaches for a
+    # capability it was not given is corrected on its next step exactly like
+    # a patch whose search string did not match. It is NOT converted into a
+    # silent no-op -- the action genuinely does not run, and the result says
+    # so and says what would change it.
+    if action in _CAPABILITY_ACTIONS:
+        refused = _capability_refusal(context, action)
+        if refused:
+            return refused
     # The task's own plan. It touches no file and runs nothing, so it is not
     # in MUTATING_ACTIONS and does not invalidate the cached system prompt --
     # the workspace is exactly as it was.

@@ -29,6 +29,7 @@ place the conversation is stored.
 
 import json
 
+import agent_capabilities
 import agent_config
 import agent_models
 import agent_plan
@@ -252,6 +253,19 @@ class Session:
         # every time and rebinding here would switch the evidence half of the
         # completion gate off without an error anywhere.
         self.verify = agent_verify.VerificationState()
+        # Which of the three higher-level capabilities the user authorised for
+        # the task being worked on now. Beside the three states it governs,
+        # under the same rules for the fourth time: one per turn, re-read at
+        # `begin_turn`, built ONCE and adopted in place rather than rebound.
+        #
+        # The warning is written a fourth time rather than referred to,
+        # because it is invisible from the call site every time and the
+        # failure it describes is silent in the worst direction here.
+        # Rebinding this would leave the action guard reading a set of flags
+        # nothing writes to, which is authorisation switched OFF with no error
+        # anywhere -- and unlike the three states below it, nothing would be
+        # drawn on screen to notice it by.
+        self.capabilities = agent_capabilities.Capabilities()
 
     # --- what the next request runs under ---------------------------------
 
@@ -368,6 +382,18 @@ class Session:
         # one, and leaving it standing would let a new question be answered on
         # the strength of checks that ran before it was asked.
         self.verify.retire()
+        # And the authorisation is re-read, from THIS task and nothing else.
+        # That is the whole of the capability lifetime: every turn starts from
+        # the user's own new words, so `/plan` on one question does not carry
+        # into the next one, and nothing accumulates that would have to be
+        # expired later. It is adopted rather than rebound for the reason the
+        # three retirements above are: the loop put this very object in the
+        # action context before it called us.
+        #
+        # Read from `task`, which is the user's typed line. Nothing the model,
+        # a worker, a tool result or a reviewer produces reaches this call --
+        # that is what makes the flags authorisation rather than a suggestion.
+        self.capabilities.adopt(task)
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": str(system_prompt)})
@@ -521,6 +547,12 @@ class Session:
         # to forget the conversation that would still refuse to answer until
         # an invisible verification had passed would be the worst of both.
         self.verify.retire()
+        # And the authorisation. Nothing is being worked on after this, so
+        # nothing is authorised: the next question re-reads its own. Turning
+        # capabilities OFF is never the dangerous direction, and leaving them
+        # standing would be a permission granted for a task the session has
+        # just been told to forget.
+        self.capabilities.retire()
         self._turns = []
 
     def __len__(self):

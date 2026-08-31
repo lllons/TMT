@@ -584,6 +584,117 @@ def panel_rows(records, width, height=None, selected=0, now=None, stream=None):
 # right one: the plan is the shape of the whole task and the panel is one
 # thing happening inside it.
 
+CAPABILITIES_TITLE = "CAPABILITIES"
+
+# What the user turned on for this task, drawn at the top of the column.
+#
+# ACTIVE ONLY. A row per capability with an on/off mark would be a list of
+# three things the user mostly did not ask for, drawn permanently, and the two
+# off rows would say nothing that the absence of the block does not already
+# say. So the block exists when something is authorised and does not when
+# nothing is, which is the same bargain the plan, verify and review blocks
+# strike about their own emptiness.
+#
+# Green, at the position `success` already holds. It is the one status here --
+# a capability in this block is on -- and a capability that is on is a switch
+# that is closed rather than a thing in progress, so it takes the settled end
+# of the scale. Nothing here adds a colour to the program.
+CAPABILITY_POSITION = 95
+
+# Colour is never the message: the mark says it too, and the command itself is
+# spelled out, so with every escape stripped the row still reads "+ /plan".
+_CAPABILITY_MARK = "●"
+_CAPABILITY_ASCII_MARK = "+"
+
+# A header and the three commands. It cannot want more than four rows because
+# there are only three capabilities.
+CAPABILITIES_MAX_ROWS = 4
+
+# The fewest worth drawing: the header and one command under it. A header
+# alone is a word with no news in it, which is the bargain `review_rows` and
+# `verify_rows` already strike at two.
+CAPABILITIES_MIN_ROWS = 2
+
+
+def capability_mark(stream=None):
+    """The active mark this stream can actually draw."""
+    if plain_output(stream) or not encodable(stream, _CAPABILITY_MARK):
+        return _CAPABILITY_ASCII_MARK
+    return _CAPABILITY_MARK
+
+
+def capabilities_rows(capabilities, width, height=None, stream=None):
+    """The capabilities block, painted, every row at most `width` columns.
+
+    Nothing at all when nothing is authorised, which is most turns. The three
+    gated capabilities are opt-in, so a permanent block saying they are off
+    would be a heading over the ordinary case.
+
+    `height` is how many rows it may take; below two it draws nothing. Where
+    it cannot show every command it shows what fits and the header still
+    counts them all -- `CAPABILITIES 3` over two rows has already said that
+    one is not drawn, which is the bargain `plan_rows` strikes and is worth
+    more than a "+1 more" row costing exactly the row it describes.
+    """
+    stream = sys.stdout if stream is None else stream
+    width = max(1, int(width))
+    if capabilities is None:
+        return []
+    try:
+        active = list(capabilities.active())
+    except Exception:
+        # Decoration is never allowed to end a turn. A state object that
+        # raises is drawn as nothing authorised, exactly as `PanelState.records`
+        # treats a register that raises as no agents.
+        return []
+    if not active:
+        return []
+    room = (CAPABILITIES_MAX_ROWS if height is None
+            else min(CAPABILITIES_MAX_ROWS, int(height)))
+    if room < CAPABILITIES_MIN_ROWS:
+        return []
+    mark = capability_mark(stream)
+    rows = [_row("%s %d" % (CAPABILITIES_TITLE, len(active)), width, stream,
+                 position=CAPABILITY_POSITION)]
+    for name in active[:room - 1]:
+        rows.append(_row("%s /%s" % (mark, name), width, stream,
+                         position=CAPABILITY_POSITION))
+    return rows
+
+
+def capabilities_report(capabilities):
+    """What a command prints: the authorisation as permanent text.
+
+    The unambiguous alternate to the block, and the only way in on a terminal
+    too narrow for two columns -- the same role `plan_report` plays for the
+    plan. It says the same things the block does in the same words, and it
+    names the command for anything that is off, because that is the one thing
+    a reader can act on.
+    """
+    try:
+        import agent_capabilities
+    except Exception:
+        return "Capability authorisation is unavailable in this session."
+    if capabilities is None:
+        return ("No capabilities are enabled for this task. Add /plan, "
+                "/review or /verify to your prompt to enable them.")
+    try:
+        active = list(capabilities.active())
+    except Exception:
+        return "The capability state could not be read."
+    rows = ["%s %d/%d" % (CAPABILITIES_TITLE, len(active),
+                          len(agent_capabilities.CAPABILITIES))]
+    for name in agent_capabilities.CAPABILITIES:
+        on = name in active
+        rows.append("%s %-8s %s"
+                    % ("+" if on else "-", agent_capabilities.command(name),
+                       "enabled" if on else "not enabled"))
+    if not active:
+        rows.append("The AI cannot enable these itself. Write the command in "
+                    "your prompt to turn one on.")
+    return "\n".join(rows)
+
+
 PLAN_TITLE = "PLAN"
 
 # Positions on the one gradient, and every one of them is a position an
@@ -1153,7 +1264,7 @@ class PanelState:
     """
 
     def __init__(self, manager=None, stream=None, plan=None, review=None,
-                 verify=None):
+                 verify=None, capabilities=None):
         self.manager = manager
         self.stream = sys.stdout if stream is None else stream
         self.open = False
@@ -1174,6 +1285,12 @@ class PanelState:
         # session empties it between turns, and a panel holding the object it
         # was built with would go on drawing evidence about a finished task.
         self.verify = verify
+        # What the user authorised for the task being worked on now, as an
+        # object or as a callable returning one, and a callable for the fourth
+        # time for the same reason: the session re-reads it between turns, and
+        # a panel holding the object it was built with would go on saying that
+        # a finished task's permissions are this one's.
+        self.capabilities = capabilities
         # The reason the panel could not open, shown once and cleared by the
         # next thing that happens. It is a live message about a live gesture,
         # so it belongs on the temporary surface with the box that carries it.
@@ -1346,7 +1463,62 @@ class PanelState:
 
         return (left, join)
 
+    def capabilities_now(self):
+        """What is authorised right now, or None when nothing is.
+
+        Nothing authorised is None here, the same bargain `plan_now`,
+        `review_now` and `verify_now` strike: `Capabilities.any()` is whether
+        there is anything to show, and a heading over three switches the user
+        left alone would be a permanent empty block in a column three other
+        things want.
+        """
+        try:
+            granted = (self.capabilities() if callable(self.capabilities)
+                       else self.capabilities)
+        except Exception:
+            return None
+        try:
+            return granted if (granted is not None and granted.any()) else None
+        except Exception:
+            return None
+
     def _task_block(self, plan, review, verify, width, height):
+        """What the user authorised, then what the task did with it.
+
+        A wrapper around `_state_block`, which is the allocator that shares
+        rows between the plan, the verification and the review and is left
+        exactly as it was. The capabilities block is prepended rather than
+        folded in, because it is not the same kind of thing: it is a fact
+        about the whole turn that is settled before any work starts and never
+        changes while it runs, and it is at most four rows and usually two.
+
+        It takes the TOP, above the plan, because it is what the three blocks
+        below it are a consequence of -- a reader who sees the answer held for
+        a review wants the row saying a review was asked for. And it is the
+        FIRST thing dropped when the rows are short, for the other side of the
+        same reason: it is context, and the plan is the work.
+        """
+        granted = capabilities_rows(self.capabilities_now(), width,
+                                    height=height, stream=self.stream)
+        if height is None:
+            return _stack([granted,
+                           self._state_block(plan, review, verify, width, None)])
+        room = max(0, int(height))
+        if granted:
+            # Its own rows, and the blank row that separates it from whatever
+            # is under it.
+            spent = len(granted) + 1
+            if (plan or review or verify) and room - spent < PLAN_MIN_ROWS:
+                # Not enough left for the plan to be worth drawing. The work
+                # wins the rows; `/plan` and the input box both still say what
+                # was authorised.
+                granted = []
+            else:
+                room -= spent
+        return _stack([granted,
+                       self._state_block(plan, review, verify, width, room)])
+
+    def _state_block(self, plan, review, verify, width, height):
         """Plan, verification and review together: the state of the task, in rows.
 
         The order is the pipeline's -- plan, then what was run, then what was
@@ -1417,7 +1589,8 @@ class PanelState:
         would cost the cards the rows that make them readable. `/plan`,
         `/verify` and `/review` say the same things on any width.
         """
-        if mode != "two_column" or not (plan or review or verify):
+        if mode != "two_column" or not (plan or review or verify
+                                        or self.capabilities_now()):
             return panel_rows(self.records(), width, height=height,
                               selected=self.selected, stream=self.stream)
         room = None if height is None else max(0, int(height) - PLAN_SHARED_MIN)
@@ -1445,7 +1618,12 @@ class PanelState:
         `/verify` and `/review` are the way in at that width, exactly as
         `/agents` is.
         """
-        if not (plan or review or verify):
+        # The capabilities block can hold the column on its own. What the
+        # user authorised is true from the moment they pressed Enter, and
+        # the three blocks below it appear as the work reaches them -- so a
+        # turn that asked for a review says so while the work is still
+        # being done rather than only once the verdict lands.
+        if not (plan or review or verify or self.capabilities_now()):
             return None
         mode, left, width = layout(columns)
         if mode != "two_column":

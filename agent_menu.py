@@ -28,9 +28,10 @@ import agent_config
 import agent_models
 from agent_live_renderer import LiveRegion
 from agent_ui import (
-    DIM, GRADIENT_TICK, RESET, _color, _supports_color, clip_to_width,
-    cycle_text, display_width, fit_to_width, gradient_phase, iter_graphemes,
-    pad_to_width, plain_output, safe_write, visible_width, wrap_lines,
+    BOLD, DIM, GRADIENT_TICK, RESET, UNDERLINE, _color, _supports_color,
+    clip_to_width, cycle_text, display_width, fit_to_width, gradient_phase,
+    iter_graphemes, pad_to_width, plain_output, safe_write, visible_width,
+    wrap_lines,
 )
 
 FALLBACK_VERSION = "0.1.0"
@@ -1923,12 +1924,20 @@ def caret_in(rows, text, cursor):
     return 0, 0
 
 
-def visible_field(text, cursor, inner, max_rows=INPUT_MAX_ROWS):
-    """The rows to draw, and where the caret is among them.
+def visible_field_rows(text, cursor, inner, max_rows=INPUT_MAX_ROWS):
+    """The rows to draw as (start index, row text), and where the caret is.
 
-    Returns (rows, caret row, caret column, hidden above, hidden below). Past
-    `max_rows` the field scrolls: the window follows the caret, because the
-    one row that must always be on screen is the one being typed into.
+    Everything `visible_field` returns, except that each row keeps the offset
+    into `text` that `layout_field` worked out for it. That offset is what
+    anything painting INSIDE the field needs: the field wraps at a column and
+    not at a word, so a row is an arbitrary slice of the line and a token
+    found by searching the row alone could be half of a longer one that
+    happens to have wrapped. Matching against the whole line and mapping the
+    answers back onto rows is the only way to be right about that.
+
+    The window arithmetic lives here and only here, with `visible_field` a
+    view onto it, because two copies of "which rows are on screen" would be
+    two things to keep agreeing with the caret.
     """
     rows = layout_field(text, inner)
     caret_row, caret_column = caret_in(rows, text, cursor)
@@ -1938,8 +1947,105 @@ def visible_field(text, cursor, inner, max_rows=INPUT_MAX_ROWS):
         top = caret_row - max_rows + 1
     top = min(top, max(0, len(rows) - max_rows))
     shown = rows[top:top + max_rows]
-    return ([body for _, body in shown], caret_row - top, caret_column,
+    return (shown, caret_row - top, caret_column,
             top, max(0, len(rows) - top - len(shown)))
+
+
+def visible_field(text, cursor, inner, max_rows=INPUT_MAX_ROWS):
+    """The rows to draw, and where the caret is among them.
+
+    Returns (rows, caret row, caret column, hidden above, hidden below). Past
+    `max_rows` the field scrolls: the window follows the caret, because the
+    one row that must always be on screen is the one being typed into.
+    """
+    shown, caret_row, caret_column, above, below = visible_field_rows(
+        text, cursor, inner, max_rows)
+    return ([body for _, body in shown], caret_row, caret_column, above, below)
+
+
+# Where the capability commands sit on the gradient, and how far across one
+# token it travels. Red at the slash, through orange, to green at the last
+# character -- the one thing on this surface that carries the gradient, and it
+# carries the whole of it because what it marks is a switch the user has just
+# turned on.
+#
+# A FIXED phase, and that is not a preference either. The prompt box repaints
+# only when its composed frame differs from the last one, which is what stops
+# the caret walking to the foot of the box and back twelve times a second
+# while somebody sits and thinks. `gradient_phase()` reads the clock, so an
+# animated token would make every frame different from the last and put that
+# flicker straight back -- for a surface that is being typed into, which is
+# the one place it is least tolerable. Fixed, the token is the same colour in
+# every frame, two frames of an untouched box stay byte-identical, and the
+# repaint is skipped exactly as it was before this existed.
+CAPABILITY_PHASE = 0.0
+CAPABILITY_SPREAD = 0.5
+
+
+def capability_spans(text):
+    """Every capability command in the text, as (start, end, name).
+
+    A thin pass-through to `agent_capabilities.spans`, which is the one parser
+    for these commands: what the box paints and what the runtime authorises
+    are then the same question asked once. Guarded to nothing, because an
+    editable install freezes its module list and a module the entry point
+    cannot see must cost the user a colour rather than the prompt.
+    """
+    try:
+        import agent_capabilities
+        return agent_capabilities.spans(text)
+    except Exception:
+        return ()
+
+
+def paint_capabilities(body, start, spans, stream):
+    """One field row with its capability commands picked out.
+
+    `start` is where `body` begins in the line, so a span found against the
+    whole line lands on the right characters here even though the field wraps
+    mid-word.
+
+    Painted AFTER the row has been fitted, never before. `fit_to_width`
+    measures with `display_width`, which counts the bytes of an escape
+    sequence as columns, so a row styled first would be trimmed through the
+    middle of an escape and leave half of one on the screen -- the rule
+    `agent_panel._row` states in its own docstring. Fitting only ever removes
+    a suffix, so a span past the end of what survived is simply dropped.
+
+    Three ways out, in order. With colour, the gradient. With ANSI but no
+    colour -- NO_COLOR on a real terminal -- weight and a rule, so the token
+    is still marked as something other than prose. With neither, which is
+    every piped, redirected and scripted run, the text exactly as it was: the
+    row still reads `/plan`, which is the command spelled out, so nothing has
+    been said in colour that was not also said in words.
+    """
+    if not spans or not body:
+        return body
+    coloured = _supports_color(stream)
+    ansi = bool(getattr(stream, "isatty", lambda: False)())
+    if not coloured and not ansi:
+        return body
+    end = start + len(body)
+    out, cut = [], 0
+    for begin, finish, _ in spans:
+        if finish <= start or begin >= end:
+            continue
+        # Clipped to the row, so a command split across two visual rows is
+        # painted on both of them rather than on neither.
+        here, there = max(begin - start, 0), min(finish - start, len(body))
+        if there <= cut:
+            continue
+        here = max(here, cut)
+        out.append(body[cut:here])
+        token = body[here:there]
+        if coloured:
+            out.append(cycle_text(token, stream, CAPABILITY_PHASE,
+                                  spread=CAPABILITY_SPREAD))
+        else:
+            out.append(BOLD + UNDERLINE + token + RESET)
+        cut = there
+    out.append(body[cut:])
+    return "".join(out)
 
 
 class LineEditor:
@@ -2412,7 +2518,12 @@ class PromptBox:
             # And a third, for the third thing the session empties between
             # turns. A panel holding the object it was built with would go on
             # drawing the checks that ran for a task that is over.
-            verify=lambda: getattr(self.session, "verify", None))
+            verify=lambda: getattr(self.session, "verify", None),
+            # And a fourth, for what the user authorised. Re-read between
+            # turns like the three above, so a panel holding the object it
+            # was built with would go on saying a finished task's permissions
+            # are this one's.
+            capabilities=lambda: getattr(self.session, "capabilities", None))
         return self._panel_state
 
     def _agents_text(self):
@@ -2836,15 +2947,36 @@ class PromptBox:
         vertically past that. The caret row is what `_frame` turns into the
         distance the caret has to be moved up from the foot of the box.
 
+        The rows come back PAINTED, with any `/plan`, `/review` or `/verify`
+        in them carrying the gradient. Done here rather than in `_frame`
+        because this is where the row is fitted, and the two have to happen in
+        this order and nowhere apart: fitting measures escape sequences as
+        though they took columns, so a row painted first would be cut through
+        the middle of one.
+
+        Nothing about the caret changes. `caret_in` measures the raw editing
+        buffer and `_place` moves the terminal cursor in columns, so neither
+        of them ever looks at a row's content -- which is what makes it safe
+        to put zero-width escapes into it.
+
         The placeholder never wraps. It is one line of shadow text standing in
         for an empty field, and a hint that grew the box would be a suggestion
         rearranging the screen before it had been taken.
         """
         if editor.placeholder_visible:
+            # Not painted. The placeholder is TMT's own words standing in for
+            # an empty field -- "Describe your next task" -- so a command
+            # highlighted in it would be marking something the user has not
+            # typed and has not authorised. `_frame` dims the whole row, and a
+            # RESET from inside would end that dim early.
             return [fit_to_width(editor.placeholder, inner)], 0, 0
-        rows, caret_row, caret_column, _, _ = visible_field(
+        shown, caret_row, caret_column, _, _ = visible_field_rows(
             editor.value, editor.cursor, inner, max_rows)
-        return [fit_to_width(row, inner) for row in rows], caret_row, caret_column
+        spans = capability_spans(editor.value)
+        rows = [paint_capabilities(fit_to_width(body, inner), start, spans,
+                                   self.stream)
+                for start, body in shown]
+        return rows, caret_row, caret_column
 
     def _read_line(self, editor, moment=None):
         """Draw the box once, then take a whole line from the input.
