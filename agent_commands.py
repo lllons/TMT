@@ -74,14 +74,23 @@ class Result:
     be unreachable from a pipe and from the test suite.
     """
 
-    __slots__ = ("title", "rows", "ok", "note", "prompt_for")
+    __slots__ = ("title", "rows", "ok", "note", "prompt_for", "to_menu")
 
-    def __init__(self, title, rows=(), ok=True, note="", prompt_for=""):
+    def __init__(self, title, rows=(), ok=True, note="", prompt_for="",
+                 to_menu=False):
         self.title = str(title)
         self.rows = list(rows)
         self.ok = bool(ok)
         self.note = str(note or "")
         self.prompt_for = str(prompt_for or "")
+        # The second thing the loop ACTS on rather than draws, beside
+        # `prompt_for`, and it is a flag rather than a screen for the reason
+        # this module has no screens at all: a handler decides what is true,
+        # and drawing the startup menu -- raw keys, a live region, a terminal
+        # that has to be put back afterwards -- is the session loop's to do.
+        # A command that returned a menu would make this module depend on the
+        # whole interface to answer one question.
+        self.to_menu = bool(to_menu)
 
     def __repr__(self):
         return "Result(title=%r, rows=%d, ok=%s)" % (self.title, len(self.rows), self.ok)
@@ -364,6 +373,34 @@ def _clear(argument, session):
             ("Workspace", str(workspace))]
     return Result("Conversation cleared", rows,
                   note="The next question starts fresh. No files were touched.")
+
+
+def _back(argument, session):
+    """Step out to the startup menu. The session is left exactly as it is.
+
+    Nothing is ended, cleared, cancelled or waited for: the conversation is
+    still the conversation, any background agents go on running, and the menu
+    that opens offers Resume where it offered Start. That is the whole of what
+    this command means -- it is a way to reach Settings and Help without
+    losing a session, which before this was only reachable by quitting.
+
+    The work of drawing the menu is the session loop's; this says the user
+    asked for it and reports what is being left behind, so a piped run -- which
+    has no menu to draw and skips it -- still gets an answer that says what
+    happened.
+    """
+    del argument
+    rows = []
+    if session is not None:
+        turns = len(session)
+        rows.append(("Session", "%d turn%s, kept"
+                     % (turns, "" if turns == 1 else "s")))
+        provider, model, workspace = _facts(session)
+        rows.append(("Model", _model_label(model, provider)))
+        rows.append(("Workspace", str(workspace)))
+    return Result("Back to the menu", rows, to_menu=True,
+                  note="Choose Resume to come back to this session. Nothing "
+                       "has been stopped or forgotten.")
 
 
 def _effort(argument, session):
@@ -712,6 +749,7 @@ _HANDLERS = {
     "model": _model,
     "note": _note,
     "agents": _agents,
+    "back": _back,
     "plan": _plan,
     # Beside `/plan` because it is the same subject, and in pipeline order:
     # the plan is what TMT said it would do, the verification is what it ran
@@ -723,6 +761,7 @@ _HANDLERS = {
 
 SUMMARY = {
     "agents": "what the background agents are doing",
+    "back": "step out to the menu, keeping the session",
     "context": "what the conversation looks like now",
     "config": "the settings a request runs under",
     "clear": "forget the conversation, keep everything else",
@@ -736,6 +775,7 @@ SUMMARY = {
 
 USAGE = {
     "agents": "/agents",
+    "back": "/back",
     "context": "/context",
     "config": "/config",
     "clear": "/clear",

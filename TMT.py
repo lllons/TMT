@@ -22,6 +22,7 @@ if _INSTALL_DIR in sys.path:
 sys.path.insert(0, _INSTALL_DIR)
 
 import agent_config
+import agent_menu
 from agent_menu import (
     BottomPad, PromptBox, TypeAhead, clear_screen, opening_pad, render_command,
     render_status, render_task, run_startup,
@@ -810,6 +811,73 @@ def _dispatch_command(task, session, manager, slow=None):
     return agent_commands.dispatch(task, session)
 
 
+def _still_running(manager):
+    """What is still working, as a phrase, or "" when nothing is.
+
+    Everything a session can have out at once, not only the fleet: the note
+    agent and the reviewer live in slots of their own and `active_count`
+    counts neither, so asking it alone would offer Settings while a review was
+    reading the tree. All three are reasons the provider and the model must
+    not move underneath them.
+
+    Guarded to "", which is the safe direction here rather than the cautious
+    one: a register that cannot answer must not be able to lock the user out
+    of Settings for the rest of the session.
+    """
+    if manager is None:
+        return ""
+    try:
+        parts = []
+        agents = int(manager.active_count())
+        if agents:
+            parts.append("%d agent%s" % (agents, "" if agents == 1 else "s"))
+        for record, name in ((manager.note(), "a note"),
+                             (manager.review(), "a review")):
+            if record is not None and not record.is_terminal():
+                parts.append(name)
+        return ", ".join(parts)
+    except Exception:
+        return ""
+
+
+def _return_to_menu(session, manager, prompt_box, pad, root):
+    """Step out to the startup menu and come back. True to resume, False to quit.
+
+    What `/back` is: the session is left exactly as it is -- the conversation,
+    the plan, every running agent -- and the startup menu is drawn over it
+    with Resume where Start was. Nothing here touches the session, and that is
+    the whole feature; the only state that changes is the screen.
+
+    The settings are re-read on the way back for the reason `main` reads them
+    on the way in: the user may have just changed one, and a setting that is
+    written and never re-read lasts until the next launch and then quietly
+    reverts. That was a real bug once, which is what `refresh_effort` exists
+    for.
+
+    A run that cannot draw a menu -- a pipe, a script, the test suite --
+    resumes at once without clearing anything. `run_startup` would return
+    "start" there anyway; what this avoids is the clear and the second header
+    that would follow it, which on a pipe is output nobody asked for.
+    """
+    if not agent_menu.is_interactive(sys.stdout):
+        return True
+    choice = run_startup(workspace=root, resuming=True,
+                         busy=lambda: _still_running(manager))
+    if choice == "exit":
+        return False
+    agent_config.refresh_model()
+    agent_config.refresh_effort()
+    agent_config.refresh_auto_update()
+    # The menu owned the screen and has just let it go. The session opens
+    # again the way it opened the first time -- cleared, header at the top --
+    # and the pad is counted again from the row the cursor is now on, which is
+    # the one moment it is answerable.
+    clear_screen()
+    drawn = render_status(workspace=root, prompt=False)
+    pad.reset(opening_pad(drawn or 0))
+    return True
+
+
 def _session_loop(root):
     """Ask, answer, repeat, until the user leaves."""
     # The header is drawn once, as the session opens: the wordmark, the date,
@@ -954,6 +1022,16 @@ def _session_loop(root):
                     answer = slow(lambda: agent_commands.run_note(
                         asked.strip(), session, manager))
                     pad.take(2 + (render_command(answer) or 0))
+            # `/back`. The menu is drawn over the session and the session is
+            # untouched behind it: nothing is cleared, nothing is cancelled,
+            # no agent is waited for. Choosing Exit there ends TMT, which is
+            # the same thing Exit has always meant on that screen.
+            if getattr(answered, "to_menu", False):
+                if not _return_to_menu(session, manager, prompt_box, pad, root):
+                    break
+                # The screen is new but the conversation is not, so the hint
+                # the last turn left is still the right thing to suggest.
+                continue
             continue
         # The question, into scrollback. The box that collected it is a live
         # region and has already been taken down, so this is the only record

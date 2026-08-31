@@ -53,6 +53,58 @@ MENU_ITEMS = (
     ("exit", "Exit", "Close TMT without starting a session"),
 )
 
+# What the first row says when the menu was reached by `/back` rather than by
+# launching. It keeps the `start` key, because it is the same choice -- go and
+# work -- and giving it a key of its own would mean every caller of this menu
+# had to learn a second word for the same answer.
+RESUME_ITEM = ("start", "Resume", "Go back to the session, which is still here")
+
+# What is said INSTEAD of the Settings row while work is still running. The
+# button is genuinely gone -- there is nothing to select and nothing to press
+# -- and this is a dim line above the list rather than a row in it, because a
+# button that silently vanished would read as a fault in TMT. Every refusal in
+# this program says what happened and what would change it; this is that rule
+# applied to an absence.
+BUSY_NOTE = ("Settings are not offered while work is running: %s. "
+             "Wait for it to finish, then /back again.")
+
+# What Exit means when there is a session behind the menu. The word is the
+# same and the consequence is not: this one ends a conversation that is still
+# alive, and a menu that did not say so would let somebody lose it by pressing
+# Enter on the row they pressed Enter on last time.
+RESUME_EXIT_DETAIL = "Close TMT and end the session"
+
+
+def menu_items(resuming=False, busy=False):
+    """The menu's rows for this moment.
+
+    Two substitutions and a removal, and all three are about what is true right
+    now rather than about taste. Coming back from a session, Start is Resume --
+    pressing it does not begin anything, it returns to something -- and Exit
+    says that it ends the session, because the word is the same as it was at
+    launch and the consequence is not. And while any work is still running
+    Settings is not offered at all, because the provider, the key and the model
+    are read while a request is in flight, and changing one underneath a
+    running agent lands a change nobody asked for in the middle of a request
+    that had already started.
+
+    The keys are unchanged, so a caller acts on `start`, `settings`, `help`
+    and `exit` exactly as it always has -- and `settings` simply is not among
+    them while work is running, which is what makes the removal a guarantee
+    rather than a hidden row somebody could still reach.
+    """
+    items = []
+    for entry in MENU_ITEMS:
+        if entry[0] == "start" and resuming:
+            items.append(RESUME_ITEM)
+        elif entry[0] == "settings" and busy:
+            continue
+        elif entry[0] == "exit" and resuming:
+            items.append((entry[0], entry[1], RESUME_EXIT_DETAIL))
+        else:
+            items.append(entry)
+    return tuple(items)
+
 HELP_LINES = (
     ("head", "TMT"),
     ("body", "A command-line coding agent. It works inside one project"),
@@ -72,6 +124,7 @@ HELP_LINES = (
     ("body", "the API key for it, and the model. The free models listed there"),
     ("body", "are OpenRouter's. Enter saves a choice for every later run."),
     ("body", "OPENROUTER_MODEL overrides the model, TMT_PROVIDER the provider."),
+    ("body", "Type /back in a session to reach this menu without losing it."),
     ("gap", ""),
     ("head", "Tips"),
     ("body", "Describe the outcome you want, not the keystrokes to reach it."),
@@ -474,13 +527,22 @@ def _field(name, value, stream, width, name_width=10):
     return _dim(line[:head], stream) + line[head:]
 
 
-def _option_row(is_selected, label, detail, stream, phase, width, label_width, suffix=""):
+def _option_row(is_selected, label, detail, stream, phase, width, label_width,
+                suffix="", live=False):
     """One selectable row.
 
     The '>' marker carries the selection on its own; colour only reinforces
     it, because colour is not always available. `suffix` is protected from
     trimming -- it marks the active model, which a narrow terminal must not be
     allowed to hide.
+
+    `live` is for a row that is saying something about itself rather than
+    about being chosen: Resume, which means "the session you left is still
+    running behind this menu". It rides the colour cycle whether or not the
+    cursor is on it, so it goes on moving while the user reads Help -- which
+    is exactly when it has something to say. A selected row already cycles, so
+    this only changes the unselected case, and the word is still "Resume" with
+    every escape stripped.
     """
     line = " " + ("> " if is_selected else "  ") + pad_to_width(label, label_width)
     head_width = display_width(line)
@@ -493,6 +555,13 @@ def _option_row(is_selected, label, detail, stream, phase, width, label_width, s
         return line
     if is_selected:
         return cycle_text(line, stream, phase, spread=0.7)
+    if live:
+        # The label alone, not the whole row: the detail beside it is ordinary
+        # explanatory text and belongs at the one neutral like every other
+        # unselected row's, and animating a sentence somebody is reading is
+        # the thing the design rules refuse.
+        return (cycle_text(line[:head_width], stream, phase, spread=0.7)
+                + _dim(line[head_width:], stream))
     return line[:head_width] + _dim(line[head_width:], stream)
 
 
@@ -507,8 +576,14 @@ def _rule(stream, phase, width):
 
 
 def render_startup_frame(selected=0, stream=None, model_id=None, workspace=None,
-                         size=None, phase=None):
-    """The whole startup screen as a list of ready-to-paint lines."""
+                         size=None, phase=None, resuming=False, busy=""):
+    """The whole startup screen as a list of ready-to-paint lines.
+
+    `resuming` is whether a session is waiting behind this menu, which turns
+    Start into Resume. `busy` is what is still running, as a phrase for the
+    note -- an empty string means nothing is, and is what removes the note and
+    puts the Settings row back.
+    """
     stream = sys.stdout if stream is None else stream
     columns, rows = _terminal(size)
     phase = gradient_phase() if phase is None else phase
@@ -516,11 +591,18 @@ def render_startup_frame(selected=0, stream=None, model_id=None, workspace=None,
     glyph = _glyphs(stream)
     model_id = model_id or agent_models.current_model()
     workspace = agent_config.ROOT_DIR if workspace is None else workspace
+    items = menu_items(resuming=resuming, busy=bool(busy))
 
     label = agent_models.describe(model_id)
     if agent_models.is_overridden():
         label += "  (forced by OPENROUTER_MODEL)"
-    label_width = max(display_width(item[1]) for item in MENU_ITEMS)
+    # Measured over every label this menu can EVER show, not over the ones
+    # showing now. Removing Settings shortens the longest label, so a column
+    # measured from what is present would slide the whole detail column left
+    # the moment work started and back again when it stopped -- a horizontal
+    # reflow, on screen, triggered by a worker finishing somewhere else.
+    label_width = max(display_width(item[1])
+                      for item in MENU_ITEMS + (RESUME_ITEM,))
 
     # Which service will answer is as much a fact about the next request as
     # which model will, and a provider with no key has to say so here rather
@@ -539,9 +621,18 @@ def render_startup_frame(selected=0, stream=None, model_id=None, workspace=None,
         _field("Workspace", str(workspace), stream, width),
         _rule(stream, phase, width),
     ]
+    if busy:
+        # Above the list, dim, and not a row in it. The Settings button is
+        # genuinely gone -- there is nothing there to select -- and this says
+        # why, because a button that vanished without a word would read as a
+        # fault rather than as a rule.
+        for text in _wrap_words(BUSY_NOTE % busy, max(1, width - 1)):
+            body.append(_dim(fit_to_width(" " + text, width), stream))
+        body.append("")
     body.extend(
-        _option_row(index == selected, item[1], item[2], stream, phase, width, label_width)
-        for index, item in enumerate(MENU_ITEMS)
+        _option_row(index == selected, item[1], item[2], stream, phase, width,
+                    label_width, live=(resuming and item[0] == "start"))
+        for index, item in enumerate(items)
     )
     body.append("")
     body.append(_footer(stream, ("{up}/{down} Navigate", "Enter Select")))
@@ -1053,6 +1144,22 @@ class BottomPad:
         room = max(0, rows - 1 - int(height))
         slack = self.rows + PROMPT_HEIGHT + (rows - self.height)
         return max(0, min(slack - int(height), room))
+
+    def reset(self, rows=0, height=None):
+        """Count the pad again, because the screen has been cleared under it.
+
+        The one thing that invalidates a pad without the window changing size:
+        `/back` draws the startup menu over the session and comes back to a
+        cleared screen with a fresh header on it, so the distance from the
+        cursor to the foot is a different number and every row this had spent
+        is spent no longer. Reset IN PLACE rather than rebound, because the
+        prompt box was handed this object when the session opened and a new
+        one here would leave the box holding the old count -- the same rule
+        every state object in TMT follows for the same reason.
+        """
+        self.rows = max(0, int(rows))
+        self.height = int(height) if height else None
+        return self.rows
 
     def take(self, lines):
         """Give up `lines` rows to something printed permanently."""
@@ -3144,11 +3251,33 @@ def _drive(render, key_reader, region, on_key):
 
 
 def main_menu(stream=None, key_reader=None, region=None, model_id=None,
-              workspace=None, selected=0):
+              workspace=None, selected=0, resuming=False, busy=None,
+              cursor=None):
     """Run the startup menu and return the chosen action.
 
     One of "start", "settings", "help" or "exit". Exhausted input, Esc, q and
     Ctrl-C all answer "exit", so no path leaves the caller waiting.
+
+    `busy` is a CALLABLE answering what is still running, re-asked on every
+    frame, because a background agent can finish while the menu is open and
+    the Settings row has to come back when it does. A plain value would freeze
+    the answer at the moment the menu opened.
+
+    **The cursor is kept on a KEY and not on an index**, which is the whole of
+    what makes a disappearing row safe. Settings is removed while work runs
+    and comes back when it stops, so an index would slide by one under a
+    cursor nobody moved -- and the row it slid onto is Exit, which ends the
+    session. Tracking the name means the cursor stays on the thing the user
+    put it on, and lands on the first row when that thing is gone.
+
+    `cursor` is that key from the OUTSIDE, and it exists because the same bug
+    came back through the caller. `run_startup` reopens this menu after
+    Settings and after Help and says where to put the cursor; it used to say
+    it as a number, and with Settings removed the number 2 is Exit rather than
+    Help -- so reading Help during a busy session left the cursor on the row
+    that ends it. `selected` is still taken, and is still an index, so every
+    existing caller and test means what it meant; `cursor` wins when it names
+    a row that is actually there.
     """
     stream = sys.stdout if stream is None else stream
     if key_reader is None:
@@ -3156,20 +3285,44 @@ def main_menu(stream=None, key_reader=None, region=None, model_id=None,
             return "start"
         key_reader = _default_reader()
     region = LiveRegion(stream) if region is None else region
-    state = {"selected": selected % len(MENU_ITEMS)}
+    busy = (lambda: "") if busy is None else busy
+
+    def running():
+        """What is still running, as a phrase, guarded to nothing."""
+        try:
+            return str(busy() or "")
+        except Exception:
+            return ""
+
+    opening = menu_items(resuming=resuming, busy=bool(running()))
+    keys = [item[0] for item in opening]
+    state = {"key": cursor if cursor in keys else opening[selected % len(opening)][0]}
+
+    def place(items):
+        """Where the cursor sits in `items`, and never off the end of them."""
+        for index, item in enumerate(items):
+            if item[0] == state["key"]:
+                return index
+        state["key"] = items[0][0]
+        return 0
 
     def render():
-        return render_startup_frame(state["selected"], stream, model_id, workspace)
+        note = running()
+        items = menu_items(resuming=resuming, busy=bool(note))
+        return render_startup_frame(place(items), stream, model_id, workspace,
+                                    resuming=resuming, busy=note)
 
     def on_key(key):
         if key in (None, "esc", "quit", "interrupt"):
             return "exit"
+        items = menu_items(resuming=resuming, busy=bool(running()))
+        index = place(items)
         if key == "up":
-            state["selected"] = (state["selected"] - 1) % len(MENU_ITEMS)
+            state["key"] = items[(index - 1) % len(items)][0]
         elif key == "down":
-            state["selected"] = (state["selected"] + 1) % len(MENU_ITEMS)
+            state["key"] = items[(index + 1) % len(items)][0]
         elif key == "enter":
-            return MENU_ITEMS[state["selected"]][0]
+            return items[index][0]
         return None
 
     return _drive(render, key_reader, region, on_key)
@@ -3403,7 +3556,8 @@ def help_screen(stream=None, key_reader=None, region=None):
     return None
 
 
-def run_startup(stream=None, key_reader=None, model_id=None, workspace=None):
+def run_startup(stream=None, key_reader=None, model_id=None, workspace=None,
+                resuming=False, busy=None):
     """Show the startup screen once and return what the user chose.
 
     Returns "start" to enter TMT, or "exit" to quit. Returns "start" without
@@ -3413,6 +3567,11 @@ def run_startup(stream=None, key_reader=None, model_id=None, workspace=None):
     key_reader was supplied: a piped or scripted run must never be able to
     reach a read, whoever called it. The individual screens are the seam for
     driving the menu without a terminal.
+
+    `resuming` and `busy` are what `/back` brings: a session is waiting behind
+    this menu, so Start reads Resume, and whatever `busy()` names is still
+    running, so Settings is not offered. Both default to the launch shape, so
+    the one call `main` makes is unchanged.
     """
     stream = sys.stdout if stream is None else stream
     if not is_interactive(stream):
@@ -3426,6 +3585,7 @@ def run_startup(stream=None, key_reader=None, model_id=None, workspace=None):
     region = LiveRegion(stream)
     workspace = agent_config.ROOT_DIR if workspace is None else workspace
     selected = 0
+    cursor = None
     try:
         _hide_cursor(stream)
         # The menu is a screen, so it starts at the top of one rather than
@@ -3433,21 +3593,34 @@ def run_startup(stream=None, key_reader=None, model_id=None, workspace=None):
         clear_screen(stream)
         # Only when TMT has no way to reach a model at all. Anyone who already
         # has a provider goes straight to the menu and changes it in Settings.
-        if not provider_is_configured():
+        #
+        # Never when resuming: a session that is running got past this at
+        # launch, and a provider form in front of somebody who pressed /back
+        # to reach Help would be asking a question that has already been
+        # answered.
+        if not resuming and not provider_is_configured():
             provider_setup(stream=stream, key_reader=key_reader, region=region,
                            text_reader=text_reader)
         while True:
             choice = main_menu(stream=stream, key_reader=key_reader, region=region,
-                               model_id=model_id, workspace=workspace, selected=selected)
+                               model_id=model_id, workspace=workspace,
+                               selected=selected, resuming=resuming, busy=busy,
+                               cursor=cursor)
             if choice == "settings":
-                selected = 1
+                # Where the cursor goes when this menu reopens, said as the
+                # ROW rather than as its position. It used to be a number, and
+                # a number is wrong the moment a row can be missing: with work
+                # running there is no Settings row, so index 2 is Exit and
+                # reading Help left the cursor on the thing that ends the
+                # session the user pressed /back to keep.
+                cursor = choice
                 chosen = settings_screen(stream=stream, key_reader=key_reader,
                                          region=region, active_id=model_id,
                                          text_reader=text_reader)
                 if chosen:
                     model_id = chosen
             elif choice == "help":
-                selected = 2
+                cursor = choice
                 help_screen(stream=stream, key_reader=key_reader, region=region)
             elif choice == "exit":
                 return "exit"

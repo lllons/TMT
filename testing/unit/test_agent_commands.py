@@ -109,7 +109,8 @@ def test_every_command_in_the_table_has_a_summary_and_a_usage_line():
     command added without them would offer a blank row or crash a refusal."""
     assert set(agent_commands.names()) == {"context", "config", "clear",
                                            "effort", "model", "note",
-                                           "agents", "plan", "verify", "review"}
+                                           "agents", "back", "plan", "verify",
+                                           "review"}
     for name in agent_commands.names():
         assert agent_commands.SUMMARY.get(name), name
         assert agent_commands.USAGE.get(name, "").startswith("/" + name), name
@@ -120,8 +121,9 @@ def test_every_command_in_the_table_has_a_summary_and_a_usage_line():
 def test_typing_a_slash_offers_the_commands_and_narrows_as_you_type():
     assert [name for name, _ in agent_commands.completions("/")] == [
         "/context", "/config", "/clear", "/effort", "/model", "/note",
-        "/agents", "/plan", "/verify", "/review"]
+        "/agents", "/back", "/plan", "/verify", "/review"]
     assert [name for name, _ in agent_commands.completions("/mo")] == ["/model"]
+    assert [name for name, _ in agent_commands.completions("/b")] == ["/back"]
     assert [name for name, _ in agent_commands.completions("/c")] == [
         "/context", "/config", "/clear"]
     assert [name for name, _ in agent_commands.completions("/co")] == [
@@ -430,7 +432,8 @@ def test_the_caret_counts_the_rows_offered_under_the_line():
     assert len(rows) == 4 and up == agent_menu._INPUT_ROW, (len(rows), up)
     assert rows[-up].strip().startswith("> fix"), rows
 
-    for typed, offered in (("/mo", 1), ("/c", 3), ("/", 10)):
+    for typed, offered in (("/mo", 1), ("/c", 3),
+                           ("/", len(agent_commands.names()))):
         rows, column, up = frame_for(typed)
         assert len(rows) == 4 + offered, (typed, len(rows))
         assert up == agent_menu._INPUT_ROW + offered, (typed, up)
