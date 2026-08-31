@@ -700,6 +700,152 @@ def plan_rows(plan, width, height=None, stream=None):
     return rows
 
 
+# --- the review block ------------------------------------------------------
+#
+# The third thing that wants this column, drawn under the plan and above the
+# agents panel. Two or three rows: what the review is doing, and what it
+# found. It is deliberately small -- the plan stays the primary task display,
+# exactly as the brief asks, and a review that took eight rows to say
+# "passed" would have taken them from the steps.
+
+REVIEW_TITLE = "REVIEW"
+
+# The same four positions the plan uses, and for the same reason: these are
+# the places `success`, `background_agent`, `warning` and `error` already hold
+# on TMT's one gradient. A passed review is green, a running one orange, a
+# warning amber and a failure red -- which is the mapping the brief asks for,
+# reached without adding a colour to the program.
+REVIEW_PASSED_POSITION = PLAN_DONE_POSITION
+REVIEW_RUNNING_POSITION = PLAN_ACTIVE_POSITION
+REVIEW_WARNING_POSITION = PLAN_BLOCKED_POSITION
+REVIEW_FAILED_POSITION = PLAN_PENDING_POSITION
+
+_REVIEW_POSITIONS = {
+    "passed": REVIEW_PASSED_POSITION,
+    "running": REVIEW_RUNNING_POSITION,
+    "warnings": REVIEW_WARNING_POSITION,
+    "failed": REVIEW_FAILED_POSITION,
+    "error": REVIEW_FAILED_POSITION,
+    "idle": REVIEW_RUNNING_POSITION,
+}
+
+# Colour is never the message here either. Every state carries a mark, the
+# marks are distinct with the escapes stripped, and `review_marks` asks the
+# stream about the marks themselves as well as about decoration generally --
+# a terminal that draws a box rule but not a filled circle would otherwise put
+# a replacement character on the one row the user is looking for.
+_REVIEW_MARKS = {"passed": "✓", "running": "●", "warnings": "!",
+                 "failed": "✗", "error": "✗", "idle": "○"}
+_REVIEW_ASCII_MARKS = {"passed": "+", "running": ">", "warnings": "!",
+                       "failed": "x", "error": "x", "idle": "-"}
+
+# The most rows the review block takes. Three: the header, the state, and one
+# line of counts. A block that grew with the findings would push the plan out
+# of a column the plan owns, and `/review` is where the findings are read in
+# full.
+REVIEW_MAX_ROWS = 3
+
+# The fewest rows each half of the task block is worth drawing in. A plan
+# needs its header, its rule and one step -- `plan_rows` cannot return fewer
+# than three rows for a plan that has any steps at all, so this is a
+# measurement of that function rather than a preference. A review needs its
+# header and its state; the counts row is what it gives up first.
+PLAN_MIN_ROWS = 3
+REVIEW_MIN_ROWS = 2
+
+
+def review_marks(stream=None):
+    """The state marks this stream can actually show."""
+    if plain_output(stream) or not encodable(stream, "".join(_REVIEW_MARKS.values())):
+        return _REVIEW_ASCII_MARKS
+    return _REVIEW_MARKS
+
+
+def review_rows(review, width, height=None, stream=None):
+    """The review block, painted, every row at most `width` columns.
+
+    Nothing at all for a review that has not started and found nothing --
+    which is most turns. A heading over "no review yet" would put a permanent
+    empty box beside every conversational question, and the column is shared.
+
+    `height` is how many rows it may take; below two it draws nothing, because
+    a header without its state is a word with no news in it.
+    """
+    stream = sys.stdout if stream is None else stream
+    width = max(1, int(width))
+    if review is None:
+        return []
+    try:
+        # `ReviewState.__bool__` is exactly "is there anything to show", and
+        # it is defined on that class for this row. An untouched review draws
+        # nothing at all.
+        if not review:
+            return []
+        # The state to DRAW, not the one stored. A stale pass is still
+        # `passed` in the state machine and must not be drawn with the passed
+        # mark, because a green tick beside work the gate is refusing is the
+        # one way this column can actively mislead.
+        state = str(review.display)
+        headline = review.headline()
+        cycles, most = review.cycles, review.max_cycles
+        blocking = review.blocking_count()
+        counts = review.counts()
+    except Exception:
+        # Decoration is never allowed to end a turn. A review object that
+        # raises is drawn as no review, exactly as `PanelState.records`
+        # treats a register that raises as no agents.
+        return []
+    room = REVIEW_MAX_ROWS if height is None else min(REVIEW_MAX_ROWS, int(height))
+    if room < 2:
+        return []
+    marks = review_marks(stream)
+    position = _REVIEW_POSITIONS.get(state, REVIEW_RUNNING_POSITION)
+    # The review in flight counts as the one being done, so a first review
+    # reads "REVIEW 1/3" while it runs rather than "0/3" -- the number the
+    # user wants is which round this is, not how many have already finished.
+    numbered = cycles + 1 if state == "running" else cycles
+    rows = [_row("%s %d/%d" % (REVIEW_TITLE, numbered, most), width, stream,
+                 position=position),
+            _row("%s %s" % (marks.get(state, "?"), headline), width, stream,
+                 position=position)]
+    if room < 3:
+        return rows
+    # The third row is only drawn when it has something to say that the second
+    # does not. "Review passed" over "0 blocking" is the same fact twice, and
+    # the row is worth more to the plan. A running review has nothing to count
+    # yet, and a stale one's counts belong to a review that no longer applies
+    # -- its second row already says what is true of it.
+    if state == "running" or review.stale:
+        return rows
+    tail = ""
+    if blocking:
+        tail = "%d blocking, %d suggestion(s)" % (blocking, counts.get("SUGGESTION", 0))
+    elif any(counts.values()):
+        tail = "%d finding(s), none blocking" % sum(counts.values())
+    if not tail:
+        return rows
+    rows.append(_row("  " + tail, width, stream, position=position))
+    return rows
+
+
+def review_report(review):
+    """What `/review` prints: the whole state as permanent text.
+
+    The unambiguous alternate to the block, and the only way in on a terminal
+    too narrow to hold two columns -- exactly as `/plan` and `/agents` are for
+    theirs. It goes to the permanent surface, so it is a record rather than a
+    frame, and it carries the findings in full because that is the thing the
+    column has no room for.
+    """
+    if review is None:
+        return ("Independent review is not available in this session, so "
+                "nothing has been reviewed.")
+    try:
+        return review.describe()
+    except Exception as error:
+        return "The review state could not be read: %s" % error
+
+
 def plan_report(plan):
     """What `/plan` prints: the plan as permanent text.
 
@@ -825,7 +971,7 @@ class PanelState:
     frame and know nothing about what ended up in it.
     """
 
-    def __init__(self, manager=None, stream=None, plan=None):
+    def __init__(self, manager=None, stream=None, plan=None, review=None):
         self.manager = manager
         self.stream = sys.stdout if stream is None else stream
         self.open = False
@@ -836,6 +982,11 @@ class PanelState:
         # drawing a task that is over. Nothing here caches it, for the same
         # reason nothing here caches an agent record.
         self.plan = plan
+        # The task's review, as an object or as a callable returning one, and
+        # a callable for exactly the reason the plan is: the session empties
+        # it between turns, and a panel holding the object it was built with
+        # would go on drawing the verdict on a task that is over.
+        self.review = review
         # The reason the panel could not open, shown once and cleared by the
         # next thing that happens. It is a live message about a live gesture,
         # so it belongs on the temporary surface with the box that carries it.
@@ -942,6 +1093,20 @@ class PanelState:
             return None
         return plan or None
 
+    def review_now(self):
+        """The review to draw right now, or None when there is nothing to draw.
+
+        An untouched review is None here, the same bargain `plan_now` strikes:
+        `ReviewState.__bool__` is whether anything has happened, and a heading
+        over "no review yet" beside every conversational question would be a
+        permanent empty box in a column two other things want.
+        """
+        try:
+            review = self.review() if callable(self.review) else self.review
+        except Exception:
+            return None
+        return review or None
+
     def frame(self, columns, rows=None):
         """(left columns, join) for a region this wide, or None for no column.
 
@@ -959,17 +1124,18 @@ class PanelState:
         """
         columns = int(columns)
         plan = self.plan_now()
+        review = self.review_now()
         if not self.open:
-            return self._plan_frame(columns, rows, plan)
+            return self._task_frame(columns, rows, plan, review)
         mode, left, width = layout(columns)
         if mode == "refused":
             self.open = False
             self.message = can_open(columns)
-            return self._plan_frame(columns, rows, plan)
+            return self._task_frame(columns, rows, plan, review)
         # Two rows kept back for the status row under the region and the spare
         # row a region never draws on.
         height = None if rows is None else max(1, int(rows) - 2)
-        body = self._shared_rows(plan, width, height, mode)
+        body = self._shared_rows(plan, review, width, height, mode)
         content = max(1, columns - 1)
 
         def join(left_rows):
@@ -977,23 +1143,67 @@ class PanelState:
 
         return (left, join)
 
-    def _shared_rows(self, plan, width, height, mode):
-        """The column when the agents panel has focus: plan on top, panel below.
+    def _task_block(self, plan, review, width, height):
+        """The plan and the review together: the state of the task, in rows.
 
-        In panel-only mode the panel takes the whole column and the plan is
-        not drawn. The panel is the thing with focus there, the window is
-        already too narrow for two columns, and a plan squeezed in above it
-        would cost the cards the rows that make them readable. `/plan` says
-        the same thing on any width.
+        The review sits UNDER the plan, always. The plan is the primary task
+        display and keeps the top of the column where the eye already looks
+        for it, and it keeps the column outright when there is not room for
+        both -- `/review` is the way to the verdict at that height, exactly as
+        `/plan` is at a width too narrow for any column at all.
+
+        Between those two extremes the review is kept and the plan is
+        shortened, because the two degrade differently. A plan short of rows
+        still says `PLAN 4/9` and shows the steps around the active one, so
+        what is missing is visible and countable. A review short of rows says
+        nothing, and nothing reads as "not reviewed" -- which is the one thing
+        about a reviewed task that must never be implied.
+
+        `height` is the rows the pair may take together, or None for as many
+        as they want. The blank row between them is drawn only when both
+        halves have something in them.
         """
-        if mode != "two_column" or not plan:
+        if height is None:
+            steps = plan_rows(plan, width, stream=self.stream)
+            block = review_rows(review, width, stream=self.stream)
+            return steps + [""] + block if (steps and block) else (steps or block)
+        room = max(0, int(height))
+        block = review_rows(review, width, height=min(REVIEW_MAX_ROWS, room),
+                            stream=self.stream)
+        steps = plan_rows(plan, width, height=room, stream=self.stream)
+        if not block:
+            return steps
+        if not steps:
+            return block
+        if room >= len(block) + PLAN_MIN_ROWS + 1:
+            # Room for both as they are. The plan takes everything the review
+            # and the divider do not.
+            return (plan_rows(plan, width, height=room - len(block) - 1,
+                              stream=self.stream) + [""] + block)
+        if room >= REVIEW_MIN_ROWS + PLAN_MIN_ROWS + 1:
+            # Room for both only if each is cut to its floor. The review gives
+            # up its counts row first; the plan gives up steps.
+            return (plan_rows(plan, width, height=PLAN_MIN_ROWS,
+                              stream=self.stream)
+                    + [""] + block[:room - PLAN_MIN_ROWS - 1])
+        return plan_rows(plan, width, height=room, stream=self.stream)
+
+    def _shared_rows(self, plan, review, width, height, mode):
+        """The column when the agents panel has focus: task on top, panel below.
+
+        In panel-only mode the panel takes the whole column and the task block
+        is not drawn. The panel is the thing with focus there, the window is
+        already too narrow for two columns, and a plan squeezed in above it
+        would cost the cards the rows that make them readable. `/plan` and
+        `/review` say the same things on any width.
+        """
+        if mode != "two_column" or not (plan or review):
             return panel_rows(self.records(), width, height=height,
                               selected=self.selected, stream=self.stream)
         room = None if height is None else max(0, int(height) - PLAN_SHARED_MIN)
-        block = plan_rows(plan, width,
-                          height=PLAN_SHARED_MAX if room is None
-                          else min(PLAN_SHARED_MAX, room),
-                          stream=self.stream)
+        block = self._task_block(plan, review, width,
+                                 PLAN_SHARED_MAX if room is None
+                                 else min(PLAN_SHARED_MAX, room))
         if room is not None and room < PLAN_SHARED_MIN:
             # Not enough rows for both. The panel wins: it was opened by a
             # deliberate gesture a moment ago and it is what the keys are
@@ -1004,23 +1214,23 @@ class PanelState:
                            selected=self.selected, stream=self.stream)
         return block + ([""] if block else []) + panel
 
-    def _plan_frame(self, columns, rows, plan):
-        """(left columns, join) for the plan alone, or None.
+    def _task_frame(self, columns, rows, plan, review):
+        """(left columns, join) for the plan and review alone, or None.
 
         Refused below the two-column threshold rather than taking the whole
         region the way an open panel does. An open panel has focus and is not
-        accepting input anywhere else; a plan is something to glance at while
-        typing, and one that swallowed the prompt box would take away the
-        thing the user was using. `/plan` is the way in at that width, exactly
-        as `/agents` is.
+        accepting input anywhere else; a plan and a verdict are things to
+        glance at while typing, and either one swallowing the prompt box would
+        take away the thing the user was using. `/plan` and `/review` are the
+        way in at that width, exactly as `/agents` is.
         """
-        if not plan:
+        if not (plan or review):
             return None
         mode, left, width = layout(columns)
         if mode != "two_column":
             return None
         height = None if rows is None else max(1, int(rows) - 2)
-        body = plan_rows(plan, width, height=height, stream=self.stream)
+        body = self._task_block(plan, review, width, height)
         if not body:
             return None
         content = max(1, columns - 1)

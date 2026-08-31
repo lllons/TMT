@@ -150,6 +150,24 @@ def _plan_state(context):
     return (context or {}).get("plan")
 
 
+def _review_veto(context, plan, obj):
+    """The refusal for a plan update the review will not allow, or "".
+
+    Guarded to nothing at every step. A turn with no review state, an install
+    where `agent_review` will not import, or a veto that raises all let the
+    update through: keeping a plan current is how the user knows where the
+    work is, and a refinement on that display must never be able to stop it.
+    """
+    review = _review_state(context)
+    if review is None:
+        return ""
+    try:
+        import agent_review
+        return agent_review.plan_veto(review, plan, obj)
+    except Exception:
+        return ""
+
+
 def _plan(context, obj):
     """Run one `plan` operation against the turn's plan.
 
@@ -171,6 +189,21 @@ def _plan(context, obj):
     if operation not in agent_plan.OPERATIONS:
         return ("FAILED: '%s' is not a plan operation. Use one of: %s."
                 % (obj.get("operation"), ", ".join(agent_plan.OPERATIONS)))
+    # A review step cannot be completed by saying it is complete. Checked here
+    # rather than inside agent_plan so that module stays pure state and knows
+    # nothing about reviews, and refused BEFORE the operation runs so a vetoed
+    # update leaves no trace of having happened -- the same rule the loop's
+    # own gate follows for a refused respond.
+    #
+    # It is a refinement and not the guarantee, and `agent_review.plan_veto`
+    # says so in its own docstring: it rests on the step's title naming
+    # review, which a model can avoid. What cannot be avoided is the gate on
+    # the final answer, which is driven by ReviewState and does not care what
+    # any step is called. This keeps the plan on screen honest; that keeps the
+    # answer honest.
+    vetoed = _review_veto(context, plan, obj)
+    if vetoed:
+        return vetoed
     try:
         if operation == "create":
             return plan.create(obj.get("steps"))
@@ -193,6 +226,200 @@ def _plan(context, obj):
         # corrupted plan must never take the session with it.
         return "FAILED: the plan could not be updated (%s: %s)." % (
             type(error).__name__, error)
+
+
+# --- the independent review ------------------------------------------------
+#
+# One verb, and it BLOCKS. The session loop is synchronous and has no event
+# loop to suspend into, so a review is an action that takes a while rather
+# than a state the loop enters -- the same shape `wait_for_agents` already
+# has, and for the same reason. Blocking is also what makes the snapshot
+# stable: while this call is out, the main agent is not running actions, so
+# nothing it does can move the tree the reviewer is reading.
+
+_NO_REVIEW_STATE = (
+    "Independent review is not available here, so 'review' did nothing and "
+    "nothing has been reviewed. Do not claim the work was reviewed. Check the "
+    "change yourself with git_diff and the file tools, and say in your final "
+    "message that no independent review ran."
+)
+
+_REVIEW_NEEDS_AGENTS = (
+    "Independent review needs background agents and they are not available "
+    "here, so 'review' did nothing and nothing has been reviewed. Do not "
+    "claim the work was reviewed."
+)
+
+_WORKERS_STILL_RUNNING = (
+    "REFUSED: %d background agent(s) are still running (%s), and they can "
+    "write to this workspace while the reviewer reads it -- the review would "
+    "be of a state that never existed. Collect them with wait_for_agents (or "
+    "stop them with kill_agent), then request the review again."
+)
+
+# The values "scope" understands. One, for now, and a wrong one is named
+# rather than ignored: a model that asked for "changed_files" and silently got
+# a whole-task review would draw the wrong conclusion from the answer.
+REVIEW_SCOPES = ("current_task",)
+
+
+def _review_state(context):
+    """The review state for this turn, or None when there is not one.
+
+    `(context or {}).get(...)` for the reason `_manager` and `_plan_state`
+    give: a background agent's context has no such key at all, and neither has
+    an install where the session never wired one in. Both must come back as
+    words rather than a KeyError that ends the turn.
+    """
+    return (context or {}).get("review")
+
+
+def _verification_text(review):
+    """What actually ran this turn, as the reviewer is told it.
+
+    An observation and never a verdict. TMT does not read a program's output
+    for whether it succeeded -- that is the rule that once called a green test
+    run a failure -- so this says what was executed and leaves what it proves
+    to the agent that can read the output.
+    """
+    ran = review.verification
+    if not ran:
+        return ("Nothing was executed in this session. There is no evidence "
+                "here that the change was verified; treat it as unverified "
+                "unless you find evidence in the repository itself.")
+    return ("These ran in this session (that they ran is all TMT recorded -- "
+            "what they proved is yours to judge):\n%s"
+            % "\n".join("  " + line for line in ran))
+
+
+def _review_snapshot(agent_review, context, obj, review):
+    """The repository state this review is taken against.
+
+    Built once, here, at the moment the review starts, and held in memory --
+    nothing of TMT's is written into the workspace. Every git call is guarded
+    by `_run_git`, so a repository that cannot be read becomes a sentence in
+    the brief rather than an exception: a workspace with no git at all is a
+    perfectly reviewable workspace, and refusing to review it would be
+    refusing the wrong thing.
+    """
+    plan = _plan_state(context)
+    paths = obj.get("paths") if isinstance(obj.get("paths"), (list, tuple)) else None
+    notes = []
+    claim = str(obj.get("notes") or obj.get("focus") or "").strip()
+    if claim:
+        # Carried, and labelled as a CLAIM. The implementing agent is allowed
+        # to point the reviewer at something; it is not allowed to be believed
+        # about it, and the reviewer's rules say so in the same words.
+        notes.append("The implementing agent says: %s\n(That is its own claim "
+                     "about its own work. Check it against the repository "
+                     "rather than accepting it.)" % claim)
+    if paths:
+        notes.append("The diff below was narrowed to: %s. Widen it yourself "
+                     "with git_diff if that looks incomplete."
+                     % ", ".join(str(p) for p in paths))
+    return agent_review.ReviewSnapshot(
+        task=str((context or {}).get("task") or ""),
+        plan_text=plan.describe() if plan is not None else "",
+        plan_complete=bool(plan.is_complete()) if plan is not None else False,
+        root=_run_git(lambda g: str(g.TMTGit.discover().root)),
+        status=_run_git(_git_status),
+        diff=_run_git(lambda g: g.TMTGit.discover().diff(paths=paths)),
+        stat=_run_git(lambda g: g.TMTGit.discover().diff_stat(paths=paths)),
+        commit=_run_git(lambda g: g.TMTGit.discover().head()),
+        changed_paths=review.changed_paths,
+        verification=_verification_text(review),
+        notes=notes)
+
+
+def _review(context, obj):
+    """Run one independent review and return what it found.
+
+    The whole lifecycle in one call, because the loop has nowhere to park a
+    half-finished one: refuse or begin, snapshot, spawn a read-only reviewer,
+    block on it, parse what it said, settle the state, report.
+
+    Every failure between those steps lands in `ReviewState.fail`, which is
+    the ERROR state, which blocks the final answer. That is section 21 of the
+    brief and it is the single most important line in this function: a
+    reviewer that crashed, timed out or returned nonsense must never be
+    mistaken for a reviewer that approved the work.
+    """
+    review = _review_state(context)
+    if review is None:
+        return _NO_REVIEW_STATE
+    try:
+        import agent_review
+    except Exception as error:
+        # The frozen-module-list failure `_run_tool` guards against. It is
+        # reported as an unavailable review rather than a passed one, and the
+        # state is untouched, so the gate goes on holding the answer.
+        return "Independent review is unavailable: %s" % error
+    scope = str(obj.get("scope") or REVIEW_SCOPES[0]).strip().lower()
+    if scope not in REVIEW_SCOPES:
+        return ("FAILED: '%s' is not a review scope. Use one of: %s."
+                % (obj.get("scope"), ", ".join(REVIEW_SCOPES)))
+    agent_manager_mod, agent_worker_mod, problem = _agent_modules()
+    if problem:
+        return problem
+    manager = _manager(context)
+    if manager is None:
+        return _REVIEW_NEEDS_AGENTS
+    running = [record for record in manager.list() if not record.is_terminal()]
+    if running:
+        # Section 22. A reviewer reading a tree that another agent is writing
+        # to is reviewing a state that never existed, and every finding it
+        # made would be about a moment that had already passed.
+        return _WORKERS_STILL_RUNNING % (
+            len(running), ", ".join("#%s" % record.id for record in running))
+    held = review.begin()
+    if held:
+        return held
+    try:
+        snapshot = _review_snapshot(agent_review, context, obj, review)
+    except Exception as error:
+        return "FAILED: %s" % review.fail(
+            "the review snapshot could not be built (%s: %s)"
+            % (type(error).__name__, error))
+    review.snapshot = snapshot
+    try:
+        record = manager.spawn(snapshot.describe(), kind="review",
+                               model=obj.get("model"), effort=obj.get("effort"))
+    except Exception as error:
+        return "FAILED: %s" % review.fail(
+            "the reviewer could not be created (%s: %s)"
+            % (type(error).__name__, error))
+    started = manager.start(
+        record, lambda rec, mgr: agent_worker_mod.run_review(rec, mgr))
+    if started is None:
+        return "FAILED: %s" % review.fail(
+            "the reviewer could not be started; it is %s" % record.status)
+    seconds = _timeout(obj)
+    finished = manager.wait([record.id], timeout=seconds)
+    if record.id not in finished:
+        # Killed rather than abandoned. A reviewer still reading while the
+        # main agent resumes editing would be reporting on a tree that has
+        # moved, and its answer could arrive long after the finding was true.
+        manager.kill(record.id)
+        return "FAILED: %s" % review.fail(
+            "the reviewer did not report within %d seconds and was stopped "
+            "(its last activity was %r)" % (int(seconds), record.activity or "none"))
+    if record.status != agent_manager_mod.Status.COMPLETED:
+        return "FAILED: %s" % review.fail(
+            "the reviewer stopped without reviewing: %s"
+            % (record.error or "it gave no reason"))
+    answer = (manager.result(record.id) or "").strip()
+    if not answer:
+        return "FAILED: %s" % review.fail("the reviewer produced no result")
+    try:
+        result = agent_review.parse_result(answer, number=review.cycles + 1)
+    except agent_review.ReviewError as error:
+        # THE line that keeps section 15 honest. Text that does not validate
+        # is not a review, whatever it claims about itself, and it leaves the
+        # task in ERROR rather than passing.
+        return "FAILED: %s" % review.fail(
+            "the reviewer's result could not be read: %s" % error)
+    review.settle(result)
+    return result.describe()
 
 
 def _agent_modules():
@@ -515,6 +742,12 @@ def execute_action(obj, context=None):
     # in MUTATING_ACTIONS and does not invalidate the cached system prompt --
     # the workspace is exactly as it was.
     if action == "plan": return _plan(context, obj)
+    # The independent review. It touches no file -- the reviewer is refused
+    # every writing verb before dispatch -- so it is not in MUTATING_ACTIONS
+    # and the cached prompt still describes the workspace correctly. It does
+    # BLOCK, for as long as the reviewer runs or the timeout allows, exactly
+    # as the two wait verbs do.
+    if action == "review": return _review(context, obj)
     # Understanding the repository. Each answers one question and no more, so
     # the model can pick the narrowest tool instead of reading whole files to
     # find one line.
@@ -649,7 +882,7 @@ ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     "delete_folder", "rename_file", "create_folder", "run_python", "run_file",
     "open_app", "git_status", "git_diff", "git_identity", "git_commit", "git_push",
     "tree", "find_text", "find_symbol", "replace_across", "code_map",
-    "related_tests", "remember", "recall", "plan",
+    "related_tests", "remember", "recall", "plan", "review",
     "spawn_agent", "agent_status", "agent_result", "wait_for_agent",
     "wait_for_agents", "kill_agent", "internal_response",
     "announce", "respond", "done",
@@ -711,6 +944,10 @@ _EVENT_KIND_FOR_ACTION = {
     # is following in the panel, and there are only ever a handful of them --
     # one per step, plus the one that made the plan.
     "plan": "milestone",
+    # A milestone for the reason `plan` is one, and more so: a review is the
+    # coarsest thing that happens in a turn, there is at most a handful of
+    # them, and its verdict is the fact the user most wants to see go past.
+    "review": "milestone",
     # `background_agent` already exists in agent_prompt.EVENT_TYPES, at
     # prominence level 1 and gradient position 40 beside milestone and tool.
     # A new element takes a place on the existing scale; it does not get a
@@ -755,6 +992,13 @@ _REPORTED_ACTIONS = frozenset((
     # be shown, and a refused operation comes back as "FAILED: ..." and is
     # read as the warning it is by the same markers every other action uses.
     "plan",
+    # Here for `_describe` rather than for the marker scan, which
+    # `action_event` overrides for this one action. Its first line is TMT's
+    # own headline -- "REVIEW PASSED", "REVIEW FAILED - 2 blocking issues" --
+    # so it is exactly the short specific sentence this set is for, and
+    # describing the request instead would put the bare word "Review" in the
+    # transcript where the verdict belongs.
+    "review",
 ))
 
 
@@ -810,6 +1054,22 @@ def action_event(action, obj, result):
         failed = any(marker in lowered for marker in _FAILURE_MARKERS)
     if action == "git_push" and text == PUSH_BLOCKED:
         failed = True
+    if action == "review":
+        # Decided by an exact prefix on a sentence THIS program wrote, and
+        # never by the marker scan above. A review's result carries the
+        # reviewer's own prose -- titles, evidence, a summary -- and a passing
+        # review that said "the tests that used to fail now pass" would be
+        # labelled a failure by any substring search for "fail". That is the
+        # false alarm that once called a green test run a failure, and this is
+        # the one action where the reviewer's words are guaranteed to be full
+        # of the words the scan looks for.
+        #
+        # Both passing verdicts begin "REVIEW PASSED"; a failure, an error,
+        # a refusal and an unavailable review all begin with something else,
+        # and every one of those is a warning rather than a success.
+        failed = not text.startswith("REVIEW PASSED")
+        if not failed:
+            kind = "success"
 
     if failed:
         # A refusal is not a crash, and a missing file is not a broken agent.

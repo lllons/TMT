@@ -422,6 +422,44 @@ class TMTGit:
             return "(no changes)"
         return _clip(_scrub("\n\n".join(sections)), MAX_DIFF_CHARS)
 
+    def diff_stat(self, paths=None):
+        """`git diff --stat`, staged and unstaged, as one block of text.
+
+        The shape of a change before its content: which files, how many lines
+        each way. An independent review starts here rather than in the diff
+        itself -- a stat that names eleven files when the task described two
+        is a finding on its own, and reading twenty thousand characters of
+        hunks to arrive at the same sentence is the expensive way round.
+
+        Read-only and never raises for an empty change; a repository with
+        nothing to show returns '(no changes)' exactly as `diff` does.
+        """
+        targets = self._paths(paths)
+        limit = ["--"] + targets if targets else []
+        staged = self._run(["diff", "--no-color", "--stat", "--cached"] + limit).stdout
+        unstaged = self._run(["diff", "--no-color", "--stat"] + limit).stdout
+        sections = []
+        if staged.strip():
+            sections.append("Staged:\n" + staged.rstrip())
+        if unstaged.strip():
+            sections.append("Unstaged:\n" + unstaged.rstrip())
+        if not sections:
+            return "(no changes)"
+        return _clip(_scrub("\n\n".join(sections)), MAX_DIFF_CHARS)
+
+    def head(self):
+        """The commit a review is taken against, as one line, or "".
+
+        "" rather than a raise, and that is the point of it being separate
+        from `commit_details`: a repository with no commits yet is a perfectly
+        ordinary thing to review, and a review that could not start because
+        `git log` had nothing to say would be refusing the first commit of
+        every project.
+        """
+        result = self._run(["log", "-1", "--no-color", "--format=%h %s"],
+                           check=False)
+        return _scrub(result.stdout.strip())
+
     def stage(self, paths):
         """Stage the given paths and return the ones git actually holds staged."""
         targets = self._paths(paths)

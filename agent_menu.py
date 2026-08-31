@@ -2404,7 +2404,11 @@ class PromptBox:
             return None
         self._panel_state = agent_panel.PanelState(
             self.manager, stream=self.stream,
-            plan=lambda: getattr(self.session, "plan", None))
+            plan=lambda: getattr(self.session, "plan", None),
+            # A callable for the reason the plan is one: the session empties
+            # its review between turns, and a panel holding the object it was
+            # built with would go on drawing the verdict on a finished task.
+            review=lambda: getattr(self.session, "review", None))
         return self._panel_state
 
     def _agents_text(self):

@@ -33,6 +33,11 @@ from agent_config import (
 from agent_config import REQUIRED_KEYS
 from agent_actions import authorizes_push, batch_summary, build_result_message, execute_action, trim_messages
 from agent_actions import READ_ONLY_ACTIONS, ACTION_LABELS, MAX_TURNS, action_event
+# The paths an action named, taken from the request rather than parsed back
+# out of the result. Imported rather than reimplemented: `note_work` needs
+# exactly the list the transcript's own events are built from, and a second
+# copy of that rule here would drift from the first without anything failing.
+from agent_actions import _paths_named
 from agent_model import (
     PARSE_FAILURE, ask_model, is_prose, is_synthetic, synthetic_reason,
 )
@@ -207,6 +212,152 @@ def plan_held_line(session):
         return "Plan not finished. Continuing."
     return _PLAN_HELD % (len(outstanding), "" if len(outstanding) == 1 else "s",
                          "%s %s" % (outstanding[0].id, outstanding[0].title))
+
+
+def review_block(session, obj):
+    """The refusal for a terminal action the review will not allow yet, or "".
+
+    The second half of the completion gate, sitting beside `plan_block` at
+    both terminal sites and asked immediately after it. Two conditions, and
+    NEITHER excuses the other: a complete plan does not excuse a review that
+    failed, and a passed review does not excuse a plan with steps left. The
+    brief asks for both to be enforced and this is what "both" means -- two
+    questions asked in sequence, each able to hold the answer on its own.
+
+    It is code and not a prompt rule for the reason the plan's gate is: a
+    model told it must be reviewed is a model that can decide it has been.
+    Here, a `respond` that arrives without a passing review is not executed at
+    all. And it cannot be argued into passing either, because nothing the
+    model writes reaches `ReviewState`: the only thing that moves that state
+    is `agent_review.parse_result` over a reviewer agent's own output.
+
+    Exempt on the same three grounds `plan_block` is exempt, and one more.
+    A turn where no review is REQUIRED is not gated, which is most turns. A
+    SYNTHETIC reply is a report this program made up about a failed call and
+    there is no model behind it to send back to. A state object that RAISES
+    lets the answer through. And a task that has been round the review loop
+    its full number of times is released rather than held forever -- see
+    `agent_review.limit_release`, which is the sentence that ending carries.
+    """
+    if session is None or not isinstance(obj, dict):
+        return ""
+    action = obj.get("action")
+    if not action or is_synthetic(obj):
+        return ""
+    try:
+        import agent_review
+        return agent_review.refusal(getattr(session, "review", None),
+                                    getattr(session, "plan", None), action)
+    except Exception:
+        return ""
+
+
+def review_held_line(session):
+    """The one line the user is shown when an answer was held for review."""
+    try:
+        import agent_review
+        return agent_review.held_line(getattr(session, "review", None),
+                                      getattr(session, "plan", None))
+    except Exception:
+        return "Review not finished. Continuing."
+
+
+# The actions whose whole purpose is to run something. Whether a run PROVED
+# anything is not decided here and is not decidable here -- reading a
+# program's output for the word "failed" is what once labelled a green test
+# run a failure -- so what is recorded is the fact that it ran and what it
+# was, and the reviewer is the one that reads the output and judges it.
+_VERIFYING_ACTIONS = ("run_file", "run_python")
+
+
+def note_work(session, action, obj):
+    """Tell the review state what this action actually did.
+
+    The one place the runtime learns whether a task is substantial, and it
+    learns it from actions that ran rather than from anything the model said
+    about them. That is what makes `is_required` unarguable: a model can
+    describe its work as small, and it cannot make `write_file` not have
+    happened.
+
+    Called after the action, beside the `MUTATING_ACTIONS` check that already
+    knows which actions write, so the one place that knows which verbs mutate
+    stays `agent_config` and `agent_review` stays pure state.
+
+    Guarded to nothing. A session with no review state, or a state that
+    raises, must not be able to end a turn that has already done its work.
+    """
+    review = getattr(session, "review", None) if session is not None else None
+    if review is None:
+        return
+    try:
+        if action in MUTATING_ACTIONS:
+            review.note_change(action, _paths_named(action, obj))
+        elif action in _VERIFYING_ACTIONS:
+            review.note_run(action, str((obj or {}).get("path") or ""))
+    except Exception:
+        pass
+
+
+def note_review_choice(session, task):
+    """Record whether the user's own words asked for a review, or for none.
+
+    The user's wording is authority in both directions and the model's is not,
+    which is why this is read from the task text once, here, exactly as
+    `authorizes_push` is. Silence is the usual case and is left as silence:
+    the runtime evidence decides then.
+    """
+    review = getattr(session, "review", None) if session is not None else None
+    if review is None:
+        return
+    try:
+        import agent_review
+        review.note_user_choice(agent_review.requests_review(task))
+    except Exception:
+        pass
+
+
+def review_release_warning(session):
+    """The line a released answer carries, or "" when nothing was released.
+
+    Section 14 of the brief, and the half of it that is easy to get wrong. The
+    cycle limit stops the review/fix loop; it must not also quietly stop the
+    user being told. When an answer goes out with a review that never passed,
+    this says so beside it.
+    """
+    try:
+        import agent_review
+        return agent_review.limit_release(getattr(session, "review", None))
+    except Exception:
+        return ""
+
+
+def completion_block(session, obj):
+    """The whole completion gate: (what to hand the model, what to show the user).
+
+    ("", "") when the answer may go out. Asked at both terminal sites, before
+    `execute_action` runs, so a refused `respond` leaves no trace of having
+    happened -- it sets no `acted`, emits no event and reaches no user.
+
+    The two conditions are asked in order and the FIRST to refuse decides,
+    which is also how the pair is told apart: the line the user sees comes
+    from whichever gate produced the refusal, rather than being guessed at
+    afterwards from the refusal's wording. Asking the gates again a moment
+    later could get a different answer -- a review settling on another thread
+    is enough -- and a user shown "plan not finished" for a review that failed
+    would go looking for the wrong thing.
+
+    The plan comes first because it is the coarser statement: a turn with
+    steps outstanding has not finished the work, and telling it what the
+    review made of unfinished work would be answering a question nobody has
+    reached yet.
+    """
+    held = plan_block(session, obj)
+    if held:
+        return held, plan_held_line(session)
+    held = review_block(session, obj)
+    if held:
+        return held, review_held_line(session)
+    return "", ""
 
 
 def is_announcement(obj):
@@ -630,12 +781,31 @@ def _session_loop(root):
                    # the right one and it is empty by the time the model can
                    # reach it. That is why the session resets the plan in
                    # place rather than assigning a new one.
-                   "plan": session.plan}
+                   "plan": session.plan,
+                   # The review for THIS task, put here for the same reason
+                   # and with the same warning as the plan above: the session
+                   # holds one ReviewState for its whole life and empties it
+                   # in `begin_turn`, a few lines below. Rebinding it there
+                   # would leave the review action writing into one object
+                   # while the completion gate read another -- the gate
+                   # silently off, with nothing anywhere to notice it by.
+                   "review": session.review,
+                   # The user's own words, verbatim. The reviewer treats this
+                   # as the source of truth and checks the implementation
+                   # against it, so it must be what was actually asked rather
+                   # than the model's account of what was asked.
+                   "task": task}
         # The request the turn starts from: the system prompt, the earlier
         # questions and answers this session has already had, and then the new
         # task. `pinned` is how much of that the loop's own trimming must
         # leave alone -- everything up to and including the task.
         messages, pinned = session.begin_turn(task, get_system_prompt())
+        # After `begin_turn`, never before: retiring the review resets every
+        # field on it, so a choice recorded a few lines earlier -- where the
+        # push authority is decided -- would be wiped by the retirement that
+        # runs between. Decided once from this task's wording alone, so
+        # nothing the model later writes can turn a required review off.
+        note_review_choice(session, task)
         last_raw, identical_count = "", 0
         live_ui = LiveUI()
         # The live area for this turn, drawn as one block at the foot of the
@@ -828,7 +998,7 @@ def _session_loop(root):
                     live_ui.intermediate_event("Processing...")
                     results = []
                     invalid = ""
-                    held = ""
+                    held = held_line = ""
                     for sub_obj in batch:
                         invalid = validate_action(sub_obj)
                         if invalid:
@@ -859,7 +1029,7 @@ def _session_loop(root):
                         # ends in a refused respond keeps everything it did
                         # before that entry -- those results are real work and
                         # are reported below with the refusal.
-                        held = plan_block(session, sub_obj)
+                        held, held_line = completion_block(session, sub_obj)
                         if held:
                             break
                         try:
@@ -879,7 +1049,14 @@ def _session_loop(root):
                             transcript.emit(action_event(sub_action, sub_obj, result)))
                         if sub_action in MUTATING_ACTIONS:
                             invalidate_prompt()
+                        note_work(session, sub_action, sub_obj)
                         if sub_action in ("done", "respond"):
+                            # Said before the answer, so an answer the review
+                            # never approved is never read without the reason
+                            # it was let out anyway.
+                            released = review_release_warning(session)
+                            if released:
+                                transcript.emit_kind("warning", released)
                             suggestion = finish_response(live_ui, relay, result,
                                                          transcript, turn_state,
                                                          pad)
@@ -902,7 +1079,7 @@ def _session_loop(root):
                         # The batch did its work and was stopped at the
                         # answer. The results go back with the refusal so the
                         # model is not asked to redo what already ran.
-                        transcript.emit_kind("warning", plan_held_line(session))
+                        transcript.emit_kind("warning", held_line)
                         relay.reset()
                         steps += 1
                         retries = 0
@@ -950,9 +1127,9 @@ def _session_loop(root):
                 # would set `acted` and emit an event for work that was
                 # refused -- and an action that is not allowed should not
                 # leave a trace of having happened.
-                held = plan_block(session, obj)
+                held, held_line = completion_block(session, obj)
                 if held:
-                    transcript.emit_kind("warning", plan_held_line(session))
+                    transcript.emit_kind("warning", held_line)
                     relay.reset()
                     live_ui.intermediate_event("Processing...")
                     steps += 1
@@ -991,6 +1168,11 @@ def _session_loop(root):
                     # "no JSON object found in response".
                     if is_synthetic(obj):
                         turn_state["outcome"] = str(result)
+                    # The same warning the batch path gives, in the same place
+                    # relative to the answer: before it.
+                    released = review_release_warning(session)
+                    if released:
+                        transcript.emit_kind("warning", released)
                     suggestion = finish_response(live_ui, relay, result,
                                                  transcript, turn_state, pad)
                 else:
@@ -998,6 +1180,7 @@ def _session_loop(root):
                     live_ui.intermediate_event(ACTION_LABELS.get(action, "Processing..."))
                 if action in MUTATING_ACTIONS:
                     invalidate_prompt()
+                note_work(session, action, obj)
                 if action in ("done", "respond"):
                     break
                 messages.extend([{"role": "assistant", "content": raw}, {"role": "user", "content": build_result_message(action, result, obj)}])

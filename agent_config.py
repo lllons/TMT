@@ -537,6 +537,19 @@ REQUIRED_KEYS = {
     # the user, and a worker has no user to make one with. agent_worker
     # refuses it outright as well, so the isolation is code and not wording.
     "plan": ["operation"],
+    # The independent review of this task's work. No required keys: a review
+    # is of everything that changed, and the optional "scope" only narrows it.
+    # Asking for one is all there is to ask -- there is deliberately no key
+    # that carries a verdict, because a verdict the model could write is a
+    # verdict the model could write for itself.
+    #
+    # Registered here and dispatched in agent_actions, documented ONLY in
+    # agent_prompt.REVIEW_REFERENCE, and refused outright by agent_worker:
+    # the same two-sided isolation `plan` has, and for a sharper reason. A
+    # review is the independent check on the main agent's work, so an agent
+    # that could review its own diff would be exactly the thing this feature
+    # exists to replace.
+    "review": [],
     "tree": [], "find_text": ["query"], "find_symbol": ["name"],
     "replace_across": ["search", "replace"], "code_map": ["target"],
     "related_tests": [], "remember": ["note"], "recall": [],

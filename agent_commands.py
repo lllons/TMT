@@ -466,6 +466,37 @@ def _plan(argument, session):
     return Result("Plan", [line for line in report.splitlines()])
 
 
+def _review(argument, session):
+    """What the independent review found, as text rather than as a block.
+
+    The unambiguous way in, and the only one on a terminal too narrow for two
+    columns -- and it is more than a convenience even on a wide one, because
+    the block is three rows and a review's findings are the part that does not
+    fit in three rows.
+
+    Read-only, and firmly so. A user cannot pass or fail a review from here
+    any more than the model can: the state moves only when a reviewer agent
+    reports, which is the whole property the feature rests on.
+    """
+    del argument
+    try:
+        import agent_panel
+    except Exception as error:
+        # Reported in words for the reason `_agents` gives: an editable
+        # install freezes its module list, and a module that is invisible to
+        # the entry point must not take a slash command down with it.
+        return Result("Review is unavailable",
+                      ["The panel module could not be loaded.", str(error)],
+                      ok=False)
+    review = getattr(session, "review", None) if session is not None else None
+    report = agent_panel.review_report(review)
+    # Prose rows rather than (label, value) pairs, and wrapped for the reason
+    # `/note` is wrapped: `render_command` fits every row with `fit_to_width`,
+    # which truncates, and a finding cut at the right-hand edge is half an
+    # answer presented as the answer.
+    return Result("Review", _wrapped_rows(report))
+
+
 def _note(argument, session):
     """Answer one question about the workspace, without disturbing anything.
 
@@ -613,6 +644,10 @@ _HANDLERS = {
     "note": _note,
     "agents": _agents,
     "plan": _plan,
+    # Beside `/plan` because it is the same subject: the plan is what TMT
+    # said it would do and the review is what an independent agent made of
+    # having done it.
+    "review": _review,
 }
 
 SUMMARY = {
@@ -624,6 +659,7 @@ SUMMARY = {
     "model": "which model answers",
     "note": "ask about the workspace without changing it",
     "plan": "the steps TMT is working through for this task",
+    "review": "what the independent review found",
 }
 
 USAGE = {
@@ -635,4 +671,5 @@ USAGE = {
     "model": "/model [<model id or name>]",
     "note": "/note <question about this workspace>",
     "plan": "/plan",
+    "review": "/review",
 }

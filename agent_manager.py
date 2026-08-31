@@ -268,6 +268,14 @@ class AgentManager:
         self._records = []
         self._by_id = {}
         self._note = None
+        # The review agent, held like the note agent and apart from the fleet
+        # for the same two reasons. It does not count against the cap -- a
+        # review is TMT auditing its own work rather than unattended work the
+        # main agent chose to start, and refusing one because five unrelated
+        # workers are busy would be refusing the wrong thing. And it does not
+        # draw a card: the review has its own block in the same column, and
+        # one thing drawn twice in two shapes reads as two things.
+        self._review = None
         self._listeners = []
         # One counter across both kinds, so no two live records can ever share
         # an id. `kill("2")` and `inspect("2")` address a record by that
@@ -319,6 +327,9 @@ class AgentManager:
         A note agent never counts against the cap and never raises: it is one
         read-only question the user asked directly, and refusing it because
         five unrelated workers are busy would be refusing the wrong thing.
+        A review agent is held apart for the same reason -- it is the quality
+        gate on the task, and a gate that can be crowded out by the work it is
+        gating is not a gate.
         """
         with self._lock:
             if kind == "worker":
@@ -338,6 +349,8 @@ class AgentManager:
             self._by_id[record.id] = record
             if kind == "note":
                 self._note = record
+            elif kind == "review":
+                self._review = record
             else:
                 self._records.append(record)
         self._emit([(AGENT_CREATED, record)])
@@ -472,6 +485,11 @@ class AgentManager:
             record = self._note
         return self.kill(record.id) if record is not None else False
 
+    def kill_review(self):
+        with self._lock:
+            record = self._review
+        return self.kill(record.id) if record is not None else False
+
     # --- reading ----------------------------------------------------------
 
     def inspect(self, agent_id):
@@ -486,6 +504,18 @@ class AgentManager:
     def note(self):
         with self._lock:
             return self._note
+
+    def review(self):
+        """The most recent review agent, or None. Not part of the fleet.
+
+        One slot rather than a list, exactly as the note has: a review runs to
+        completion before the action that started it returns, so two can never
+        be live at once, and the finished one is only ever wanted until the
+        next replaces it. Its findings live in `agent_review.ReviewState`,
+        which is where anything that outlives the agent belongs.
+        """
+        with self._lock:
+            return self._review
 
     def visible_agents(self, now=None):
         """The workers a panel should draw right now.

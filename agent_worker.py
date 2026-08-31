@@ -67,6 +67,23 @@ NOTE_ACTIONS = frozenset({
     "announce", "internal_response",
 })
 
+# Everything the review agent may do, and nothing else. Read-only by
+# construction in exactly the way NOTE_ACTIONS is, and a whitelist for exactly
+# the same reason: a blacklist silently admits every action added to TMT after
+# it was written, and the person adding the action is not the person who wrote
+# the blacklist.
+#
+# It is NOTE_ACTIONS plus `find_symbol`'s companions and nothing that writes.
+# The reviewer is deliberately not given `run_file`: a reviewer that runs the
+# code is a reviewer that changes what it is reviewing -- a test run writes
+# caches, a script writes files -- and it would also be reading a result it
+# produced rather than the one the implementing agent produced. What actually
+# ran this turn is put in its brief as an observed fact instead, and judging
+# what that proves is its job.
+#
+# `review` itself is absent, so a reviewer cannot start a review of its own.
+REVIEW_ACTIONS = frozenset(NOTE_ACTIONS)
+
 # What a worker may never do, whatever its prompt says. `git_push` because a
 # push needs the user's own words behind it and a worker's task text is
 # written by a model; `respond` and `done` because they are how a turn ends
@@ -76,7 +93,14 @@ NOTE_ACTIONS = frozenset({
 # panel. A worker writing to it would be editing the shape of a task it can
 # see only one step of, and a worker completing a step would let the main
 # agent finish on work the worker had merely claimed.
-WORKER_FORBIDDEN = frozenset({"git_push", "respond", "done", "plan"})
+# `review` for the same shape of reason, from the other end: a review is the
+# INDEPENDENT check on the main agent's work, and independence is the whole of
+# its value. A worker that could start one would be reviewing a diff it had
+# itself just written, and the reviewer agent -- which runs through this same
+# loop -- would be able to review its own review. Refused here in code as well
+# as being absent from every background prompt, so the isolation does not rest
+# on wording.
+WORKER_FORBIDDEN = frozenset({"git_push", "respond", "done", "plan", "review"})
 
 # Refused to every background agent, for a different reason from the verbs
 # above: these two are not the wrong shape for a worker, they are unreachable
@@ -133,6 +157,18 @@ _NOT_A_WORKER_VERB = (
 _NOT_A_NOTE_VERB = (
     "You are answering one question by reading the workspace and may not "
     "change it."
+)
+
+# The same refusal for the reviewer, in its own words. Threaded through the
+# loop rather than shared with the note's because a model told the wrong
+# reason reasonably looks for another route to the same effect -- the mistake
+# WORKER_NEEDS_TERMINAL was given its own sentence to avoid. A reviewer told
+# it is "answering one question" would reasonably conclude that fixing what it
+# found is somebody's job it might take on.
+_NOT_A_REVIEW_VERB = (
+    "You are reviewing work you did not write, and a reviewer that edits the "
+    "code is no longer independent of it. Report the finding instead; the "
+    "implementing agent makes the change."
 )
 
 _NEEDS_A_TERMINAL = (
@@ -199,8 +235,11 @@ def _default_prompt(kind):
         import agent_subprompts
     except Exception as error:
         raise RuntimeError("the %s prompt is unavailable: %s" % (kind, error))
-    return (agent_subprompts.note_prompt() if kind == "note"
-            else agent_subprompts.worker_prompt())
+    if kind == "note":
+        return agent_subprompts.note_prompt()
+    if kind == "review":
+        return agent_subprompts.review_prompt()
+    return agent_subprompts.worker_prompt()
 
 
 def _reply_flags(obj):
@@ -402,8 +441,15 @@ class _StreamSink:
             pass
 
 
-def _refusal(action, allowed, forbidden):
-    """The sentence refusing an action, or "" when it may run."""
+def _refusal(action, allowed, forbidden, read_only=_NOT_A_NOTE_VERB):
+    """The sentence refusing an action, or "" when it may run.
+
+    `read_only` is why this agent's whitelist exists, in its own words. It is
+    passed down rather than looked up because two whitelists can hold the same
+    verbs and mean different things by it: the note agent and the reviewer are
+    both read-only and are read-only for different reasons, and the reason is
+    the half of the sentence a model actually acts on.
+    """
     if action in WORKER_NEEDS_TERMINAL:
         # Checked ahead of both sets below, so the sentence names the real
         # reason. Told it was "not a worker verb" the model would reasonably
@@ -413,7 +459,7 @@ def _refusal(action, allowed, forbidden):
     if action in forbidden:
         return _REFUSED % (action, _NOT_A_WORKER_VERB)
     if allowed is not None and action not in allowed:
-        return _REFUSED % (action, _NOT_A_NOTE_VERB)
+        return _REFUSED % (action, read_only)
     return ""
 
 
@@ -430,8 +476,9 @@ def _stop(manager, record, sentence):
     return sentence
 
 
-def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden):
-    """The step loop both kinds of agent run. Returns its response string."""
+def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
+              read_only=_NOT_A_NOTE_VERB):
+    """The step loop every kind of agent runs. Returns its response string."""
     messages = [{"role": "system", "content": system_prompt},
                 {"role": "user", "content": record.task}]
     # The worker's own conversation, and never anybody else's. Assigned to the
@@ -570,7 +617,8 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden):
 
         if isinstance(obj.get("actions"), list) and obj["actions"]:
             outcome, response, ran = _run_batch(
-                obj["actions"], record, manager, dispatch, allowed, forbidden)
+                obj["actions"], record, manager, dispatch, allowed, forbidden,
+                read_only=read_only)
             if ran:
                 acted = True
             if outcome == "response":
@@ -607,7 +655,7 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden):
                          "in %d attempts" % retries)
 
         action = obj["action"]
-        refusal = _refusal(action, allowed, forbidden)
+        refusal = _refusal(action, allowed, forbidden, read_only)
         if refusal:
             if hand_back(raw, refusal):
                 continue
@@ -644,7 +692,8 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden):
                  % steps)
 
 
-def _run_batch(batch, record, manager, dispatch, allowed, forbidden):
+def _run_batch(batch, record, manager, dispatch, allowed, forbidden,
+               read_only=_NOT_A_NOTE_VERB):
     """Run a batch of actions. Returns (outcome, payload, ran_anything).
 
     `outcome` is "response" when an entry finished the agent, "invalid" when
@@ -665,7 +714,7 @@ def _run_batch(batch, record, manager, dispatch, allowed, forbidden):
         if invalid:
             return "invalid", _batch_complaint(invalid, results), ran
         action = entry["action"]
-        refusal = _refusal(action, allowed, forbidden)
+        refusal = _refusal(action, allowed, forbidden, read_only)
         if refusal:
             return "invalid", _batch_complaint(refusal, results), ran
         if action == "announce":
@@ -731,3 +780,29 @@ def run_note(record, manager, ask=None, execute=None, system_prompt=None):
                      execute or _default_execute(),
                      system_prompt if system_prompt is not None else _default_prompt("note"),
                      allowed=NOTE_ACTIONS, forbidden=WORKER_FORBIDDEN)
+
+
+def run_review(record, manager, ask=None, execute=None, system_prompt=None):
+    """Run the review agent: one independent audit of work it did not write.
+
+    The same loop again, with `REVIEW_ACTIONS` as a whitelist. Read-only is
+    enforced here, before dispatch, and is not left to the prompt: the brief
+    asks for a reviewer that cannot silently modify code, and a prompt is a
+    request where this is a guarantee.
+
+    Its `record.task` is the review brief -- the user's request, the plan, the
+    git status and the diff, built by `agent_review.ReviewSnapshot.describe`.
+    Everything past that it fetches itself with its read tools, which is the
+    difference between a reviewer that looked at the repository and one that
+    was handed a summary and agreed with it.
+
+    What comes back is the `response` of its single `internal_response`, and
+    `agent_review.parse_result` is the only thing allowed to turn that into a
+    review verdict.
+    """
+    return _run_loop(record, manager,
+                     ask or _default_ask(),
+                     execute or _default_execute(),
+                     system_prompt if system_prompt is not None else _default_prompt("review"),
+                     allowed=REVIEW_ACTIONS, forbidden=WORKER_FORBIDDEN,
+                     read_only=_NOT_A_REVIEW_VERB)

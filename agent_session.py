@@ -32,6 +32,7 @@ import json
 import agent_config
 import agent_models
 import agent_plan
+import agent_review
 from agent_ui import CHARS_PER_TOKEN
 
 # What one turn is allowed to contribute, and how much of the window all of
@@ -232,6 +233,16 @@ class Session:
         # The loop builds its context BEFORE it calls `begin_turn`, so that is
         # not a hypothetical.
         self.plan = agent_plan.Plan()
+        # The review of the task being worked on now, beside the plan and
+        # under exactly the same rules: one per turn, retired at `begin_turn`,
+        # built ONCE and emptied in place rather than rebound. The loop puts
+        # this object in the action context BEFORE it calls `begin_turn`, so
+        # assigning a new one here would leave the review action writing into
+        # state the completion gate is no longer reading -- the gate silently
+        # switched off, with no error anywhere to notice it by. That is the
+        # same trap the plan has, and it is written down twice because it is
+        # invisible from the call site both times.
+        self.review = agent_review.ReviewState()
 
     # --- what the next request runs under ---------------------------------
 
@@ -335,6 +346,14 @@ class Session:
         the session died on the next question the user asked.
         """
         self.plan.retire()
+        # The review goes with the plan, at the same moment and for the same
+        # reasons. Left standing, the previous task's failed review would
+        # refuse the answer to a question that has nothing to do with it, and
+        # the column would be showing a verdict on work the user had stopped
+        # asking about. Retired at the START of the next turn rather than at
+        # the end of this one, so a review that passed stays on screen beside
+        # the answer it let out.
+        self.review.retire()
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": str(system_prompt)})
@@ -479,6 +498,11 @@ class Session:
         place.
         """
         self.plan.retire()
+        # And the review with it. A session told to forget the conversation
+        # that would still refuse to answer until an invisible review had
+        # passed would be the worst of both, which is the sentence written
+        # above about the plan and is just as true here.
+        self.review.retire()
         self._turns = []
 
     def __len__(self):
