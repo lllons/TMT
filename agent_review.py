@@ -790,6 +790,26 @@ class ReviewState:
         # None means they did not say, which is the usual case.
         self.user_choice = None
         self.snapshot = None
+        # What each reviewer of this task cost, as the register measured it.
+        # An observation, exactly as `_verification` is, and kept here because
+        # the reviewer's own record ages off the screen after five seconds
+        # while this outlives the turn.
+        self._costs = []
+        # The checklist the current reviewer declared, as an
+        # `agent_reviewbot.Agenda`, or None before any review has run.
+        # Attached by `agent_actions._review` at the moment the reviewer is
+        # spawned, and it is the SAME object that hangs off that reviewer's
+        # `AgentRecord` -- the record is what the reviewer's own thread writes
+        # through and this is what outlives it, so `/review` and the strip
+        # under the progress bar report one list rather than two copies.
+        #
+        # It is a readout and nothing else. Nothing here reads it, no gate
+        # consults it, and a review whose reviewer declared no agenda at all
+        # passes and fails exactly as it did before this existed. That
+        # separation is deliberate: an agenda is the reviewer's own account of
+        # what it meant to do, and a gate driven by it would be a gate a
+        # reviewer could open by shortening its list.
+        self.agenda = None
 
     # --- reading ----------------------------------------------------------
 
@@ -923,6 +943,10 @@ class ReviewState:
                             % (len(self._changed_paths),
                                ", ".join(self._changed_paths[:12])))
             return "\n".join(rows)
+        cost = self.cost_line()
+        if cost:
+            rows.append(cost)
+        rows.extend(self._agenda_rows())
         if self.error:
             rows.append("Error: %s" % self.error)
         rows.append("Review %d of at most %d for this task."
@@ -939,6 +963,25 @@ class ReviewState:
         if last is not None:
             rows.extend(["", last.describe()])
         return "\n".join(rows)
+
+    def _agenda_rows(self, title="What the reviewer set out to check:"):
+        """The current reviewer's declared checklist, or no rows at all.
+
+        Guarded to nothing at every step, because this is a readout inside a
+        report: an agenda that cannot be described must cost `/review` those
+        rows and never the findings under them. That is the same bargain the
+        column strikes -- `review_rows` draws a review that raises as no
+        review -- applied to the permanent surface.
+        """
+        agenda = self.agenda
+        if agenda is None:
+            return []
+        try:
+            if not len(agenda):
+                return []
+            return ["", title, agenda.describe()]
+        except Exception:
+            return []
 
     # --- what the runtime observed ---------------------------------------
 
@@ -972,6 +1015,56 @@ class ReviewState:
     def note_user_choice(self, choice):
         """Record that the user asked for a review, or asked for none."""
         self.user_choice = None if choice is None else bool(choice)
+
+    def note_cost(self, tokens=None, exact=False, seconds=None):
+        """What the reviewer that just ran cost, from the register's figures.
+
+        An OBSERVATION and never a verdict, the same footing `note_run` sits
+        on: these are numbers `AgentManager` measured about a thread it owned,
+        and nothing here reads them for whether the review was any good.
+
+        It is recorded on the state rather than left on the `AgentRecord`
+        because the record ages out of the strip after five seconds and this
+        outlives the turn. Without it "what did that review cost" is a
+        question only answerable while the review is still on screen -- which
+        is the moment nobody is asking it.
+
+        Both halves are kept apart from `exact`, which travels with them: a
+        token figure the provider never reported is drawn with a leading `~`,
+        the rule everywhere else in TMT, and a total mixing one measured
+        number with one estimated one is an estimate.
+        """
+        self._costs.append({
+            "number": self.cycles + 1,
+            "tokens": max(0, int(tokens or 0)),
+            "exact": bool(exact),
+            "seconds": None if seconds is None else max(0.0, float(seconds)),
+        })
+
+    @property
+    def costs(self):
+        """What each reviewer of this task cost, in the order they ran."""
+        return tuple(dict(cost) for cost in self._costs)
+
+    def cost_line(self):
+        """One line naming what the last reviewer cost, or "".
+
+        Nothing at all when nothing was measured, rather than a row of zeroes
+        -- the rule the corner meter already follows, and the reason is the
+        same: a readout of an absence is worse than the absence.
+        """
+        if not self._costs:
+            return ""
+        cost = self._costs[-1]
+        parts = []
+        if cost["tokens"]:
+            parts.append("%s%d tokens" % ("" if cost["exact"] else "~",
+                                          cost["tokens"]))
+        if cost["seconds"] is not None:
+            parts.append("%ds" % int(round(cost["seconds"])))
+        if not parts:
+            return ""
+        return "Reviewer #%d used %s." % (cost["number"], " in ".join(parts))
 
     # --- moving through the lifecycle -------------------------------------
 
@@ -1056,8 +1149,14 @@ class ReviewState:
         self._changed_seen = set()
         self._changed_since = []
         self._verification = []
+        self._costs = []
         self.user_choice = None
         self.snapshot = None
+        # Dropped rather than retired in place, because it is not this
+        # object's to empty: the agenda belongs to a reviewer's record, that
+        # reviewer is over, and a fresh review gets a fresh one from
+        # `agent_actions._review`. Nothing holds the old one afterwards.
+        self.agenda = None
 
     def __bool__(self):
         """Whether anything has happened worth drawing.

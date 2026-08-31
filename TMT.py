@@ -843,8 +843,25 @@ def _session_loop(root):
     # agent's row stays for the retention window and then goes, exactly as
     # its card does -- the two are the same fact drawn twice and they must
     # disappear together.
-    agent_rows = lambda columns: agent_panel.agent_status_rows(
-        manager.visible_agents(), columns, stream=sys.stdout)
+    #
+    # The reviewbot's rows go on the end of the same strip, because it is one
+    # of these agents: same loop, same record, same background thread. What it
+    # is not is one of the fleet -- it lives in the manager's own review slot
+    # rather than in the register, so `visible_agents` never returns it and it
+    # had no row at all until it was asked for by name. A review blocks the
+    # whole session for as long as it takes, and for the whole of that time
+    # the only thing on screen about it was the word "Running" in the column.
+    #
+    # Last rather than first: the fleet cannot be running at the same time --
+    # `agent_actions._review` refuses to start a review while any worker is
+    # live -- so in practice one of the two lists is always empty, and the
+    # order only decides which way round they would appear if that ever
+    # changed. The reviewer is the subordinate of the two.
+    agent_rows = lambda columns: (
+        agent_panel.agent_status_rows(manager.visible_agents(), columns,
+                                      stream=sys.stdout)
+        + agent_panel.reviewbot_rows(manager.review(), session.review, columns,
+                                     stream=sys.stdout))
     # Lines the user typed while a turn was running. They are taken from
     # the reader when the turn ends and answered before the next question
     # is asked, in the order they were entered.

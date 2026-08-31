@@ -550,6 +550,19 @@ REQUIRED_KEYS = {
     # that could review its own diff would be exactly the thing this feature
     # exists to replace.
     "review": [],
+    # The reviewbot's readout: the checklist it declares before it starts and
+    # ticks off as it goes. One verb with an "operation" for the reason `plan`
+    # has one -- every operation acts on the same single object, and a model
+    # choosing between `agenda_create` and `agenda_update` would be choosing
+    # between two spellings of one thing.
+    #
+    # Registered here so `validate_action` knows it exists, documented ONLY in
+    # agent_subprompts.REVIEW_AGENDA_REFERENCE, and APPLIED only inside
+    # `agent_worker`'s loop -- which is where the reviewer's own record is.
+    # `execute_action` answers it with a sentence saying so, because the main
+    # agent has no agenda to write to and a silent "Unknown action" would send
+    # a model looking for a spelling mistake.
+    "review_agenda": ["operation"],
     # The evidence half of the completion gate. No required keys, for the
     # reason `review` has none: a verification is of whatever changed, and the
     # optional keys ("scope", "paths", "level", "full", "timeout") only narrow
