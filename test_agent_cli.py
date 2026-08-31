@@ -483,6 +483,117 @@ def test_the_counts_on_an_edit_are_counted_rather_than_guessed():
     assert "added" not in none_given.detail, none_given.detail
 
 
+# --- what a ranged read says it read ----------------------------------------
+#
+# Every one of these drives the real `read_lines` through `execute_action`
+# rather than handing `action_event` a string somebody typed here, because the
+# whole point of the range is that it comes back off what the action actually
+# returned. A fabricated result would test the parser against itself.
+
+NUMBERED = "\n".join("line %d" % n for n in range(1, 41)) + "\n"
+
+
+def read_lines_event(**keys):
+    """Run one real read_lines in the active workspace, return its event."""
+    obj = dict(keys, action="read_lines")
+    return agent_actions.action_event(
+        "read_lines", obj, agent_actions.execute_action(obj))
+
+
+def test_a_ranged_read_says_which_lines_it_read():
+    """"Read Lines app.py" is the same row for the fortieth read of a file as
+    for the first, and which part of the file was looked at is most of what a
+    ranged read means. It is also measurable, so it is said."""
+    box = Workspace(files={"app.py": NUMBERED})
+    try:
+        box.use()
+        event = read_lines_event(path="app.py", start=12, end=15)
+        assert event.message == "Read Lines (12-15) app.py", event.message
+        assert event.kind == "file_read", event.kind
+
+        # A single line is still start-end. "(12)" beside "(12-15)" reads as a
+        # count of lines to anyone who has not been told otherwise.
+        one = read_lines_event(path="app.py", start=7, end=7)
+        assert one.message == "Read Lines (7-7) app.py", one.message
+    finally:
+        box.close()
+
+
+def test_the_range_shown_is_what_was_read_not_what_was_asked_for():
+    """read_lines clamps to the file: 1-500 of a forty-line file is answered
+    with 1-40, and an absent end is filled in with the last line. The row is
+    built from the gutter that came back, so it says forty both times. Taking
+    the numbers off the request instead would print a range nobody read."""
+    box = Workspace(files={"app.py": NUMBERED})
+    try:
+        box.use()
+        overshot = read_lines_event(path="app.py", start=1, end=500)
+        assert overshot.message == "Read Lines (1-40) app.py", overshot.message
+
+        to_the_end = read_lines_event(path="app.py", start=38)
+        assert to_the_end.message == "Read Lines (38-40) app.py", to_the_end.message
+    finally:
+        box.close()
+
+
+def test_a_read_that_returned_no_lines_claims_no_range():
+    """A missing file, a range the wrong way round and a start past the end
+    all come back as a sentence or as nothing, and none of them says which
+    lines were read. The row drops back to the plain label rather than
+    guessing one out of the request."""
+    box = Workspace(files={"app.py": NUMBERED})
+    try:
+        box.use()
+        for keys in ({"path": "gone.py", "start": 1, "end": 20},
+                     {"path": "app.py", "start": 30, "end": 10},
+                     {"path": "app.py", "start": 900, "end": 950}):
+            event = read_lines_event(**keys)
+            assert event.message == "Read Lines %s" % keys["path"], event.message
+    finally:
+        box.close()
+
+    # The parser is asked directly for the one shape no real result can carry.
+    # read_lines renders its block with range(start, end + 1), so the last
+    # gutter is never below the first -- but a range printed backwards would
+    # be a lie on the row, and the guard against it has to be reachable by
+    # something or it is only a comment.
+    assert agent_actions._lines_read("   30 | a\n   10 | b") is None
+
+
+def test_a_file_whose_own_lines_look_like_gutters_is_read_honestly():
+    """The number on the row is TMT's own numbering, not the file's contents.
+    A file that happens to contain "  99 | ..." would hand a looser reading
+    the wrong range, and it would look entirely plausible."""
+    box = Workspace(files={"log.txt": "   99 | first\n  100 | second\n  101 | third\n"})
+    try:
+        box.use()
+        event = read_lines_event(path="log.txt", start=1, end=3)
+        assert event.message == "Read Lines (1-3) log.txt", event.message
+    finally:
+        box.close()
+
+
+def test_only_the_ranged_read_gains_a_range():
+    """read_file takes no range and read_lines is the only action whose extent
+    is a fact. Nothing else on the transcript changes shape."""
+    box = Workspace(files={"app.py": NUMBERED})
+    try:
+        box.use()
+        whole = agent_actions.action_event(
+            "read_file", {"path": "app.py"},
+            agent_actions.execute_action({"action": "read_file", "path": "app.py"}))
+        assert whole.message == "Read File app.py", whole.message
+
+        # And the batch path is the same path: it composes its events through
+        # action_event, so a read inside a batch is described identically.
+        obj = {"action": "read_lines", "path": "app.py", "start": 2, "end": 4}
+        batch = agent_actions.batch_events(
+            [obj], [agent_actions.execute_action(obj)])
+        assert [event.message for event in batch] == ["Read Lines (2-4) app.py"], batch
+    finally:
+        box.close()
+
+
 def test_permanent_output_leaves_the_live_region_intact():
     """The two surfaces share one terminal. Writing history has to erase the
     live region, print, and paint it again -- printing straight past it leaves

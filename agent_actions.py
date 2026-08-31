@@ -1009,6 +1009,41 @@ def _line_count(text):
     return len(text.splitlines())
 
 
+# The gutter `agent_file_ops.read_lines` writes in front of every line it
+# returns: the line number right-aligned in five columns, then " | ". A number
+# past 99999 is wider than the field and gets no padding at all, so the run of
+# leading spaces is optional rather than fixed.
+_READ_GUTTER = re.compile(r"^ *(\d+) \|")
+
+
+def _lines_read(result):
+    """The line range a `read_lines` result actually covers, or None.
+
+    Measured off the gutter TMT itself printed, and never taken from the
+    action's own `start` and `end`. The two disagree whenever the request
+    overshoots the file: `read_lines` clamps `end` to the last line and fills
+    an absent one in, so a model asking for 1-500 of a forty-line file is
+    answered with 1-40, and a row reading "(1-500)" would put on screen a
+    range nobody read. This is not the forbidden reading-of-data either --
+    what is parsed back is this program's own numbering, not the file's
+    contents, and the first and last rows of the block carry it whatever the
+    lines between them happen to say.
+
+    Every unreadable shape returns None and the row falls back to the plain
+    label. A missing file, a backwards range and an empty result all say
+    nothing about which lines were read, and no range at all is better than
+    a plausible one.
+    """
+    rows = str(result).splitlines()
+    if not rows:
+        return None
+    first, last = _READ_GUTTER.match(rows[0]), _READ_GUTTER.match(rows[-1])
+    if not (first and last):
+        return None
+    start, end = int(first.group(1)), int(last.group(1))
+    return (start, end) if end >= start else None
+
+
 def _describe(action, obj, result):
     """A one-line public description of what an action did.
 
@@ -1027,6 +1062,17 @@ def _describe(action, obj, result):
         # part that is known.
         target = obj.get("path") or obj.get("query") or obj.get("app") or ""
         label = ACTION_LABELS.get(action, action)
+        if action == "read_lines":
+            # The one read whose extent is a fact rather than a guess, so it
+            # is said: "Read Lines (12-15) CalcTUI.py". Without it the fifth
+            # read of one file is the same row as the first, and a reader
+            # scrolling back cannot tell which part of it the agent looked at
+            # -- which is most of what a ranged read means. Always start-end,
+            # even for a single line: "(12)" beside "(12-15)" invites reading
+            # as a count, and "(12-12)" can only mean what it says.
+            covered = _lines_read(result)
+            if covered:
+                label = "%s (%d-%d)" % (label, covered[0], covered[1])
         return "%s %s" % (label, target) if target else label
     if first and len(first) <= 200:
         return first
