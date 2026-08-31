@@ -57,5 +57,16 @@ py-modules = [
     "agent_testsel",
     "agent_tree",
     "agent_ui",
+    "agent_verify",
+    "agent_verify_discovery",
+    "agent_verify_engine",
     "agent_worker",
 ]
+
+# The suite lives under testing/ and is run with `python run_tests.py`, which
+# needs no configuration. This section is for pytest, which can also collect
+# the same files -- and which would otherwise put only `testing/unit` on
+# sys.path and fail to import a single agent module.
+[tool.pytest.ini_options]
+pythonpath = [".", "testing/unit", "testing/integration"]
+testpaths = ["testing"]

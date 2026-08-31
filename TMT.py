@@ -262,6 +262,52 @@ def review_held_line(session):
         return "Review not finished. Continuing."
 
 
+def verify_block(session, obj):
+    """The refusal for a terminal action verification will not allow, or "".
+
+    The third condition of the completion gate, and the one that is EVIDENCE
+    rather than judgement. The plan says the work was done and the review says
+    it looks right; neither of them ran anything. This one holds the answer
+    until a command in this repository actually exited zero.
+
+    It is code and not a prompt rule for the reason the other two are, and
+    more so: a model told it must verify is a model that can decide it has.
+    Here there is nothing to decide with. Nothing the model writes reaches
+    `VerificationState` -- there is no key on the `verify` action that carries
+    a status, and the only thing that moves that state is a process's exit
+    code, read by `agent_verify_engine` from `subprocess`.
+
+    Exempt on the same three grounds `plan_block` is exempt, and two more. A
+    turn where no verification is REQUIRED is not gated, which is most turns.
+    A task at the cycle limit is released rather than held forever. And a
+    repository that offered NOTHING TO RUN is released too, because there is
+    no evidence to be had there and a verifier that cannot verify holding
+    finished work hostage is the worst outcome available -- see
+    `agent_verify.limit_release`, which is the sentence either ending carries.
+    """
+    if session is None or not isinstance(obj, dict):
+        return ""
+    action = obj.get("action")
+    if not action or is_synthetic(obj):
+        return ""
+    try:
+        import agent_verify
+        return agent_verify.refusal(getattr(session, "verify", None),
+                                    getattr(session, "plan", None), action)
+    except Exception:
+        return ""
+
+
+def verify_held_line(session):
+    """The one line the user is shown when an answer was held for verification."""
+    try:
+        import agent_verify
+        return agent_verify.held_line(getattr(session, "verify", None),
+                                      getattr(session, "plan", None))
+    except Exception:
+        return "Verification not finished. Continuing."
+
+
 # The actions whose whole purpose is to run something. Whether a run PROVED
 # anything is not decided here and is not decidable here -- reading a
 # program's output for the word "failed" is what once labelled a green test
@@ -286,16 +332,57 @@ def note_work(session, action, obj):
     Guarded to nothing. A session with no review state, or a state that
     raises, must not be able to end a turn that has already done its work.
     """
-    review = getattr(session, "review", None) if session is not None else None
-    if review is None:
+    if session is None:
         return
-    try:
-        if action in MUTATING_ACTIONS:
-            review.note_change(action, _paths_named(action, obj))
-        elif action in _VERIFYING_ACTIONS:
-            review.note_run(action, str((obj or {}).get("path") or ""))
-    except Exception:
-        pass
+    paths = None
+    review = getattr(session, "review", None)
+    if review is not None:
+        try:
+            if action in MUTATING_ACTIONS:
+                paths = _paths_named(action, obj)
+                review.note_change(action, paths)
+            elif action in _VERIFYING_ACTIONS:
+                review.note_run(action, str((obj or {}).get("path") or ""))
+        except Exception:
+            pass
+    # The same observation, to the state that gates on evidence. It has to be
+    # told separately rather than sharing the review's record, because the two
+    # go stale independently: a review passes over a diff and a verification
+    # passes over a tree, and an edit after either one invalidates that one
+    # whatever the other is doing. Guarded to nothing for the reason above --
+    # a state that raises must not end a turn that has done its work.
+    verify = getattr(session, "verify", None)
+    if verify is not None:
+        try:
+            if action in MUTATING_ACTIONS:
+                if paths is None:
+                    paths = _paths_named(action, obj)
+                verify.note_change(action, paths)
+        except Exception:
+            pass
+
+
+def _panel_refresh(live_panel):
+    """A callable that nudges whichever relay is current, or does nothing.
+
+    Handed to the action context so a blocking action can make the right-hand
+    column repaint while it works. It closes over the DICT rather than over a
+    relay, so it goes on working when the next turn puts a new relay in --
+    which is the same indirection `_panel_changed` already uses, for the same
+    reason: a subscription per turn would stack a dead listener per question.
+
+    Guarded to nothing. A repaint that fails is a repaint that did not happen,
+    and it must never be able to fail the action that asked for it.
+    """
+    def refresh():
+        relay = live_panel.get("relay")
+        if relay is None:
+            return
+        try:
+            relay.refresh()
+        except Exception:
+            pass
+    return refresh
 
 
 def note_review_choice(session, task):
@@ -316,6 +403,25 @@ def note_review_choice(session, task):
         pass
 
 
+def note_verify_choice(session, task):
+    """Record whether the user's own words asked for verification, or for none.
+
+    Read from the task text once, after `begin_turn`, for exactly the reasons
+    `note_review_choice` is: the user's wording is authority in both
+    directions, the model's is not, and the retirement that runs inside
+    `begin_turn` resets every field on the state -- so a choice recorded
+    before it would be wiped by it.
+    """
+    verify = getattr(session, "verify", None) if session is not None else None
+    if verify is None:
+        return
+    try:
+        import agent_verify
+        verify.note_user_choice(agent_verify.requests_verification(task))
+    except Exception:
+        pass
+
+
 def review_release_warning(session):
     """The line a released answer carries, or "" when nothing was released.
 
@@ -329,6 +435,27 @@ def review_release_warning(session):
         return agent_review.limit_release(getattr(session, "review", None))
     except Exception:
         return ""
+
+
+def verify_release_warning(session):
+    """The line a released answer carries when verification never passed."""
+    try:
+        import agent_verify
+        return agent_verify.limit_release(getattr(session, "verify", None))
+    except Exception:
+        return ""
+
+
+def release_warnings(session):
+    """Every line a released answer has to carry, in pipeline order.
+
+    Both gates can release for their own reasons and both releases have to be
+    said. Silently letting an answer out under one of them would be exactly
+    the failure the release mechanism exists to avoid -- an answer that reads
+    as though the checks approved it.
+    """
+    return tuple(line for line in (verify_release_warning(session),
+                                   review_release_warning(session)) if line)
 
 
 def completion_block(session, obj):
@@ -354,6 +481,16 @@ def completion_block(session, obj):
     held = plan_block(session, obj)
     if held:
         return held, plan_held_line(session)
+    # Verification before review, which is the order of the pipeline and the
+    # order the two are worth asking in. Verification is evidence and costs a
+    # subprocess; review is judgement and costs a whole agent run -- and the
+    # reviewer's brief carries what verification found, so a review requested
+    # before anything ran is a review of unverified work. A model told about
+    # the review first would go and get one, and then be told to verify, and
+    # then need a second review because the fixes made the first one stale.
+    held = verify_block(session, obj)
+    if held:
+        return held, verify_held_line(session)
     held = review_block(session, obj)
     if held:
         return held, review_held_line(session)
@@ -790,6 +927,20 @@ def _session_loop(root):
                    # while the completion gate read another -- the gate
                    # silently off, with nothing anywhere to notice it by.
                    "review": session.review,
+                   # The verification for THIS task, put here for the same
+                   # reason and with the same warning as the two above: the
+                   # session holds one VerificationState for its whole life
+                   # and empties it in `begin_turn`, a few lines below.
+                   "verify": session.verify,
+                   # How the verify action tells the screen a check finished.
+                   # `live_panel` is built before this dict and re-pointed at
+                   # each turn's relay, exactly as the manager's own panel
+                   # subscription is -- so this closure keeps working across
+                   # turns without stacking a listener per question. A
+                   # verification blocks the loop for as long as its commands
+                   # take, and without this the column would stand still for
+                   # the whole of it.
+                   "refresh": _panel_refresh(live_panel),
                    # The user's own words, verbatim. The reviewer treats this
                    # as the source of truth and checks the implementation
                    # against it, so it must be what was actually asked rather
@@ -806,6 +957,9 @@ def _session_loop(root):
         # runs between. Decided once from this task's wording alone, so
         # nothing the model later writes can turn a required review off.
         note_review_choice(session, task)
+        # And the verification choice, in the same place and for the same
+        # reason: after the retirement, from the user's own words, once.
+        note_verify_choice(session, task)
         last_raw, identical_count = "", 0
         live_ui = LiveUI()
         # The live area for this turn, drawn as one block at the foot of the
@@ -1054,8 +1208,7 @@ def _session_loop(root):
                             # Said before the answer, so an answer the review
                             # never approved is never read without the reason
                             # it was let out anyway.
-                            released = review_release_warning(session)
-                            if released:
+                            for released in release_warnings(session):
                                 transcript.emit_kind("warning", released)
                             suggestion = finish_response(live_ui, relay, result,
                                                          transcript, turn_state,
@@ -1170,8 +1323,7 @@ def _session_loop(root):
                         turn_state["outcome"] = str(result)
                     # The same warning the batch path gives, in the same place
                     # relative to the answer: before it.
-                    released = review_release_warning(session)
-                    if released:
+                    for released in release_warnings(session):
                         transcript.emit_kind("warning", released)
                     suggestion = finish_response(live_ui, relay, result,
                                                  transcript, turn_state, pad)

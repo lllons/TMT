@@ -100,7 +100,14 @@ REVIEW_ACTIONS = frozenset(NOTE_ACTIONS)
 # loop -- would be able to review its own review. Refused here in code as well
 # as being absent from every background prompt, so the isolation does not rest
 # on wording.
-WORKER_FORBIDDEN = frozenset({"git_push", "respond", "done", "plan", "review"})
+# `verify` for the third variation on the same reason: verification is the
+# EVIDENCE the main agent's final answer is gated on, and a worker producing
+# it would let that agent finish on checks it never chose and never saw. It
+# would also run the project's whole test suite on a background thread while
+# the main agent edits the files under it, which is a result about a tree that
+# never existed -- the same hazard `review` refuses to start into.
+WORKER_FORBIDDEN = frozenset({"git_push", "respond", "done", "plan", "review",
+                              "verify"})
 
 # Refused to every background agent, for a different reason from the verbs
 # above: these two are not the wrong shape for a worker, they are unreachable

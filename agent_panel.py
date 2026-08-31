@@ -828,6 +828,168 @@ def review_rows(review, width, height=None, stream=None):
     return rows
 
 
+# --- the verify block ------------------------------------------------------
+#
+# The fourth thing that wants this column, drawn between the plan and the
+# review. Between them because that is the order of the pipeline -- plan,
+# verify, review -- and a column read downward should say what happened in the
+# order it happened.
+#
+# It is the one block here that draws a ROW PER ITEM rather than a state and a
+# count, and that is the whole of what it is for: "VERIFY failed" says nothing
+# a user can act on, and "✗ Targeted tests   2 failed" says which check and
+# what it reported. The rows are what section 15 asks to be visible while the
+# run happens.
+
+VERIFY_TITLE = "VERIFY"
+
+# The same positions again, and again no new colour: a passed check is
+# `success` (95), a running one `background_agent` (40), a failure `error`
+# (10). A skipped or pending check gets no gradient position at all and is
+# drawn dim, which is the neutral the brief asks for -- and it is the honest
+# painting, because a check that did not run is not a result.
+_VERIFY_POSITIONS = {
+    "passed": PLAN_DONE_POSITION,
+    "running": PLAN_ACTIVE_POSITION,
+    "planning": PLAN_ACTIVE_POSITION,
+    "failed": PLAN_PENDING_POSITION,
+    "error": PLAN_PENDING_POSITION,
+    "cancelled": PLAN_BLOCKED_POSITION,
+    "stale": PLAN_BLOCKED_POSITION,
+    "idle": PLAN_ACTIVE_POSITION,
+}
+
+# Colour is never the message here either. Every check status carries its own
+# mark, the marks are distinct with the escapes stripped, and `verify_marks`
+# asks the stream about the marks themselves as well as about decoration
+# generally -- the rule `plan_marks` and `review_marks` already follow.
+_VERIFY_MARKS = {"passed": "✓", "failed": "✗", "running": "●",
+                 "pending": "○", "skipped": "–", "error": "!"}
+_VERIFY_ASCII_MARKS = {"passed": "+", "failed": "x", "running": ">",
+                       "pending": ".", "skipped": "-", "error": "!"}
+
+# The most rows the verify block takes: a header and five checks. Five because
+# that is the widest a discovered check list gets in practice -- syntax,
+# format, lint, type check, tests -- and a block that grew without limit would
+# take the column off the plan, which owns it.
+VERIFY_MAX_ROWS = 6
+
+# The fewest worth drawing: the header and one row under it. A header alone is
+# a word with no news in it, which is the bargain `review_rows` already
+# strikes at two.
+VERIFY_MIN_ROWS = 2
+
+
+def verify_marks(stream=None):
+    """The check-status marks this stream can actually show."""
+    if plain_output(stream) or not encodable(stream, "".join(_VERIFY_MARKS.values())):
+        return _VERIFY_ASCII_MARKS
+    return _VERIFY_MARKS
+
+
+def verify_check_text(check, width, marks):
+    """One check as plain text, in the widest form that fits.
+
+    Three forms, widest first, and the last is returned even when it does not
+    fit -- `_row` elides it, and a row that says which check it is beats no
+    row at all. This is section 33: the column gives up the detail before it
+    gives up the name, and it never gives up the mark.
+    """
+    mark = marks.get(getattr(check, "status", ""), "?")
+    name = str(getattr(check, "name", "?"))
+    detail = ""
+    try:
+        detail = check.detail()
+    except Exception:
+        detail = ""
+    for text in ("%s %-14s %s" % (mark, name, detail),
+                 "%s %s  %s" % (mark, name, detail),
+                 "%s %s" % (mark, name)):
+        text = text.rstrip()
+        if display_width(text) <= width:
+            return text
+    return "%s %s" % (mark, name)
+
+
+def verify_rows(verify, width, height=None, stream=None):
+    """The verify block, painted, every row at most `width` columns.
+
+    Nothing at all for a verification that has not started, which is most
+    turns -- the same bargain the review block strikes, and for the same
+    reason: the column is shared and a permanent empty heading beside every
+    conversational question would be worth less than the rows it cost.
+
+    `height` is how many rows it may take; below two it draws nothing, because
+    a header with no check under it says only that verification exists.
+    """
+    stream = sys.stdout if stream is None else stream
+    width = max(1, int(width))
+    if verify is None:
+        return []
+    try:
+        # `VerificationState.__bool__` is exactly "is there anything to show".
+        if not verify:
+            return []
+        # The state to DRAW, not the one stored. A stale pass is still
+        # `passed` in the state machine and must not be drawn with the passed
+        # mark: a green tick beside work the gate is refusing is the one way
+        # this column can actively mislead, and it is the bug `review_rows`
+        # shipped with before a test found it.
+        state = str(verify.display)
+        headline = verify.headline()
+        cycles, most = verify.cycles, verify.max_cycles
+        checks = list(verify.checks())
+    except Exception:
+        # Decoration is never allowed to end a turn. A state object that
+        # raises is drawn as no verification at all.
+        return []
+    room = VERIFY_MAX_ROWS if height is None else min(VERIFY_MAX_ROWS, int(height))
+    if room < VERIFY_MIN_ROWS:
+        return []
+    marks = verify_marks(stream)
+    position = _VERIFY_POSITIONS.get(state, PLAN_ACTIVE_POSITION)
+    # The run in flight counts as the one being done, so a first verification
+    # reads "VERIFY 1/3" while it runs rather than "0/3" -- the number wanted
+    # is which round this is, not how many have already finished.
+    numbered = cycles + 1 if state in ("running", "planning") else cycles
+    rows = [_row("%s %d/%d" % (VERIFY_TITLE, numbered, most), width, stream,
+                 position=position)]
+    if not checks:
+        rows.append(_row("%s %s" % (marks.get(state, "?"), headline), width,
+                         stream, position=position))
+        return rows
+    # As many checks as fit and no "+N more" row, for the reason `plan_rows`
+    # gives: that row would cost exactly the row that would have shown another
+    # check. `/verify` has all of them, and the failing ones are also in the
+    # result the model was handed.
+    for check in checks[:room - 1]:
+        status = str(getattr(check, "status", ""))
+        rows.append(_row(verify_check_text(check, width, marks), width, stream,
+                         position=_VERIFY_POSITIONS.get(status),
+                         # A check that has not run is not a result and is not
+                         # painted like one. Dim is the neutral, and it is the
+                         # same neutral the agent bars use.
+                         dim=status in ("skipped", "pending")))
+    return rows
+
+
+def verify_report(verify):
+    """What `/verify` prints: the whole state as permanent text.
+
+    The unambiguous alternate to the block, and the only way in on a terminal
+    too narrow to hold two columns -- exactly as `/plan` and `/review` are for
+    theirs. It carries the failing output in full, which is the thing the
+    column has no room for and the thing another cycle depends on.
+    """
+    if verify is None:
+        return ("Verification is not available in this session, so nothing "
+                "has been verified.")
+    try:
+        return verify.describe()
+    except Exception as error:
+        return "The verification state could not be read: %s" % error
+
+
 def review_report(review):
     """What `/review` prints: the whole state as permanent text.
 
@@ -869,6 +1031,25 @@ def plan_report(plan):
     else:
         rows.append("TMT cannot finish this task until every step is complete.")
     return "\n".join(rows)
+
+
+def _stack(blocks):
+    """Several blocks of rows, one blank row between the ones that exist.
+
+    The divider is drawn between two blocks that both have something in them
+    and nowhere else, which is what stops a column that happens to have no
+    review in it opening with a blank row. Written once here rather than
+    repeated at each pair, because with three blocks there are three pairs and
+    the rule is the same for all of them.
+    """
+    out = []
+    for rows in blocks:
+        if not rows:
+            continue
+        if out:
+            out.append("")
+        out.extend(rows)
+    return out
 
 
 def _pad(text, columns):
@@ -971,7 +1152,8 @@ class PanelState:
     frame and know nothing about what ended up in it.
     """
 
-    def __init__(self, manager=None, stream=None, plan=None, review=None):
+    def __init__(self, manager=None, stream=None, plan=None, review=None,
+                 verify=None):
         self.manager = manager
         self.stream = sys.stdout if stream is None else stream
         self.open = False
@@ -987,6 +1169,11 @@ class PanelState:
         # it between turns, and a panel holding the object it was built with
         # would go on drawing the verdict on a task that is over.
         self.review = review
+        # The task's verification, as an object or as a callable returning
+        # one, and a callable for the third time for the same reason: the
+        # session empties it between turns, and a panel holding the object it
+        # was built with would go on drawing evidence about a finished task.
+        self.verify = verify
         # The reason the panel could not open, shown once and cleared by the
         # next thing that happens. It is a live message about a live gesture,
         # so it belongs on the temporary surface with the box that carries it.
@@ -1107,6 +1294,21 @@ class PanelState:
             return None
         return review or None
 
+    def verify_now(self):
+        """The verification to draw right now, or None when there is nothing.
+
+        An untouched verification is None here, the same bargain `plan_now`
+        and `review_now` strike: `VerificationState.__bool__` is whether
+        anything has happened, and a heading over "not verified yet" beside
+        every conversational question would be a permanent empty box in a
+        column three other things want.
+        """
+        try:
+            verify = self.verify() if callable(self.verify) else self.verify
+        except Exception:
+            return None
+        return verify or None
+
     def frame(self, columns, rows=None):
         """(left columns, join) for a region this wide, or None for no column.
 
@@ -1125,17 +1327,18 @@ class PanelState:
         columns = int(columns)
         plan = self.plan_now()
         review = self.review_now()
+        verify = self.verify_now()
         if not self.open:
-            return self._task_frame(columns, rows, plan, review)
+            return self._task_frame(columns, rows, plan, review, verify)
         mode, left, width = layout(columns)
         if mode == "refused":
             self.open = False
             self.message = can_open(columns)
-            return self._task_frame(columns, rows, plan, review)
+            return self._task_frame(columns, rows, plan, review, verify)
         # Two rows kept back for the status row under the region and the spare
         # row a region never draws on.
         height = None if rows is None else max(1, int(rows) - 2)
-        body = self._shared_rows(plan, review, width, height, mode)
+        body = self._shared_rows(plan, review, verify, width, height, mode)
         content = max(1, columns - 1)
 
         def join(left_rows):
@@ -1143,65 +1346,82 @@ class PanelState:
 
         return (left, join)
 
-    def _task_block(self, plan, review, width, height):
-        """The plan and the review together: the state of the task, in rows.
+    def _task_block(self, plan, review, verify, width, height):
+        """Plan, verification and review together: the state of the task, in rows.
 
-        The review sits UNDER the plan, always. The plan is the primary task
-        display and keeps the top of the column where the eye already looks
-        for it, and it keeps the column outright when there is not room for
-        both -- `/review` is the way to the verdict at that height, exactly as
+        The order is the pipeline's -- plan, then what was run, then what was
+        made of it -- so a column read downward says what happened in the
+        order it happened. The PLAN keeps the top, always. It is the primary
+        task display, it is where the eye already looks for it, and it keeps
+        the column outright when there is not room for anything else;
+        `/verify` and `/review` are the way in at that height, exactly as
         `/plan` is at a width too narrow for any column at all.
 
-        Between those two extremes the review is kept and the plan is
-        shortened, because the two degrade differently. A plan short of rows
+        Between those extremes the small blocks are kept and the plan is
+        shortened, because they degrade differently. A plan short of rows
         still says `PLAN 4/9` and shows the steps around the active one, so
-        what is missing is visible and countable. A review short of rows says
-        nothing, and nothing reads as "not reviewed" -- which is the one thing
-        about a reviewed task that must never be implied.
+        what is missing is visible and countable. A verify or review block
+        short of rows says nothing, and nothing reads as "not verified" and
+        "not reviewed" -- the two things about a finished task that must never
+        be implied.
 
-        `height` is the rows the pair may take together, or None for as many
-        as they want. The blank row between them is drawn only when both
-        halves have something in them.
+        Where even the floors do not fit, the blocks are dropped from the
+        BOTTOM: the review goes before the verification, because the review is
+        the later stage and a task that has not been verified has not reached
+        it. The plan is never dropped.
+
+        `height` is the rows the stack may take together, or None for as many
+        as it wants. A blank row goes between any two blocks that both have
+        something in them, and nowhere else.
         """
         if height is None:
-            steps = plan_rows(plan, width, stream=self.stream)
-            block = review_rows(review, width, stream=self.stream)
-            return steps + [""] + block if (steps and block) else (steps or block)
+            return _stack([plan_rows(plan, width, stream=self.stream),
+                           verify_rows(verify, width, stream=self.stream),
+                           review_rows(review, width, stream=self.stream)])
         room = max(0, int(height))
-        block = review_rows(review, width, height=min(REVIEW_MAX_ROWS, room),
-                            stream=self.stream)
+        # The small blocks first, each at its own ceiling, because the plan is
+        # what absorbs whatever they leave.
+        lower = [(verify_rows(verify, width,
+                              height=min(VERIFY_MAX_ROWS, room),
+                              stream=self.stream), VERIFY_MIN_ROWS),
+                 (review_rows(review, width,
+                              height=min(REVIEW_MAX_ROWS, room),
+                              stream=self.stream), REVIEW_MIN_ROWS)]
+        lower = [(rows, floor) for rows, floor in lower if rows]
         steps = plan_rows(plan, width, height=room, stream=self.stream)
-        if not block:
+        if not lower:
             return steps
         if not steps:
-            return block
-        if room >= len(block) + PLAN_MIN_ROWS + 1:
-            # Room for both as they are. The plan takes everything the review
-            # and the divider do not.
-            return (plan_rows(plan, width, height=room - len(block) - 1,
-                              stream=self.stream) + [""] + block)
-        if room >= REVIEW_MIN_ROWS + PLAN_MIN_ROWS + 1:
-            # Room for both only if each is cut to its floor. The review gives
-            # up its counts row first; the plan gives up steps.
-            return (plan_rows(plan, width, height=PLAN_MIN_ROWS,
-                              stream=self.stream)
-                    + [""] + block[:room - PLAN_MIN_ROWS - 1])
-        return plan_rows(plan, width, height=room, stream=self.stream)
+            return _stack([rows for rows, _ in lower])
+        while lower:
+            # Every block below the plan costs its own rows and one divider.
+            spent = sum(len(rows) for rows, _ in lower) + len(lower)
+            if room >= spent + PLAN_MIN_ROWS:
+                return _stack([plan_rows(plan, width, height=room - spent,
+                                         stream=self.stream)]
+                              + [rows for rows, _ in lower])
+            floors = sum(min(floor, len(rows)) for rows, floor in lower) + len(lower)
+            if room >= floors + PLAN_MIN_ROWS:
+                trimmed = [rows[:floor] for rows, floor in lower]
+                return _stack([plan_rows(plan, width, height=room - floors,
+                                         stream=self.stream)] + trimmed)
+            lower.pop()
+        return steps
 
-    def _shared_rows(self, plan, review, width, height, mode):
+    def _shared_rows(self, plan, review, verify, width, height, mode):
         """The column when the agents panel has focus: task on top, panel below.
 
         In panel-only mode the panel takes the whole column and the task block
         is not drawn. The panel is the thing with focus there, the window is
         already too narrow for two columns, and a plan squeezed in above it
-        would cost the cards the rows that make them readable. `/plan` and
-        `/review` say the same things on any width.
+        would cost the cards the rows that make them readable. `/plan`,
+        `/verify` and `/review` say the same things on any width.
         """
-        if mode != "two_column" or not (plan or review):
+        if mode != "two_column" or not (plan or review or verify):
             return panel_rows(self.records(), width, height=height,
                               selected=self.selected, stream=self.stream)
         room = None if height is None else max(0, int(height) - PLAN_SHARED_MIN)
-        block = self._task_block(plan, review, width,
+        block = self._task_block(plan, review, verify, width,
                                  PLAN_SHARED_MAX if room is None
                                  else min(PLAN_SHARED_MAX, room))
         if room is not None and room < PLAN_SHARED_MIN:
@@ -1214,23 +1434,24 @@ class PanelState:
                            selected=self.selected, stream=self.stream)
         return block + ([""] if block else []) + panel
 
-    def _task_frame(self, columns, rows, plan, review):
-        """(left columns, join) for the plan and review alone, or None.
+    def _task_frame(self, columns, rows, plan, review, verify=None):
+        """(left columns, join) for the task blocks alone, or None.
 
         Refused below the two-column threshold rather than taking the whole
         region the way an open panel does. An open panel has focus and is not
-        accepting input anywhere else; a plan and a verdict are things to
-        glance at while typing, and either one swallowing the prompt box would
-        take away the thing the user was using. `/plan` and `/review` are the
-        way in at that width, exactly as `/agents` is.
+        accepting input anywhere else; a plan, a check list and a verdict are
+        things to glance at while typing, and any of them swallowing the
+        prompt box would take away the thing the user was using. `/plan`,
+        `/verify` and `/review` are the way in at that width, exactly as
+        `/agents` is.
         """
-        if not (plan or review):
+        if not (plan or review or verify):
             return None
         mode, left, width = layout(columns)
         if mode != "two_column":
             return None
         height = None if rows is None else max(1, int(rows) - 2)
-        body = self._task_block(plan, review, width, height)
+        body = self._task_block(plan, review, verify, width, height)
         if not body:
             return None
         content = max(1, columns - 1)

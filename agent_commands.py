@@ -497,6 +497,37 @@ def _review(argument, session):
     return Result("Review", _wrapped_rows(report))
 
 
+def _verify(argument, session):
+    """What verification actually ran, as text rather than as a block.
+
+    The unambiguous alternate to the column, and the only way in on a terminal
+    too narrow for two columns -- and more than a convenience even on a wide
+    one, because the block is six rows and a failing command's output is the
+    part that does not fit in six rows.
+
+    Read-only, and firmly so. A user cannot pass or fail a verification from
+    here any more than the model can: the state moves only when a command
+    exits, which is the whole property the feature rests on.
+    """
+    del argument
+    try:
+        import agent_panel
+    except Exception as error:
+        # Reported in words for the reason `_agents` gives: an editable
+        # install freezes its module list, and a module that is invisible to
+        # the entry point must not take a slash command down with it.
+        return Result("Verify is unavailable",
+                      ["The panel module could not be loaded.", str(error)],
+                      ok=False)
+    verify = getattr(session, "verify", None) if session is not None else None
+    report = agent_panel.verify_report(verify)
+    # Prose rows, wrapped, for the reason `/review` and `/note` are wrapped:
+    # `render_command` fits every row with `fit_to_width`, which truncates,
+    # and a failing command's output cut at the right-hand edge is half an
+    # answer presented as the answer.
+    return Result("Verify", _wrapped_rows(report))
+
+
 def _note(argument, session):
     """Answer one question about the workspace, without disturbing anything.
 
@@ -644,9 +675,11 @@ _HANDLERS = {
     "note": _note,
     "agents": _agents,
     "plan": _plan,
-    # Beside `/plan` because it is the same subject: the plan is what TMT
-    # said it would do and the review is what an independent agent made of
-    # having done it.
+    # Beside `/plan` because it is the same subject, and in pipeline order:
+    # the plan is what TMT said it would do, the verification is what it ran
+    # to find out whether it worked, and the review is what an independent
+    # agent made of having done it.
+    "verify": _verify,
     "review": _review,
 }
 
@@ -659,6 +692,7 @@ SUMMARY = {
     "model": "which model answers",
     "note": "ask about the workspace without changing it",
     "plan": "the steps TMT is working through for this task",
+    "verify": "what was actually run to check this task's work",
     "review": "what the independent review found",
 }
 
@@ -671,5 +705,6 @@ USAGE = {
     "model": "/model [<model id or name>]",
     "note": "/note <question about this workspace>",
     "plan": "/plan",
+    "verify": "/verify",
     "review": "/review",
 }

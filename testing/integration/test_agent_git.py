@@ -43,7 +43,6 @@ _TRAILER_ADDRESS = re.compile(r"<([^<>]+)>")
 # config can still be read back for comparison.
 REAL_ENV = dict(os.environ)
 GIT = shutil.which("git")
-PROJECT_DIR = Path(__file__).resolve().parent
 
 FORCE_TOKENS = ("--force", "--force-with-lease", "-f", "--mirror")
 
@@ -63,6 +62,17 @@ agent_git = _import("agent_git")
 agent_config = _import("agent_config")
 agent_actions = _import("agent_actions")
 agent_prompt = _import("agent_prompt")
+
+# The project root, derived from a MODULE rather than from __file__: this file
+# lives in testing/integration/, so __file__.parent is the test directory and
+# not the tree these tests read agent_git.py, .tmt_git, .gitignore and TMT.py
+# out of. agent_config resolves its own identity files from its own __file__,
+# so the directory holding it IS the root. The fallback keeps a half-written
+# agent_config a test failure rather than an import error that aborts the run,
+# which is the whole point of _import above.
+PROJECT_DIR = (Path(agent_config.__file__).resolve().parent
+               if agent_config is not None
+               else Path(__file__).resolve().parents[2])
 
 
 def require(module, name):
@@ -1341,7 +1351,14 @@ def test_every_module_imports_and_is_clean_utf8_text():
     byte, which Python refuses to parse at all, once reached a module this way.
     """
     import importlib
-    root = Path(__file__).resolve().parent
+    # PROJECT_DIR, not __file__.parent: this test file lives in
+    # testing/integration/, whose *.py are all test modules. Globbing there
+    # would hit the startswith("test_") continue on every one of them and the
+    # test would pass having checked nothing -- the guard against a NUL byte in
+    # a module, silently switched off. The count assertion below is the belt to
+    # that braces: it can never go vacuous again without failing.
+    root = PROJECT_DIR
+    checked = 0
     for source in sorted(root.glob("*.py")):
         raw = source.read_bytes()
         assert b"\x00" not in raw, f"{source.name} contains a NUL byte"
@@ -1349,6 +1366,10 @@ def test_every_module_imports_and_is_clean_utf8_text():
         if source.name.startswith("test_") or source.name == "run_tests.py":
             continue
         importlib.import_module(source.stem)      # raises if it cannot load
+        checked += 1
+    assert checked > 10, (
+        f"only {checked} modules were checked in {root}: this test has gone "
+        "vacuous and is no longer guarding anything")
 
 
 # ---------------------------------------------------------------------------

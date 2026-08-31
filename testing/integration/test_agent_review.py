@@ -1678,7 +1678,8 @@ def test_the_plan_keeps_the_column_when_there_is_no_room_for_both():
     settled(review, status="PASS")
     state = panel_state(plan=worked_plan(), review=review)
     rows = [visible(row) for row in
-            state._task_block(state.plan_now(), state.review_now(), 30, 4)]
+            state._task_block(state.plan_now(), state.review_now(),
+                              state.verify_now(), 30, 4)]
     assert any("PLAN" in row for row in rows), rows
     assert not any("REVIEW" in row for row in rows), rows
 
@@ -1690,7 +1691,8 @@ def test_both_are_kept_and_shortened_when_there_is_just_room():
     plan = worked_plan("One", "Two", "Three", "Four", "Five", "Six")
     state = panel_state(plan=plan, review=review)
     rows = [visible(row) for row in
-            state._task_block(state.plan_now(), state.review_now(), 30, 6)]
+            state._task_block(state.plan_now(), state.review_now(),
+                              state.verify_now(), 30, 6)]
     assert any("PLAN" in row for row in rows), rows
     assert any("REVIEW" in row for row in rows), rows
     assert len(rows) <= 6, rows
@@ -1920,6 +1922,18 @@ def test_the_release_warning_reaches_the_user_only_at_the_limit():
 
 
 # --- end to end through TMT.main -------------------------------------------
+#
+# Every task text here declines verification, and that is deliberate rather
+# than incidental. Verification is required on exactly the evidence a review
+# is -- three plan steps and a file actually written -- so without the
+# decline every one of these would be held by the verify gate first and would
+# be testing two gates at once. Each test below is about the REVIEW gate, and
+# the interaction between the two is tested where it belongs, in
+# test_agent_verify_engine.test_verification_is_asked_for_before_review.
+#
+# It also exercises the decline path through the real loop, which is worth
+# having: `agent_verify.requests_verification` answers False here, and the
+# user's own words are the only thing that can turn a required gate off.
 
 PLAN_STEPS = ["Implement it", "Run the tests", "Independent review"]
 
@@ -1977,7 +1991,7 @@ def test_an_answer_is_held_until_a_review_has_actually_passed():
                                          file="feature.py", line=1)]),
             reviewer_reply(status="PASS", summary="The fix is right.")):
         drawn, seen, console = drive_session(
-            ["add the feature", "quit"], replies)
+            ["add the feature, no verification needed", "quit"], replies)
 
     assert len(seen) == len(replies), len(seen)
     text = visible(drawn)
@@ -2015,7 +2029,7 @@ def test_the_review_gate_holds_an_answer_a_complete_plan_would_have_let_out():
                            issues=[issue(title="Expiry is not enforced")]),
             reviewer_reply(status="PASS", summary="The fix is right.")):
         drawn, seen, console = drive_session(
-            ["add the feature", "quit"], replies)
+            ["add the feature, no verification needed", "quit"], replies)
 
     assert len(seen) == len(replies), len(seen)
     text = visible(drawn)
@@ -2066,7 +2080,7 @@ def test_a_review_that_errors_holds_the_answer_and_says_so():
                               "response": "Looks fine to me."}),
                   reviewer_reply(status="PASS", summary="Read it properly.")):
         drawn, seen, console = drive_session(
-            ["add the feature", "quit"], replies)
+            ["add the feature, no verification needed", "quit"], replies)
 
     assert len(seen) == len(replies), len(seen)
     text = visible(drawn)
@@ -2089,7 +2103,7 @@ def test_the_cycle_limit_releases_the_answer_and_tells_the_user():
     with Reviewer(reviewer_reply(status="FAIL", summary="Still wrong.",
                                  issues=[issue(title="Still wrong")])):
         drawn, seen, console = drive_session(
-            ["add the feature", "quit"], replies)
+            ["add the feature, no verification needed", "quit"], replies)
     assert len(seen) == len(replies), len(seen)
     text = visible(drawn)
     assert "Done what I could." in text, text[-2500:]
@@ -2109,7 +2123,7 @@ def test_the_next_question_is_not_gated_by_the_last_ones_review():
     ]
     with Reviewer(reviewer_reply(status="PASS", summary="Fine.")):
         drawn, seen, console = drive_session(
-            ["add the feature", "and now something unrelated", "quit"], replies)
+            ["add the feature, no verification needed", "and now something unrelated", "quit"], replies)
     assert len(seen) == len(replies), len(seen)
     text = visible(drawn)
     assert "First answer." in text and "Second answer." in text
@@ -2128,7 +2142,7 @@ def test_clear_after_a_failed_review_does_not_end_the_session():
     with Reviewer(reviewer_reply(status="FAIL", summary="No.",
                                  issues=[issue()])):
         drawn, seen, console = drive_session(
-            ["add the feature", "/clear", "a fresh question", "quit"], replies)
+            ["add the feature, no verification needed", "/clear", "a fresh question", "quit"], replies)
     text = visible(drawn)
     assert "after the clear" in text, text[-2000:]
     assert [m["role"] for m in seen[-1]] == ["system", "user"], seen[-1]

@@ -239,7 +239,11 @@ def test_memory_outlives_the_process_that_wrote_it():
             "agent_config.INSTALL_DIR = pathlib.Path(%r)\n"
             "import agent_memory\n"
             "print(agent_memory.recall())\n"
-        ) % (str(Path(__file__).resolve().parent), str(box.path), str(box.install))
+        # The repo root, derived from the module rather than from __file__:
+        # this file lives in testing/integration/, and a child pointed there
+        # could not import agent_config at all.
+        ) % (str(Path(agent_config.__file__).resolve().parent),
+             str(box.path), str(box.install))
         done = subprocess.run([__import__("sys").executable, "-c", script],
                               capture_output=True, text=True, timeout=120)
         assert "regex based" in done.stdout, (done.stdout, done.stderr)

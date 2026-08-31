@@ -33,6 +33,7 @@ import agent_config
 import agent_models
 import agent_plan
 import agent_review
+import agent_verify
 from agent_ui import CHARS_PER_TOKEN
 
 # What one turn is allowed to contribute, and how much of the window all of
@@ -243,6 +244,14 @@ class Session:
         # same trap the plan has, and it is written down twice because it is
         # invisible from the call site both times.
         self.review = agent_review.ReviewState()
+        # The verification of the task being worked on now, beside the other
+        # two and under identical rules: one per turn, retired at
+        # `begin_turn`, built ONCE and emptied in place rather than rebound.
+        # The warning above about the action context is written a third time
+        # rather than referred to, because it is invisible from the call site
+        # every time and rebinding here would switch the evidence half of the
+        # completion gate off without an error anywhere.
+        self.verify = agent_verify.VerificationState()
 
     # --- what the next request runs under ---------------------------------
 
@@ -354,6 +363,11 @@ class Session:
         # the end of this one, so a review that passed stays on screen beside
         # the answer it let out.
         self.review.retire()
+        # And the verification with them. Evidence is about a tree at a
+        # moment: a run that passed for the last task says nothing about this
+        # one, and leaving it standing would let a new question be answered on
+        # the strength of checks that ran before it was asked.
+        self.verify.retire()
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": str(system_prompt)})
@@ -503,6 +517,10 @@ class Session:
         # passed would be the worst of both, which is the sentence written
         # above about the plan and is just as true here.
         self.review.retire()
+        # And the verification, for the reason the review goes: a session told
+        # to forget the conversation that would still refuse to answer until
+        # an invisible verification had passed would be the worst of both.
+        self.verify.retire()
         self._turns = []
 
     def __len__(self):

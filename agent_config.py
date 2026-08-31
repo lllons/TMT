@@ -550,6 +550,18 @@ REQUIRED_KEYS = {
     # that could review its own diff would be exactly the thing this feature
     # exists to replace.
     "review": [],
+    # The evidence half of the completion gate. No required keys, for the
+    # reason `review` has none: a verification is of whatever changed, and the
+    # optional keys ("scope", "paths", "level", "full", "timeout") only narrow
+    # or widen it. There is deliberately NO key that carries a status --
+    # nothing a model can write moves verification state, because the only
+    # thing that moves it is a process exiting zero.
+    #
+    # Registered here and dispatched in agent_actions, documented ONLY in
+    # agent_prompt.VERIFY_REFERENCE, and refused outright by agent_worker: the
+    # same two-sided isolation `plan` and `review` have. A worker that could
+    # verify would be producing the evidence for its own work.
+    "verify": [],
     "tree": [], "find_text": ["query"], "find_symbol": ["name"],
     "replace_across": ["search", "replace"], "code_map": ["target"],
     "related_tests": [], "remember": ["note"], "recall": [],

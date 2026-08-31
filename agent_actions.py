@@ -168,6 +168,24 @@ def _review_veto(context, plan, obj):
         return ""
 
 
+def _verify_veto(context, plan, obj):
+    """The refusal for a plan update verification will not allow, or "".
+
+    The same shape as `_review_veto` and guarded to nothing in the same way,
+    and asked FIRST of the two: verification comes before review in the
+    pipeline, so a plan whose verification step is outstanding should be told
+    about that rather than about a review it has not reached yet.
+    """
+    verify = _verify_state(context)
+    if verify is None:
+        return ""
+    try:
+        import agent_verify
+        return agent_verify.plan_veto(verify, plan, obj)
+    except Exception:
+        return ""
+
+
 def _plan(context, obj):
     """Run one `plan` operation against the turn's plan.
 
@@ -201,7 +219,10 @@ def _plan(context, obj):
     # the final answer, which is driven by ReviewState and does not care what
     # any step is called. This keeps the plan on screen honest; that keeps the
     # answer honest.
-    vetoed = _review_veto(context, plan, obj)
+    # Verification first, then review: that is the order of the pipeline, so a
+    # plan with both steps outstanding is told about the one it has to do
+    # next rather than the one after it.
+    vetoed = _verify_veto(context, plan, obj) or _review_veto(context, plan, obj)
     if vetoed:
         return vetoed
     try:
@@ -437,6 +458,114 @@ def _agent_modules():
         return agent_manager, agent_worker, ""
     except Exception as error:
         return None, None, "Background agents are unavailable: %s" % error
+
+
+# --- verification -----------------------------------------------------------
+#
+# One verb, and it BLOCKS -- the same shape `review` and the two wait verbs
+# have, and for the same reason: the session loop is synchronous and has no
+# event loop to suspend into, so running a test suite is an action that takes
+# a while rather than a state the loop enters. Blocking is also what keeps the
+# evidence meaningful: while this call is out the main agent is not editing,
+# so the tree the commands ran against is the tree that was reported on.
+#
+# Unlike `review`, no model is involved anywhere. Discovery reads files, the
+# engine runs argv lists, and the statuses are exit codes. That is what makes
+# section 18's guarantee absolute rather than approximate: there is no text
+# anywhere on this path for a model to write.
+
+_NO_VERIFY_STATE = (
+    "Verification is not available here, so 'verify' did nothing and nothing "
+    "has been verified. Do not claim the work was verified. Check what you can "
+    "with run_file and the file tools, and say in your final message that no "
+    "verification ran."
+)
+
+# The values "scope" understands. One, for now, and a wrong one is named
+# rather than ignored: a model that asked for "changed_files" and silently got
+# a whole-task verification would draw the wrong conclusion from the answer.
+VERIFY_SCOPES = ("current_task",)
+
+
+def _verify_state(context):
+    """The verification state for this turn, or None when there is not one.
+
+    `(context or {}).get(...)` for the reason `_manager`, `_plan_state` and
+    `_review_state` give: a background agent's context has no such key at all,
+    and neither has an install where the session never wired one in. Both must
+    come back as words rather than a KeyError that ends the turn.
+    """
+    return (context or {}).get("verify")
+
+
+def _verify_level(obj):
+    """(level or None, refusal). A level the model asked for, validated."""
+    raw = obj.get("level")
+    if raw in (None, ""):
+        return None, ""
+    try:
+        level = int(raw)
+    except (TypeError, ValueError):
+        return None, ("FAILED: \"level\" must be a whole number from 1 to 6, "
+                      "not %r." % (raw,))
+    if not 1 <= level <= 6:
+        return None, ("FAILED: \"level\" must be from 1 (basic) to 6 (full "
+                      "regression); %d is outside that." % level)
+    return level, ""
+
+
+def _verify(context, obj):
+    """Run one verification and return what the checks actually said.
+
+    The whole lifecycle in one call, because the loop has nowhere to park a
+    half-finished one: refuse or begin, inspect the repository, choose the
+    checks, run them in order, settle the state, report.
+
+    Every failure between those steps lands in `VerificationState.fail`, which
+    is the ERROR state, which blocks the final answer. A verification that
+    crashed, timed out or could not choose a command must never be mistaken
+    for one that found the work sound.
+    """
+    verify = _verify_state(context)
+    if verify is None:
+        return _NO_VERIFY_STATE
+    try:
+        import agent_verify_engine
+    except Exception as error:
+        # The frozen-module-list failure `_run_tool` guards against. Reported
+        # as unavailable rather than passed, and the state is untouched, so
+        # the gate goes on holding the answer.
+        return "Verification is unavailable: %s" % error
+    scope = str(obj.get("scope") or VERIFY_SCOPES[0]).strip().lower()
+    if scope not in VERIFY_SCOPES:
+        return ("FAILED: '%s' is not a verification scope. Use one of: %s."
+                % (obj.get("scope"), ", ".join(VERIFY_SCOPES)))
+    level, refused = _verify_level(obj)
+    if refused:
+        return refused
+    paths = obj.get("paths") if isinstance(obj.get("paths"), (list, tuple)) else None
+    result, held = agent_verify_engine.verify(
+        verify, paths=paths, level=level, full=bool(obj.get("full", False)),
+        timeout=_timeout(obj) if obj.get("timeout") else None,
+        # The screen's own nudge. The session loop puts a refresh callable
+        # here so the column can show checks finishing while this call blocks;
+        # a context without one simply does not repaint, which is what every
+        # scripted and piped run does anyway.
+        on_change=(context or {}).get("refresh"))
+    if result is None:
+        return held
+    # What ran is put in the REVIEW's brief, because the reviewer's job
+    # includes judging whether the verification was the right verification.
+    # It is stated as fact rather than quoted, which is allowed here and
+    # nowhere else: these are commands TMT chose and exit codes TMT read, not
+    # a program's opinion of itself.
+    review = _review_state(context)
+    if review is not None:
+        try:
+            review.note_run("verify", agent_verify_engine.review_note(result))
+        except Exception:
+            pass
+    return result.describe()
 
 
 def _agent_id(obj):
@@ -748,6 +877,12 @@ def execute_action(obj, context=None):
     # BLOCK, for as long as the reviewer runs or the timeout allows, exactly
     # as the two wait verbs do.
     if action == "review": return _review(context, obj)
+    # Verification. It writes no file of TMT's, so it is not in
+    # MUTATING_ACTIONS and the cached prompt still describes the workspace --
+    # but it DOES run the project's own commands, which is why it goes through
+    # `agent_execution.run_command` and nothing else. It BLOCKS for as long as
+    # the checks take, exactly as `review` and the two wait verbs do.
+    if action == "verify": return _verify(context, obj)
     # Understanding the repository. Each answers one question and no more, so
     # the model can pick the narrowest tool instead of reading whole files to
     # find one line.
@@ -882,7 +1017,7 @@ ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     "delete_folder", "rename_file", "create_folder", "run_python", "run_file",
     "open_app", "git_status", "git_diff", "git_identity", "git_commit", "git_push",
     "tree", "find_text", "find_symbol", "replace_across", "code_map",
-    "related_tests", "remember", "recall", "plan", "review",
+    "related_tests", "remember", "recall", "plan", "review", "verify",
     "spawn_agent", "agent_status", "agent_result", "wait_for_agent",
     "wait_for_agents", "kill_agent", "internal_response",
     "announce", "respond", "done",
@@ -948,6 +1083,10 @@ _EVENT_KIND_FOR_ACTION = {
     # coarsest thing that happens in a turn, there is at most a handful of
     # them, and its verdict is the fact the user most wants to see go past.
     "review": "milestone",
+    # A milestone beside the review, for the same reasons and one more: a
+    # verification takes real time, and the row saying it happened is the one
+    # the user scrolls back to when they want to know what was actually run.
+    "verify": "milestone",
     # `background_agent` already exists in agent_prompt.EVENT_TYPES, at
     # prominence level 1 and gradient position 40 beside milestone and tool.
     # A new element takes a place on the existing scale; it does not get a
@@ -999,6 +1138,12 @@ _REPORTED_ACTIONS = frozenset((
     # describing the request instead would put the bare word "Review" in the
     # transcript where the verdict belongs.
     "review",
+    # Here for `_describe` for exactly the reason `review` is, and with the
+    # same override in `action_event`: its first line is TMT's own headline --
+    # "VERIFY PASSED - 2 checks, 0 failures" -- so it is the short specific
+    # sentence this set is for, and describing the request instead would put
+    # the bare word "Verify" in the transcript where the evidence belongs.
+    "verify",
 ))
 
 
@@ -1114,6 +1259,16 @@ def action_event(action, obj, result):
         # a refusal and an unavailable review all begin with something else,
         # and every one of those is a warning rather than a success.
         failed = not text.startswith("REVIEW PASSED")
+        if not failed:
+            kind = "success"
+    if action == "verify":
+        # The same rule as `review` above and for the same reason, sharpened:
+        # a verification's result quotes what the commands printed, and a
+        # passing run of a test suite whose output says "2 previously failing
+        # tests now pass" would be labelled a failure by any substring search.
+        # So the decision is an exact prefix on a sentence THIS program wrote,
+        # built by `VerificationResult.headline` from exit codes.
+        failed = not text.startswith("VERIFY PASSED")
         if not failed:
             kind = "success"
 

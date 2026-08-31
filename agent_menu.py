@@ -2408,7 +2408,11 @@ class PromptBox:
             # A callable for the reason the plan is one: the session empties
             # its review between turns, and a panel holding the object it was
             # built with would go on drawing the verdict on a finished task.
-            review=lambda: getattr(self.session, "review", None))
+            review=lambda: getattr(self.session, "review", None),
+            # And a third, for the third thing the session empties between
+            # turns. A panel holding the object it was built with would go on
+            # drawing the checks that ran for a task that is over.
+            verify=lambda: getattr(self.session, "verify", None))
         return self._panel_state
 
     def _agents_text(self):

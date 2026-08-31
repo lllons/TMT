@@ -1,7 +1,10 @@
 """Code runners and approved desktop application launching."""
 
+import os
 import platform
+import shutil
 import subprocess
+import time
 from pathlib import Path
 import agent_config
 from agent_file_ops import safe_path
@@ -88,3 +91,173 @@ def open_app(app_name, file_path=None, url=None):
         return f"Could not find '{cfg['exe']}' — is it installed and on PATH?"
     except OSError as error:
         return f"Error launching {key}: {error}"
+
+
+# --- running a project's own verification commands --------------------------
+#
+# `run_file` above runs ONE FILE by its extension, which is the right shape for
+# "run this script and show me what it printed" and the wrong shape for "run
+# whatever this repository tests itself with". Verification needs the second,
+# and it needs three things `run_file` does not give it: a timeout measured in
+# minutes rather than ten seconds, the real exit code rather than a string, and
+# the ability to run a command that is not a file at all.
+#
+# What it deliberately does NOT add is a new way to execute things. Same
+# `subprocess.run`, same `cwd=agent_config.ROOT_DIR`, same capture. The one
+# rule that matters is stated here because everything else rests on it:
+#
+#   **THE COMMAND IS ALWAYS AN ARGV LIST AND THERE IS NEVER A SHELL.**
+#
+# `shell=True` appears nowhere on this path, and a repository-defined command
+# is therefore never a string that gets interpreted. `agent_verify_discovery`
+# builds argv from a fixed table of runner shapes plus a NAME taken from the
+# project -- a package.json script, a Makefile target -- and validates that
+# name before it goes anywhere near here. So a package.json containing
+# `"test": "vitest && rm -rf /"` is run as `npm run test`, by npm, with npm's
+# own semantics; TMT never parses or executes that string itself. There is a
+# test that greps this module and the verify modules for `shell=True`.
+
+# The ceiling on one verification command. Ten minutes: a real test suite can
+# take several, and something that has not finished in ten is stuck rather
+# than slow. It is a ceiling on the caller's request, not the default -- the
+# caller passes what it thinks the check needs.
+MAX_COMMAND_TIMEOUT = 600.0
+DEFAULT_COMMAND_TIMEOUT = 300.0
+
+# How much of a command's output is captured. Larger than `_run_cmd`'s 2000,
+# because a failing test suite's useful part is its tail and 2000 characters of
+# a pytest run is sometimes not even the summary. `agent_verify` trims it again
+# for the model; this is what is read off the pipe.
+MAX_COMMAND_OUTPUT = 40000
+
+
+class CommandOutcome:
+    """What running one command actually did.
+
+    `exit_code` is None and only None when the command did not run to
+    completion -- it was not on PATH, it timed out, the OS refused it. That is
+    the distinction the whole verification engine is built on: an exit code is
+    evidence, and its absence is the absence of evidence, and the two must
+    never be collapsed into a boolean.
+    """
+
+    __slots__ = ("argv", "exit_code", "output", "duration", "error")
+
+    def __init__(self, argv, exit_code=None, output="", duration=0.0, error=""):
+        self.argv = tuple(argv or ())
+        self.exit_code = exit_code
+        self.output = output
+        self.duration = float(duration)
+        self.error = error
+
+    @property
+    def ran(self):
+        return self.exit_code is not None
+
+    @property
+    def ok(self):
+        return self.exit_code == 0
+
+    def __repr__(self):
+        return "CommandOutcome(%s, exit=%r)" % (" ".join(self.argv), self.exit_code)
+
+
+def command_available(argv):
+    """The resolved path of a command's executable, or "" when there is none.
+
+    Asked before running rather than inferred from a failure afterwards,
+    because "the tool is not installed" and "the tool ran and found problems"
+    are different answers and only one of them is about the code. TMT never
+    installs anything to make this come back true -- see the verification
+    rules; a missing tool is reported, never fixed behind the user's back.
+    """
+    if not argv:
+        return ""
+    return shutil.which(str(argv[0])) or ""
+
+
+def _command_env():
+    """The child's environment: this process's, plus one correction.
+
+    Inherited rather than constructed, so a project's virtualenv, PATH and
+    tool configuration reach the command exactly as they would if the user ran
+    it. The single addition is `PYTHONIOENCODING`, and it is a correction
+    rather than a policy: a Python child printing anything non-ASCII into a
+    pipe on Windows dies with a UnicodeEncodeError and would be reported as a
+    failing check when nothing about the code is wrong. It is only set when
+    the environment has not already made a choice.
+    """
+    env = dict(os.environ)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return env
+
+
+def run_command(argv, timeout=DEFAULT_COMMAND_TIMEOUT, cwd=None):
+    """Run one argv list in the workspace and report exactly what happened.
+
+    Never a shell, never a string. `argv` is a list and is passed straight to
+    `subprocess.run`, so no part of it is interpreted by anything but the
+    program named in its first element.
+
+    `cwd` defaults to the workspace root, which is the same boundary every
+    other execution in TMT runs inside. A caller may narrow it to a directory
+    under the root; anything outside is refused, because a verification
+    command that could pick its own working directory would be a way around
+    the sandbox the file tools enforce.
+    """
+    argv = [str(part) for part in (argv or ())]
+    if not argv:
+        return CommandOutcome((), error="no command was given")
+    seconds = max(1.0, min(float(timeout or DEFAULT_COMMAND_TIMEOUT),
+                           MAX_COMMAND_TIMEOUT))
+    root = Path(agent_config.ROOT_DIR)
+    if cwd is None:
+        working = root
+    else:
+        # Through the same check the file tools use, so a directory outside the
+        # workspace raises rather than being quietly accepted.
+        working = safe_path(cwd)
+    if not command_available(argv):
+        return CommandOutcome(
+            argv, error="'%s' was not found on PATH. TMT does not install it; "
+                        "install it yourself or use a command this project "
+                        "already provides." % argv[0])
+    started = time.time()
+    try:
+        done = subprocess.run(argv, capture_output=True, cwd=str(working),
+                              timeout=seconds, env=_command_env(),
+                              encoding="utf-8", errors="replace")
+    except subprocess.TimeoutExpired as expired:
+        # A timeout is NOT a failure. The command did not report, so nothing is
+        # known about the code -- what came out before the clock ran out is
+        # kept, because it is often where the hang is visible.
+        partial = _joined(getattr(expired, "stdout", ""), getattr(expired, "stderr", ""))
+        return CommandOutcome(argv, output=partial,
+                              duration=time.time() - started,
+                              error="it did not finish within %d seconds and "
+                                    "was stopped" % int(seconds))
+    except OSError as error:
+        return CommandOutcome(argv, duration=time.time() - started,
+                              error="it could not be started (%s)" % error)
+    return CommandOutcome(argv, exit_code=int(done.returncode),
+                          output=_joined(done.stdout, done.stderr),
+                          duration=time.time() - started)
+
+
+def _joined(out, err):
+    """stdout and stderr as one stream, bounded, in the order they are read.
+
+    One stream because a runner splits its report across both and reading only
+    one of them loses half the evidence -- pytest's summary is on stdout and a
+    traceback from a crashed collection is on stderr.
+    """
+    parts = []
+    for chunk in (out, err):
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode("utf-8", "replace")
+        if chunk:
+            parts.append(chunk)
+    text = "".join(parts)
+    if len(text) <= MAX_COMMAND_OUTPUT:
+        return text
+    return text[-MAX_COMMAND_OUTPUT:]
