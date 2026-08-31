@@ -937,7 +937,7 @@ The suite lives in `testing/`, split into `testing/unit/` and `testing/integrati
 The runner stays at the root and discovers both; see
 [testing/README.md](testing/README.md) for what belongs where.
 
-996 tests, about two minutes. Eight of them read the API key from `.tmt_key`,
+1000 tests, about two minutes. Eight of them read the API key from `.tmt_key`,
 so on a fresh clone with no key configured those eight fail and the rest pass.
 
 ## License

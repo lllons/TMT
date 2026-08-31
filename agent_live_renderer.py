@@ -606,13 +606,24 @@ class LiveRelay:
         return self._lead(len(lines) + len(tail)) + lines + tail
 
     def _compose_with_panel(self, status, body, size, width, panel):
-        """The region with the agents panel as its right-hand column.
+        """The region with a right-hand column beside it.
 
-        The status row is the one thing left full width and below both
-        columns. It is the instrument measuring the turn, and an instrument
-        belongs under the thing it is measuring rather than beside it -- and
-        squeezing it into the left column would cost the bar and the token
-        readout the room they need to say anything.
+        The status row and the per-agent rows are the two things left full
+        width and below both columns. They are the instruments measuring the
+        turn, and an instrument belongs under the thing it is measuring rather
+        than beside it -- squeezing the bar and the token readout into the
+        left column would cost them the room they need to say anything.
+
+        **The agent rows are in the tail here for the same reason they are in
+        the tail without a panel, and leaving them out was a real bug.** This
+        branch used to compose `[status]` alone, which was invisible while the
+        only thing that wanted the column was the agents panel: that panel is
+        opened by a deliberate gesture and is shut while a turn runs, so this
+        branch was almost never taken. A PLAN makes the column permanent, and
+        from then on every session with a plan in it lost its agent bars the
+        moment the plan appeared -- the two could never be on screen at once.
+        It is the same root cause as the plan being drawn twice: a branch that
+        was rehearsed only in the case where the column was rare.
 
         Only the panel is composed against the LEFT column here. Everything
         above this region is untouched: it is already printed, it is the
@@ -620,7 +631,13 @@ class LiveRelay:
         module may never do.
         """
         left_columns, join = panel
-        tail = [status] if status else []
+        # Both instruments, in the order the no-panel branch puts them: the
+        # main agent's own bar, then the agents it delegated to, which are
+        # subordinate to it. `room` below already subtracts the whole tail, so
+        # a terminal short of rows gives them up out of the REPLY rather than
+        # growing the region past the window -- exactly as it does without a
+        # panel.
+        tail = ([status] if status else []) + self._agent_rows(width)
         left = []
         if left_columns:
             footer = self._footer_rows((left_columns + 1, size.lines))

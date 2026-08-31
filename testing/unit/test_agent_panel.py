@@ -716,6 +716,131 @@ def test_the_relay_puts_the_panel_beside_its_own_rows():
         screen.close()
 
 
+def relay_with(state, records, clock=None, status="bar 40%", body="a reply"):
+    """A live region with a right-hand column AND per-agent rows in it.
+
+    Both hooks supplied, which is the shape a real session has the moment it
+    both plans and delegates -- and the shape that was never composed in a
+    test until the two stopped appearing together.
+    """
+    import agent_live_renderer
+
+    return agent_live_renderer.LiveRelay(
+        stream=Console(),
+        footer=lambda size=None: ["  > the box"],
+        panel=lambda columns, rows: state.frame(columns, rows),
+        agent_rows=lambda columns: agent_panel.agent_status_rows(
+            records, columns, stream=Console(),
+            now=None if clock is None else clock.now))._compose(status, body)
+
+
+def a_plan(*titles):
+    import agent_plan
+
+    plan = agent_plan.Plan(list(titles) or
+                           ["Inspect the repository", "Implement it",
+                            "Add the tests", "Verify implementation"])
+    plan.update(1, "completed")
+    return plan
+
+
+def test_the_agent_bars_and_a_plan_are_on_screen_at_the_same_time():
+    """The bug this exists for: they were never both drawn. `_compose` sends
+    every region that has a column to `_compose_with_panel`, and that branch
+    composed the status row alone -- it never asked for the agent rows at all.
+
+    Invisible while the agents panel was the only thing that wanted the
+    column, because that panel is opened by a gesture and is shut while a turn
+    runs, so the branch was almost never taken. A PLAN makes the column
+    permanent, and from then on every session that planned AND delegated lost
+    its agent bars the moment the plan appeared."""
+    manager, clock = register(2)
+    plan = a_plan()
+    state = agent_panel.PanelState(manager, stream=Console(),
+                                   plan=lambda: plan)
+    screen = Screen(100, 24)
+    try:
+        rows = [visible(row) for row in
+                relay_with(state, manager.visible_agents(), clock)]
+        text = "\n".join(rows)
+        # The plan has the column.
+        assert "PLAN 1/4" in text, text
+        assert "S1" in text and "S4" in text, text
+        # The box and the reply are still in the left column.
+        assert any("> the box" in row for row in rows), text
+        assert any(row.startswith("┌") for row in rows), text
+        # And BOTH agents have a bar, which is the half that was missing.
+        assert sum(1 for row in rows if "#1" in row) == 1, text
+        assert sum(1 for row in rows if "#2" in row) == 1, text
+    finally:
+        screen.close()
+
+
+def test_the_bars_sit_full_width_under_both_columns_in_the_usual_order():
+    """They are instruments, like the status row, and an instrument belongs
+    under the thing it measures. The order is the one the no-panel branch
+    already used: the main agent's own bar, then the agents it delegated to,
+    which are subordinate to it."""
+    manager, clock = register(2)
+    state = agent_panel.PanelState(manager, stream=Console(),
+                                   plan=lambda: a_plan())
+    screen = Screen(100, 24)
+    try:
+        rows = [visible(row) for row in
+                relay_with(state, manager.visible_agents(), clock)]
+        status = [index for index, row in enumerate(rows)
+                  if row.strip() == "bar 40%"]
+        assert len(status) == 1, rows
+        bars = [index for index, row in enumerate(rows) if "#" in row]
+        assert bars, rows
+        assert min(bars) > status[0], "the bars go UNDER the status row"
+        assert max(bars) == len(rows) - 1, "and they are the last rows"
+        planned = [index for index, row in enumerate(rows) if "PLAN" in row]
+        assert planned and max(planned) < status[0], \
+            "both columns are above both instruments"
+        # Full width, and never past the terminal's spare column.
+        for row in rows:
+            assert menu().display_width(row) <= 100, (len(row), row)
+    finally:
+        screen.close()
+
+
+def test_a_short_window_gives_up_the_reply_rather_than_the_bars():
+    """`room` subtracts the whole tail, so the rows the bars need come out of
+    the reply box. A region that grew past the window instead would scroll
+    away from the cursor moves that repaint it, and every repaint after that
+    lands on rows that have moved."""
+    manager, clock = register(4)
+    state = agent_panel.PanelState(manager, stream=Console(),
+                                   plan=lambda: a_plan())
+    screen = Screen(100, 14)
+    try:
+        body = "\n".join("reply line %d" % n for n in range(40))
+        rows = [visible(row) for row in
+                relay_with(state, manager.visible_agents(), clock, body=body)]
+        assert len(rows) <= 14, (len(rows), rows)
+        for number in range(1, 5):
+            assert any("#%d" % number in row for row in rows), \
+                ("agent #%d lost its bar" % number, rows)
+    finally:
+        screen.close()
+
+
+def test_a_session_that_delegates_nothing_composes_exactly_what_it_did():
+    """The fix costs a plan-only session precisely nothing: no extra row, and
+    the status row is still the last thing in the region. Two frames of an
+    untouched region being identical is what lets the repaint be skipped."""
+    state = agent_panel.PanelState(None, stream=Console(), plan=lambda: a_plan())
+    screen = Screen(100, 24)
+    try:
+        rows = [visible(row) for row in relay_with(state, ())]
+        assert rows[-1].strip() == "bar 40%", rows
+        assert not any("#" in row and "PLAN" not in row and "S" not in row
+                       for row in rows[-1:]), rows
+    finally:
+        screen.close()
+
+
 def test_a_change_outside_the_region_can_ask_it_to_repaint():
     """The relay repaints when the reply moves on and when the status row
     changes, and at no other time -- the repaint-on-a-timer is gone and that
