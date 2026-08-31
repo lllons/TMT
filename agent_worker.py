@@ -67,6 +67,19 @@ NOTE_ACTIONS = frozenset({
     "announce", "internal_response",
 })
 
+# The reviewbot's readout verb. Handled by this loop directly rather than
+# through `execute_action`, for a reason `TERMINAL_ACTION` shares and for one
+# of its own: it writes to the agenda hanging off THIS agent's record, and the
+# only thing that can find that record is the manager -- which `_context`
+# deliberately withholds from a background agent so a worker cannot spawn
+# workers of its own. Routing it through the dispatcher would mean handing
+# every worker a register in order to give one reviewer a checklist.
+#
+# `execute_action` still knows the name and answers it with a sentence saying
+# where it belongs, so a main model or a plain worker that emits it is
+# corrected rather than told "Unknown action".
+AGENDA_ACTION = "review_agenda"
+
 # Everything the review agent may do, and nothing else. Read-only by
 # construction in exactly the way NOTE_ACTIONS is, and a whitelist for exactly
 # the same reason: a blacklist silently admits every action added to TMT after
@@ -82,7 +95,13 @@ NOTE_ACTIONS = frozenset({
 # what that proves is its job.
 #
 # `review` itself is absent, so a reviewer cannot start a review of its own.
-REVIEW_ACTIONS = frozenset(NOTE_ACTIONS)
+#
+# `review_agenda` is the one verb it has that the note agent does not, and it
+# is what the two lists were named separately for: the reviewer says what it
+# is going to check before it checks anything, and ticks each item off as it
+# goes. It writes to a readout and nothing else -- no file, no workspace, no
+# review verdict -- so it does not cost the reviewer its read-only guarantee.
+REVIEW_ACTIONS = frozenset(NOTE_ACTIONS | {AGENDA_ACTION})
 
 # What a worker may never do, whatever its prompt says. `git_push` because a
 # push needs the user's own words behind it and a worker's task text is
@@ -150,6 +169,30 @@ _ACTION_RAISED = (
 _ANNOUNCED = ("Noted. Nothing you write is shown to anyone, so an announcement "
               "costs a step and tells nobody. The task is not finished: emit "
               "the action you just described.")
+
+# What the reviewer is told after touching its agenda. The tail matters: the
+# agenda is a readout and updating it is not reviewing, so a reviewer that has
+# just ticked an item is pointed straight back at the work rather than left
+# looking at a checklist it could keep tidying.
+_AGENDA_RESULT = ("Agenda: %s\nThat updated the readout only; it reviewed "
+                  "nothing. Take the next action for the item you are on.")
+
+# The nudge a reviewer gets when it has started reviewing without saying what
+# it was going to check. It is the shape `build_result_message` already uses
+# for a missing `progress` sentence, and it is that shape for the same reason:
+# it RIDES ON A RESULT, so it costs no step and cannot fail one.
+#
+# Deliberately not enforced. A gate here -- refusing every action until an
+# agenda exists -- would let a reviewer that could not produce the shape burn
+# its retry budget and end in ERROR, and ERROR blocks the final answer. A
+# readout must never be able to stop the work it is reporting on, so this is
+# taught in the prompt, nudged once here, and never required.
+_AGENDA_MISSING = (
+    "\n\nReminder: you have not declared your agenda, and the person waiting "
+    "can see that you are working but not what you are working through. Emit "
+    "{\"action\":\"review_agenda\",\"operation\":\"create\",\"items\":[...]} "
+    "with the four to eight things you are checking, then carry on."
+)
 
 _REFUSED = (
     "REFUSED: '%s' is not available to you. %s Emit a different action, or "
@@ -538,6 +581,26 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
         _invalidate_prompt()
         return result
 
+    nudged = [False]
+
+    def agenda_nudge():
+        """The reminder tail for a reviewer that has not declared its agenda.
+
+        Once per run, and only for an agent that HAS the verb -- a worker or a
+        note agent would be told to emit an action it is refused. Guarded to
+        the empty string throughout: this is a line of advice, and a reviewer
+        must not be able to fail because a reminder could not be built.
+        """
+        if nudged[0] or AGENDA_ACTION not in (allowed or ()):
+            return ""
+        try:
+            if len(record.agenda or ()):
+                return ""
+        except Exception:
+            return ""
+        nudged[0] = True
+        return _AGENDA_MISSING
+
     while steps < rounds:
         _guard(record)
         # Reported at the top of the step rather than at the end of it, so the
@@ -642,7 +705,7 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
             messages.append({"role": "user", "content":
                              "Batch results:\n%s\nOutput your next action, or "
                              "internal_response when the task is done."
-                             % "\n".join(response)})
+                             % "\n".join(response) + agenda_nudge()})
             continue
 
         # Read before validation, deliberately. `internal_response` is
@@ -677,6 +740,25 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
             messages.append({"role": "assistant", "content": raw})
             messages.append({"role": "user", "content": _ANNOUNCED})
             continue
+        if action == AGENDA_ACTION:
+            # The reviewbot's readout, applied here rather than dispatched.
+            # `_refusal` above has already turned it away for every agent whose
+            # whitelist does not carry it, so reaching this line means the
+            # reviewer, and only the reviewer.
+            #
+            # It costs a step, because it is a whole request to a model and
+            # pretending otherwise would let a reviewer spend its budget on the
+            # readout and run out before it reviewed anything. A refusal is
+            # fed back as an ordinary result rather than through `hand_back`:
+            # the agenda is a display, and a reviewer that got the shape wrong
+            # should read the correction and carry on reviewing, not spend a
+            # retry proving it can operate a checklist.
+            steps += 1
+            retries = 0
+            result = manager.apply_agenda(record.id, obj)
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "user", "content": _AGENDA_RESULT % result})
+            continue
 
         try:
             result = dispatch(obj, action)
@@ -692,7 +774,8 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
         steps += 1
         retries = 0
         messages.append({"role": "assistant", "content": raw})
-        messages.append({"role": "user", "content": _result_message(action, result)})
+        messages.append({"role": "user",
+                         "content": _result_message(action, result) + agenda_nudge()})
 
     return _stop(manager, record,
                  "stopped: ran out of steps after %d actions without finishing"
@@ -726,6 +809,14 @@ def _run_batch(batch, record, manager, dispatch, allowed, forbidden,
             return "invalid", _batch_complaint(refusal, results), ran
         if action == "announce":
             results.append("%s: nothing was shown; nobody sees your messages" % action)
+            continue
+        if action == AGENDA_ACTION:
+            # Answered here as well as on the single-action path, because a
+            # batch dispatches through the same `execute` and the agenda is
+            # not reachable from there. Without this a reviewer that put its
+            # agenda in a batch would be told the verb belongs somewhere else
+            # while looking at the one place it does belong.
+            results.append("%s: %s" % (action, manager.apply_agenda(record.id, entry)))
             continue
         try:
             result = dispatch(entry, action)

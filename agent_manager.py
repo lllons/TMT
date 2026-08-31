@@ -209,6 +209,18 @@ class AgentRecord:
         # the truth is "nobody knows".
         self.lines_added = 0
         self.lines_removed = 0
+        # The reviewbot's declared checklist, and None for every other kind of
+        # agent. It is an `agent_reviewbot.Agenda` when there is one, attached
+        # by `agent_actions._review` at the moment the reviewer is spawned and
+        # shared -- one object, two references -- with the turn's
+        # `agent_review.ReviewState`, so the strip under the progress bar and
+        # `/review` are reading the same list rather than two copies of it.
+        #
+        # Declared here as a plain attribute rather than constructed here, so
+        # this module goes on importing nothing it does not need: a manager
+        # that had to import the agenda to make a record would fail to import
+        # at all on an install whose frozen module list has not caught up.
+        self.agenda = None
         self.conversation = []
         # The daemon thread running it, once `start` has made one. Held so a
         # caller that needs to know the thread has actually unwound -- a test,
@@ -591,6 +603,57 @@ class AgentManager:
             record.activity = text
         self._emit([(AGENT_ACTIVITY_CHANGED, record)])
         return record
+
+    def apply_agenda(self, agent_id, obj):
+        """Run one `review_agenda` operation for this agent, and repaint.
+
+        The rules are all in `agent_reviewbot`; what is here is the register's
+        two jobs. It finds the agent, which is the only thing that knows which
+        agenda is being written to, and it emits -- without which the strip
+        would hold the frame it had when the review started and catch up only
+        when something else forced a repaint. A review blocks the main loop for
+        minutes, so "something else" is a long time away.
+
+        The agenda is mutated OUTSIDE the lock. That is deliberate and it is
+        the same rule every other field here follows: readers do not take the
+        lock, because a panel that had to lock the register to draw a frame
+        could stall a worker by being slow. What the lock protects is the
+        register's own maps, and an agenda belongs to exactly one agent, which
+        is written to by exactly one thread -- its own.
+
+        Everything comes back as a string, including every refusal, because
+        the caller is a step loop feeding a model: a reviewer that got the
+        shape wrong corrects it on its next step exactly as it does for a
+        patch whose search text did not match.
+        """
+        with self._lock:
+            record = self._by_id.get(str(agent_id))
+        if record is None:
+            return "There is no agenda here: this agent is not registered."
+        try:
+            import agent_reviewbot
+        except Exception as error:
+            # The frozen-module-list failure every late import here guards
+            # against. A readout that cannot be built is a readout, never a
+            # reason to end a review.
+            return "The review agenda is unavailable: %s" % error
+        if record.agenda is None:
+            record.agenda = agent_reviewbot.Agenda()
+        try:
+            result = agent_reviewbot.apply_operation(record.agenda, obj)
+        except agent_reviewbot.AgendaError as error:
+            return "FAILED: %s" % error
+        except Exception as error:
+            return "FAILED: the agenda could not be updated (%s: %s)" % (
+                type(error).__name__, error)
+        operation = str((obj or {}).get("operation", "")).strip().lower()
+        if operation not in agent_reviewbot.READ_ONLY_OPERATIONS:
+            # Announced only when something actually moved, the rule
+            # `set_activity` keeps a few methods above: a `show` changes
+            # nothing, and emitting for it would repaint the region for a
+            # frame identical to the one already on screen.
+            self._emit([(AGENT_ACTIVITY_CHANGED, record)])
+        return result
 
     def _apply_tokens(self, agent_id, tokens_in, tokens_out,
                       input_exact, output_exact, accumulate):

@@ -320,6 +320,13 @@ _WORKERS_STILL_RUNNING = (
     "stop them with kill_agent), then request the review again."
 )
 
+_REVIEW_AGENDA_ELSEWHERE = (
+    "REFUSED: 'review_agenda' belongs to the independent reviewer and is "
+    "applied inside its own run. It writes to that reviewer's checklist, and "
+    "you do not have one. Nothing was changed. Start a review with "
+    "{\"action\":\"review\"} if this task needs one."
+)
+
 # The values "scope" understands. One, for now, and a wrong one is named
 # rather than ignored: a model that asked for "changed_files" and silently got
 # a whole-task review would draw the wrong conclusion from the answer.
@@ -394,6 +401,48 @@ def _review_snapshot(agent_review, context, obj, review):
         notes=notes)
 
 
+def _attach_agenda(record, review):
+    """Give this reviewer a fresh agenda, and point the review state at it.
+
+    A new one per review, not one per task: a second cycle is a second
+    reviewer with its own list, and carrying the first one's ticked items over
+    would show a review as most of the way through work it has not started.
+    The finished list of the review before it is in that review's own result,
+    which is where a finished thing belongs.
+
+    Guarded to nothing, deliberately. Everything here is a readout, and the
+    review runs identically without it.
+    """
+    try:
+        import agent_reviewbot
+        agenda = agent_reviewbot.Agenda()
+        record.agenda = agenda
+        review.agenda = agenda
+        return agenda
+    except Exception:
+        return None
+
+
+def _note_review_cost(review, record):
+    """Tell the review state what its reviewer cost. Guarded to nothing.
+
+    `exact` is both halves or neither, the rule the corner meter follows: a
+    total that mixes one figure the provider reported with one this runtime
+    estimated is an estimate, and it is drawn with a leading `~` to say so.
+
+    Every failure here is swallowed. A readout must never be the thing that
+    turns a completed review into a failed one.
+    """
+    try:
+        elapsed = record.elapsed(record.finished_at)
+        review.note_cost(
+            tokens=record.total_tokens(),
+            exact=bool(record.tokens_in_exact and record.tokens_out_exact),
+            seconds=elapsed)
+    except Exception:
+        pass
+
+
 def _review(context, obj):
     """Run one independent review and return what it found.
 
@@ -451,6 +500,18 @@ def _review(context, obj):
         return "FAILED: %s" % review.fail(
             "the reviewer could not be created (%s: %s)"
             % (type(error).__name__, error))
+    # The checklist the reviewer will declare into, attached BEFORE the thread
+    # exists so there is no window in which the reviewer has started and its
+    # readout has nowhere to go. One object with two references: the record is
+    # what the reviewer's own thread writes through, and the review state is
+    # what outlives the record -- a copy would leave the strip drawing one and
+    # `/review` printing the other.
+    #
+    # Guarded to nothing. A readout that cannot be built must never be what
+    # stops a review: without it the reviewer's `review_agenda` calls come
+    # back as sentences saying so, and the strip falls back to the bar, the
+    # tokens and the activity label, all of which are measured either way.
+    _attach_agenda(record, review)
     started = manager.start(
         record, lambda rec, mgr: agent_worker_mod.run_review(rec, mgr))
     if started is None:
@@ -458,6 +519,17 @@ def _review(context, obj):
             "the reviewer could not be started; it is %s" % record.status)
     seconds = _timeout(obj)
     finished = manager.wait([record.id], timeout=seconds)
+    # What that reviewer cost, recorded before anything can go wrong with what
+    # it said. It is the register's own measurement of a thread it owned, and
+    # it is put on the review state because the record ages off the strip five
+    # seconds after it finishes while the state outlives the turn -- so
+    # "what did that review cost" stops being a question that is only
+    # answerable while nobody is asking it.
+    #
+    # Recorded on every path, including a reviewer that timed out or returned
+    # nonsense: those cost exactly as much as a good one, and leaving the
+    # figure off the failures would make reviews look cheaper than they are.
+    _note_review_cost(review, record)
     if record.id not in finished:
         # Killed rather than abandoned. A reviewer still reading while the
         # main agent resumes editing would be reporting on a tree that has
@@ -943,6 +1015,17 @@ def execute_action(obj, context=None):
     # BLOCK, for as long as the reviewer runs or the timeout allows, exactly
     # as the two wait verbs do.
     if action == "review": return _review(context, obj)
+    # The reviewbot's own readout, and the one registered verb this dispatcher
+    # deliberately does not carry out. It writes to the agenda hanging off one
+    # reviewer's record, and the only thing that can find that record is the
+    # manager -- which a background agent's context deliberately withholds, so
+    # a worker cannot spawn workers of its own. `agent_worker` applies it
+    # inside the loop that has both.
+    #
+    # Answered with a sentence rather than left to fall through to "Unknown
+    # action", which would be a true statement that sends the reader looking
+    # for a typo. This one names where the verb lives and who may use it.
+    if action == "review_agenda": return _REVIEW_AGENDA_ELSEWHERE
     # Verification. It writes no file of TMT's, so it is not in
     # MUTATING_ACTIONS and the cached prompt still describes the workspace --
     # but it DOES run the project's own commands, which is why it goes through
@@ -1084,6 +1167,11 @@ ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     "open_app", "git_status", "git_diff", "git_identity", "git_commit", "git_push",
     "tree", "find_text", "find_symbol", "replace_across", "code_map",
     "related_tests", "remember", "recall", "plan", "review", "verify",
+    # Registered here although only the reviewer can carry it out, so an agent
+    # that emits it anyway is named in words rather than by its raw verb. Every
+    # other registered action has an entry; a missing one shows the reader
+    # `review_agenda` where every neighbouring row says `Review Agenda`.
+    "review_agenda",
     "spawn_agent", "agent_status", "agent_result", "wait_for_agent",
     "wait_for_agents", "kill_agent", "internal_response",
     "announce", "respond", "done",

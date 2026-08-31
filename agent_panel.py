@@ -47,7 +47,7 @@ about.
 import sys
 import time
 
-from agent_manager import Status
+from agent_manager import RETENTION_SECONDS, Status
 from agent_ui import (
     DIM, RESET, _color, _supports_color, display_width, encodable,
     fit_to_width, plain_output, strip_ansi, visible_width,
@@ -405,6 +405,321 @@ def agent_status_rows(records, columns, stream=None, now=None):
     """
     return [agent_status_row(record, columns, stream, now)
             for record in (records or ())]
+
+
+# --- the reviewbot strip ---------------------------------------------------
+#
+# The independent reviewer, drawn where the workers are drawn, because it is
+# one of them: it runs on the same loop, on a background thread, with the same
+# record behind it. What it is not is one of the fleet -- it lives in the
+# manager's own `_review` slot rather than in `_records`, so `visible_agents`
+# never returns it and it had no row at all until this block existed.
+#
+# That absence was the whole complaint. A review blocks the main loop for as
+# long as it takes, and for the whole of that time the only thing on screen
+# about it was `REVIEW 1/3 / ● Running independent review` in the column: no
+# token figure, no elapsed time, no activity, nothing saying whether it was
+# working through the job or reading the same file for the fortieth time.
+# In the user's words, "just a promise that it is actually doing what it is
+# meant to". Every fact drawn here was already being measured; none of it was
+# being shown.
+#
+# Three rows' worth, and each one answers a different question:
+#
+#   ████░░░░ reviewbot  3/7  ~12k T +840  18s
+#              Read Lines agent_review.py
+#     A1 ✓ Understand what was asked
+#     A2 ✓ Read the changeset
+#     A3 ● Read the implementation in context
+#     A4 ○ Check the tests cover it
+#
+# The first is the instrument: how far through its own declared agenda it is,
+# what it has cost, how long it has been going. The second is the current
+# task, in the reviewer's tool's words, on its own row so a long path does not
+# squeeze the figures. The rest are the agenda itself, which is the reviewer's
+# own list -- see `agent_reviewbot` for why the runtime never supplies one.
+
+REVIEWBOT_NAME = "reviewbot"
+
+# How many rows the whole block may take: the status row, the activity row,
+# and six of the agenda. Six because the agenda is windowed around the item
+# being worked on, exactly as the plan column windows its steps, so a longer
+# list scrolls rather than being cut off at its top -- and because this strip
+# shares the live region with the reply box, which gives up rows for it.
+#
+# There is no competition for the strip while a review runs: `agent_actions`
+# refuses to start a review while any worker is live, so the fleet's own rows
+# are empty for the whole of it.
+REVIEWBOT_MAX_ROWS = 8
+AGENDA_MAX_ROWS = 6
+
+# The marks an agenda row carries, and the ASCII they degrade to. Colour is
+# never the message here either: every status has its own glyph, the four are
+# distinct with the escapes stripped, and `agenda_marks` asks the stream about
+# the marks themselves as well as about decoration generally -- a terminal
+# that draws a box rule but not a tick would otherwise put a replacement
+# character on the one column the reader is scanning.
+_AGENDA_MARKS = {"done": "✓", "active": "●", "pending": "○", "skipped": "–"}
+_AGENDA_ASCII_MARKS = {"done": "+", "active": ">", "pending": ".",
+                       "skipped": "-"}
+
+# Positions on the one gradient, and no new colour: a checked item is
+# `success` (95), the one in hand is `background_agent` (40), and a skipped
+# one is `warning` (60) -- a check the reviewer consciously set aside is
+# exactly the thing that word is for. A pending item takes no position at all
+# and is drawn dim, which is the honest painting: it has not happened.
+_AGENDA_POSITIONS = {"done": DONE_POSITION, "active": AGENT_POSITION,
+                     "skipped": KILLED_POSITION}
+
+# Red, at the position `error` already holds. The reviewbot's bar is the
+# neutral ramp like every other background agent's -- grey through white --
+# and turns red at exactly one moment: when the review it is reporting has
+# come back with something blocking, or has not come back at all. That is the
+# gradient spent on its sharpest distinction rather than a colour invented for
+# a new feature, and it is why the bar is worth watching at the end as well as
+# during: a red bar in the strip says the answer is being held.
+REVIEWBOT_FAILED_POSITION = FAILED_POSITION
+
+# The review states that paint the bar red. `failed` is blocking findings and
+# `error` is a review that never reported -- the two states `agent_review`
+# refuses to release a final answer from. A stale pass is NOT one of them: the
+# work moved under a review that really did pass, which is amber news about
+# the code rather than bad news from the reviewer, and `review_rows` already
+# says so in the column.
+_REVIEWBOT_ALARM = ("failed", "error")
+
+
+def agenda_marks(stream=None):
+    """The agenda-status marks this stream can actually show."""
+    if plain_output(stream) or not encodable(stream, "".join(_AGENDA_MARKS.values())):
+        return _AGENDA_ASCII_MARKS
+    return _AGENDA_MARKS
+
+
+def reviewbot_bar(progress, stream, alarm=False, width=AGENT_BAR_WIDTH):
+    """The reviewbot's bar: the neutral ramp, or red when the review is bad news.
+
+    `neutral_bar` unless `alarm`, so the ordinary case is byte-identical to
+    every other background agent's bar and the reviewbot reads as one of them.
+    The red form is the same shape drawn at one gradient position rather than
+    along the ramp -- a single colour, because it is not reporting a scale, it
+    is reporting a state.
+    """
+    if not alarm:
+        return neutral_bar(progress, stream, width=width)
+    plain = plain_output(stream)
+    full, empty = ("#", "-") if plain else ("█", "░")
+    width = max(1, int(width))
+    progress = min(100, max(0, int(progress)))
+    filled = round(width * progress / 100.0)
+    done, left = full * filled, empty * (width - filled)
+    if not _supports_color(stream):
+        return done + left
+    # Each half is painted only when it has something in it. An empty span
+    # would otherwise put an escape pair on the row that draws nothing, on
+    # every repaint of a bar that is full or a bar that is empty -- which are
+    # the two states this one is most often in.
+    return ((_color(done, REVIEWBOT_FAILED_POSITION, stream) if done else "")
+            + ((DIM + left + RESET) if left else ""))
+
+
+def reviewbot_progress(record, agenda=None):
+    """How full the reviewbot's bar is, 0-100.
+
+    The agenda's own share when there is one, which is the one completion
+    figure in TMT that is not a guess: the reviewer said how many things it
+    would check and has itself reported which of them are finished. Without an
+    agenda it falls back to `agent_progress` -- the step budget spent, the same
+    figure and the same honesty as every other agent's bar.
+
+    A terminal record is full whichever it used, because it is over, and that
+    is the one moment completion is actually known.
+    """
+    if getattr(record, "is_terminal", None) and record.is_terminal():
+        return 100
+    try:
+        if agenda is not None and len(agenda):
+            return int(agenda.progress())
+    except Exception:
+        pass
+    return agent_progress(record)
+
+
+def reviewbot_alarm(review):
+    """Whether the bar should be red: the review is blocking or never reported."""
+    try:
+        return str(review.display) in _REVIEWBOT_ALARM
+    except Exception:
+        return False
+
+
+def reviewbot_status_row(record, columns, stream=None, now=None, agenda=None,
+                         alarm=False):
+    """The reviewbot's own row, in the shape every agent row already has.
+
+    `reviewbot  3/7  ~12k T +840  18s`. It is deliberately the same row as
+    `agent_status_row` with two substitutions, because the strip must read as
+    one list of background agents rather than as two features stacked:
+
+    - the identity is the word rather than `#4`. A reviewer is not a numbered
+      member of the fleet -- there is one of it, it is in its own slot, and a
+      number would invite the reader to look for it in the AGENTS panel, where
+      it is not.
+    - the `+12 -3` slot carries `3/7` instead. A reviewer writes nothing, by
+      construction: every writing verb is refused to it before dispatch, so
+      its line counts are two zeroes on every row of every review. What goes
+      there instead is the figure that does move.
+
+    The row gives up its parts from the right as the terminal narrows, exactly
+    as an agent's does, and what it never gives up is which agent it is.
+    """
+    stream = sys.stdout if stream is None else stream
+    bar = reviewbot_bar(reviewbot_progress(record, agenda), stream, alarm=alarm)
+    name = REVIEWBOT_NAME
+    checked = ""
+    try:
+        if agenda is not None and len(agenda):
+            settled, total = agenda.counts()
+            checked = "%d/%d" % (settled, total)
+    except Exception:
+        checked = ""
+    tokens = _token_text(record)
+    elapsed = _elapsed_text(record, now)
+    for parts in ((name, checked, tokens, elapsed),
+                  (name, checked, tokens),
+                  (name, checked),
+                  (name,)):
+        text = "  ".join(part for part in parts if part)
+        # Measured as drawn: the bar carries escapes and counting those would
+        # shrink the row for characters the terminal never puts on screen.
+        if display_width(text) + AGENT_BAR_WIDTH + 2 <= max(1, int(columns) - 1):
+            return bar + " " + fit_to_width(
+                text, max(1, int(columns) - AGENT_BAR_WIDTH - 2))
+    return bar
+
+
+def reviewbot_activity_row(record, columns, stream=None):
+    """The reviewer's current task, dim and indented under its bar, or "".
+
+    Its own row rather than a part of the row above for one measured reason: a
+    label is `Read Lines agent_review.py` and paths are long, so putting it in
+    the fitted run of parts would push the token figure and the elapsed time
+    off the row on any terminal narrower than about a hundred columns -- and
+    those two are the other half of what was asked for. Nothing is worth
+    buying with them.
+
+    Dim, because it is the one thing here that changes every few seconds and
+    a bright row that flickers pulls the eye off the bar it belongs to.
+    """
+    stream = sys.stdout if stream is None else stream
+    label = str(getattr(record, "activity", "") or "").strip()
+    if not label:
+        return ""
+    return _row("  " + label, max(1, int(columns) - 1), stream, dim=True)
+
+
+def agenda_row_text(item, marks):
+    """One agenda item as plain text: its label, its mark, its title."""
+    text = "%s %s %s" % (item.id, marks.get(item.status, "?"), item.title)
+    return "%s (%s)" % (text, item.note) if item.note else text
+
+
+def agenda_rows(agenda, columns, stream=None, height=None):
+    """The declared agenda, one row per item, or nothing at all.
+
+    Nothing when the reviewer declared nothing, which is a real case and is
+    left looking like one: the bar and the activity row still say a reviewer
+    is running and what it is doing, and no list is drawn claiming to be its
+    plan. See `agent_reviewbot` for why the runtime never supplies one.
+
+    Windowed around the item in hand, exactly as `plan_rows` windows its
+    steps and for the same reason: the one row that must always be on screen
+    is the one the work is happening on, and an agenda scrolled to its top
+    while the reviewer works on A9 is a list about a different moment.
+    """
+    stream = sys.stdout if stream is None else stream
+    columns = max(1, int(columns))
+    try:
+        items = list(getattr(agenda, "items", ()) or ())
+        if not items:
+            return []
+        room = AGENDA_MAX_ROWS if height is None else min(AGENDA_MAX_ROWS,
+                                                          int(height))
+        if room < 1:
+            return []
+        marks = agenda_marks(stream)
+        shown = _plan_window(items, room, agenda.active_index())[1]
+        return [_row("  " + agenda_row_text(item, marks), columns - 1, stream,
+                     position=_AGENDA_POSITIONS.get(item.status),
+                     dim=item.status == "pending")
+                for item in shown]
+    except Exception:
+        # The whole body, not only the attribute read. `active_index` and the
+        # item fields are just as much somebody else's object as `items` is,
+        # and decoration is never allowed to end a turn.
+        return []
+
+
+def reviewbot_rows(record, review=None, columns=80, stream=None, now=None,
+                   agenda=None, height=None):
+    """The whole reviewbot strip, or nothing at all.
+
+    Nothing when no review has run this session, so a session that never
+    reviews draws exactly the screen it drew before any of this existed.
+
+    A finished reviewer keeps its rows for `RETENTION_SECONDS`, the same
+    window a finished worker's card and row are kept for, because they are the
+    same fact drawn twice and they must disappear together -- and because the
+    last thing a reader wants is the ticked agenda vanishing at the instant
+    the review reports. What outlives that is the REVIEW block in the column,
+    which is where a finished review's verdict belongs.
+
+    `agenda` may be passed explicitly; otherwise it is taken off the record,
+    which is where `agent_actions` puts it when it spawns the reviewer. Both
+    are one object -- see `agent_reviewbot.Agenda`.
+    """
+    stream = sys.stdout if stream is None else stream
+    if record is None:
+        return []
+    try:
+        if agenda is None:
+            agenda = getattr(record, "agenda", None)
+        if _aged_out(record, now):
+            return []
+        alarm = reviewbot_alarm(review) if review is not None else False
+        room = REVIEWBOT_MAX_ROWS if height is None else min(REVIEWBOT_MAX_ROWS,
+                                                             int(height))
+        if room < 1:
+            return []
+        rows = [reviewbot_status_row(record, columns, stream, now, agenda, alarm)]
+        if room < 2:
+            return rows
+        activity = reviewbot_activity_row(record, columns, stream)
+        if activity:
+            rows.append(activity)
+        rows.extend(agenda_rows(agenda, columns, stream, height=room - len(rows)))
+        return rows
+    except Exception:
+        # Decoration is never allowed to end a turn. A record or an agenda
+        # that raises costs the strip its rows, exactly as a register that
+        # raises costs `PanelState.records` its cards.
+        return []
+
+
+def _aged_out(record, now=None):
+    """Whether a finished reviewbot's rows have outlived their retention window.
+
+    Filtered on read, off `finished_at`, which is how `visible_agents` retires
+    a worker's card -- no timer, nothing to cancel, nothing to leak, and it
+    survives the region being taken down and rebuilt between turns.
+    """
+    if not (getattr(record, "is_terminal", None) and record.is_terminal()):
+        return False
+    finished = getattr(record, "finished_at", None)
+    if finished is None:
+        return False
+    moment = time.monotonic() if now is None else now
+    return finished + RETENTION_SECONDS <= moment
 
 
 def _state_word(record):

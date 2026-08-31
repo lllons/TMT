@@ -113,6 +113,11 @@ REVIEW_VERBS = (
     "find_symbol", "tree", "code_map", "related_tests", "recall",
     "git_status", "git_diff", "git_identity",
     "announce", "internal_response",
+    # The one verb the reviewer has and the note agent does not: its own
+    # checklist, declared before it reads anything and ticked off as it goes.
+    # It is what puts something on screen during a review that is measured
+    # rather than promised -- see agent_reviewbot.
+    "review_agenda",
 )
 
 _cached_worker = None
@@ -271,8 +276,49 @@ CRITICAL and MAJOR are BLOCKING: each one sends the task back for another round 
 Your "status" and your issues must agree. A "PASS" listing a CRITICAL finding is a contradiction, and the runtime resolves it against you: blocking findings decide, so it is recorded as a FAIL and your own claim is shown beside it."""
 
 
+REVIEW_AGENDA_REFERENCE = r"""=== YOUR AGENDA, AND THE FIRST ACTION YOU TAKE ===
+A review blocks the whole session for as long as it takes. The person waiting can see a bar, a token count, an elapsed time and whatever file you are reading - and, unless you tell them, nothing at all about what you are actually working through. So before you read anything, you say what you are going to check. Then you tick each item off as you finish with it, and they can watch the review happen instead of waiting for it.
+
+review_agenda - keys: operation. It updates a readout on the user's screen. It reviews nothing, reads nothing and changes nothing.
+
+YOUR FIRST ACTION IS ALWAYS THIS, with operation "create":
+  {"action":"review_agenda","operation":"create","items":["Understand what was asked","Read the diff end to end","Check refresh-token expiry is enforced","Read the callers of validate_refresh","Check the tests cover the new paths","Check every requirement in the request"]}
+
+Then, as you finish each one:
+  {"action":"review_agenda","operation":"update","item":1,"status":"done"}
+  {"action":"review_agenda","operation":"update","item":"A2","status":"done"}
+
+Two at once, when one action settled both:
+  {"action":"review_agenda","operation":"update","updates":[{"item":3,"status":"done"},{"item":4,"status":"done"}]}
+
+Something you could not check. There is no "skip" operation - it is an update to the "skipped" status, and the "note" is required, because a skip with no reason is indistinguishable from a check you quietly dropped:
+  {"action":"review_agenda","operation":"update","item":5,"status":"skipped","note":"the test directory is not in this repository"}
+
+Something you discovered you also need to check:
+  {"action":"review_agenda","operation":"add","items":["Check the migration script handles an empty table"]}
+
+And if you have lost track of your own list:
+  {"action":"review_agenda","operation":"show"}
+
+HOW TO WRITE THE ITEMS:
+Four to eight of them. They are specific to THIS change and are written in your own words: "Check refresh-token expiry is enforced" is an agenda, "Inspect the implementation" is a heading. Someone reading the list should be able to tell what you are reviewing from the list alone. Put them in the order you will do them - the phases below are that order, and an item may cover more than one phase or a phase may need two items.
+
+WHAT THE RUNTIME DOES WITH IT:
+It draws it. That is all. It does not check your work against it, it does not require you to finish it, and it will not stop you returning a verdict with items still open. What it does do is show the list to the person waiting, so an item you tick is a statement they have read.
+
+WHAT NEVER WORKS:
+  BAD: reviewing first and declaring the agenda at the end          (the readout was blank for the whole review)
+  BAD: {"action":"review_agenda","operation":"update","item":2,"status":"done"} for something you have not checked
+  BAD: re-creating the agenda half way through                      (refused once anything is ticked; use "add")
+  BAD: marking an item done because you ran out of ideas            (mark it skipped, and say why)
+  BAD: {"action":"review_agenda","operation":"create","items":["Review the code"]}   (one item that says nothing)
+  GOOD: create first, then one update per item as you actually finish it."""
+
+
 REVIEWER_RULES = """=== HOW YOU REVIEW ===
 Work through this in order. Do not skip to a verdict.
+
+Before A, declare your agenda with review_agenda "create". It is your first action of the review, every time. See the section on it below.
 
 A. UNDERSTAND THE REQUEST. Read the user's original request in your brief. Write down for yourself what was explicitly asked for, what is implied by it, and what "finished" would look like. Do not judge the implementation yet.
 
@@ -300,7 +346,8 @@ Rules that hold throughout:
 5. Do not report style preferences as defects. A finding is something that is wrong, missing, risky or unmaintainable, not something you would have written differently.
 6. You have no memory of previous reviews of this task. If your brief shows work that answers an earlier finding, judge the code in front of you now.
 7. Finish with exactly one internal_response carrying the result object, whatever happened - including when you found nothing at all, which is a PASS with an empty issues list and is a perfectly good review.
-8. Never state a fact you did not read. Every path, line number, count and test result in your review must be one an action returned to you or your brief stated. If you could not check something, say so in the summary rather than assuming it."""
+8. Never state a fact you did not read. Every path, line number, count and test result in your review must be one an action returned to you or your brief stated. If you could not check something, say so in the summary rather than assuming it.
+9. Keep the agenda honest as you go. Tick an item when you have actually finished it, not when you have started it, and mark it skipped with a reason when you could not do it rather than ticking it. The list is on screen while you work: an item you tick is something the person waiting now believes you checked."""
 
 
 WORKER_RULES = """=== HOW YOU WORK ===
@@ -481,7 +528,7 @@ def _shape_section():
             "prompt: read what you need.\n\n" + _tree())
 
 
-def _common(header, overrides, rules, examples, reference=None):
+def _common(header, overrides, rules, examples, reference=None, extra=None):
     """Assemble one background prompt from the shared parts and its own.
 
     The order matters and is the main prompt's order: what you are, how you
@@ -494,6 +541,15 @@ def _common(header, overrides, rules, examples, reference=None):
     `INTERNAL_RESPONSE_REFERENCE`, which is right for the two agents whose
     ending is a sentence; the reviewer passes its own, because its ending is a
     structured object and the verb without its shape teaches half of it.
+
+    `extra` is one more section, drawn immediately after `reference`, for a
+    verb one kind of agent has and the others do not. The reviewer passes its
+    agenda there. It is a parameter rather than a fourth positional section
+    because the other two prompts must not gain a blank line where nothing is
+    inserted -- `"
+
+".join` over a None would put one there, so the entry is
+    left out of the list entirely.
     """
     apps = ", ".join("%s (%s)" % (key, value["description"])
                      for key, value in APP_REGISTRY.items()) or "none"
@@ -503,6 +559,7 @@ def _common(header, overrides, rules, examples, reference=None):
         overrides,
         rules,
         INTERNAL_RESPONSE_REFERENCE if reference is None else reference,
+    ] + ([extra] if extra else []) + [
         agent_prompt.ACTION_REFERENCE,
         "Permitted apps for open_app: %s" % apps,
         agent_prompt.PREFERENCE_RULES,
@@ -566,6 +623,7 @@ def review_prompt():
         return _cached_review
     _cached_review = _common(REVIEWER_HEADER, REVIEWER_OVERRIDES, REVIEWER_RULES,
                              REVIEWER_EXAMPLES,
-                             reference=REVIEW_RESULT_REFERENCE)
+                             reference=REVIEW_RESULT_REFERENCE,
+                             extra=REVIEW_AGENDA_REFERENCE)
     _review_dirty = False
     return _cached_review
