@@ -2,6 +2,15 @@
   <img src="assets/Recording%202026-08-29%20103658.gif" width="600">
 </p>
 
+<p align="center">
+  <b>English</b> ·
+  <a href="otherlang/README.zh.md">中文</a> ·
+  <a href="otherlang/README.ja.md">日本語</a> ·
+  <a href="otherlang/README.fr.md">Français</a> ·
+  <a href="otherlang/README.es.md">Español</a> ·
+  <a href="otherlang/README.ru.md">Русский</a>
+</p>
+
 
 ## "Too Many Tools" — a CLI coding agent. It edits files in a sandboxed workspace, runs code in a dozen languages, and commits and pushes automatically on any repo.
 
