@@ -690,11 +690,12 @@ def test_a_worker_that_reaches_for_a_user_facing_ending_is_refused_not_obeyed():
     whatever the prompt said and whatever the model believes.
 
     The legacy names are driven here too, and they are the interesting half:
-    a worker's reply is translated by `_adopt_verb` BEFORE the whitelist is
-    consulted, so an old `respond` arrives at the refusal already spelled
-    `end_conversation` and is turned away by the same one entry. An old
-    `announce` arrives as `send_message`, which a worker IS allowed, and is
-    answered with the sentence saying nobody reads it."""
+    a worker's reply is translated by `adopt_verb` BEFORE the whitelist is
+    consulted, so an old `respond` -- and an old bare `done`, which is filled
+    in with a message on the way through -- both arrive at the refusal already
+    spelled `end_conversation` and are turned away by the same one entry. An
+    old `announce` arrives as `send_message`, which a worker IS allowed, and
+    is answered with the sentence saying nobody reads it."""
     box = Project(files=PROJECT)
     manager = agent_manager.AgentManager()
     try:
@@ -720,14 +721,17 @@ def test_a_worker_that_reaches_for_a_user_facing_ending_is_refused_not_obeyed():
         # through entries of their own.
         assert "REFUSED: 'respond'" not in fed_back, fed_back
         assert "REFUSED: 'done'" not in fed_back, fed_back
-        assert fed_back.count("REFUSED: 'end_conversation'") == 2, fed_back
-        # The bare legacy `done` is turned away one step earlier, by
-        # validation rather than by the whitelist: it translates to an
-        # `end_conversation` with no "message", which is now a required key.
-        # A different sentence, the same outcome -- handed back, not obeyed --
-        # and the verb it names is the current one either way.
-        assert "Action 'end_conversation' is missing required keys" in fed_back, \
-            fed_back
+        # THREE, and the third is the bare legacy `done`. It used to be turned
+        # away one step earlier and by a different rule -- it translated to an
+        # `end_conversation` carrying no "message", which is a required key,
+        # so validation refused it before the whitelist ever saw it. That was
+        # a hole in the translation rather than a feature of it: `done` took
+        # no keys, so the commonest legacy ending shape met a missing-key
+        # complaint instead of the refusal that actually applies to it.
+        # `adopt_verb` fills the message in now, and all three endings reach
+        # the same one entry and the same one sentence.
+        assert fed_back.count("REFUSED: 'end_conversation'") == 3, fed_back
+        assert "missing required keys" not in fed_back, fed_back
         assert "no user to answer" in fed_back
         # The message verb is ALLOWED to a worker and answered rather than
         # refused: it costs a step and the model is told nobody read it.

@@ -380,24 +380,71 @@ def state_settled(result):
 def test_a_cancelled_run_is_not_a_passed_one():
     """Ctrl-C during a verification is the user stopping it. It propagates so
     the session loop's own handler ends the turn, with the state already
-    recording why."""
+    recording why -- and a run that was stopped is not evidence, so the gate
+    goes on holding the answer.
+
+    **The checks are built here rather than discovered, and that is the whole
+    reason this test used to be unreliable.** It ran `E.verify` against
+    `Discovery(root=".")` -- the REAL repository -- and what that selects
+    depends on what git reports as changed. On a working copy with an
+    uncommitted `.py` file a syntax check is selected, the injected runner
+    raises, and the state is cancelled the way this test means. On a CLEAN
+    checkout nothing is selected, so nothing can be interrupted, the fallback
+    below cancels the state by hand -- and `refusal` then releases it, because
+    the run it is asked about had nothing to run.
+
+    So the assertion failed on every clean clone and passed on the machine it
+    was written on, which is exactly backwards from what a test is for. It was
+    recorded in the project notes for a long time as failing for reasons
+    nobody knew. The trigger is one uncommitted Python file.
+
+    Whether `refusal` SHOULD release a cancelled run that had nothing to run
+    is a real question and is deliberately not settled here -- see the notes.
+    What this test is about is the ordinary case: a run that had work to do
+    and was stopped part way through it.
+    """
+    state = a_state()
+    state.cancel("the user stopped it with Ctrl-C")
+    assert state.state == V.CANCELLED, state.state
+    assert not state.passed
+    assert state.last is None, "nothing was settled, so there is no result"
+    assert V.refusal(state, agent_plan.Plan(["a", "b", "c"]),
+                     "end_conversation") != ""
+
+
+def test_a_ctrl_c_during_a_check_propagates_and_cancels_the_state():
+    """The other half of the sentence above, and it was never actually tested.
+
+    The old version passed `Runner(KeyboardInterrupt())` and expected the
+    interrupt to reach it. It never did: `Runner` re-raises only what is an
+    `Exception`, and `KeyboardInterrupt` is a `BaseException`, so the helper
+    RETURNED the exception object as though it were a command outcome. The
+    engine then tripped over `outcome.ran`, the AttributeError was caught as
+    an ordinary failure, and the state settled to ERROR -- after which the
+    test's own fallback called `cancel()` by hand and the assertions passed.
+    The propagation the docstring described had nothing behind it.
+
+    So this raises for real, from the runner, and asserts both halves: that
+    the interrupt reaches the session loop rather than being swallowed into a
+    failed check, and that the state records why on its way past.
+
+    `paths` is given so the selection does not depend on what git reports as
+    changed -- which is the thing that made the test above unreliable.
+    """
+    def interrupted(argv, timeout=None):
+        raise KeyboardInterrupt
+
     state = V.VerificationState()
     state.note_change("write_file", ("a.py",))
     raised = None
     try:
         E.verify(state, discovery=D.Discovery(root=".", ecosystems=("python",)),
-                 runner=Runner(KeyboardInterrupt()),
-                 level=6)
+                 runner=interrupted, paths=["agent_verify.py"], level=6)
     except KeyboardInterrupt as error:
         raised = error
-    if raised is None:
-        # Nothing was selected to run, so nothing could be interrupted; drive
-        # the cancellation at the level it is enforced instead.
-        state.cancel("the user stopped it with Ctrl-C")
+    assert raised is not None, "the interrupt must reach the session loop"
     assert state.state == V.CANCELLED, state.state
     assert not state.passed
-    assert V.refusal(state, agent_plan.Plan(["a", "b", "c"]),
-                     "end_conversation") != ""
 
 
 def test_a_passed_check_is_reused_only_while_nothing_has_moved():

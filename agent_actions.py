@@ -1134,6 +1134,48 @@ _LEGACY_ACTIONS = {"announce": SEND_MESSAGE, "done": END_CONVERSATION}
 _NOT_FINAL = ("false", "no", "0", "")
 
 
+# What a bare legacy `done` becomes the message of. `done` took no keys at
+# all, and `execute_action` has always answered one with this word -- so
+# supplying it here is not TMT inventing an answer, it is the same default
+# moved one step earlier, to where `validate_action` can see it.
+#
+# Without it the net half-works, which is worse than not working: the name is
+# translated and the reply is then REJECTED for a missing `message`, so the
+# commonest legacy ending shape costs a retry instead of ending the turn. A
+# net that only catches the replies that were already nearly right is not a
+# net.
+LEGACY_EMPTY_MESSAGE = "done"
+
+
+def adopt_verb(obj):
+    """Rewrite this reply to the verb in force now. Returns it, mutated.
+
+    The whole translation in one place, so the two step loops and the
+    dispatcher cannot drift: `canonical_action` decides WHAT it means, and
+    this is what makes the object say it.
+
+    It also fills in the one key the rename created a hole in. `done` required
+    no keys and `end_conversation` requires `message`, so renaming alone left
+    a bare `{"action":"done"}` failing validation -- translated, and then
+    refused for a key it never had to carry.
+
+    The reply the model actually wrote is untouched by this: the loops keep
+    `raw` and put that in the conversation, so the record still shows the
+    model its own words.
+    """
+    if not isinstance(obj, dict):
+        return obj
+    was = obj.get("action")
+    adopted = canonical_action(obj)
+    if not adopted:
+        return obj
+    obj["action"] = adopted
+    if (adopted == END_CONVERSATION and was != END_CONVERSATION
+            and "message" not in obj):
+        obj["message"] = LEGACY_EMPTY_MESSAGE
+    return obj
+
+
 def canonical_action(obj):
     """The verb this reply means, under the names in force now.
 

@@ -907,3 +907,66 @@ def test_a_message_inside_a_workers_batch_is_answered_rather_than_dispatched():
 
     assert result == "task complete", result
     assert execute.calls == ["read_file"], execute.calls
+
+
+# --- the hole the rename opened in its own safety net -----------------------
+
+def test_a_bare_legacy_done_still_ends_the_turn_on_the_first_try():
+    """`done` required NO keys and `end_conversation` requires `message`, so
+    renaming alone left the commonest legacy ending shape half-translated: the
+    verb was adopted and the reply was then REFUSED for a key it never had to
+    carry. A net that only catches the replies that were already nearly right
+    is not a net -- it turns a rename into a lost round for exactly the model
+    the net exists for.
+
+    `adopt_verb` supplies the word `execute_action` has always answered a bare
+    `done` with, which is the same default moved one step earlier to where
+    validation can see it, rather than TMT inventing an answer."""
+    adopted = agent_actions.adopt_verb({"action": "done"})
+    assert adopted["action"] == END, adopted
+    assert adopted["message"] == agent_actions.LEGACY_EMPTY_MESSAGE, adopted
+    assert agent_prompt.validate_action(adopted) is None, adopted
+    assert agent_actions.execute_action(adopted, {}) == "done"
+
+
+def test_a_legacy_ending_that_carried_its_own_words_keeps_them():
+    """The default is a floor, never an overwrite. A model that said something
+    must have said it: filling in a message it did wrote would be TMT putting
+    words in its mouth, which is the one thing this whole net must not do."""
+    for legacy in ({"action": "done", "message": "I finished."},
+                   {"action": "respond", "message": "I finished."}):
+        adopted = agent_actions.adopt_verb(dict(legacy))
+        assert adopted["action"] == END, adopted
+        assert adopted["message"] == "I finished.", adopted
+
+
+def test_a_bare_legacy_respond_is_filled_in_too():
+    """`respond` required a message, so a bare one was always invalid -- but it
+    reaches the same ending and is filled in by the same rule rather than by a
+    second one. One rule for one hole."""
+    adopted = agent_actions.adopt_verb({"action": "respond"})
+    assert adopted["action"] == END and adopted["message"], adopted
+
+
+def test_the_default_is_not_applied_to_a_message_or_to_the_new_names():
+    """It exists for one verb that took no keys. A bare `send_message` and a
+    bare `end_conversation` are ordinary mistakes and must still be reported
+    as missing a message, or the net would be quietly answering for the model
+    on the path where the model simply forgot."""
+    for bare in ({"action": "announce"}, {"action": SEND},
+                 {"action": END}):
+        adopted = agent_actions.adopt_verb(dict(bare))
+        assert "message" not in adopted, adopted
+        assert agent_prompt.validate_action(adopted) is not None, adopted
+
+
+def test_a_bare_legacy_done_ends_a_real_turn_without_spending_a_retry():
+    """The property that actually matters, through the real loop: one reply,
+    one model call, the turn over. Before the fill-in this cost a retry and a
+    second request to say the same thing."""
+    drawn, seen, _console = drive_session(
+        ["finish up", "quit"],
+        [json.dumps({"action": "done"}),
+         json.dumps(obj(END, message="unreached"))])
+    assert len(seen) == 1, len(seen)
+    assert "unreached" not in visible(drawn), "the turn ran on past the ending"

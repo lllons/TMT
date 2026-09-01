@@ -38,7 +38,7 @@ from agent_actions import READ_ONLY_ACTIONS, ACTION_LABELS, MAX_TURNS, action_ev
 # they used to have. Imported rather than spelled out again: the loop's
 # terminal check and the dispatcher's own branch must be the same string,
 # and two copies of it are two chances for the turn to stop ending.
-from agent_actions import END_CONVERSATION, SEND_MESSAGE, canonical_action
+from agent_actions import END_CONVERSATION, SEND_MESSAGE, adopt_verb as _adopt_verb
 # The paths an action named, taken from the request rather than parsed back
 # out of the result. Imported rather than reimplemented: `note_work` needs
 # exactly the list the transcript's own events are built from, and a second
@@ -524,26 +524,6 @@ def completion_block(session, obj):
     if held:
         return held, review_held_line(session)
     return "", ""
-
-
-def _adopt_verb(obj):
-    """Rewrite this reply's action to the name in force now. Returns it.
-
-    One line of work and one place it happens, which is the point: everything
-    downstream -- `is_send_message`, the three completion gates, the terminal
-    test, `execute_action`, `action_event` -- reads `obj["action"]`, and every
-    one of them would otherwise need to know that `respond` used to mean two
-    different things depending on a flag.
-
-    The reply the model actually wrote is untouched: `raw` is what goes into
-    the conversation as the assistant turn, so the record still shows the
-    model its own words.
-    """
-    if isinstance(obj, dict):
-        adopted = canonical_action(obj)
-        if adopted:
-            obj["action"] = adopted
-    return obj
 
 
 def is_send_message(obj):

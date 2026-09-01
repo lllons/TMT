@@ -255,12 +255,9 @@ def _adopt_verb(obj):
         return obj
     try:
         import agent_actions
-        adopted = agent_actions.canonical_action(obj)
+        return agent_actions.adopt_verb(obj)
     except Exception:
         return obj
-    if adopted:
-        obj["action"] = adopted
-    return obj
 
 
 def _guard(record):
