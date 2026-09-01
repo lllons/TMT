@@ -557,6 +557,39 @@ def _review(context, obj):
     return result.describe()
 
 
+def _read_only_refusal(context, action):
+    """The delegation contract's refusal for this action here, or "".
+
+    The second of the two layers enforcing read-only, and the rule itself is
+    NOT restated: it asks `agent_delegation.refusal`, which is the same
+    function `agent_worker` asks before dispatch. One rule, two places that
+    enforce it, because two copies of a security policy are two policies.
+
+    Imported at call time, for the reason `_run_tool` and `_agent_modules`
+    import at call time: a module missing from a frozen install's list must
+    come back as behaviour this function can describe rather than as an
+    ImportError at the top of the file that stops TMT starting at all.
+
+    An unreadable `agent_delegation` FAILS CLOSED for a context that says it is
+    read-only: the delegation was constrained, the rule cannot be consulted,
+    and letting the write through would be the one outcome the constraint
+    exists to prevent. A context with no `read_only` key is not the unreadable
+    case -- it is every ordinary caller in TMT, and it is untouched.
+    """
+    if not (context or {}).get("read_only"):
+        return ""
+    try:
+        import agent_delegation
+    except Exception as error:
+        return ("CONSTRAINT VIOLATION\n\nThis delegation is read-only and the "
+                "rule that says what that permits could not be loaded (%s), so "
+                "'%s' was refused rather than run. Finish with "
+                "internal_response and say what you would have changed."
+                % (error, action))
+    return agent_delegation.refusal(
+        agent_delegation.DelegationConstraints(read_only=True), action)
+
+
 def _agent_modules():
     """(agent_manager, agent_worker), or (None, None) with a sentence.
 
@@ -716,15 +749,202 @@ def _agent_line(record, now=None):
     line = ("#%s %s -- %s (%s%d tokens in, %s%d out)"
             % (record.id, record.status, record.activity or "no activity yet",
                marks[0], record.tokens_in, marks[1], record.tokens_out))
+    contract = _contract_line(record)
+    if contract:
+        line += "\n    contract: %s" % contract
     if record.paths:
         line += "\n    wrote: %s" % ", ".join(record.paths)
+    blocked = _violations_line(record)
+    if blocked:
+        line += "\n    blocked: %s" % blocked
     if record.error:
         line += "\n    error: %s" % record.error
     return line
 
 
+def _contract_line(record):
+    """`READ ONLY  TIMEOUT 10:00  (4:12 left)  reports: diff, summary`, or "".
+
+    Empty for an unconstrained delegation, which is what keeps `agent_status`
+    identical to the report it produced before contracts existed. Guarded
+    throughout: a status line is a readout, and a readout must never be able
+    to end the action that is producing it.
+    """
+    try:
+        import agent_delegation
+        constraints = getattr(record, "constraints", None)
+        if constraints is None or constraints.is_default():
+            return ""
+        parts = list(constraints.chips())
+        left = record.remaining()
+        if left is not None and not record.is_terminal():
+            parts.append("(%s left)" % agent_delegation.clock_text(left))
+        names = constraints.report.names()
+        if names:
+            parts.append("reports: " + ", ".join(names))
+        return "  ".join(parts)
+    except Exception:
+        return ""
+
+
+def _violations_line(record):
+    try:
+        import agent_delegation
+        return agent_delegation.violations_line(getattr(record, "violations", ()))
+    except Exception:
+        return ""
+
+
+def _worker_diff(record):
+    """What git says about the files THIS delegation wrote, or "".
+
+    Limited to `record.paths` -- the paths the worker's own actions named --
+    and that limit is the whole of section 46. The main agent goes on working
+    while a worker runs, and several workers can run at once, so the
+    repository's whole diff is emphatically not one delegation's work. Asking
+    git about the files this one actually touched is the most that can be
+    attributed to it, and it is derived from the repository rather than from
+    anything the worker said about itself.
+
+    "" when it wrote nothing, so the report says "No workspace changes" from
+    the fact rather than from an empty git answer that could also mean git was
+    unavailable.
+    """
+    paths = tuple(getattr(record, "paths", ()) or ())
+    if not paths:
+        return ""
+    try:
+        import agent_git
+        return agent_git.TMTGit.discover().diff(paths=list(paths))
+    except Exception as error:
+        # A repository that is not a repository, or a git that is not there.
+        # Reported as what it is rather than as "no changes", which would be a
+        # claim about the workspace TMT is in no position to make.
+        return "(the diff could not be read: %s)" % error
+
+
+def delegation_result(record):
+    """One delegation's structured result, built from state and not from prose.
+
+    Everything in it is either measured by the runtime -- the status, the
+    timing, the step count, the paths the worker's own actions named, the
+    operations its contract refused -- or is the worker's own
+    `internal_response`, which goes in `summary` and nowhere else. That
+    division is sections 17, 18 and 19 in one function: a file list is never
+    read out of a sentence, a diff is never a claim, and the one field that IS
+    the model's words is named as such.
+
+    The diff is fetched only when the contract asked for one. It is a git
+    subprocess, and running it for every collected worker would spend it on
+    reports nobody asked for.
+    """
+    import agent_delegation
+    import agent_manager
+    constraints = getattr(record, "constraints", None) or agent_delegation.DEFAULT
+    status = _result_status(record, agent_manager, agent_delegation)
+    want_diff = False
+    try:
+        want_diff = bool(constraints.report.diff)
+    except Exception:
+        want_diff = False
+    return agent_delegation.DelegationResult(
+        record.id, status, task=getattr(record, "task", ""),
+        constraints=constraints,
+        # The worker's own report, or -- when it never produced one -- the
+        # manager's honest sentence about why there is none. `result()`
+        # already falls back to the error for exactly this reason.
+        summary=(getattr(record, "result", "") or getattr(record, "error", "")),
+        inspected=getattr(record, "reads", ()),
+        changed=getattr(record, "paths", ()),
+        diff=_worker_diff(record) if want_diff else "",
+        errors=getattr(record, "error", ""),
+        violations=getattr(record, "violations", ()),
+        duration=_record_duration(record),
+        started_at=getattr(record, "started_at", None),
+        finished_at=getattr(record, "finished_at", None),
+        steps=getattr(record, "steps", None))
+
+
+def _record_duration(record):
+    """How long this delegation ran, in seconds, or None.
+
+    Read through the record's own `elapsed`, which already stops at
+    `finished_at` -- a duration that went on counting after the work stopped
+    would be reporting time the work did not take.
+    """
+    try:
+        import time as _time
+        return record.elapsed(_time.monotonic())
+    except Exception:
+        return None
+
+
+def _result_status(record, agent_manager, agent_delegation):
+    """The delegation's outcome word from the record's lifecycle status.
+
+    The one translation between the two vocabularies, and they are separate on
+    purpose: `agent_manager.Status` is about a thread's lifecycle and
+    `agent_delegation`'s words are about a contract's outcome. Keeping them
+    apart is what lets the manager go on calling a stop a "kill" while the
+    report calls it what the main agent needs to hear, which is "cancelled".
+
+    A delegation that was refused every write it tried and produced nothing is
+    reported as a CONSTRAINT VIOLATION rather than as a completion, because
+    "completed" would tell the main agent the work is done when the contract
+    is the reason it is not. A delegation that hit a violation and finished
+    anyway is COMPLETED with the violations listed -- section 8's "do not
+    automatically mark the whole worker as failed unless the violation makes
+    successful completion impossible".
+    """
+    status = getattr(record, "status", "")
+    if status == agent_manager.Status.TIMED_OUT:
+        return agent_delegation.TIMED_OUT
+    if status == agent_manager.Status.KILLED:
+        return agent_delegation.CANCELLED
+    if status == agent_manager.Status.FAILED:
+        if getattr(record, "violations", ()) and not getattr(record, "paths", ()):
+            return agent_delegation.CONSTRAINT_VIOLATION
+        return agent_delegation.FAILED
+    if status == agent_manager.Status.COMPLETED:
+        return agent_delegation.COMPLETED
+    return agent_delegation.RUNNING
+
+
+def _report_text(manager, record):
+    """What one finished delegation is reported as, to the main agent.
+
+    An unconstrained delegation is reported EXACTLY as it was before contracts
+    existed -- same sentence, same quoting of the worker's own words -- which
+    is section 4 held to at the one place a change would be most visible. A
+    constrained one gets the structured result instead, carrying only the
+    sections its contract asked for.
+    """
+    try:
+        constraints = getattr(record, "constraints", None)
+        structured = constraints is not None and not constraints.is_default()
+    except Exception:
+        structured = False
+    if structured:
+        try:
+            return delegation_result(record).describe()
+        except Exception:
+            # A report that cannot be assembled must not lose the worker's
+            # own words, which are the thing that was actually asked for.
+            structured = False
+    result = manager.result(record.id) or "(no report)"
+    return "Background agent #%s (%s) reported:\n%s" % (
+        record.id, record.status, result)
+
+
 def _spawn_agent(manager, obj):
-    """Create a background worker and start it. Returns a sentence."""
+    """Create a background worker under its contract and start it.
+
+    The contract is parsed BEFORE anything is registered, so a malformed one
+    leaves no agent behind at all -- section 38's "do not partially start a
+    worker with half-valid constraints". A model that wrote `"timeout": 600`
+    instead of `"timeout_seconds"` is told so and spawns nothing, rather than
+    being handed an untimed worker it believes has ten minutes.
+    """
     agent_manager, agent_worker, problem = _agent_modules()
     if problem:
         return problem
@@ -734,8 +954,17 @@ def _spawn_agent(manager, obj):
                 "agent is to carry out, written as a whole piece of work it can "
                 "finish on its own without asking anyone anything.")
     try:
+        import agent_delegation
+    except Exception as error:
+        return ("Background agents are unavailable: the delegation contract "
+                "could not be loaded (%s)." % error)
+    constraints, refused = agent_delegation.parse(obj.get("constraints"))
+    if refused:
+        return refused
+    try:
         record = manager.spawn(task.strip(), model=obj.get("model"),
-                               effort=obj.get("effort"))
+                               effort=obj.get("effort"),
+                               constraints=constraints)
     except agent_manager.CapacityError as error:
         # A structured refusal, not silence. The sentence names the cap and
         # says what to do about it, because the party reading it is a model
@@ -744,10 +973,20 @@ def _spawn_agent(manager, obj):
     if manager.start(record, lambda rec, mgr: agent_worker.run_worker(rec, mgr)) is None:
         return ("Background agent #%s could not be started; it is %s."
                 % (record.id, record.status))
-    return ("Started background agent #%s on: %s\nIt runs on its own from here. "
+    # The contract is repeated back, so the main agent's own record of what it
+    # delegated is the runtime's reading of the object rather than the object
+    # it sent. A model that asked for a constraint it did not get would
+    # otherwise carry on believing it had one.
+    contract = constraints.describe()
+    said = ("Started background agent #%s on: %s" % (record.id, record.task))
+    if contract:
+        said += "\nUnder this contract, enforced by TMT and not by asking:\n%s" % (
+            "\n".join("    " + line for line in contract.splitlines()))
+    running, cap = manager.capacity()
+    return (said + "\nIt runs on its own from here (%d of %d workers running). "
             "Carry on with other work, then use wait_for_agents to collect what "
             "it produced, or agent_status to see how it is getting on."
-            % (record.id, record.task))
+            % (running, cap))
 
 
 def _agent_status(manager, obj):
@@ -762,9 +1001,9 @@ def _agent_status(manager, obj):
     if not records:
         return ("No background agents have been started in this session. Use "
                 "spawn_agent to delegate a piece of work.")
-    running = manager.active_count()
-    header = ("%d background agent(s), %d still running:"
-              % (len(records), running))
+    running, cap = manager.capacity()
+    header = ("%d background agent(s), %d of %d worker slots running:"
+              % (len(records), running, cap))
     return "\n".join([header] + [_agent_line(record) for record in records])
 
 
@@ -775,14 +1014,34 @@ def _agent_result(manager, obj):
     if record is None:
         return "There is no background agent with id %r." % agent_id
     if not record.is_terminal():
-        return ("Background agent #%s has not finished; it is %s and its last "
+        line = ("Background agent #%s has not finished; it is %s and its last "
                 "activity was %r. Use wait_for_agent to block until it does."
                 % (record.id, record.status, record.activity))
+        contract = _contract_line(record)
+        return line + ("\n    contract: %s" % contract if contract else "")
     result = manager.result(record.id)
-    if not result:
+    if not result and not _is_constrained(record):
         return ("Background agent #%s is %s and produced no report."
                 % (record.id, record.status))
-    return "Background agent #%s (%s) reported:\n%s" % (record.id, record.status, result)
+    return _report_text(manager, record)
+
+
+def _is_constrained(record):
+    """Whether this delegation was given a contract at all.
+
+    What it gates is whether a delegation that produced no sentence is
+    reported as "produced no report" or as a structured result. A constrained
+    one always gets the structured result, even with no report requirements
+    and nothing to quote, because the structure carries the thing that
+    sentence cannot: WHY there is no report. A delegation stopped at its
+    deadline after seventeen actions and one that crashed on its first are
+    both "no report" in the old sentence and are different facts -- which is
+    the collapse sections 14, 21 and 44 all forbid.
+    """
+    try:
+        return not record.constraints.is_default()
+    except Exception:
+        return False
 
 
 def _wait_report(manager, records, finished):
@@ -797,9 +1056,7 @@ def _wait_report(manager, records, finished):
         if record.id not in finished:
             waiting.append(record)
             continue
-        result = manager.result(record.id) or "(no report)"
-        lines.append("Background agent #%s (%s) reported:\n%s"
-                     % (record.id, record.status, result))
+        lines.append(_report_text(manager, record))
     if waiting:
         lines.append("Still running after the wait: %s. Their work is not lost "
                      "-- wait for them again, or collect them later with "
@@ -1080,6 +1337,22 @@ def execute_action(obj, context=None):
     # verbs the loop does. `or obj["action"]` keeps the old behaviour for an
     # object with no action at all: a KeyError, raised where it always was.
     action = canonical_action(obj) or obj["action"]
+    # The delegation contract's SECOND layer, asked before anything is
+    # dispatched. `agent_worker` has already refused every mutating verb for a
+    # read-only delegation before it got here; this is what refuses one that
+    # reached the dispatcher another way -- a direct call, a test, a third
+    # dispatch path somebody adds later.
+    #
+    # It is the `push_authorized` shape a hundred lines below, and it is that
+    # shape on purpose: a returned sentence rather than a raised error, so a
+    # model that reaches for a verb its contract does not carry is corrected on
+    # its next step exactly like a patch whose search string did not match. The
+    # key is ABSENT rather than False for an unconstrained delegation and for
+    # every non-worker caller, so the guard is not even consulted on the paths
+    # that existed before this feature.
+    refused = _read_only_refusal(context, action)
+    if refused:
+        return refused
     if action == "write_file": return write_file(obj["path"], obj.get("content", ""))
     if action == "append_file": return append_file(obj["path"], obj.get("content", ""))
     if action == "write_files": return write_files(obj["files"])

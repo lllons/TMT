@@ -354,17 +354,34 @@ end_conversation - keys: message. Sends your final text and ENDS the task. The O
 ORCHESTRATION_REFERENCE = r"""=== BACKGROUND AGENTS - DELEGATING WORK ===
 You can hand a piece of work to a background agent and carry on. It runs on its own thread, with the same file, search and git tools you have, in this same workspace. It cannot push, it cannot delete, it cannot talk to the user, and it cannot start agents of its own.
 
-At most 5 background agents run at once. You do not count against that, and neither does the note agent the user starts with /note.
+At most 10 background agents run at once. You do not count against that, and neither does the note agent the user starts with /note. An eleventh is refused with a sentence saying so - there is no queue, so wait for one or kill one first.
 
-spawn_agent - keys: task. Optional: model, effort. Starts one background agent and returns straight away with its id. The "task" is the whole instruction that agent will get: it cannot see this conversation, cannot ask you anything, and cannot ask the user anything, so write it as a self-contained piece of work.
+spawn_agent - keys: task. Optional: model, effort, constraints. Starts one background agent and returns straight away with its id. The "task" is the whole instruction that agent will get: it cannot see this conversation, cannot ask you anything, and cannot ask the user anything, so write it as a self-contained piece of work.
   {"action":"spawn_agent","task":"Add a percent operator to Calc.py: a percent(a, b) returning a * b / 100, wired into main() alongside the existing four operators.","progress":"Delegating the percent operator."}
   {"action":"spawn_agent","task":"Write tests/test_report.py covering build() in src/report.py, one case per branch.","effort":"high","progress":"Delegating the report tests."}
 
-agent_status - keys: none. Optional: id. What every background agent is doing, or one of them.
+=== THE DELEGATION CONTRACT - "constraints" ===
+A delegation is a contract, not a wish. "constraints" says what that agent may do, how long it may run, and what it must report - and TMT ENFORCES ALL THREE ITSELF. The agent is told its contract, and it is also refused at the dispatcher, so it cannot get round any of it by choosing a different tool.
+
+  {"action":"spawn_agent","task":"Investigate how authentication is put together in this repository: find the entry point, the token handling and the tests that cover them.","constraints":{"read_only":true,"timeout_seconds":600,"report":{"file_list":true,"summary":true}},"progress":"Delegating the auth investigation, read-only with a 10 minute limit."}
+
+"read_only": true - that agent may read, search, inspect structure and read git. Every verb that changes anything is refused before it runs: writing, appending, patching, replacing, copying, renaming, creating or deleting a file or folder, running a program, committing, launching an app, or writing to TMT's memory. A refused attempt comes back to you in the result as a constraint violation, with what it tried.
+"timeout_seconds": a whole number from 1 to 3600. The clock starts when the agent starts and covers the WHOLE delegation, not one action. At the deadline TMT stops it: no further action runs, its status becomes timed_out, its worker slot is released at once, and you still get whatever it had done and whatever report it owed. A timed-out agent has NOT failed and is reported separately from one that did.
+"report": {"file_list":true,"diff":true,"summary":true} - what TMT must collect when it ends. file_list is the files its own actions actually read and wrote; diff is what git says about the files it wrote; summary is its own account of the work. The first two are collected by TMT from real state, so they are true even for an agent that timed out or was killed.
+
+Choose them deliberately rather than putting all of them on everything:
+  Investigating something: read_only true, a timeout, file_list and summary. Read-only is the important one - an investigation that quietly edits is the failure you are guarding against.
+  Implementing something: read_only false, a generous timeout, file_list, diff and summary, so you can audit what it actually changed rather than what it says it changed.
+  A quick lookup: read_only true, a short timeout, summary only.
+  Something open-ended you will supervise yourself: no constraints at all is fine, and is exactly what spawn_agent did before this existed.
+
+The contract is fixed once the agent starts. There is no action that changes it, and asking for one is not a route to anything - spawn a second agent instead.
+
+agent_status - keys: none. Optional: id. What every background agent is doing, or one of them, and how many of the 10 worker slots are running. A constrained agent's line also carries its contract and how much of its time is left.
   {"action":"agent_status","progress":"Checking how the background agents are getting on."}
   {"action":"agent_status","id":"2","progress":"Checking agent 2 before I wait on it."}
 
-agent_result - keys: id. What one finished agent reported. Says so instead if it has not finished.
+agent_result - keys: id. What one finished agent reported. Says so instead if it has not finished. An agent spawned with constraints reports as a structured result: its status (completed, failed, timed_out, cancelled or constraint_violation), how long it ran against its limit, what it got through, any blocked operations, and the report sections its contract asked for.
   {"action":"agent_result","id":"2","progress":"Collecting what agent 2 produced."}
 
 wait_for_agent - keys: id. Optional: timeout (seconds, up to 600). BLOCKS until that agent finishes, then returns its report.

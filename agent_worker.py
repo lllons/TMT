@@ -34,6 +34,20 @@ inserted between that check and the `execute(...)` call.
 added to TMT after it was written, which is the failure that matters: the
 person adding the action is not the person who wrote the blacklist.
 
+**A delegation's contract is enforced here, before dispatch.** A worker spawned
+with constraints carries an `agent_delegation.DelegationConstraints` on its
+record, and this loop asks `agent_delegation.refusal` about every action on
+both the single-action path and the batch path, ahead of every other refusal,
+so a read-only delegation is told which of the two facts about it is the
+reason. The deadline is the same idea in `_guard`: checked at all three
+cancellation boundaries, carrying exactly the guarantee a kill carries and no
+larger one. `agent_delegation` is imported at module scope rather than inside
+the functions, which is the one place this module departs from its own
+late-import rule and is deliberate: an install missing that module must fail
+to start a worker at all, and be reported as "background agents are
+unavailable", rather than start one whose read-only contract silently does
+nothing.
+
 `ask`, `execute` and `system_prompt` are all injectable, so the loop can be
 tested without a model, without a network and without a real workspace. The
 defaults are looked up inside the functions rather than imported at module
@@ -43,7 +57,8 @@ absent from a frozen install's module list.
 
 import json
 
-from agent_manager import WorkerCancelled, clip_activity
+import agent_delegation
+from agent_manager import WorkerCancelled, WorkerTimedOut, clip_activity
 
 # The verb a background agent may use to say something, and the one it may
 # not use at all. Spelled here rather than imported from `agent_actions`,
@@ -279,14 +294,39 @@ def _adopt_verb(obj):
 
 
 def _guard(record):
-    """Stop here if this agent has been cancelled.
+    """Stop here if this agent has been cancelled, or is out of time.
 
     Called at each of the three boundaries. It raises rather than returning a
     value because two of the three places it is called from -- the stream
     handler, and the middle of a batch -- have no way to report one.
+
+    The deadline is checked HERE, on the same three boundaries the cancel flag
+    is, and that is what makes a delegation's timeout an enforcement rather
+    than a sentence in a prompt. The guarantee it carries is exactly the one
+    `kill` carries and is no larger: *after the deadline, no further tool call
+    is dispatched.* A request already in flight still finishes arriving,
+    because a Python thread cannot be terminated and a streamed response has
+    no abort primitive -- though a streamed one does stop being read, because
+    the stream handler is one of the three boundaries.
+
+    The cancel flag is checked first so that a worker killed at the same
+    instant its deadline passes is recorded as killed. A person deciding to
+    stop the work is the more specific fact of the two, and it is the one the
+    person is expecting to see.
     """
     if record.cancel.is_set():
         raise WorkerCancelled("agent %s was cancelled" % record.id)
+    try:
+        expired = record.expired()
+    except Exception:
+        # A record that cannot answer imposes no deadline. Same direction as
+        # `AgentRecord.timeout_seconds`: a missed deadline costs a long-running
+        # worker, and a spurious one throws finished work away.
+        expired = False
+    if expired:
+        raise WorkerTimedOut(
+            "agent %s reached the %s deadline of its delegation"
+            % (record.id, agent_delegation.clock_text(record.timeout_seconds())))
 
 
 def _chars_per_token():
@@ -428,6 +468,41 @@ def _result_message(action, result):
             "the task is done." % text)
 
 
+# The path key every reading action carries, and the actions that carry one.
+# Used to build the "Inspected" half of a delegation's file list, so it is
+# taken from the REQUEST -- where a path is a fact -- and never from anything
+# the model wrote about what it had read. Section 17.
+#
+# A whitelist rather than "every action that is not a mutation", because the
+# question is not "did this fail to write" but "did this look at a file", and
+# `create_folder` answers no to both. `find_text` and `find_symbol` take an
+# optional path that narrows the search rather than naming the thing read, so
+# they are deliberately absent: a search over the whole workspace would
+# otherwise record the workspace root as a file that was inspected.
+_READING_ACTIONS = frozenset({"read_file", "read_lines", "code_map",
+                              "related_tests"})
+
+
+def _record_reads(manager, record, action, obj):
+    """Tell the manager which file this action looked at, if it named one.
+
+    Guarded throughout and never allowed to matter: this is the material for a
+    report, and a report that could not be assembled must not be able to undo
+    an action that ran. Exactly the discipline `_record_paths` keeps around
+    its line counting.
+    """
+    if action not in _READING_ACTIONS or not isinstance(obj, dict):
+        return
+    for key in ("path", "target"):
+        value = obj.get(key)
+        if isinstance(value, str) and value.strip():
+            try:
+                manager.note_reads(record.id, [value.strip()])
+            except Exception:
+                pass
+            return
+
+
 def _record_paths(manager, record, action, obj, result=None):
     """Tell the manager what this action wrote: which files, and how much.
 
@@ -541,6 +616,41 @@ class _StreamSink:
             pass
 
 
+def _constraint_refusal(manager, record, action, obj, constraints):
+    """The contract's refusal for this action, or "". Records the violation.
+
+    Asked BEFORE `_refusal`, so a read-only delegation reaching for
+    `write_file` is told which of the two facts about it is the reason -- the
+    contract it was given, not the kind of agent it is. Told the second, a
+    model reasonably looks for another route to the same effect, which is the
+    mistake `WORKER_NEEDS_TERMINAL` was given its own sentence to avoid.
+
+    The rule itself is `agent_delegation.refusal` and is not restated here.
+    That is the point of the split: the loop knows WHEN to ask and the
+    delegation module knows WHAT the answer is, so the second layer in
+    `execute_action` gets the same answer from the same function rather than
+    from a second copy of the policy.
+
+    Recording the violation is guarded because the refusal must stand even if
+    the register cannot be written to. Refusing and forgetting is a smaller
+    failure than remembering and allowing.
+    """
+    said = agent_delegation.refusal(constraints, action)
+    if not said:
+        return ""
+    try:
+        import agent_actions
+        paths = agent_actions._paths_named(action, obj)
+    except Exception:
+        paths = ()
+    try:
+        manager.note_violation(record.id,
+                               agent_delegation.violation(action, paths))
+    except Exception:
+        pass
+    return said
+
+
 def _refusal(action, allowed, forbidden, read_only=_NOT_A_NOTE_VERB):
     """The sentence refusing an action, or "" when it may run.
 
@@ -577,8 +687,15 @@ def _stop(manager, record, sentence):
 
 
 def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
-              read_only=_NOT_A_NOTE_VERB):
-    """The step loop every kind of agent runs. Returns its response string."""
+              read_only=_NOT_A_NOTE_VERB, constraints=None):
+    """The step loop every kind of agent runs. Returns its response string.
+
+    `constraints` is this delegation's contract, read off the record by
+    `run_worker`. It is threaded through as a parameter rather than fetched
+    from the record at each check so there is one value for the whole run and
+    nothing can substitute another halfway through -- section 39 in the shape
+    of a local variable.
+    """
     messages = [{"role": "system", "content": system_prompt},
                 {"role": "user", "content": record.task}]
     # The worker's own conversation, and never anybody else's. Assigned to the
@@ -627,6 +744,7 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
         manager.set_activity(record.id, _activity_label(action, obj))
         _guard(record)
         result = execute(obj, _context(record))
+        _record_reads(manager, record, action, obj)
         _record_paths(manager, record, action, obj, result)
         _invalidate_prompt()
         return result
@@ -739,7 +857,7 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
         if isinstance(obj.get("actions"), list) and obj["actions"]:
             outcome, response, ran = _run_batch(
                 obj["actions"], record, manager, dispatch, allowed, forbidden,
-                read_only=read_only)
+                read_only=read_only, constraints=constraints)
             if ran:
                 acted = True
             if outcome == "response":
@@ -776,7 +894,11 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
                          "in %d attempts" % retries)
 
         action = obj["action"]
-        refusal = _refusal(action, allowed, forbidden, read_only)
+        # The contract first, then the kind of agent. Both are refusals before
+        # dispatch and neither reaches `execute`; what differs is the sentence,
+        # and the sentence is the half a model actually acts on.
+        refusal = (_constraint_refusal(manager, record, action, obj, constraints)
+                   or _refusal(action, allowed, forbidden, read_only))
         if refusal:
             if hand_back(raw, refusal):
                 continue
@@ -834,7 +956,7 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
 
 
 def _run_batch(batch, record, manager, dispatch, allowed, forbidden,
-               read_only=_NOT_A_NOTE_VERB):
+               read_only=_NOT_A_NOTE_VERB, constraints=None):
     """Run a batch of actions. Returns (outcome, payload, ran_anything).
 
     `outcome` is "response" when an entry finished the agent, "invalid" when
@@ -856,7 +978,13 @@ def _run_batch(batch, record, manager, dispatch, allowed, forbidden,
         if invalid:
             return "invalid", _batch_complaint(invalid, results), ran
         action = entry["action"]
-        refusal = _refusal(action, allowed, forbidden, read_only)
+        # The same two refusals in the same order as the single-action path,
+        # and the batch path is not an afterthought here: this repository has
+        # been bitten twice by a branch that was only ever rehearsed in the
+        # rare case, and a constraint enforced on one dispatch path is a
+        # constraint a model can walk round by putting the write in a list.
+        refusal = (_constraint_refusal(manager, record, action, entry, constraints)
+                   or _refusal(action, allowed, forbidden, read_only))
         if refusal:
             return "invalid", _batch_complaint(refusal, results), ran
         if action == SEND_MESSAGE:
@@ -895,9 +1023,44 @@ def _context(record):
     part the user's safety actually rests on. `manager` is absent too, so the
     orchestration actions report themselves unavailable rather than letting a
     worker spawn workers of its own.
+
+    `read_only` is the second layer of the delegation contract, and it is the
+    `push_authorized` shape used for exactly the reason that one exists: the
+    loop above has already refused every mutating verb before dispatch, and
+    this is what refuses one that somehow reached the dispatcher anyway -- a
+    direct call, a future third dispatch path, a test. Both layers ask
+    `agent_delegation.refusal`, so there is one rule and two places that
+    enforce it rather than two rules that can disagree.
+
+    Absent -- rather than False -- for an unconstrained delegation, so an
+    ordinary worker's context is byte-for-byte the dict it always was and the
+    dispatcher's guard is not even consulted.
     """
-    return {"push_authorized": False, "agent_id": record.id,
-            "agent_kind": record.kind}
+    context = {"push_authorized": False, "agent_id": record.id,
+               "agent_kind": record.kind}
+    try:
+        if record.constraints is not None and record.constraints.read_only:
+            context["read_only"] = True
+    except Exception:
+        # A contract that cannot be read is treated as read-only HERE, which
+        # is the opposite direction from the deadline and is right for the
+        # opposite reason: the harm of a wrong read-only is a refused action a
+        # model is told about and can work around, and the harm of a wrong
+        # write is a file nobody agreed to change.
+        context["read_only"] = True
+    return context
+
+
+def constraints_of(record):
+    """This delegation's contract, or None. Never raises.
+
+    One accessor rather than `record.constraints` at four call sites, because
+    a record built by an older install -- or by a test that made one by hand --
+    has no such attribute, and a worker that could not start because a
+    contract was missing would be refusing every unconstrained delegation,
+    which is the whole of what section 4 forbids.
+    """
+    return getattr(record, "constraints", None)
 
 
 def run_worker(record, manager, ask=None, execute=None, system_prompt=None):
@@ -908,14 +1071,53 @@ def run_worker(record, manager, ask=None, execute=None, system_prompt=None):
     `agent_subprompts.worker_prompt()`. All three are injectable so a test
     needs neither a model nor a real workspace.
 
-    Raises WorkerCancelled if the agent is killed while it runs; the manager's
-    thread wrapper expects that and leaves the record KILLED.
+    The delegation's contract is read off the record -- never passed in --
+    because the record is where it was attached at spawn and a second way to
+    supply one would be a second thing that could disagree with the register,
+    the panel and the report.
+
+    Raises WorkerCancelled if the agent is killed while it runs and
+    WorkerTimedOut if its deadline passes; the manager's thread wrapper
+    expects both and records KILLED or TIMED_OUT accordingly.
     """
+    constraints = constraints_of(record)
+    prompt = (system_prompt if system_prompt is not None
+              else _default_prompt("worker"))
     return _run_loop(record, manager,
                      ask or _default_ask(),
                      execute or _default_execute(),
-                     system_prompt if system_prompt is not None else _default_prompt("worker"),
-                     allowed=None, forbidden=WORKER_FORBIDDEN)
+                     _with_contract(prompt, constraints),
+                     allowed=None, forbidden=WORKER_FORBIDDEN,
+                     constraints=constraints)
+
+
+def _with_contract(prompt, constraints):
+    """The worker's prompt with its delegation contract on the end.
+
+    Appended to the assembled prompt rather than built into it, and that is
+    what keeps `agent_subprompts.worker_prompt()` a cached constant: the tree
+    of the workspace is expensive to build and identical for every worker, so
+    rebuilding it per delegation would pay for the whole walk to add four
+    lines. A contract is four lines; a workspace is eight thousand tokens.
+
+    An unconstrained delegation gets the prompt back UNCHANGED -- not with an
+    empty section, not with a trailing blank line -- so a worker spawned the
+    way every worker was spawned before this existed reads a byte-for-byte
+    identical prompt. There is a test for that, because "backward compatible"
+    is a claim and byte equality is a measurement.
+
+    Guarded, because a prompt that cannot be decorated is still a prompt and a
+    worker that could not start over a contract SUMMARY would be the readout
+    stopping the work it reports on.
+    """
+    try:
+        if constraints is None or constraints.is_default():
+            return prompt
+        import agent_subprompts
+        section = agent_subprompts.delegation_section(constraints)
+    except Exception:
+        return prompt
+    return "%s\n\n%s" % (prompt, section) if section else prompt
 
 
 def run_note(record, manager, ask=None, execute=None, system_prompt=None):

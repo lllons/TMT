@@ -599,6 +599,85 @@ def _common(header, overrides, rules, examples, reference=None, extra=None):
     ]).strip()
 
 
+DELEGATION_HEADER = "=== YOUR DELEGATION CONTRACT ==="
+
+# What a constrained worker is told about its own contract, and the sentence
+# that says who enforces it.
+#
+# The prompt EXPLAINS the rules; the runtime ENFORCES them. Section 64 asks for
+# both and warns against confusing them, and the warning is worth taking
+# literally: everything in this section is also true without it. A read-only
+# delegation whose prompt failed to build is still read-only, because
+# `agent_worker` asks `agent_delegation.refusal` before every dispatch and
+# `execute_action` asks again at the dispatcher. What this section buys is a
+# worker that does not spend six of its steps discovering the rule -- which is
+# the same argument the withheld-capability notice in the main prompt makes,
+# and it costs about the same.
+_CONTRACT_TAIL = (
+    "These are not requests. TMT refuses the action itself, before it runs, "
+    "and the refusal reaches you as an ordinary action result you can work "
+    "around. There is no other tool that gets past them and no way to ask for "
+    "them to be changed: the contract was fixed when you were started."
+)
+
+_READ_ONLY_ADVICE = (
+    "Because you are read-only: if the task cannot be finished without "
+    "changing a file, that is not a failure. Do the reading, then finish with "
+    "internal_response saying exactly what you would have changed, in which "
+    "file, and why. The main agent makes the change."
+)
+
+_TIMEOUT_ADVICE = (
+    "Because you have a deadline: work in the order that makes your report "
+    "useful if you are stopped early. Read the most important thing first, and "
+    "do not leave everything you learned for a final message you may not "
+    "reach."
+)
+
+_REPORT_ADVICE = {
+    "file_list": "TMT collects the file list itself, from the files your "
+                 "actions actually named. You do not have to list them.",
+    "diff": "TMT collects the diff itself, from the repository. Do not "
+            "describe your changes as if that were the diff.",
+    "summary": "The summary is the \"response\" of your internal_response. "
+               "Keep it to what was found or done and why it matters.",
+}
+
+
+def delegation_section(constraints):
+    """The contract section a constrained worker's prompt carries, or "".
+
+    Returns "" for an unconstrained delegation, so `agent_worker._with_contract`
+    can leave that prompt byte-for-byte identical to the one every worker read
+    before contracts existed -- which is what makes section 4's backward
+    compatibility a measurement rather than a claim.
+
+    Built per delegation rather than cached, unlike the three prompts in this
+    module: it is four lines against their twenty thousand tokens, and caching
+    a per-worker fact would be the one place two delegations could share state.
+    """
+    try:
+        if constraints is None or constraints.is_default():
+            return ""
+        described = constraints.describe()
+    except Exception:
+        return ""
+    if not described:
+        return ""
+    lines = [DELEGATION_HEADER, described, "", _CONTRACT_TAIL]
+    advice = []
+    if constraints.read_only:
+        advice.append(_READ_ONLY_ADVICE)
+    if constraints.timeout_seconds is not None:
+        advice.append(_TIMEOUT_ADVICE)
+    for name in constraints.report.names():
+        advice.append(_REPORT_ADVICE[name])
+    if advice:
+        lines.append("")
+        lines.extend(advice)
+    return "\n".join(lines)
+
+
 def worker_prompt():
     """The system prompt a background worker runs under. Cached."""
     global _cached_worker, _worker_dirty

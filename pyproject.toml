@@ -37,6 +37,7 @@ py-modules = [
     "agent_config",
     "agent_context",
     "agent_credentials",
+    "agent_delegation",
     "agent_execution",
     "agent_file_ops",
     "agent_git",

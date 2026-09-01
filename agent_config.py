@@ -774,6 +774,14 @@ REQUIRED_KEYS = {
     # A background agent's action context carries no manager, so each of them
     # reports itself unavailable there rather than letting a worker spawn
     # workers of its own.
+    # `spawn_agent` still needs only a task, which is what keeps every
+    # delegation written before contracts existed valid: "constraints" is
+    # optional, and an omitted one is the unconstrained delegation a worker
+    # has always been. Its shape is validated by `agent_delegation.parse`
+    # rather than here, because REQUIRED_KEYS answers "is this key present"
+    # and a contract needs "is this key's object well formed" -- which comes
+    # back as a sentence the model can correct, before any worker is
+    # registered.
     "spawn_agent": ["task"], "agent_status": [], "agent_result": ["id"],
     "wait_for_agent": ["id"], "wait_for_agents": [], "kill_agent": ["id"],
     # The verb a background agent ends on, and the one place the isolation is

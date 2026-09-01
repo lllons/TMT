@@ -47,6 +47,7 @@ about.
 import sys
 import time
 
+import agent_delegation
 from agent_manager import RETENTION_SECONDS, Status
 from agent_ui import (
     DIM, RESET, _color, _supports_color, display_width, encodable,
@@ -121,12 +122,25 @@ _STATE_WORDS = {
     Status.COMPLETED: "done",
     Status.KILLED: "killed",
     Status.FAILED: "failed",
+    # Two words would not fit the narrowest form of the row this appears on,
+    # and the row gives up its parts from the right -- so a long word here
+    # would be dropped exactly when the state is most worth reading. "timeout"
+    # is the state, not the setting, and nothing else on a card can be
+    # confused with it.
+    Status.TIMED_OUT: "timeout",
 }
 
 _STATE_POSITIONS = {
     Status.COMPLETED: DONE_POSITION,
     Status.KILLED: KILLED_POSITION,
     Status.FAILED: FAILED_POSITION,
+    # The same position a killed agent takes, and deliberately not the failed
+    # one. Section 34 asks for red-or-orange, and the reason to choose the
+    # orange is the distinction the whole timeout feature rests on: a
+    # delegation that ran out of time has not crashed, and painting it the
+    # same colour as one that did would undo in the interface what the status
+    # vocabulary was split apart to say.
+    Status.TIMED_OUT: KILLED_POSITION,
 }
 
 # Every spelling of the four keys the panel takes while it has focus, as both
@@ -252,17 +266,29 @@ def layout(columns):
     return ("two_column", content - GUTTER - width, width)
 
 
-def counter_text(count):
+def counter_text(count, maximum=None):
     """The agent counter for the main screen, or "" when there are none.
 
     Nothing to report means nothing drawn, exactly as the corner meter does
     it: a row reading "0 agents" is a readout of an absence, and the absence
     is already on screen as the panel not being there.
+
+    `maximum` turns it into `4/10 agents`, which is what section 31 asks for.
+    It is optional, and the form without it is unchanged, because the counter
+    sits on the prompt caption beside the token meter and a caller that has no
+    register to ask has no honest maximum to state either -- a hard-coded 10
+    drawn beside a count nobody could verify would be the readout inventing
+    half of itself.
     """
     count = max(0, int(count))
     if not count:
         return ""
-    return "%d agent%s" % (count, "" if count == 1 else "s")
+    if maximum is None:
+        return "%d agent%s" % (count, "" if count == 1 else "s")
+    # Always plural once the maximum is on the row: the word is describing the
+    # slots, not the count, and "1/10 agent" is simply wrong English in the
+    # one readout that is meant to be read at a glance.
+    return "%d/%d agents" % (count, max(0, int(maximum)))
 
 
 # The per-agent bars that sit under the main one, and the whole of why they
@@ -359,6 +385,86 @@ def _elapsed_text(record, now=None):
     return "%dh%02dm" % (seconds // 3600, (seconds % 3600) // 60)
 
 
+# --- what a delegation's contract looks like on screen ----------------------
+#
+# Three small readers, all of them guarded to "" and none of them able to
+# raise. A record with a contract this module cannot read costs the row its
+# chips, exactly as a record that raises costs `PanelState.records` its cards:
+# decoration is never allowed to end a turn, and a delegation's constraints
+# are decoration on a screen even though they are enforcement everywhere else.
+#
+# Compact by design (section 32). A card is about twenty columns wide, and the
+# constraints have to sit beside a token figure and a state word, so they are
+# chips -- `RO`, `4:12`, `F D S` -- and the long forms live in `/agents` and
+# in the delegation's own result, where there is room to read them.
+
+# The one-letter forms of the report requirements, in the fixed order
+# `ReportRequirements.names` returns them. Letters rather than words because
+# all three together are five columns this way and nineteen the other, and
+# what the row has to say at a glance is "this delegation owes a report", with
+# which parts of it being the detail.
+_REPORT_LETTERS = {"file_list": "F", "diff": "D", "summary": "S"}
+
+
+def _constraints_of(record):
+    """The record's contract, or None. Never raises, never invents one."""
+    try:
+        constraints = getattr(record, "constraints", None)
+        if constraints is None or constraints.is_default():
+            return None
+        return constraints
+    except Exception:
+        return None
+
+
+def constraint_chips(record):
+    """`("RO", "4:12/10:00", "F D S")` -- one delegation's contract, compact.
+
+    The time chip is REMAINING against the limit while the delegation runs and
+    the limit alone once it has stopped, because a countdown on a card that has
+    finished counting is the "fake countdown" section 33 forbids. It is read
+    off the record's own deadline arithmetic, which is the same arithmetic the
+    runtime enforces the timeout with -- so the number on screen cannot drift
+    from the number that will actually stop the work.
+    """
+    constraints = _constraints_of(record)
+    if constraints is None:
+        return ()
+    chips = []
+    try:
+        if constraints.read_only:
+            chips.append("RO")
+        seconds = constraints.timeout_seconds
+        if seconds is not None:
+            limit = agent_delegation.clock_text(seconds)
+            left = None
+            if not (getattr(record, "is_terminal", None) and record.is_terminal()):
+                left = record.remaining()
+            chips.append("%s/%s" % (agent_delegation.clock_text(left), limit)
+                         if left is not None else limit)
+        letters = [_REPORT_LETTERS[name] for name in constraints.report.names()]
+        if letters:
+            chips.append(" ".join(letters))
+    except Exception:
+        return tuple(chips)
+    return tuple(chips)
+
+
+def constraint_row(record, width, stream=None):
+    """The card's third row: this delegation's contract, or nothing at all.
+
+    Drawn dim and indented under the number, which is where a card's detail
+    lives. It is the FIRST row given up when the region is short -- ahead of
+    the activity label -- because a contract does not change while a
+    delegation runs and can be read at leisure with `/agents`, where the
+    activity label is the only thing on the card that says the work is moving.
+    """
+    chips = constraint_chips(record)
+    if not chips:
+        return []
+    return [_row("   " + "  ".join(chips), width, stream, dim=True)]
+
+
 def agent_status_row(record, columns, stream=None, now=None):
     """One agent's row for under the main progress bar.
 
@@ -382,10 +488,19 @@ def agent_status_row(record, columns, stream=None, now=None):
     tokens = ("%s%s out" % (mark, _short_count(out))) if out else ""
     elapsed = _elapsed_text(record, now)
     state = _state_word(record)
+    # The contract, if there is one, as the shortest useful thing that can be
+    # said about it on a row this narrow: `RO` and the time remaining against
+    # the limit. It sits between the identity and the figures, so it survives
+    # the row narrowing for as long as the lines do -- a delegation that is
+    # read-only or is running out of time is a different thing from the one
+    # beside it, and losing that first would lose the reason the rows differ.
+    contract = "  ".join(constraint_chips(record)[:2])
     # Widest first, then each shorter form drops the least useful thing left.
-    for parts in ((name, lines, tokens, elapsed, state),
-                  (name, lines, tokens, elapsed),
-                  (name, lines, elapsed),
+    for parts in ((name, contract, lines, tokens, elapsed, state),
+                  (name, contract, lines, tokens, elapsed),
+                  (name, contract, lines, elapsed),
+                  (name, contract, lines),
+                  (name, contract),
                   (name, lines),
                   (name,)):
         text = "  ".join(part for part in parts if part)
@@ -772,14 +887,21 @@ def _token_text(record):
 
 
 def card_lines(record, width, selected=False, now=None, stream=None,
-               activity=True):
+               activity=True, contract=True):
     """One agent's card, painted, every row at most `width` columns.
 
-    Two rows. The first carries the number, the token figures and the state,
-    and is never dropped. The second carries the activity label and is the
-    first thing given up when the region is short of rows -- an agent whose
-    label has gone is still identifiably running, while an agent whose numbers
-    have gone is a row of prose.
+    Up to three rows. The first carries the number, the token figures and the
+    state, and is never dropped. The second carries this delegation's contract
+    and exists only when there is one. The third carries the activity label
+    and is the first thing given up when the region is short of rows -- an
+    agent whose label has gone is still identifiably running, while an agent
+    whose numbers have gone is a row of prose.
+
+    `contract` is a separate switch from `activity` so the two can be given up
+    in the order that keeps the most useful thing longest: the contract goes
+    first, because it does not change while the delegation runs and `/agents`
+    will say it in full, where the activity label is the only thing on the
+    card that says the work is still moving.
 
     `now` is accepted so a caller with a clock has somewhere to put it, and
     deliberately reaches nothing: no card reports elapsed time. The live
@@ -794,6 +916,8 @@ def card_lines(record, width, selected=False, now=None, stream=None,
     marker = ">" if selected else " "
     head = "%s #%s: %s" % (marker, record.id, _token_text(record))
     rows = [_row(head, width, stream, position=_state_position(record))]
+    if contract:
+        rows.extend(constraint_row(record, width, stream))
     if activity:
         label = str(getattr(record, "activity", "") or "").strip()
         if label:
@@ -816,7 +940,22 @@ def entry_count(records):
     return len(list(records)) + 1
 
 
-def panel_rows(records, width, height=None, selected=0, now=None, stream=None):
+def panel_title(records, maximum=None):
+    """`AGENTS 4` or `AGENTS 4/10`. The header the panel and `/agents` share.
+
+    The maximum appears only when a caller supplied one, which is the rule
+    `counter_text` follows and for the same reason: the panel is handed a list
+    of records and has no register to ask, so a hard-coded 10 here would be
+    the header stating half of itself from memory.
+    """
+    total = len(list(records))
+    if maximum is None:
+        return "%s %d" % (TITLE, total)
+    return "%s %d/%d" % (TITLE, total, max(0, int(maximum)))
+
+
+def panel_rows(records, width, height=None, selected=0, now=None, stream=None,
+               maximum=None):
     """The panel column, painted, every row at most `width` columns.
 
     A header naming the panel and counting the agents, one rule under it, a
@@ -846,14 +985,15 @@ def panel_rows(records, width, height=None, selected=0, now=None, stream=None):
     total = len(records)
     selected = max(0, min(entry_count(records) - 1, int(selected)))
 
-    def build(shown, first, activity, hint):
-        rows = [_row("%s %d" % (TITLE, total), width, stream,
+    def build(shown, first, activity, hint, contract=True):
+        rows = [_row(panel_title(records, maximum), width, stream,
                      position=AGENT_POSITION),
                 ("-" if plain_output(stream) else "─") * width]
         for offset, record in enumerate(shown):
             rows.extend(card_lines(record, width,
                                    selected=(first + offset) == selected,
-                                   now=now, stream=stream, activity=activity))
+                                   now=now, stream=stream, activity=activity,
+                                   contract=contract))
         if records:
             rows.append("")
         killing = selected >= total
@@ -865,8 +1005,13 @@ def panel_rows(records, width, height=None, selected=0, now=None, stream=None):
                 rows.append(_row(said, width, stream, dim=True))
         return rows
 
-    for activity, hint in ((True, True), (True, False), (False, False)):
-        rows = build(records, 0, activity, hint)
+    # What is given up, in order: the hint (teaching, learned once), then the
+    # contract rows (fixed for the life of a delegation, and stated in full by
+    # `/agents`), then the activity labels (the only thing on a card that says
+    # the work is moving), then cards themselves.
+    for activity, hint, contract in ((True, True, True), (True, False, True),
+                                     (True, False, False), (False, False, False)):
+        rows = build(records, 0, activity, hint, contract)
         if height is None or len(rows) <= int(height):
             return rows
 
@@ -880,10 +1025,10 @@ def panel_rows(records, width, height=None, selected=0, now=None, stream=None):
         first = 0
         if selected < total:
             first = max(0, min(selected - count + 1, total - count))
-        rows = build(records[first:first + count], first, False, False)
+        rows = build(records[first:first + count], first, False, False, False)
         if len(rows) <= int(height):
             return rows
-    return build([], 0, False, False)[:max(1, int(height))]
+    return build([], 0, False, False, False)[:max(1, int(height))]
 
 
 # ---------------------------------------------------------------------------
@@ -1547,11 +1692,28 @@ def agents_report(manager, now=None):
         records = tuple(manager.visible_agents(now))
     except Exception:
         return "Background agents are unavailable in this session."
+    try:
+        running, cap = manager.capacity()
+    except Exception:
+        running, cap = len(records), None
     if not records:
+        # No capacity figure here, deliberately. "0 of 10 worker slots in use"
+        # is a readout of an absence twice over, and the sentence already says
+        # the only thing there is to say.
         return "No background agents are running."
-    lines = ["%s %d" % (TITLE, len(records))]
+    head = "%s %d" % (TITLE, len(records))
+    if cap is not None:
+        head += "   WORKERS %d/%d" % (running, cap)
+    lines = [head]
     for record in records:
         lines.append("#%s: %s" % (record.id, _token_text(record)))
+        # The contract in FULL here rather than as chips. `/agents` prints to
+        # the permanent surface and has the width of the terminal, where a
+        # card has about twenty columns -- so this is the place the user
+        # actually reads what was delegated, and abbreviating it here to match
+        # the card would be shrinking the one readout that has room.
+        for line in _contract_report_lines(record):
+            lines.append("   " + line)
         label = str(getattr(record, "activity", "") or "").strip()
         if label:
             lines.append("   " + label)
@@ -1559,6 +1721,36 @@ def agents_report(manager, now=None):
         if task:
             lines.append("   " + _elide(task, 68))
     return "\n".join(lines)
+
+
+def _contract_report_lines(record):
+    """`/agents`'s two contract lines for one delegation, or none at all.
+
+    Guarded to nothing, like every other reader of a contract in this module:
+    a command that printed a traceback instead of a report would be worse than
+    one that printed a report with a line missing.
+    """
+    constraints = _constraints_of(record)
+    if constraints is None:
+        return ()
+    out = []
+    try:
+        chips = list(constraints.chips())
+        left = record.remaining()
+        if left is not None and not record.is_terminal():
+            chips.append("(%s left)" % agent_delegation.clock_text(left))
+        if chips:
+            out.append("  ".join(chips))
+        reports = constraints.report.chips()
+        if reports:
+            out.append("REPORTS " + "  ".join(reports))
+        blocked = agent_delegation.violations_line(
+            getattr(record, "violations", ()))
+        if blocked:
+            out.append("BLOCKED " + blocked)
+    except Exception:
+        return tuple(out)
+    return tuple(out)
 
 
 class PanelState:
@@ -1629,8 +1821,22 @@ class PanelState:
     def count(self, now=None):
         return len(self.records(now))
 
+    def maximum(self):
+        """The register's worker cap, or None when there is no register.
+
+        Asked rather than assumed, so the number on screen is the number the
+        capacity check actually enforces. A hard-coded 10 here would be a
+        second place the cap is written down, and the day somebody changed
+        `agent_manager.MAX_WORKERS` the interface would go on promising the
+        old one.
+        """
+        try:
+            return int(self.manager.max_workers)
+        except Exception:
+            return None
+
     def counter(self, now=None):
-        return counter_text(self.count(now))
+        return counter_text(self.count(now), self.maximum())
 
     def open_panel(self, columns):
         """Open it, or record why it cannot. Returns whether it opened.
@@ -1907,7 +2113,8 @@ class PanelState:
         if mode != "two_column" or not (plan or review or verify
                                         or self.capabilities_now()):
             return panel_rows(self.records(), width, height=height,
-                              selected=self.selected, stream=self.stream)
+                              selected=self.selected, stream=self.stream,
+                              maximum=self.maximum())
         room = None if height is None else max(0, int(height) - PLAN_SHARED_MIN)
         block = self._task_block(plan, review, verify, width,
                                  PLAN_SHARED_MAX if room is None
@@ -1919,7 +2126,8 @@ class PanelState:
             block = []
         left = None if height is None else max(1, int(height) - len(block) - 1)
         panel = panel_rows(self.records(), width, height=left,
-                           selected=self.selected, stream=self.stream)
+                           selected=self.selected, stream=self.stream,
+                           maximum=self.maximum())
         return block + ([""] if block else []) + panel
 
     def _task_frame(self, columns, rows, plan, review, verify=None):

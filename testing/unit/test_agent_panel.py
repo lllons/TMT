@@ -612,6 +612,12 @@ def test_the_counter_says_how_many_and_nothing_when_there_are_none():
     assert agent_panel.counter_text(1) == "1 agent"
     assert agent_panel.counter_text(3) == "3 agents"
     assert agent_panel.counter_text(-2) == ""
+    # With the register's cap beside it, which is what a caller that HAS a
+    # register passes. Always plural there: the word describes the slots, and
+    # "1/10 agent" is wrong English in a readout meant to be read at a glance.
+    assert agent_panel.counter_text(1, 10) == "1/10 agents"
+    assert agent_panel.counter_text(4, 10) == "4/10 agents"
+    assert agent_panel.counter_text(0, 10) == ""
 
 
 def test_the_counter_rides_on_the_caption_beside_the_facts():
@@ -638,9 +644,9 @@ def test_the_counter_follows_the_manager_through_the_box():
     sandbox = Sandbox()
     try:
         box = menu().PromptBox(stream=Console(), manager=manager)
-        assert box._agents_text() == "2 agents"
+        assert box._agents_text() == "2/10 agents"
         caption = visible(box.lines(editor(), size=(100, 24))[0])
-        assert "2 agents" in caption, caption
+        assert "2/10 agents" in caption, caption
 
         manager.kill_all()
         clock.advance(agent_manager.RETENTION_SECONDS + 1)
@@ -660,7 +666,7 @@ def test_the_running_box_carries_the_counter_on_the_meter_row():
         box = menu().PromptBox(stream=Console(), manager=manager)
         rows = [visible(row) for row in
                 box.running_lines("Working.", size=(100, 24))]
-        assert "1 agent" in rows[0], rows
+        assert "1/10 agents" in rows[0], rows
     finally:
         sandbox.close()
 
@@ -676,7 +682,7 @@ def test_a_finished_card_stays_for_five_seconds_and_then_the_counter_drops_it():
     manager.complete(record.id, "finished")
 
     assert state.count() == 1
-    assert state.counter() == "1 agent"
+    assert state.counter() == "1/10 agents"
     assert any("done" in row for row in panel_text(state.records()))
 
     clock.advance(agent_manager.RETENTION_SECONDS - 0.5)

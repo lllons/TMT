@@ -126,9 +126,13 @@ def test_a_spawned_worker_carries_the_task_it_was_given_verbatim():
     assert manager.list() == (record,)
 
 
-def test_the_sixth_worker_is_refused_with_a_sentence_and_not_with_silence():
+def test_the_eleventh_worker_is_refused_with_a_sentence_and_not_with_silence():
     """A model handed a bare failure retries it forever. The refusal has to
-    say what to do instead, because the party reading it is a model."""
+    say what to do instead, because the party reading it is a model.
+
+    Ten, not five. The cap is read from the module rather than written out
+    here, so this test says "one more than the maximum" whatever the maximum
+    is -- which is what it was always testing."""
     manager = AgentManager(clock=Clock())
     for index in range(agent_manager.MAX_WORKERS):
         manager.spawn("task %d" % index)
@@ -138,7 +142,7 @@ def test_the_sixth_worker_is_refused_with_a_sentence_and_not_with_silence():
     except CapacityError as error:
         said = str(error)
     else:
-        raise AssertionError("a sixth worker was accepted")
+        raise AssertionError("a worker past the cap was accepted")
     assert "maximum" in said, said
     assert "wait_for_agents" in said and "kill_agent" in said, said
     # And the refusal did not half-register it.
@@ -150,13 +154,16 @@ def test_finishing_a_worker_makes_room_for_another():
     records = [manager.spawn("task %d" % i) for i in range(agent_manager.MAX_WORKERS)]
     manager.complete(records[0].id, "done")
     assert manager.active_count() == agent_manager.MAX_WORKERS - 1
-    sixth = manager.spawn("now there is room")
-    assert sixth.id == "6", sixth.id
+    extra = manager.spawn("now there is room")
+    # One past the cap, because ids are handed out in order and every one of
+    # the cap's worth was taken first. Derived rather than written out, so the
+    # test goes on meaning "the next id" when the cap moves again.
+    assert extra.id == str(agent_manager.MAX_WORKERS + 1), extra.id
 
 
 def test_the_note_agent_never_counts_against_the_worker_cap():
     """It is one read-only question the user asked directly. Refusing it
-    because five unrelated workers are busy would refuse the wrong thing."""
+    because ten unrelated workers are busy would refuse the wrong thing."""
     manager = AgentManager(clock=Clock())
     for index in range(agent_manager.MAX_WORKERS):
         manager.spawn("task %d" % index)

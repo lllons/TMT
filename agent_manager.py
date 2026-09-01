@@ -38,10 +38,18 @@ has scrolled off the panel is still in `list()` and its answer is still in
 import threading
 import time
 
-# Five at once. The main AI does not count against this and neither does the
+# Ten at once. The main AI does not count against this and neither does the
 # note agent: the cap exists to bound how much work is running unattended, and
 # neither of those is unattended.
-MAX_WORKERS = 5
+#
+# It was five. The number is enforced in exactly one place -- `spawn`, against
+# `_active_count_locked` -- and the count is DERIVED from the records rather
+# than maintained as a tally, which is what makes the invariant
+# `0 <= running <= MAX_WORKERS` hold by construction: there is no increment to
+# forget and no decrement to run twice, so a worker that completes, fails,
+# times out and is killed in four racing threads still releases exactly one
+# slot, because it releases none -- it simply stops being counted.
+MAX_WORKERS = 10
 
 # How long a finished agent's card stays on screen after it finishes.
 RETENTION_SECONDS = 5.0
@@ -73,13 +81,32 @@ class Status:
     COMPLETED = "completed"
     KILLED = "killed"
     FAILED = "failed"
+    # A delegation that reached the deadline its contract gave it. Kept apart
+    # from KILLED and from FAILED, and it is worth saying why both ways round.
+    #
+    # Not KILLED: nobody asked for it to stop. A kill is the main agent or the
+    # user deciding the work is wrong; a timeout is the contract the work was
+    # started under running out, which is a thing the delegation itself agreed
+    # to and often a thing it half-finished usefully.
+    #
+    # Not FAILED: a worker that inspected forty files and ran out of time has
+    # not crashed, and a main agent told "failed" would go looking for a bug
+    # that is not there. Section 44 of the brief asks for exactly this
+    # distinction and the report vocabulary in `agent_delegation` keeps it.
+    TIMED_OUT = "timed_out"
 
 
-# The three states nothing comes back from. Every transition into one of them
+# The four states nothing comes back from. Every transition into one of them
 # stamps `finished_at` and sets the record's `done` event, and every one of
 # them is checked against this set rather than against a list of names written
 # out again at each call site.
-TERMINAL = frozenset({Status.COMPLETED, Status.KILLED, Status.FAILED})
+#
+# TIMED_OUT is in here, which is what releases a timed-out worker's slot: the
+# capacity check counts records that are NOT terminal, so a record entering
+# this set stops being counted by the same arithmetic that stopped counting a
+# completed one. There is no separate release to get wrong.
+TERMINAL = frozenset({Status.COMPLETED, Status.KILLED, Status.FAILED,
+                      Status.TIMED_OUT})
 
 
 # The event bus, as module-level strings. A listener is handed the name and
@@ -91,6 +118,8 @@ AGENT_TOKEN_UPDATE = "agent_token_update"
 AGENT_COMPLETED = "agent_completed"
 AGENT_KILLED = "agent_killed"
 AGENT_FAILED = "agent_failed"
+AGENT_TIMED_OUT = "agent_timed_out"
+AGENT_VIOLATION = "agent_violation"
 AGENT_REMOVED_FROM_UI = "agent_removed_from_ui"
 AGENT_RESULT_AVAILABLE = "agent_result_available"
 NOTE_STARTED = "note_started"
@@ -108,8 +137,27 @@ class WorkerCancelled(Exception):
     """
 
 
+class WorkerTimedOut(WorkerCancelled):
+    """Raised inside a worker once its delegation's deadline has passed.
+
+    A SUBCLASS of WorkerCancelled on purpose, and the reason is worth stating
+    because subclassing an exception to inherit handling is usually the wrong
+    instinct. Here it is exactly right: every `except WorkerCancelled: raise`
+    in the worker loop and in the batch runner exists to say "this is not an
+    action failing, it is the agent stopping -- do not swallow it and do not
+    hand it back to the model", and that sentence is true word for word of a
+    deadline. A separate exception would need every one of those clauses
+    copied, and the day somebody added a fifth and forgot the copy, a
+    timed-out worker would have its own timeout handed back to it as an
+    action error to correct.
+
+    What differs is only how the ending is RECORDED, and that is decided in
+    one place -- the thread wrapper in `start`, which catches this first.
+    """
+
+
 class CapacityError(RuntimeError):
-    """A sixth worker was asked for while five were already running.
+    """An eleventh worker was asked for while ten were already running.
 
     It carries a sentence rather than a code because the party that has to act
     on it is a language model: the orchestration action turns this into the
@@ -148,11 +196,34 @@ class AgentRecord:
     """
 
     def __init__(self, agent_id, number, kind, task, prompt="", model="",
-                 effort="", created_at=None):
+                 effort="", created_at=None, constraints=None, clock=None):
         self.id = str(agent_id)
         self.number = int(number)
         self.kind = kind
         self.task = task
+        # This delegation's contract: what it may do, how long it may run, and
+        # what it owes when it stops. An `agent_delegation.DelegationConstraints`
+        # or None, and the two mean the same thing to every reader -- None is
+        # the unconstrained delegation every worker was before this existed.
+        #
+        # Assigned once, here, and never again. That is the whole of section
+        # 39: `DelegationConstraints` has no setter, this attribute is written
+        # by the constructor, and nothing in this module or any other assigns
+        # to it afterwards. A contract a running worker's own model could
+        # rewrite would not be a contract, and a test asserts the absence
+        # rather than trusting the convention.
+        #
+        # It is per-record, which is the whole of section 22: one worker's
+        # contract is one object hanging off one record, there is no module
+        # global anywhere on this path, and the default is a shared IMMUTABLE
+        # singleton, so even the fallback cannot carry state between two
+        # delegations.
+        self.constraints = constraints
+        # The clock this record measures its own deadline against. The
+        # manager's injected one, so a test advances a number instead of
+        # spending ten real minutes proving a ten-minute rule -- exactly what
+        # the retention window already does.
+        self._clock = clock or time.monotonic
         self.prompt = prompt
         self.model = model or ""
         self.effort = effort or ""
@@ -198,6 +269,20 @@ class AgentRecord:
         self.result = ""
         self.error = ""
         self.paths = ()
+        # The workspace paths this agent READ, as opposed to the ones it wrote
+        # (`paths`, above). Kept separately because a report has to say both --
+        # "11 inspected, 0 changed" is the whole answer for an investigation --
+        # and because merging them would make a read-only delegation's report
+        # unable to distinguish the two at all.
+        #
+        # Taken from the requests the agent's own actions carried, never from
+        # anything it said afterwards. Section 17.
+        self.reads = ()
+        # Operations this agent asked for and was refused by its contract, as
+        # `agent_delegation.violation` dicts. A blocked write is frequently the
+        # reason a delegation did not finish, so it is recorded rather than
+        # only refused, and it reaches the main agent in the result.
+        self.violations = ()
         # What this agent measurably changed, in lines, and only where both
         # halves are actually known. They come off the same `action_event`
         # detail the main loop's own counter reads, so a worker's work is
@@ -238,6 +323,77 @@ class AgentRecord:
 
     def total_tokens(self):
         return self.tokens_in + self.tokens_out
+
+    # --- the delegation's deadline ---------------------------------------
+    #
+    # Three small functions and no timer thread, which is the same shape the
+    # retention window has and it is chosen for the same reasons: nothing to
+    # cancel, nothing to leak, no clock that has to actually pass in a test,
+    # and an answer that is correct even if nobody ever asked. What makes it
+    # an ENFORCEMENT rather than a readout is where it is asked FROM --
+    # `agent_worker._guard`, on the line before every dispatch, which is the
+    # same boundary that carries the kill guarantee.
+
+    def timeout_seconds(self):
+        """This delegation's runtime limit in seconds, or None.
+
+        Guarded, because a record with a malformed contract must not be able
+        to raise out of the panel that is drawing it or the sweep that is
+        deciding capacity. A contract that cannot be read imposes no deadline
+        -- which is the safe direction here, unlike read-only: the harm of a
+        missed deadline is a worker that runs long, and the harm of a spurious
+        one is finished work thrown away.
+        """
+        try:
+            seconds = self.constraints.timeout_seconds
+        except Exception:
+            return None
+        return None if seconds is None else int(seconds)
+
+    def deadline(self):
+        """The moment this delegation must stop, on the manager's clock.
+
+        None when it has no timeout, and None until it has STARTED. Section 11
+        asks for the timer to begin when the worker is admitted to the running
+        state rather than when it was registered, and `started_at` is stamped
+        by `start()` at exactly that moment -- so the deadline is simply not
+        yet a number for a record that has been spawned and not begun, and a
+        worker cannot lose part of its time to something else being slow.
+        """
+        seconds = self.timeout_seconds()
+        if seconds is None or self.started_at is None:
+            return None
+        return self.started_at + seconds
+
+    def remaining(self, now=None):
+        """Seconds left before the deadline, never below zero. None if none.
+
+        Clamped at zero rather than going negative, because every reader of it
+        is either drawing a countdown or deciding how long to block, and a
+        negative wait is a wait that never happened.
+        """
+        end = self.deadline()
+        if end is None:
+            return None
+        moment = self._clock() if now is None else now
+        return max(0.0, end - moment)
+
+    def expired(self, now=None):
+        """Whether the deadline has passed. False for anything terminal.
+
+        False once the record is terminal so that a finished delegation's card
+        is not re-reported as timing out for the rest of the session, and so
+        that the sweep is idempotent: a record can enter TIMED_OUT once and
+        can never be moved again by anything, which is section 26's
+        "cleanup must be idempotent" answered by construction.
+        """
+        if self.is_terminal():
+            return False
+        end = self.deadline()
+        if end is None:
+            return False
+        moment = self._clock() if now is None else now
+        return moment >= end
 
     def elapsed(self, now):
         """How long this agent has been running, in seconds.
@@ -332,17 +488,31 @@ class AgentManager:
 
     # --- creating and starting -------------------------------------------
 
-    def spawn(self, task, model=None, effort=None, prompt="", kind="worker"):
+    def spawn(self, task, model=None, effort=None, prompt="", kind="worker",
+              constraints=None):
         """Register a new agent in Status.CREATED and return its record.
 
         Raises CapacityError when the workers already running are at the cap.
         A note agent never counts against the cap and never raises: it is one
         read-only question the user asked directly, and refusing it because
-        five unrelated workers are busy would be refusing the wrong thing.
+        ten unrelated workers are busy would be refusing the wrong thing.
         A review agent is held apart for the same reason -- it is the quality
         gate on the task, and a gate that can be crowded out by the work it is
         gating is not a gate.
+
+        `constraints` is this delegation's contract and is attached to the
+        record and never touched again. It is per-delegation and nothing
+        global: two workers spawned a millisecond apart with opposite
+        contracts each hold their own object, which is section 22.
+
+        The expiry sweep runs FIRST, before capacity is counted. That is what
+        makes section 28 work: a worker whose deadline passed while nobody was
+        looking is retired here, its slot stops being counted by the same
+        arithmetic that stops counting a completed one, and the delegation
+        being spawned starts instead of being refused by a worker that is not
+        really running.
         """
+        self.expire()
         with self._lock:
             if kind == "worker":
                 running = self._active_count_locked()
@@ -357,7 +527,8 @@ class AgentManager:
             number = self._counter
             record = AgentRecord(str(number), number, kind, task,
                                  prompt=prompt, model=model or "",
-                                 effort=effort or "", created_at=self._clock())
+                                 effort=effort or "", created_at=self._clock(),
+                                 constraints=constraints, clock=self._clock)
             self._by_id[record.id] = record
             if kind == "note":
                 self._note = record
@@ -398,6 +569,15 @@ class AgentManager:
             self._emit([(started, record)])
             try:
                 response = runner(record, self)
+            except WorkerTimedOut:
+                # Caught BEFORE WorkerCancelled, which it is a subclass of.
+                # The order is the whole of what tells the two endings apart,
+                # and reversing it would record every timeout as a kill --
+                # which is precisely the collapse section 44 forbids.
+                with self._lock:
+                    already = record.status == Status.TIMED_OUT
+                if not already:
+                    self.time_out(record.id)
             except WorkerCancelled:
                 with self._lock:
                     already_killed = record.status == Status.KILLED
@@ -481,6 +661,92 @@ class AgentManager:
         self._emit([(AGENT_KILLED, record)])
         return True
 
+    def time_out(self, agent_id):
+        """Stop an agent because its delegation's deadline passed. True if it did.
+
+        The same mechanism `kill` uses -- set the cancel flag, mark it
+        terminal -- because there is only one way to stop a Python thread's
+        work and inventing a second would be inventing a second set of
+        guarantees to get wrong. What differs is the STATUS, and that is the
+        whole point: the runtime stopped this one, nobody asked it to, and the
+        report has to be able to say so.
+
+        The guarantee is the one `kill` carries, word for word: after this
+        returns, no further tool call will be dispatched by that worker. A
+        request already in flight still finishes arriving, because a thread
+        cannot be terminated and a stream has no abort primitive. Claiming
+        more than that would be a lie in the one place a lie is expensive.
+
+        Idempotent, like every other terminal transition here: a record that
+        is already terminal returns False and is left exactly as it is, so a
+        worker that completes at the same instant its deadline passes ends as
+        whichever landed first and never as both.
+        """
+        with self._lock:
+            record = self._by_id.get(str(agent_id))
+            if record is None or record.is_terminal():
+                return False
+            record.cancel.set()
+            self._finish_locked(record, Status.TIMED_OUT, "Timed out")
+        # AGENT_RESULT_AVAILABLE alongside, for the reason `fail` carries it:
+        # something a caller was waiting on is now readable -- partial work,
+        # the paths it touched, the reason it stopped -- and a listener that
+        # only woke on completion would leave a main agent waiting on a worker
+        # that had already stopped.
+        self._emit([(AGENT_TIMED_OUT, record), (AGENT_RESULT_AVAILABLE, record)])
+        return True
+
+    def expire(self, now=None):
+        """Retire every running agent whose deadline has passed. Returns them.
+
+        The runtime half of the timeout, and it is deliberately a SWEEP rather
+        than a timer thread. That is this module's existing discipline -- the
+        retention window is filtered on read for the same reasons, and they
+        all hold here: there is no timer to cancel, no thread to leak, no
+        callback that can fire into a manager that is being torn down, and a
+        test drives it by advancing a number rather than by waiting.
+
+        It is called from every place a stale "running" would matter: before
+        the capacity check in `spawn`, from `active_count`, from
+        `visible_agents` on every repaint, and inside `wait`, which bounds its
+        own blocking by the nearest deadline so a wait can never outlive one.
+        A worker also checks its OWN deadline at each of the three
+        cancellation boundaries, which is what actually stops the work -- this
+        sweep is what makes the register, the capacity and the screen agree
+        with that even when the worker is between boundaries.
+
+        Nothing is swept twice: `expired()` is False for anything terminal and
+        `time_out` refuses a terminal record, so the two guards agree and the
+        cleanup is idempotent however many threads arrive at once.
+        """
+        moment = self._clock() if now is None else now
+        with self._lock:
+            due = [record for record in self._records
+                   if record.expired(moment)]
+            for slot in (self._note, self._review):
+                if slot is not None and slot.expired(moment):
+                    due.append(slot)
+        return tuple(record for record in due if self.time_out(record.id))
+
+    def note_violation(self, agent_id, entry):
+        """Record one operation this agent's contract refused. Returns the record.
+
+        Kept on the record rather than only refused in the loop, because a
+        blocked write is often the reason a delegation did not finish its task
+        -- section 41 -- and a main agent reading an incomplete result with no
+        explanation for it would be being kept in the dark by TMT rather than
+        by the worker.
+        """
+        if not isinstance(entry, dict):
+            return None
+        with self._lock:
+            record = self._by_id.get(str(agent_id))
+            if record is None:
+                return None
+            record.violations = tuple(record.violations) + (dict(entry),)
+        self._emit([(AGENT_VIOLATION, record)])
+        return record
+
     def kill_all(self):
         """Kill every live worker and return how many were killed.
 
@@ -535,8 +801,15 @@ class AgentManager:
         Every live one, plus every finished one still inside its retention
         window. Filtered on read, which is the whole reason there is no timer
         thread in this module.
+
+        The deadline sweep runs first, so a delegation whose time is up is
+        drawn as TIMED OUT on the very next repaint rather than going on
+        showing a bar that is still filling. Section 13's "do not allow a
+        timed-out worker to remain active invisibly", answered on the one path
+        the screen actually reads.
         """
         moment = self._clock() if now is None else now
+        self.expire(moment)
         with self._lock:
             visible, retired = [], []
             for record in self._records:
@@ -557,8 +830,31 @@ class AgentManager:
         return sum(1 for record in self._records if not record.is_terminal())
 
     def active_count(self):
+        """How many workers are running, after retiring any that are out of time.
+
+        Swept first so the figure is the truth rather than the last thing
+        anybody noticed. This is the number the capacity check, the panel
+        header and the corner meter all read, and a stale one would refuse an
+        eleventh delegation on behalf of a worker that stopped ten minutes ago.
+        """
+        self.expire()
         with self._lock:
             return self._active_count_locked()
+
+    def capacity(self):
+        """`(running, maximum)` -- what the interface draws as `4/10`.
+
+        One call rather than two, because the pair has to be consistent: two
+        separate reads could straddle a worker finishing and put a count on
+        screen that was never true.
+        """
+        self.expire()
+        with self._lock:
+            return self._active_count_locked(), self._max_workers
+
+    @property
+    def max_workers(self):
+        return self._max_workers
 
     def result(self, agent_id):
         """What the agent produced, as a string.
@@ -707,18 +1003,46 @@ class AgentManager:
         self._emit([(AGENT_TOKEN_UPDATE, record)])
         return record
 
+    def _add_paths(self, record, attribute, paths):
+        """Append paths to one of the record's path tuples, each once.
+
+        Assigned as one whole tuple rather than appended to in place, which is
+        the rule every field on a record follows: a reader that does not take
+        the lock sees either the old tuple or the new one and never a list
+        being grown under it.
+        """
+        seen = list(getattr(record, attribute))
+        for path in paths or ():
+            if isinstance(path, str) and path.strip() and path not in seen:
+                seen.append(path)
+        setattr(record, attribute, tuple(seen))
+        return record
+
     def note_paths(self, agent_id, paths):
         """Record the workspace paths an agent has written to, each once."""
         with self._lock:
             record = self._by_id.get(str(agent_id))
             if record is None:
                 return None
-            seen = list(record.paths)
-            for path in paths or ():
-                if isinstance(path, str) and path.strip() and path not in seen:
-                    seen.append(path)
-            record.paths = tuple(seen)
-            return record
+            return self._add_paths(record, "paths", paths)
+
+    def note_reads(self, agent_id, paths):
+        """Record the workspace paths an agent has READ, each once.
+
+        The other half of a delegation's file list. Separate from `paths`
+        because "11 inspected, 0 changed" is the whole answer for an
+        investigation and one merged list could not say it -- and because a
+        read-only delegation's changed list must be empty as a fact about what
+        happened rather than as a claim anybody made.
+
+        Never used for the conflict report: two agents reading the same file
+        is not a conflict, it is a Tuesday.
+        """
+        with self._lock:
+            record = self._by_id.get(str(agent_id))
+            if record is None:
+                return None
+            return self._add_paths(record, "reads", paths)
 
     def set_steps(self, agent_id, steps=None, max_steps=None):
         """Record how much of its step budget an agent has spent.
@@ -831,15 +1155,36 @@ class AgentManager:
         with self._lock:
             records = [self._by_id[key] for key in wanted if key in self._by_id]
         deadline = None if timeout is None else time.monotonic() + float(timeout)
-        for record in records:
-            if record.is_terminal():
-                continue
+        while True:
+            # Retire anything already out of time before deciding to block on
+            # it. Without this, a wait with no timeout on a delegation whose
+            # deadline passes while the wait is out would block forever on a
+            # worker the contract had already ended -- the timeout enforced
+            # everywhere except the one call that is actually watching for it.
+            self.expire()
+            pending = [record for record in records if not record.is_terminal()]
+            if not pending:
+                break
             remaining = None
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-            record.done.wait(remaining)
+            # Never block past the nearest delegation deadline. Each slice is
+            # the shortest of what the caller asked for and what the earliest
+            # contract allows; when it runs out the loop sweeps and comes back
+            # round, so the timeout takes effect during the wait rather than
+            # after it. Contracts with no timeout contribute nothing, so a
+            # wait on unconstrained workers blocks exactly as it always did.
+            due = [left for left in (record.remaining() for record in pending)
+                   if left is not None]
+            if due:
+                soonest = max(0.0, min(due))
+                remaining = soonest if remaining is None else min(remaining, soonest)
+            if remaining is not None and remaining <= 0:
+                # A deadline that has already passed: sweep rather than sleep.
+                continue
+            pending[0].done.wait(remaining)
         return {record.id: record for record in records if record.is_terminal()}
 
     def wait_all(self, timeout=None):
