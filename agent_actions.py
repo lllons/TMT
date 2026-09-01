@@ -177,7 +177,7 @@ def _capability_refusal(context, action):
 _NO_PLAN_STATE = (
     "Planning is not available here, so '%s' did nothing and no plan exists. "
     "Carry out the work with the ordinary file, search and git actions, and "
-    "say what you did in your final respond."
+    "say what you did in your final end_conversation."
 )
 
 
@@ -948,7 +948,11 @@ def execute_action(obj, context=None):
     `context` carries per-task authority, currently {'push_authorized': bool}.
     Callers that pass nothing get the safe default: no push authority.
     """
-    action = obj["action"]
+    # Translated here as well as in the loops, so a caller that reaches this
+    # function directly -- a worker, a test, anything -- gets the same two
+    # verbs the loop does. `or obj["action"]` keeps the old behaviour for an
+    # object with no action at all: a KeyError, raised where it always was.
+    action = canonical_action(obj) or obj["action"]
     if action == "write_file": return write_file(obj["path"], obj.get("content", ""))
     if action == "append_file": return append_file(obj["path"], obj.get("content", ""))
     if action == "write_files": return write_files(obj["files"])
@@ -1086,15 +1090,77 @@ def execute_action(obj, context=None):
         if action == "wait_for_agents": return _wait_for_agents(manager, obj)
         return _kill_agent(manager, obj)
     # A background agent's ending, and NOT a terminal action here. The main
-    # loop ends a turn on `done` and `respond` only, so a main model that
-    # somehow emitted this one gets an ordinary result and carries on -- which
-    # is the whole point of it being a separate verb rather than a flag.
+    # loop ends a turn on `end_conversation` and on nothing else, so a main
+    # model that somehow emitted this one gets an ordinary result and carries
+    # on -- which is the whole point of it being a separate verb rather than a
+    # flag.
     if action == "internal_response": return obj.get("response", "")
     # Never terminal. The loop shows the message and carries straight on; the
     # result exists only so the batch report has something to record.
-    if action == "announce": return obj.get("message", "")
-    if action in ("respond", "done"): return obj.get("message", "done")
+    if action == SEND_MESSAGE: return obj.get("message", "")
+    if action == END_CONVERSATION: return obj.get("message", "done")
     return f"Unknown action: {action}"
+
+# --- the two verbs that talk to the user -----------------------------------
+
+# The verb that says something and lets the turn go on.
+SEND_MESSAGE = "send_message"
+# The verb that says the last thing and ends the task. The only one that ends
+# anything at all.
+END_CONVERSATION = "end_conversation"
+
+# What those two used to be called, and it is a SEMANTIC translation rather
+# than a table of spellings -- `respond` meant either verb depending on a flag,
+# so the flag is what decides which one it becomes.
+#
+# This is a narrow compatibility layer and it is deliberately NOT TAUGHT. No
+# prompt mentions these names, no tool list offers them, and no error message
+# suggests them; the only thing that knows them is this function. It exists
+# because these two verbs are the ones a turn ENDS on, and a model that reached
+# for the old name would otherwise spend its retry budget being told the name
+# was wrong and finish having said nothing to the user. A rename is not worth
+# a lost answer.
+#
+# It cannot become a bypass. Every old name lands on a new verb and goes
+# through exactly the gates that verb goes through: `respond` becomes
+# `end_conversation`, which the plan, the review and the verification all hold
+# on precisely as they held `respond`.
+_LEGACY_ACTIONS = {"announce": SEND_MESSAGE, "done": END_CONVERSATION}
+
+# The keys that used to make `respond` mean "and keep going". False-ish here
+# meant the message was not the final one, so a `respond` carrying one is a
+# `send_message` and not an ending. Read as a string as well as a bool,
+# because a model that writes "false" means false.
+_NOT_FINAL = ("false", "no", "0", "")
+
+
+def canonical_action(obj):
+    """The verb this reply means, under the names in force now.
+
+    `announce` becomes `send_message` and `done` becomes `end_conversation`.
+    `respond` becomes whichever it actually meant: it ended the task unless it
+    carried `final` set false, so a `respond` with that flag is a
+    `send_message` and everything else is an `end_conversation`. Translating
+    the MEANING rather than the spelling is what makes the old flag safe to
+    delete -- a reply written under the old rules still does exactly what it
+    did.
+
+    Anything already using the current names, and every other action in TMT,
+    is returned untouched. Not a dict, or no action at all, comes back as ""
+    so the caller's own validation reports it rather than this raising.
+    """
+    if not isinstance(obj, dict):
+        return ""
+    action = obj.get("action")
+    if not isinstance(action, str):
+        return ""
+    if action == "respond":
+        final = obj.get("final", True)
+        if isinstance(final, str):
+            final = final.strip().lower() not in _NOT_FINAL
+        return END_CONVERSATION if final else SEND_MESSAGE
+    return _LEGACY_ACTIONS.get(action, action)
+
 
 READ_ONLY_ACTIONS = ("list_files", "read_file", "search_files", "read_lines", "git_diff")
 
@@ -1119,7 +1185,7 @@ _MISSING_PROGRESS = (
 # The actions that ARE the thing being said, and so need nothing said about
 # them. Kept beside the reminder rather than inferred, so adding an action
 # cannot silently make it exempt.
-_SPEAKS_FOR_ITSELF = frozenset(("respond", "done", "announce"))
+_SPEAKS_FOR_ITSELF = frozenset((END_CONVERSATION, SEND_MESSAGE))
 
 
 def _said_something(obj):
@@ -1150,7 +1216,7 @@ def build_result_message(action, result, obj=None):
     if "not found" in result_str.lower() and action in ("read_file", "run_python", "patch_file", "read_lines", "copy_file"):
         return f"FAILED: {result_str}\nCheck the file path with list_files and retry."
     if action in READ_ONLY_ACTIONS:
-        message = f"Result:\n{result_str}\nNow output a respond action that naturally answers the user's question using this data."
+        message = f"Result:\n{result_str}\nNow output an end_conversation action that naturally answers the user's question using this data."
     else:
         message = f"Result: {result_str}"
     # Appended to the end, after whatever the result had to say, so it is the
@@ -1174,7 +1240,7 @@ ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     "review_agenda",
     "spawn_agent", "agent_status", "agent_result", "wait_for_agent",
     "wait_for_agents", "kill_agent", "internal_response",
-    "announce", "respond", "done",
+    SEND_MESSAGE, END_CONVERSATION,
 )}
 
 def batch_summary(batch):
@@ -1384,10 +1450,10 @@ def action_event(action, obj, result):
     Called after the action, never before, so the event can report what
     happened rather than what was intended.
     """
-    # These three produce no event of their own. Two are the answer and the
-    # third is drawn as progress by the loop before the work it announces --
-    # an event here would print the same sentence a second time.
-    if action in ("respond", "done", "announce"):
+    # Neither produces an event of its own. `end_conversation` IS the answer,
+    # and `send_message` is drawn by the loop before the work it is talking
+    # about -- an event here would print the same sentence a second time.
+    if action in (END_CONVERSATION, SEND_MESSAGE):
         return None
     kind = _EVENT_KIND_FOR_ACTION.get(action, "tool")
     text = str(result)

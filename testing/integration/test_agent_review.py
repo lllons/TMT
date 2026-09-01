@@ -672,7 +672,7 @@ def test_a_conversational_turn_needs_no_review():
     review = agent_review.ReviewState()
     assert not review.is_required(None)
     assert not review.is_required(agent_plan.Plan())
-    assert agent_review.refusal(review, None, "respond") == ""
+    assert agent_review.refusal(review, None, "end_conversation") == ""
 
 
 def test_reading_a_lot_and_changing_nothing_needs_no_review():
@@ -694,7 +694,7 @@ def test_a_substantial_plan_with_real_changes_requires_a_review():
     plan = worked_plan()
     assert len(plan.steps) >= agent_review.REVIEW_MIN_PLAN_STEPS
     assert review.is_required(plan)
-    assert agent_review.refusal(review, plan, "respond") != ""
+    assert agent_review.refusal(review, plan, "end_conversation") != ""
 
 
 def test_the_user_can_ask_for_a_review_or_ask_for_none():
@@ -706,7 +706,7 @@ def test_the_user_can_ask_for_a_review_or_ask_for_none():
     worked = state_after_work()                  # everything a gate wants
     worked.note_user_choice(False)
     assert not worked.is_required(worked_plan())
-    assert agent_review.refusal(worked, worked_plan(), "respond") == ""
+    assert agent_review.refusal(worked, worked_plan(), "end_conversation") == ""
 
 
 def test_the_wording_that_asks_for_a_review_and_the_wording_that_declines_it():
@@ -747,21 +747,23 @@ def test_declining_beats_asking_when_the_user_wrote_both():
 
 # --- the gate ---------------------------------------------------------------
 
-def test_the_gate_only_holds_the_two_terminal_actions():
+def test_the_gate_only_holds_the_one_terminal_action():
     """Holding a read or a patch would stop the model doing the very thing it
-    is being told to do."""
+    is being told to do -- and `send_message` is on this list for a sharper
+    reason still: it is how the model tells the user what the reviewer
+    objected to. Gating it would silence the explanation of the very failure
+    that is holding the answer back."""
     review = state_after_work()
     plan = worked_plan()
     for action in ("read_file", "patch_file", "git_diff", "plan", "review",
-                   "announce", "spawn_agent"):
+                   "send_message", "spawn_agent"):
         assert agent_review.refusal(review, plan, action) == "", action
-    for action in ("respond", "done"):
-        assert agent_review.refusal(review, plan, action) != "", action
+    assert agent_review.refusal(review, plan, "end_conversation") != ""
 
 
 def test_no_review_at_all_blocks_and_says_how_to_start_one():
     review = state_after_work(paths=("a.py", "b.py"))
-    held = agent_review.refusal(review, worked_plan(), "respond")
+    held = agent_review.refusal(review, worked_plan(), "end_conversation")
     assert held.startswith("BLOCKED:")
     assert "2 file(s)" in held
     assert '{"action":"review"}' in held
@@ -770,7 +772,7 @@ def test_no_review_at_all_blocks_and_says_how_to_start_one():
 def test_a_running_review_blocks():
     review = state_after_work()
     review.begin()
-    held = agent_review.refusal(review, worked_plan(), "respond")
+    held = agent_review.refusal(review, worked_plan(), "end_conversation")
     assert "running now" in held
 
 
@@ -781,7 +783,7 @@ def test_a_failed_review_blocks_and_names_the_findings():
                           file="token.py", line=148),
                     issue(identifier="R-002", severity="CRITICAL",
                           title="Health check is behind auth")])
-    held = agent_review.refusal(review, worked_plan(), "respond")
+    held = agent_review.refusal(review, worked_plan(), "end_conversation")
     assert "R-001 MAJOR: Expiry is not enforced (token.py:148)" in held
     assert "R-002 CRITICAL: Health check is behind auth" in held
     assert "cannot mark the review passed yourself" in held
@@ -791,7 +793,7 @@ def test_a_review_that_errored_blocks():
     review = state_after_work()
     review.begin()
     review.fail("the reviewer produced no result")
-    held = agent_review.refusal(review, worked_plan(), "respond")
+    held = agent_review.refusal(review, worked_plan(), "end_conversation")
     assert "not a review that passed" in held
     assert "produced no result" in held
 
@@ -799,15 +801,14 @@ def test_a_review_that_errored_blocks():
 def test_a_passing_review_lets_the_answer_out():
     review = state_after_work()
     settled(review, status="PASS")
-    assert agent_review.refusal(review, worked_plan(), "respond") == ""
-    assert agent_review.refusal(review, worked_plan(), "done") == ""
+    assert agent_review.refusal(review, worked_plan(), "end_conversation") == ""
 
 
 def test_a_pass_with_warnings_lets_the_answer_out():
     review = state_after_work()
     settled(review, status="PASS_WITH_WARNINGS",
             issues=[issue(severity="MINOR"), issue(severity="SUGGESTION")])
-    assert agent_review.refusal(review, worked_plan(), "respond") == ""
+    assert agent_review.refusal(review, worked_plan(), "end_conversation") == ""
 
 
 def test_a_pass_goes_stale_the_moment_the_code_moves_under_it():
@@ -820,14 +821,14 @@ def test_a_pass_goes_stale_the_moment_the_code_moves_under_it():
     review.note_change("patch_file", ("src/other.py",))
     assert review.stale
     assert not review.passed
-    held = agent_review.refusal(review, worked_plan(), "respond")
+    held = agent_review.refusal(review, worked_plan(), "end_conversation")
     assert "1 file(s) have been changed since it ran" in held
     assert "src/other.py" in held
     # And a fresh review clears it.
     settled(review, status="PASS", summary="Reviewed again.")
     assert not review.stale
     assert review.passed
-    assert agent_review.refusal(review, worked_plan(), "respond") == ""
+    assert agent_review.refusal(review, worked_plan(), "end_conversation") == ""
 
 
 def test_marking_the_plan_or_answering_does_not_make_a_pass_stale():
@@ -850,14 +851,14 @@ def test_a_broken_review_object_lets_the_answer_through():
         def is_required(self, plan=None):
             raise RuntimeError("boom")
 
-    assert agent_review.refusal(Broken(), worked_plan(), "respond") == ""
+    assert agent_review.refusal(Broken(), worked_plan(), "end_conversation") == ""
     assert agent_review.held_line(Broken()) != ""
     assert agent_review.limit_release(Broken()) == ""
     assert agent_panel.review_rows(Broken(), 30, stream=Terminal()) == []
 
 
 def test_a_missing_review_state_gates_nothing():
-    assert agent_review.refusal(None, worked_plan(), "respond") == ""
+    assert agent_review.refusal(None, worked_plan(), "end_conversation") == ""
     assert agent_panel.review_rows(None, 30, stream=Terminal()) == []
 
 
@@ -880,7 +881,7 @@ def test_the_cycle_limit_releases_the_answer_rather_than_deadlocking_it():
     review = state_after_work()
     for _ in range(agent_review.MAX_REVIEW_CYCLES):
         settled(review, status="FAIL", issues=[issue()])
-    assert agent_review.refusal(review, worked_plan(), "respond") == ""
+    assert agent_review.refusal(review, worked_plan(), "end_conversation") == ""
     warning = agent_review.limit_release(review)
     assert "Review did not pass" in warning
     assert "3 reviews ran" in warning
@@ -1003,9 +1004,9 @@ def test_the_veto_is_a_refinement_and_the_gate_is_the_guarantee():
          "capabilities": agent_capabilities.Capabilities("/plan /review")})
     assert not out.startswith("FAILED:"), out
     assert plan.is_complete()
-    assert agent_plan.refusal(plan, "respond") == ""
+    assert agent_plan.refusal(plan, "end_conversation") == ""
     # ...and the answer is still refused.
-    assert agent_review.refusal(review, plan, "respond") != ""
+    assert agent_review.refusal(review, plan, "end_conversation") != ""
 
 
 def test_a_plan_action_still_works_with_no_review_state_at_all():
@@ -1206,7 +1207,7 @@ def test_a_reviewer_that_returns_prose_leaves_the_task_in_error():
     assert "could not be read" in out
     assert review.state == agent_review.ERROR
     assert not review.passed
-    assert agent_review.refusal(review, worked_plan(), "respond") != ""
+    assert agent_review.refusal(review, worked_plan(), "end_conversation") != ""
 
 
 def test_a_reviewer_that_returns_an_invalid_result_leaves_the_task_in_error():
@@ -1304,7 +1305,7 @@ def test_a_review_at_the_cycle_limit_refuses_to_start_another_reviewer():
 def test_the_review_action_is_never_terminal_in_the_main_loop():
     """It has to be able to run in the middle of a turn and hand its findings
     back, which is the whole loop the feature is."""
-    assert "review" not in ("done", "respond")
+    assert "review" != agent_actions.END_CONVERSATION
     review = state_after_work()
     with Reviewer(reviewer_reply()):
         result = run_review(review, plan=worked_plan(),
@@ -1879,7 +1880,7 @@ def test_the_completion_gate_asks_the_plan_first_and_then_the_review():
     session = agent_session.Session()
     session.plan.create(["Implement it", "Test it", "Independent review"])
     session.review.note_change("write_file", ("a.py",))
-    respond = {"action": "respond", "message": "done"}
+    respond = {"action": "end_conversation", "message": "done"}
 
     held, line = TMT.completion_block(session, respond)
     assert "plan you made" in held
@@ -1900,7 +1901,7 @@ def test_a_passing_review_does_not_excuse_an_incomplete_plan():
     session.plan.create(["Implement it", "Test it", "Independent review"])
     session.review.note_change("write_file", ("a.py",))
     settled(session.review, status="PASS")
-    held, line = TMT.completion_block(session, {"action": "respond",
+    held, line = TMT.completion_block(session, {"action": "end_conversation",
                                                 "message": "done"})
     assert "plan you made" in held
     assert "Plan not finished" in line
@@ -1916,7 +1917,7 @@ def test_the_gate_is_silent_on_a_synthetic_reply():
     session.plan.update(updates=[{"step": n, "status": "completed"}
                                  for n in (1, 2, 3)])
     session.review.note_change("write_file", ("a.py",))
-    synthetic = {"action": "done", "message": "the provider failed",
+    synthetic = {"action": "end_conversation", "message": "the provider failed",
                  agent_model.SYNTHETIC_KEY: True,
                  agent_model.SYNTHETIC_REASON: "provider"}
     assert TMT.review_block(session, synthetic) == ""
@@ -1924,9 +1925,9 @@ def test_the_gate_is_silent_on_a_synthetic_reply():
 
 
 def test_the_gate_is_silent_with_no_session_or_a_non_object():
-    assert TMT.review_block(None, {"action": "respond"}) == ""
-    assert TMT.review_block(agent_session.Session(), "respond") == ""
-    assert TMT.completion_block(None, {"action": "respond"}) == ("", "")
+    assert TMT.review_block(None, {"action": "end_conversation"}) == ""
+    assert TMT.review_block(agent_session.Session(), "end_conversation") == ""
+    assert TMT.completion_block(None, {"action": "end_conversation"}) == ("", "")
 
 
 def test_the_users_own_words_are_read_once_after_the_turn_begins():
@@ -2018,7 +2019,7 @@ def _completed(*positions):
 
 
 def _answered(message):
-    return json.dumps({"action": "respond", "message": message})
+    return json.dumps({"action": "end_conversation", "message": message})
 
 
 def test_an_answer_is_held_until_a_review_has_actually_passed():

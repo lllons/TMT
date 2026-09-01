@@ -723,7 +723,7 @@ _NO_REVIEW = (
     "done, and no review has been run.\n"
     "Run one now with {\"action\":\"review\"}. It reads the diff, the plan and "
     "your request, and comes back with findings you must act on. Do not "
-    "respond again until a review has passed."
+    "call end_conversation again until a review has passed."
 )
 
 _REVIEW_FAILED = (
@@ -1207,7 +1207,7 @@ def refusal(review, plan=None, action=None):
     other guard in that loop fails in. A broken review object holding finished
     work hostage is the worst outcome available.
     """
-    if action is not None and action not in ("respond", "done"):
+    if action is not None and action != "end_conversation":
         return ""
     if review is None:
         return ""

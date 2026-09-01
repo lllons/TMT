@@ -598,7 +598,13 @@ def test_the_new_fields_do_not_change_validation():
     assert agent_prompt.validate_action(plain) is None
     assert agent_prompt.validate_action(decorated) is None
     assert agent_prompt.validate_action(
-        {"action": "respond", "message": "ok", "next_step": "Run the tests"}) is None
+        {"action": "end_conversation", "message": "ok",
+         "next_step": "Run the tests"}) is None
+    # The other verb that talks, decorated the same way. Neither of them is a
+    # special case in the validator and neither has ever needed to be.
+    assert agent_prompt.validate_action(
+        {"action": "send_message", "message": "ok",
+         "progress": "Saying what is next."}) is None
     # A missing required key is still a missing required key.
     assert agent_prompt.validate_action(
         {"action": "read_file", "progress": "Reading."}) is not None
@@ -610,13 +616,13 @@ def prompt_rules():
 
 
 def test_the_system_prompt_requires_a_closing_summary_of_what_was_made():
-    """The respond message is the only thing the user ever reads, so a turn
-    that ends without one has failed however much work it did -- and one that
-    ends with "done" has told them nothing. The prompt has to say both, in the
-    rules and in the behaviour section, because a model that skims one may
+    """The end_conversation message is the only thing the user ever reads, so a
+    turn that ends without one has failed however much work it did -- and one
+    that ends with "done" has told them nothing. The prompt has to say both, in
+    the rules and in the behaviour section, because a model that skims one may
     still read the other."""
     rules = prompt_rules()
-    assert "You HAVE to end every task with a respond action" in rules, rules
+    assert "You HAVE to end every task with an end_conversation action" in rules, rules
     assert "YOU MUST FINISH BY SUMMARISING WHAT YOU MADE" in rules, rules
     # What a summary is: the files, and what was run and reported.
     for phrase in ("which files you created, changed or deleted",
@@ -624,8 +630,8 @@ def test_the_system_prompt_requires_a_closing_summary_of_what_was_made():
                    "Name the files"):
         assert phrase in rules, phrase
     # And what it is not, shown rather than only described.
-    assert '{"action":"respond","message":"Done."}' in rules, rules
-    assert "A task that changed nothing still ends with a respond" in rules
+    assert '{"action":"end_conversation","message":"Finished."}' in rules, rules
+    assert "A task that changed nothing still ends with an end_conversation" in rules
 
     # The wrong examples are wrong on purpose and must not be mistaken for the
     # right ones: every example in the section is still valid JSON and a valid
@@ -661,8 +667,8 @@ def test_the_system_prompt_teaches_progress_events_and_next_step():
     assert "may NOT do is repeat it silently" in rules
     assert "must say what is DIFFERENT about this use" in rules
     assert "Never write a sentence you have already written" in rules
-    # respond, done and announce are exempt: they are already the thing said.
-    assert "respond, done and announce are the exceptions" in rules
+    # The two verbs that talk are exempt: they are already the thing said.
+    assert "send_message and end_conversation are the exceptions" in rules
     assert "Never put a credential" in rules
     assert "never treated as their next message" in rules
     assert "never claim anything was done" in rules
@@ -688,7 +694,10 @@ def test_every_new_field_example_in_the_prompt_is_valid_and_obeys_its_own_rules(
                 assert event["type"] in agent_prompt.EVENT_TYPES, line
                 assert event["message"], line
             if "next_step" in entry:
-                assert entry["action"] in ("done", "respond"), line
+                # Only the ending carries one, which is what rule 8 of that
+                # same section says: a send_message means the task is not over
+                # and there is nothing yet to suggest.
+                assert entry["action"] == "end_conversation", line
                 # Four is the ask, and the prompt's own examples are
                 # where a model would otherwise learn that five is fine.
                 assert agent_ui.count_words(entry["next_step"]) <= (
@@ -708,7 +717,7 @@ def test_the_prompt_still_carries_the_rules_that_came_before():
         assert heading in rules, heading
     assert "NEVER use write_file on a file that already exists" in rules
     assert "Never tell the user to run git config" in rules
-    assert "Every task ends with a respond action" in rules
+    assert "Every task ends with an end_conversation action" in rules
     assert "Output EXACTLY ONE JSON object and nothing else" in rules
 
 
@@ -726,19 +735,24 @@ def test_a_reply_tmt_made_up_says_so_and_is_still_a_usable_action():
     tell it apart. Both, from the same object."""
     for raw in (agent_model._extract_json(""),
                 agent_model._extract_json("   "),
-                agent_model._extract_json('{"action":"done"'),
+                agent_model._extract_json('{"action":"end_conversation"'),
                 agent_model._error_reply("HTTP 429 rate limited")):
         obj = json.loads(raw)
-        assert obj["action"] == "done", obj
+        # The verb that ends turns is the verb TMT ends one with. It used to
+        # fabricate `done`, which no longer exists; a fabricated reply that the
+        # loop's terminal test did not recognise would leave a failed provider
+        # call running the turn on instead of reporting it.
+        assert obj["action"] == "end_conversation", obj
         assert obj["message"], obj
         assert agent_model.is_synthetic(obj), obj
         assert agent_prompt.validate_action(obj) is None, obj
 
     # A reply the model actually sent is not marked, whatever it says.
-    real = json.loads(agent_model._extract_json('{"action":"done","message":"ok"}'))
+    real = json.loads(agent_model._extract_json(
+        '{"action":"end_conversation","message":"ok"}'))
     assert agent_model.is_synthetic(real) is False, real
     assert agent_model.is_synthetic(None) is False
-    assert agent_model.is_synthetic("done") is False
+    assert agent_model.is_synthetic("end_conversation") is False
 
 
 def test_prose_where_json_was_asked_for_is_shown_as_the_answer():
@@ -750,7 +764,7 @@ def test_prose_where_json_was_asked_for_is_shown_as_the_answer():
     turn as though the model had said it."""
     reply = "I committed the change and pushed it to main."
     obj = json.loads(agent_model._extract_json(reply))
-    assert obj["action"] == "done"
+    assert obj["action"] == "end_conversation"
     assert obj["message"] == reply, obj
     # The model's own words, so not marked as something TMT made up.
     assert agent_model.is_synthetic(obj) is False, obj
@@ -763,8 +777,8 @@ def test_prose_where_json_was_asked_for_is_shown_as_the_answer():
 
     # Prose wrapped around a JSON object is still the JSON object.
     mixed = json.loads(agent_model._extract_json(
-        'Sure! {"action":"done","message":"ok"} hope that helps'))
-    assert mixed == {"action": "done", "message": "ok"}, mixed
+        'Sure! {"action":"end_conversation","message":"ok"} hope that helps'))
+    assert mixed == {"action": "end_conversation", "message": "ok"}, mixed
 
 
 def test_the_system_prompt_is_sent_as_one_cacheable_block():
@@ -831,7 +845,7 @@ def test_every_worked_example_is_exactly_what_the_model_should_emit():
                 if line.startswith("You emit:")]
     assert len(examples) >= 12, len(examples)
 
-    respond_seen = 0
+    ending_seen = 0
     for line in examples:
         obj = json.loads(line)                    # an unparseable example is broken
         entries = obj.get("actions", [obj])
@@ -839,7 +853,7 @@ def test_every_worked_example_is_exactly_what_the_model_should_emit():
         for entry in entries:
             assert agent_prompt.validate_action(entry) is None, line
             if "next_step" in entry:
-                assert entry["action"] in ("done", "respond"), line
+                assert entry["action"] == "end_conversation", line
                 # The prompt asks for four words; its own examples must not be
                 # the place a model learns that five is fine.
                 assert agent_ui.count_words(entry["next_step"]) <= \
@@ -847,12 +861,12 @@ def test_every_worked_example_is_exactly_what_the_model_should_emit():
                 assert not entry["next_step"].rstrip().endswith((".", "?", "!")), line
             for event in entry.get("events", []):
                 assert event["type"] in agent_prompt.EVENT_TYPES, line
-        if entries[-1]["action"] in ("done", "respond"):
-            respond_seen += 1
+        if entries[-1]["action"] == "end_conversation":
+            ending_seen += 1
         # A batch that does work must finish it, exactly as the rules say.
         if len(entries) > 1:
-            assert entries[-1]["action"] in ("done", "respond"), line
-    assert respond_seen >= 8, respond_seen
+            assert entries[-1]["action"] == "end_conversation", line
+    assert ending_seen >= 8, ending_seen
 
 
 def test_the_prompt_says_plainly_that_prose_reaches_nobody():
@@ -867,9 +881,10 @@ def test_the_prompt_says_plainly_that_prose_reaches_nobody():
     assert "There is no situation, none, in which the right answer is text outside JSON" in rules
     # Every kind of turn the model might think is an exception is named as one
     # that is not: a greeting, a refusal, and a question back.
-    assert "A greeting is a respond action" in rules
-    assert "A refusal is a respond action" in rules
-    assert "A question back to the user is a respond action" in rules
+    assert "A greeting is an end_conversation whose message is a greeting" in rules
+    assert "A refusal is an end_conversation whose message explains why" in rules
+    assert ("A question back to the user is an end_conversation whose message "
+            "asks it") in rules
     # And the worked examples cover those same cases, so the rule is shown as
     # well as stated.
     examples = agent_prompt.ANSWERING_EXAMPLES

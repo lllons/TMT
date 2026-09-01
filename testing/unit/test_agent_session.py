@@ -195,7 +195,7 @@ def test_the_carried_answer_is_the_json_action_the_model_speaks_in():
     assistant = carried[1]
     assert assistant["role"] == "assistant"
     payload = json.loads(assistant["content"])       # loose prose would raise
-    assert payload["action"] == "respond", payload
+    assert payload["action"] == "end_conversation", payload
     assert payload["message"].startswith("Built it in Calc.py."), payload
 
 

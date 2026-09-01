@@ -34,6 +34,11 @@ from agent_config import (
 from agent_config import REQUIRED_KEYS
 from agent_actions import authorizes_push, batch_summary, build_result_message, execute_action, trim_messages
 from agent_actions import READ_ONLY_ACTIONS, ACTION_LABELS, MAX_TURNS, action_event
+# The two verbs that talk to the user, and the translation of the names
+# they used to have. Imported rather than spelled out again: the loop's
+# terminal check and the dispatcher's own branch must be the same string,
+# and two copies of it are two chances for the turn to stop ending.
+from agent_actions import END_CONVERSATION, SEND_MESSAGE, canonical_action
 # The paths an action named, taken from the request rather than parsed back
 # out of the result. Imported rather than reimplemented: `note_work` needs
 # exactly the list the transcript's own events are built from, and a second
@@ -150,9 +155,13 @@ _ACTION_RAISED = (
     "a corrected action."
 )
 
-# What the model is told after an announcement, so the turn goes on.
-_ANNOUNCED = ("That was shown to the user as progress. The task is not "
-              "finished. Emit the action you just announced.")
+# What the model is told after a `send_message`, so the turn goes on. It says
+# the task is NOT finished in as many words, because the one mistake this verb
+# invites is a model treating "I have told the user" as "I am done".
+_MESSAGE_SENT = ("That was shown to the user. It did NOT end the task and the "
+                 "task is not finished: send_message never ends anything. "
+                 "Carry on with the work, and use end_conversation only when "
+                 "you have actually finished.")
 
 # What the USER is shown when a final answer is refused because the plan is
 # not finished. One line, naming the step being waited on, because the plan
@@ -517,41 +526,53 @@ def completion_block(session, obj):
     return "", ""
 
 
-def is_announcement(obj):
-    """Whether this is the model saying what it is about to do.
+def _adopt_verb(obj):
+    """Rewrite this reply's action to the name in force now. Returns it.
 
-    Two shapes mean it, and they are not equally safe.
+    One line of work and one place it happens, which is the point: everything
+    downstream -- `is_send_message`, the three completion gates, the terminal
+    test, `execute_action`, `action_event` -- reads `obj["action"]`, and every
+    one of them would otherwise need to know that `respond` used to mean two
+    different things depending on a flag.
 
-    `announce` is the one to reach for: it has no terminal meaning at all, so
-    there is nothing to get wrong. The turn cannot end on it however it is
-    written, whatever other keys ride along, and whatever the model forgets.
-
-    `respond` with `final: false` means the same thing and stays supported,
-    but it is a flag on the action that DOES end the task, so forgetting the
-    flag fails silently in the worst direction -- "I'll read the parser first"
-    ending the turn with the parser unread, the work undone and the user
-    having to ask again. A separate verb cannot be forgotten into a terminal
-    action, which is the whole reason `announce` exists beside it.
-
-    On `respond`, absent means final, so every reply written before that key
-    existed still means exactly what it meant. A string is read as well as a
-    bool, because a model that writes "false" means false and being pedantic
-    about the type here would resurrect the bug this exists to fix.
+    The reply the model actually wrote is untouched: `raw` is what goes into
+    the conversation as the assistant turn, so the record still shows the
+    model its own words.
     """
-    if not isinstance(obj, dict):
-        return False
-    if obj.get("action") == "announce":
-        return True
-    if obj.get("action") != "respond":
-        return False
-    value = obj.get("final", True)
-    if isinstance(value, str):
-        value = value.strip().lower() not in ("false", "no", "0", "")
-    return not value
+    if isinstance(obj, dict):
+        adopted = canonical_action(obj)
+        if adopted:
+            obj["action"] = adopted
+    return obj
 
 
-def announce(obj, transcript):
-    """Show an announcement and return whether there was anything to show.
+def is_send_message(obj):
+    """Whether this reply talks to the user WITHOUT ending the task.
+
+    One shape means it and there is nothing else to check: the verb.
+    `send_message` has no terminal meaning at all, so the turn cannot end on
+    it however it is written, whatever other keys ride along, and whatever the
+    model forgets. A `send_message` carrying `"final": true` is still a
+    message; the key is not read here and is not read anywhere.
+
+    That absence is the feature. This used to be two shapes -- `announce`, and
+    `respond` with `final: false` -- and the second was a flag on the action
+    that DOES end the task, so forgetting it failed silently in the worst
+    direction: "I'll read the parser first" ending the turn with the parser
+    unread, the work undone and the user having to ask again. There is no flag
+    to forget now. The two meanings are two verbs, and neither can be written
+    as the other.
+
+    A reply using the old names never reaches this: `agent_actions.
+    canonical_action` has already translated it, and it translates the MEANING
+    -- a `respond` that carried `final: false` arrives here as a
+    `send_message`, which is what it always meant.
+    """
+    return isinstance(obj, dict) and obj.get("action") == SEND_MESSAGE
+
+
+def send_message(obj, transcript):
+    """Show a message and return whether there was anything to show.
 
     It goes to the transcript, not through `finish_response`: it is permanent,
     it belongs in the scrollback with the rest of the turn, and it is not the
@@ -1302,6 +1323,12 @@ def _session_loop(root):
                     relay.release()
                     turn_state["outcome"] = _UNUSABLE_OUTCOME % retries
                     break
+                # Translated before anything looks at it, so every check
+                # below -- the message test, the completion gates, the
+                # terminal test, the dispatcher -- sees the two verbs in force
+                # now and nothing else has to know the old names. A reply that
+                # already uses them is returned untouched.
+                _adopt_verb(obj)
                 declared_events(obj, transcript, turn_state)
                 if "actions" in obj:
                     batch = obj["actions"]
@@ -1316,6 +1343,9 @@ def _session_loop(root):
                     invalid = ""
                     held = held_line = ""
                     for sub_obj in batch:
+                        # Each entry in its own right: a batch is a list of
+                        # actions and an old name can appear in any of them.
+                        _adopt_verb(sub_obj)
                         invalid = validate_action(sub_obj)
                         if invalid:
                             # Handed back below so the model can correct it,
@@ -1336,8 +1366,8 @@ def _session_loop(root):
                         # over. The entries after it are the work it announced,
                         # and ending the turn on it would leave every one of
                         # them unrun.
-                        if is_announcement(sub_obj):
-                            announce(sub_obj, transcript)
+                        if is_send_message(sub_obj):
+                            send_message(sub_obj, transcript)
                             results.append(f"{sub_action}: shown to the user")
                             continue
                         # The same gate the single-action path takes, in the
@@ -1366,7 +1396,7 @@ def _session_loop(root):
                         if sub_action in MUTATING_ACTIONS:
                             invalidate_prompt()
                         note_work(session, sub_action, sub_obj)
-                        if sub_action in ("done", "respond"):
+                        if sub_action == END_CONVERSATION:
                             # Said before the answer, so an answer the review
                             # never approved is never read without the reason
                             # it was let out anyway.
@@ -1428,14 +1458,14 @@ def _session_loop(root):
                 # to do used to be indistinguishable from the model saying what
                 # it had done, so "I'll inspect the files first" ended the turn
                 # with nothing inspected.
-                if is_announcement(obj):
-                    announce(obj, transcript)
+                if is_send_message(obj):
+                    send_message(obj, transcript)
                     relay.reset()
                     live_ui.intermediate_event("Processing...")
                     steps += 1
                     retries = 0
                     messages.extend([{"role": "assistant", "content": raw},
-                                     {"role": "user", "content": _ANNOUNCED}])
+                                     {"role": "user", "content": _MESSAGE_SENT}])
                     continue
                 # The plan's gate, and it is taken BEFORE the action runs.
                 # `respond` has no side effect worth avoiding, but running it
@@ -1474,7 +1504,7 @@ def _session_loop(root):
                 # later when the answer lands.
                 session.count_event(
                     transcript.emit(action_event(action, obj, result)))
-                if action in ("done", "respond"):
+                if action == END_CONVERSATION:
                     # A reply ask_model made up to report a failure is shown
                     # like any other, because the user has to be told. It is
                     # not recorded as the model's answer: the sentence in it
@@ -1495,7 +1525,7 @@ def _session_loop(root):
                 if action in MUTATING_ACTIONS:
                     invalidate_prompt()
                 note_work(session, action, obj)
-                if action in ("done", "respond"):
+                if action == END_CONVERSATION:
                     break
                 messages.extend([{"role": "assistant", "content": raw}, {"role": "user", "content": build_result_message(action, result, obj)}])
             else:

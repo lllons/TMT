@@ -430,7 +430,7 @@ def test_the_gate_holds_every_state_that_is_not_a_pass():
     plan = complete_plan()
 
     def blocked(state):
-        return bool(V.refusal(state, plan, "respond"))
+        return bool(V.refusal(state, plan, "end_conversation"))
 
     idle = V.VerificationState()
     idle.note_change("write_file", ("a.py",))
@@ -466,10 +466,13 @@ def test_the_gate_only_ever_holds_a_terminal_action():
     is being told to do."""
     state = state_after(failing())
     plan = complete_plan()
-    assert V.refusal(state, plan, "respond")
-    assert V.refusal(state, plan, "done")
+    assert V.refusal(state, plan, "end_conversation")
+    # `send_message` is on this list rather than beside the ending, and that
+    # is the point of the rename: it talks to the user without finishing, so
+    # gating it would silence the model through exactly the wait -- a whole
+    # test suite running -- that the user most wants narrated.
     for action in ("read_file", "write_file", "verify", "review", "plan",
-                   "run_file", "git_commit"):
+                   "run_file", "git_commit", "send_message"):
         assert V.refusal(state, plan, action) == "", action
 
 
@@ -484,7 +487,7 @@ def test_the_gate_releases_rather_than_trapping_a_session():
     for _ in range(V.MAX_VERIFY_CYCLES):
         limited.begin()
         limited.settle(V.VerificationResult(checks=[failing()]))
-    assert V.refusal(limited, plan, "respond") == ""
+    assert V.refusal(limited, plan, "end_conversation") == ""
     assert "did not pass" in V.limit_release(limited)
 
     # A repository with nothing to run. There is no evidence to be had, and a
@@ -494,7 +497,7 @@ def test_the_gate_releases_rather_than_trapping_a_session():
     barren.note_change("write_file", ("a.py",))
     barren.begin()
     barren.settle(V.VerificationResult(checks=[skipped()]))
-    assert V.refusal(barren, plan, "respond") == ""
+    assert V.refusal(barren, plan, "end_conversation") == ""
     assert "nothing it could run" in V.limit_release(barren)
 
 
@@ -506,9 +509,9 @@ def test_a_barren_repository_is_gated_again_once_something_changes():
     state.note_change("write_file", ("a.py",))
     state.begin()
     state.settle(V.VerificationResult(checks=[skipped()]))
-    assert V.refusal(state, plan, "respond") == ""
+    assert V.refusal(state, plan, "end_conversation") == ""
     state.note_change("write_file", ("b.py",))
-    assert V.refusal(state, plan, "respond") != "", \
+    assert V.refusal(state, plan, "end_conversation") != "", \
         "an edit after a released run is not covered by it"
 
 
@@ -519,10 +522,10 @@ def test_a_state_object_that_raises_lets_the_answer_through():
         def is_required(self, plan=None):
             raise RuntimeError("boom")
 
-    assert V.refusal(Broken(), complete_plan(), "respond") == ""
+    assert V.refusal(Broken(), complete_plan(), "end_conversation") == ""
     assert V.limit_release(Broken()) == ""
     assert "not finished" in V.held_line(Broken())
-    assert V.refusal(None, complete_plan(), "respond") == ""
+    assert V.refusal(None, complete_plan(), "end_conversation") == ""
 
 
 def test_the_held_line_names_the_reason_the_user_can_see():
@@ -564,7 +567,7 @@ def test_the_veto_is_a_refinement_and_the_gate_is_the_guarantee():
     assert V.plan_veto(state, plan, update) == "", "the title dodges the veto"
     for step in plan.steps:
         plan.update(step.position, "completed")
-    assert V.refusal(state, plan, "respond") != "", \
+    assert V.refusal(state, plan, "end_conversation") != "", \
         "and the gate refuses the answer anyway"
 
     assert V.is_verify_step("Verify implementation")
@@ -732,21 +735,21 @@ def test_no_gate_excuses_another():
     unfinished = agent_plan.Plan(["Implement", "Test", "Explain"])
     done = complete_plan()
 
-    assert agent_plan.refusal(unfinished, "respond") != ""
-    assert agent_plan.refusal(done, "respond") == ""
+    assert agent_plan.refusal(unfinished, "end_conversation") != ""
+    assert agent_plan.refusal(done, "end_conversation") == ""
 
     verified = state_after(passing())
     unverified = state_after(failing())
-    assert V.refusal(unverified, done, "respond") != ""
-    assert V.refusal(verified, done, "respond") == ""
+    assert V.refusal(unverified, done, "end_conversation") != ""
+    assert V.refusal(verified, done, "end_conversation") == ""
 
     reviewed = passed_review()
     unreviewed = agent_review.ReviewState()
     unreviewed.note_change("write_file", ("a.py",))
-    assert agent_review.refusal(unreviewed, done, "respond") != ""
-    assert agent_review.refusal(reviewed, done, "respond") == ""
+    assert agent_review.refusal(unreviewed, done, "end_conversation") != ""
+    assert agent_review.refusal(reviewed, done, "end_conversation") == ""
 
     # Only all three together let it out.
-    assert (agent_plan.refusal(done, "respond")
-            or V.refusal(verified, done, "respond")
-            or agent_review.refusal(reviewed, done, "respond")) == ""
+    assert (agent_plan.refusal(done, "end_conversation")
+            or V.refusal(verified, done, "end_conversation")
+            or agent_review.refusal(reviewed, done, "end_conversation")) == ""

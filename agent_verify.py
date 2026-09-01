@@ -686,7 +686,8 @@ _NO_VERIFY = (
     "no verification has been run.\n"
     "Run one now with {\"action\":\"verify\"}. It inspects this repository, "
     "works out which checks are worth running for what you changed, runs them, "
-    "and reports what they said. Do not respond again until it passes."
+    "and reports what they said. Do not call end_conversation again until it "
+    "passes."
 )
 
 _VERIFY_FAILED = (
@@ -1093,7 +1094,7 @@ def refusal(verify, plan=None, action=None):
     A state object that RAISES lets the answer through, the direction every
     other guard in that loop fails in.
     """
-    if action is not None and action not in ("respond", "done"):
+    if action is not None and action != "end_conversation":
         return ""
     if verify is None:
         return ""

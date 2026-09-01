@@ -220,7 +220,7 @@ def test_a_blocked_step_still_counts_as_outstanding():
     plan.update(2, "completed")
     assert not plan.is_complete()
     assert [step.id for step in plan.outstanding()] == ["S1"]
-    assert agent_plan.refusal(plan, "respond"), "a blocked step let the turn end"
+    assert agent_plan.refusal(plan, "end_conversation"), "a blocked step let the turn end"
 
 
 def test_create_replaces_the_plan_and_can_carry_progress_forward():
@@ -291,13 +291,13 @@ def test_a_plan_with_work_against_it_cannot_be_cleared():
     assert "create" in said, said
     # It is still there, and it still holds the answer back.
     assert len(plan) == 2
-    assert agent_plan.refusal(plan, "respond"), "clearing let the answer through"
+    assert agent_plan.refusal(plan, "end_conversation"), "clearing let the answer through"
     # And through the dispatcher, which is the path the model actually takes.
     assert "FAILED:" in run({"operation": "clear"}, context={"plan": plan})
     # Reshaping it is the route that IS open, because it says what changed.
     plan.create([{"title": "Implement", "status": "completed"},
                  {"title": "Run the tests", "status": "completed"}])
-    assert agent_plan.refusal(plan, "respond") == ""
+    assert agent_plan.refusal(plan, "end_conversation") == ""
 
 
 def test_retiring_a_plan_is_unconditional_and_clearing_it_is_not():
@@ -324,7 +324,7 @@ def test_retiring_a_plan_is_unconditional_and_clearing_it_is_not():
         assert plan.retire() is None, name
         assert len(plan) == 0 and not plan, name
         assert plan.is_complete(), name
-        assert agent_plan.refusal(plan, "respond") == "", name
+        assert agent_plan.refusal(plan, "end_conversation") == "", name
         # Retiring twice is not a special case either.
         plan.retire()
 
@@ -373,35 +373,42 @@ def test_the_gate_holds_a_final_action_and_names_what_is_outstanding():
     outstanding" is, and it is what the model is sent."""
     plan = plan_of("Inspect", "Run the tests")
     plan.update(1, "completed")
-    for action in ("respond", "done"):
-        said = agent_plan.refusal(plan, action)
-        assert said.startswith("BLOCKED"), said
-        assert "S2: Run the tests" in said, said
-        assert "1 step is" in said, said
-        assert "\"operation\":\"update\"" in said, said
+    # One verb, where there used to be two. `respond` and `done` both ended a
+    # turn and the gate had to name both; `end_conversation` is the only verb
+    # that ends anything now, so it is the only one the gate has to hold. A
+    # reply written with an old name reaches this having already been
+    # translated -- see test_agent_verbs.py, which drives that end to end.
+    said = agent_plan.refusal(plan, "end_conversation")
+    assert said.startswith("BLOCKED"), said
+    assert "S2: Run the tests" in said, said
+    assert "1 step is" in said, said
+    assert "\"operation\":\"update\"" in said, said
 
 
 def test_the_gate_releases_when_every_step_is_complete():
     plan = plan_of("One", "Two")
     plan.update(1, "completed")
     plan.update(2, "completed")
-    assert agent_plan.refusal(plan, "respond") == ""
-    assert agent_plan.refusal(plan, "done") == ""
+    assert agent_plan.refusal(plan, "end_conversation") == ""
 
 
 def test_the_gate_never_holds_a_turn_that_made_no_plan():
     """Most turns. The gate is a consequence of having made a plan, never a
     requirement to make one."""
-    assert agent_plan.refusal(agent_plan.Plan(), "respond") == ""
-    assert agent_plan.refusal(None, "respond") == ""
+    assert agent_plan.refusal(agent_plan.Plan(), "end_conversation") == ""
+    assert agent_plan.refusal(None, "end_conversation") == ""
 
 
-def test_the_gate_only_ever_holds_the_two_terminal_actions():
+def test_the_gate_only_ever_holds_the_one_terminal_action():
     """Everything else is the work the gate is asking for. Holding a read or a
-    patch would stop the model doing the very thing it is being told to do."""
+    patch would stop the model doing the very thing it is being told to do --
+    and `send_message` is on this list for a sharper reason than the rest: it
+    is how the model talks to the user WHILE the plan is being worked, so
+    gating it would leave the user watching silence through exactly the work
+    they most want narrated."""
     plan = plan_of("One", "Two")
-    for action in ("read_file", "patch_file", "announce", "plan", "git_commit",
-                   "spawn_agent", "internal_response"):
+    for action in ("read_file", "patch_file", "send_message", "plan",
+                   "git_commit", "spawn_agent", "internal_response"):
         assert agent_plan.refusal(plan, action) == "", action
 
 
@@ -499,7 +506,10 @@ def test_an_action_context_with_no_plan_answers_in_words():
         result = agent_actions.execute_action(
             {"action": "plan", "operation": "create", "steps": ["One"]}, context)
         assert "not available" in result, result
-        assert "respond" in result, result
+        # It points at the verb that still works, and that verb has a new
+        # name. A sentence still naming `respond` would send the model at a
+        # word the validator no longer knows.
+        assert "end_conversation" in result, result
 
 
 def test_a_plan_that_raises_is_reported_and_never_escapes():
@@ -557,7 +567,7 @@ def test_the_plan_belongs_to_the_task_and_not_to_the_session():
     assert not session.plan.is_complete()
     session.begin_turn("a completely different question")
     assert len(session.plan) == 0, session.plan.describe()
-    assert agent_plan.refusal(session.plan, "respond") == ""
+    assert agent_plan.refusal(session.plan, "end_conversation") == ""
 
 
 def test_a_finished_plan_is_retired_by_the_next_question():
@@ -576,12 +586,12 @@ def test_a_finished_plan_is_retired_by_the_next_question():
     session.plan.create(["Implement", "Run the tests"])
     _worked(session.plan, 1, 2)
     # The gate let this turn answer, which is what makes the state reachable.
-    assert agent_plan.refusal(session.plan, "respond") == ""
+    assert agent_plan.refusal(session.plan, "end_conversation") == ""
     held = session.plan
     session.begin_turn("and now something unrelated")
     assert session.plan is held, "the session rebound its plan"
     assert len(session.plan) == 0, session.plan.describe()
-    assert agent_plan.refusal(session.plan, "respond") == ""
+    assert agent_plan.refusal(session.plan, "end_conversation") == ""
 
 
 def test_a_half_done_plan_is_retired_too_however_the_turn_ended():
@@ -591,10 +601,10 @@ def test_a_half_done_plan_is_retired_too_however_the_turn_ended():
     session = agent_session.Session()
     session.plan.create(["Implement", "Run the tests"])
     _worked(session.plan, 1)
-    assert agent_plan.refusal(session.plan, "respond"), "not the half-done shape"
+    assert agent_plan.refusal(session.plan, "end_conversation"), "not the half-done shape"
     session.begin_turn("something unrelated")
     assert len(session.plan) == 0, session.plan.describe()
-    assert agent_plan.refusal(session.plan, "respond") == ""
+    assert agent_plan.refusal(session.plan, "end_conversation") == ""
 
 
 def test_the_session_empties_its_plan_in_place_and_never_rebinds_it():
@@ -617,7 +627,7 @@ def test_clearing_the_conversation_clears_the_plan():
     session.plan.create(["One", "Two"])
     session.clear()
     assert len(session.plan) == 0
-    assert agent_plan.refusal(session.plan, "respond") == ""
+    assert agent_plan.refusal(session.plan, "end_conversation") == ""
 
 
 def test_clearing_the_conversation_clears_a_plan_that_has_work_against_it():
@@ -1044,7 +1054,7 @@ def test_a_final_answer_is_refused_while_the_plan_is_unfinished():
     early = "Everything is finished, I promise."
     replies = [json.dumps({"action": "plan", "operation": "create",
                            "steps": ["Inspect the repository", "Run the tests"]})]
-    replies += [json.dumps({"action": "respond", "message": "%s (%d)" % (early, n)})
+    replies += [json.dumps({"action": "end_conversation", "message": "%s (%d)" % (early, n)})
                 for n in range(agent_config.rounds_for_effort() + 2)]
     drawn, seen, console = drive_session(["add the feature /plan", "quit"], replies)
 
@@ -1066,12 +1076,12 @@ def test_the_answer_lands_once_every_step_is_complete():
     replies = [
         json.dumps({"action": "plan", "operation": "create",
                     "steps": ["Implement it", "Run the tests"]}),
-        json.dumps({"action": "respond", "message": "too early"}),
+        json.dumps({"action": "end_conversation", "message": "too early"}),
         json.dumps({"action": "plan", "operation": "update", "step": 1,
                     "status": "completed"}),
         json.dumps({"action": "plan", "operation": "update", "step": 2,
                     "status": "completed"}),
-        json.dumps({"action": "respond", "message": answer}),
+        json.dumps({"action": "end_conversation", "message": answer}),
     ]
     drawn, seen, console = drive_session(["add the feature /plan", "quit"], replies)
 
@@ -1091,11 +1101,11 @@ def test_a_batch_that_ends_in_an_early_answer_keeps_the_work_it_did():
             {"action": "plan", "operation": "create",
              "steps": ["Write the file", "Run the tests"]},
             {"action": "write_file", "path": "made.txt", "content": "hi\n"},
-            {"action": "respond", "message": "All done already."}]}),
+            {"action": "end_conversation", "message": "All done already."}]}),
         json.dumps({"action": "plan", "operation": "update",
                     "steps": [{"step": 1, "status": "completed"},
                               {"step": 2, "status": "completed"}]}),
-        json.dumps({"action": "respond", "message": "Wrote made.txt."}),
+        json.dumps({"action": "end_conversation", "message": "Wrote made.txt."}),
     ]
     drawn, seen, console = drive_session(["make a file /plan", "quit"], replies)
 
@@ -1128,7 +1138,7 @@ def _planned_turn(answer):
                     "status": "completed"}),
         json.dumps({"action": "plan", "operation": "update", "step": 2,
                     "status": "completed"}),
-        json.dumps({"action": "respond", "message": answer}),
+        json.dumps({"action": "end_conversation", "message": answer}),
     ]
 
 
@@ -1147,7 +1157,7 @@ def test_the_next_question_is_answered_after_a_turn_that_finished_its_plan():
     """
     first, second = "Added the feature.", "Second answer."
     replies = _planned_turn(first) + [
-        json.dumps({"action": "respond", "message": second})]
+        json.dumps({"action": "end_conversation", "message": second})]
     drawn, seen, console = drive_session(
         ["add the feature /plan", "and now something unrelated", "quit"], replies)
 
@@ -1172,7 +1182,7 @@ def test_clear_after_a_finished_plan_does_not_end_the_session():
     """
     first, second = "Added the feature.", "Second answer."
     replies = _planned_turn(first) + [
-        json.dumps({"action": "respond", "message": second})]
+        json.dumps({"action": "end_conversation", "message": second})]
     drawn, seen, console = drive_session(
         ["add the feature /plan", "/clear", "and now something else", "quit"], replies)
 

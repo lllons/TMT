@@ -866,8 +866,8 @@ def test_the_agenda_decides_nothing_about_whether_a_review_passes():
     for review in (empty, half):
         settled(review, status="PASS")
     assert empty.passed is half.passed is True
-    assert agent_review.refusal(empty, plan, "respond") == ""
-    assert agent_review.refusal(half, plan, "respond") == ""
+    assert agent_review.refusal(empty, plan, "end_conversation") == ""
+    assert agent_review.refusal(half, plan, "end_conversation") == ""
     assert not half.agenda.is_complete()
     # And a failing review is refused whatever its checklist says, including a
     # checklist that is complete.
@@ -877,4 +877,4 @@ def test_the_agenda_decides_nothing_about_whether_a_review_passes():
     done.update(1, "done")
     assert done.is_complete()
     assert not failed.passed
-    assert agent_review.refusal(failed, plan, "respond") != ""
+    assert agent_review.refusal(failed, plan, "end_conversation") != ""

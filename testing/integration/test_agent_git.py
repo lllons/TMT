@@ -1269,7 +1269,10 @@ def test_git_diff_returns_the_changed_content_and_needs_no_push_authorization():
         assert "truncat" in huge.lower(), huge[-400:]
 
         follow_up = agent_actions.build_result_message("git_diff", "some diff")
-        assert "respond" in follow_up, follow_up
+        # It names the verb that ends a turn, and that verb has a new name. A
+        # sentence still saying "respond" would point the model at a word the
+        # validator no longer knows.
+        assert "end_conversation" in follow_up, follow_up
     finally:
         sandbox.close()
 

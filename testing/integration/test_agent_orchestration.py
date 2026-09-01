@@ -211,7 +211,7 @@ def test_a_worker_is_told_it_cannot_talk_to_anyone_and_must_do_real_work():
 
 
 def test_a_worker_is_told_plainly_that_it_cannot_verify_the_test_suite():
-    """run_file gives up at 10 seconds and the suite needs about 60, so a
+    """run_file gives up at 10 seconds and a real suite takes far longer, so a
     worker asked to verify tests gets a timeout. The danger is not the
     timeout, it is a worker reporting a pass it never saw -- the main agent
     commits on that."""
@@ -219,7 +219,11 @@ def test_a_worker_is_told_plainly_that_it_cannot_verify_the_test_suite():
     try:
         worker = agent_subprompts.worker_prompt()
         assert "YOU CANNOT RUN THE TEST SUITE." in worker
-        assert "10 seconds" in worker and "about 60" in worker
+        # Both halves of the arithmetic, so the model can see WHY rather than
+        # only being told. The ceiling is a number; the suite's cost is stated
+        # beside it, and either one alone leaves the rule looking arbitrary.
+        assert "10 seconds" in worker, worker
+        assert "takes minutes" in worker, worker
         assert "do not report a pass or a failure you did not see" in worker
         assert "say what you did instead" in worker
         assert "A fabricated green run" in worker
@@ -426,23 +430,26 @@ def test_every_orchestration_action_is_registered_and_reachable():
 
 def test_internal_response_is_registered_and_is_not_terminal_for_the_main_loop():
     """The load-bearing half of the isolation. The main loop ends a turn on
-    `done` and `respond`; a main model that somehow emitted an
-    internal_response gets an ordinary action result and the turn carries on,
-    so a worker's private report can never become a user's answer.
+    `end_conversation` and on nothing else; a main model that somehow emitted
+    an internal_response gets an ordinary action result and the turn carries
+    on, so a worker's private report can never become a user's answer.
 
     Asserted against TMT.py's own source, because the property being claimed
-    is about that tuple and nothing else."""
-    assert "internal_response" not in ("done", "respond")
+    is about that comparison and nothing else. It used to be a two-name tuple
+    -- `("done", "respond")` -- and the rename collapsed it to one verb, which
+    makes the property easier to state rather than weaker: there is exactly
+    one name that can end a turn and `internal_response` is not it."""
+    assert agent_actions.END_CONVERSATION != "internal_response"
     assert act("internal_response", {}, response="a worker's report") == \
         "a worker's report"
     assert act("internal_response", {}) == ""
 
     source = (Path(agent_actions.__file__).resolve().parent / "TMT.py").read_text(
         encoding="utf-8")
-    assert 'action in ("done", "respond")' in source, \
-        "the loop's terminal check is not the tuple this test is about"
-    assert 'sub_action in ("done", "respond")' in source
-    # And the tuple has not quietly grown a third member.
+    assert "if action == END_CONVERSATION:" in source, \
+        "the loop's terminal check is not the comparison this test is about"
+    assert "if sub_action == END_CONVERSATION:" in source
+    # And the check has not quietly grown a second member.
     assert "internal_response" not in source, \
         "TMT.py names internal_response; the isolation is no longer structural"
 
@@ -678,15 +685,24 @@ def test_a_worker_runs_on_the_worker_prompt_uses_tools_and_ends_on_one_verb():
 
 
 def test_a_worker_that_reaches_for_a_user_facing_ending_is_refused_not_obeyed():
-    """respond and done end a turn for a user, and a worker has no user. The
+    """end_conversation ends a turn for a user, and a worker has no user. The
     refusal is a check on the action name before dispatch, so it holds
-    whatever the prompt said and whatever the model believes."""
+    whatever the prompt said and whatever the model believes.
+
+    The legacy names are driven here too, and they are the interesting half:
+    a worker's reply is translated by `_adopt_verb` BEFORE the whitelist is
+    consulted, so an old `respond` arrives at the refusal already spelled
+    `end_conversation` and is turned away by the same one entry. An old
+    `announce` arrives as `send_message`, which a worker IS allowed, and is
+    answered with the sentence saying nobody reads it."""
     box = Project(files=PROJECT)
     manager = agent_manager.AgentManager()
     try:
         script = Script(
-            json.dumps({"action": "respond", "message": "All done!"}),
+            json.dumps({"action": "end_conversation", "message": "All done!"}),
+            json.dumps({"action": "respond", "message": "Really done!"}),
             json.dumps({"action": "done"}),
+            json.dumps({"action": "send_message", "message": "Starting now."}),
             json.dumps({"action": "announce", "message": "I'll start now."}),
             json.dumps({"action": "internal_response", "response": "Nothing to do."}),
         )
@@ -698,11 +714,24 @@ def test_a_worker_that_reaches_for_a_user_facing_ending_is_refused_not_obeyed():
         fed_back = "\n".join(
             message["content"] for message in record.conversation
             if message["role"] == "user")
-        assert "REFUSED: 'respond'" in fed_back, fed_back
-        assert "REFUSED: 'done'" in fed_back, fed_back
+        assert "REFUSED: 'end_conversation'" in fed_back, fed_back
+        # Two refusals collapsed into one because there is one verb to refuse,
+        # and the old names reach it through the translation rather than
+        # through entries of their own.
+        assert "REFUSED: 'respond'" not in fed_back, fed_back
+        assert "REFUSED: 'done'" not in fed_back, fed_back
+        assert fed_back.count("REFUSED: 'end_conversation'") == 2, fed_back
+        # The bare legacy `done` is turned away one step earlier, by
+        # validation rather than by the whitelist: it translates to an
+        # `end_conversation` with no "message", which is now a required key.
+        # A different sentence, the same outcome -- handed back, not obeyed --
+        # and the verb it names is the current one either way.
+        assert "Action 'end_conversation' is missing required keys" in fed_back, \
+            fed_back
         assert "no user to answer" in fed_back
-        assert "nobody sees your messages" in fed_back or \
-            "shown to anyone" in fed_back, fed_back
+        # The message verb is ALLOWED to a worker and answered rather than
+        # refused: it costs a step and the model is told nobody read it.
+        assert "Nothing you write reaches anybody" in fed_back, fed_back
     finally:
         manager.kill_all()
         box.close()

@@ -141,7 +141,7 @@ class Turn:
             if self.facts:
                 message += "\n\nIn that turn: " + ", ".join(self.facts)
             out.append({"role": "assistant",
-                        "content": json.dumps({"action": "respond",
+                        "content": json.dumps({"action": "end_conversation",
                                                "message": message})})
         return out
 

@@ -45,6 +45,15 @@ import json
 
 from agent_manager import WorkerCancelled, clip_activity
 
+# The verb a background agent may use to say something, and the one it may
+# not use at all. Spelled here rather than imported from `agent_actions`,
+# because this module imports that one INSIDE its functions on purpose -- a
+# frozen module list must not be able to stop a worker loading -- and a
+# module-scope import for two strings would give that up. There is a test that
+# the two spellings agree.
+SEND_MESSAGE = "send_message"
+END_CONVERSATION = "end_conversation"
+
 # How many actions a worker may take before it is stopped. Larger than a
 # user-facing turn's budget because a delegated task is a whole piece of work
 # rather than one exchange, and a worker that runs out has nobody to ask.
@@ -64,7 +73,7 @@ NOTE_ACTIONS = frozenset({
     "list_files", "read_file", "read_lines", "search_files", "find_text",
     "find_symbol", "tree", "code_map", "related_tests", "recall",
     "git_status", "git_diff", "git_identity",
-    "announce", "internal_response",
+    "send_message", "internal_response",
 })
 
 # The reviewbot's readout verb. Handled by this loop directly rather than
@@ -125,8 +134,8 @@ REVIEW_ACTIONS = frozenset(NOTE_ACTIONS | {AGENDA_ACTION})
 # would also run the project's whole test suite on a background thread while
 # the main agent edits the files under it, which is a result about a tree that
 # never existed -- the same hazard `review` refuses to start into.
-WORKER_FORBIDDEN = frozenset({"git_push", "respond", "done", "plan", "review",
-                              "verify"})
+WORKER_FORBIDDEN = frozenset({"git_push", "end_conversation", "plan",
+                              "review", "verify"})
 
 # Refused to every background agent, for a different reason from the verbs
 # above: these two are not the wrong shape for a worker, they are unreachable
@@ -166,9 +175,10 @@ _ACTION_RAISED = (
     "line numbers are unquoted numbers, flags are unquoted true or false."
 )
 
-_ANNOUNCED = ("Noted. Nothing you write is shown to anyone, so an announcement "
-              "costs a step and tells nobody. The task is not finished: emit "
-              "the action you just described.")
+_MESSAGE_SENT = ("Noted, and nothing was shown. Nothing you write reaches "
+                 "anybody -- you have no user -- so send_message costs a step "
+                 "and tells nobody. The task is not finished: emit the action "
+                 "you just described.")
 
 # What the reviewer is told after touching its agenda. The tail matters: the
 # agenda is a readout and updating it is not reviewing, so a reviewer that has
@@ -226,6 +236,31 @@ _NEEDS_A_TERMINAL = (
     "the background with no terminal to be asked at. Name the path in your "
     "internal_response and leave the deletion to the main agent."
 )
+
+
+def _adopt_verb(obj):
+    """Rewrite a reply's action to the name in force now, if it needs it.
+
+    The worker's half of the translation the main loop does. It matters less
+    here -- a background agent is refused `end_conversation` either way -- but
+    it matters for `send_message`, which is on the note agent's and the
+    reviewer's whitelists: a reviewer that reached for the old `announce`
+    would otherwise be refused a verb it is allowed.
+
+    Guarded to nothing. `agent_actions` is imported inside the call for the
+    reason every import in this module is, and a translation that cannot be
+    made leaves the reply exactly as the model wrote it.
+    """
+    if not isinstance(obj, dict):
+        return obj
+    try:
+        import agent_actions
+        adopted = agent_actions.canonical_action(obj)
+    except Exception:
+        return obj
+    if adopted:
+        obj["action"] = adopted
+    return obj
 
 
 def _guard(record):
@@ -645,6 +680,7 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
 
         try:
             obj = json.loads(raw)
+            _adopt_verb(obj)
         except (ValueError, TypeError) as error:
             if hand_back(raw, _UNREADABLE % error):
                 continue
@@ -732,13 +768,13 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
             return _stop(manager, record,
                          "stopped: the model kept asking for actions it is not "
                          "allowed (%d attempts)" % retries)
-        if action == "announce":
+        if action == SEND_MESSAGE:
             # Valid, and pointless here: nothing a background agent writes is
             # shown to anyone. It costs a step and the model is told why.
             steps += 1
             retries = 0
             messages.append({"role": "assistant", "content": raw})
-            messages.append({"role": "user", "content": _ANNOUNCED})
+            messages.append({"role": "user", "content": _MESSAGE_SENT})
             continue
         if action == AGENDA_ACTION:
             # The reviewbot's readout, applied here rather than dispatched.
@@ -795,6 +831,7 @@ def _run_batch(batch, record, manager, dispatch, allowed, forbidden,
     results = []
     ran = False
     for entry in batch:
+        _adopt_verb(entry)
         if not isinstance(entry, dict):
             return "invalid", _batch_complaint(
                 "every entry in 'actions' must be a JSON object", results), ran
@@ -807,7 +844,7 @@ def _run_batch(batch, record, manager, dispatch, allowed, forbidden,
         refusal = _refusal(action, allowed, forbidden, read_only)
         if refusal:
             return "invalid", _batch_complaint(refusal, results), ran
-        if action == "announce":
+        if action == SEND_MESSAGE:
             results.append("%s: nothing was shown; nobody sees your messages" % action)
             continue
         if action == AGENDA_ACTION:

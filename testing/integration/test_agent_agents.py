@@ -699,11 +699,16 @@ def test_a_batch_runs_every_entry_and_reports_them_all_back():
     assert fed_back.count("read_file: file contents") == 2, fed_back
 
 
-def test_a_worker_may_not_respond_or_finish_with_done():
-    """`respond` and `done` end a turn for a user, and a worker has no user.
-    Refused before dispatch, and the model is told which verb to use."""
+def test_a_worker_may_not_end_a_conversation():
+    """`end_conversation` ends a turn for a user, and a worker has no user.
+    Refused before dispatch, and the model is told which verb to use.
+
+    `respond` is driven beside it because it is the name a model trained on
+    the old shape reaches for: it is translated to `end_conversation` before
+    the whitelist is consulted, so the single refusal covers both spellings
+    and there is no old name that walks past it."""
     manager = AgentManager(clock=Clock())
-    for forbidden in ("respond", "done"):
+    for forbidden in ("end_conversation", "respond"):
         record = manager.spawn("do the thing")
         ask = Replies([action(forbidden, message="here is your answer"), FINISH])
         execute = Executor()
@@ -799,7 +804,11 @@ def test_the_note_whitelist_holds_no_verb_that_changes_the_workspace():
     for name in agent_worker.NOTE_ACTIONS:
         assert name not in agent_config.MUTATING_ACTIONS, name
     for name in ("run_file", "run_python", "git_commit", "git_push", "open_app",
-                 "remember", "replace_across", "respond", "done"):
+                 "remember", "replace_across", "end_conversation",
+                 # The old spellings are not on it either. They are not on any
+                 # list: the translation happens first, so a whitelist naming
+                 # them would be a second, drifting copy of the same fact.
+                 "respond", "done", "announce"):
         assert name not in agent_worker.NOTE_ACTIONS, name
 
 
@@ -899,16 +908,26 @@ def test_a_worker_that_runs_out_of_steps_is_recorded_failed_with_a_reason():
     assert len(ask.calls) == agent_worker.WORKER_ROUNDS, len(ask.calls)
 
 
-def test_an_announcement_costs_a_step_and_tells_the_model_nobody_saw_it():
-    manager = AgentManager(clock=Clock())
-    record = manager.spawn("do the thing")
-    ask = Replies([action("announce", message="I will read the parser first."),
-                   FINISH])
-    execute = Executor()
-    assert run(record, manager, ask, execute) == "task complete"
-    assert execute.actions == [], execute.actions
-    told = ask.calls[1]["messages"][-1]["content"]
-    assert "shown to anyone" in told, told
+def test_a_message_costs_a_step_and_tells_the_model_nobody_saw_it():
+    """`send_message` is on a worker's whitelist and is answered rather than
+    refused -- but a worker has no user, so the sentence it wrote reached
+    nobody. It has to be told that in as many words, or a worker that thinks
+    it has reported something spends its budget narrating to an empty room.
+
+    The legacy `announce` is driven beside it: the worker translates it before
+    the whitelist is consulted, so it is the same verb and gets the same
+    answer rather than being refused as an unknown one."""
+    for verb in ("send_message", "announce"):
+        manager = AgentManager(clock=Clock())
+        record = manager.spawn("do the thing")
+        ask = Replies([action(verb, message="I will read the parser first."),
+                       FINISH])
+        execute = Executor()
+        assert run(record, manager, ask, execute) == "task complete", verb
+        assert execute.actions == [], execute.actions
+        told = ask.calls[1]["messages"][-1]["content"]
+        assert "Nothing you write reaches anybody" in told, (verb, told)
+        assert "costs a step" in told, (verb, told)
 
 
 def test_prose_after_real_work_is_kept_as_the_agents_own_report():
@@ -917,7 +936,7 @@ def test_prose_after_real_work_is_kept_as_the_agents_own_report():
     import agent_model
     manager = AgentManager(clock=Clock())
     record = manager.spawn("do the thing")
-    prose = json.dumps({"action": "done", "message": "I renamed it in three files.",
+    prose = json.dumps({"action": "end_conversation", "message": "I renamed it in three files.",
                         agent_model.PROSE_KEY: True})
     ask = Replies([action("write_file", path="a.py", content="x"), prose])
     assert run(record, manager, ask, Executor()) == "I renamed it in three files."
@@ -927,7 +946,8 @@ def test_prose_before_any_work_is_handed_back_rather_than_accepted():
     import agent_model
     manager = AgentManager(clock=Clock())
     record = manager.spawn("do the thing")
-    prose = json.dumps({"action": "done", "message": "I'll start by reading it.",
+    prose = json.dumps({"action": "end_conversation",
+                        "message": "I'll start by reading it.",
                         agent_model.PROSE_KEY: True})
     ask = Replies([prose, FINISH])
     assert run(record, manager, ask) == "task complete"
@@ -941,7 +961,7 @@ def test_a_provider_failure_stops_the_agent_instead_of_being_retried():
     import agent_model
     manager = AgentManager(clock=Clock())
     record = manager.spawn("do the thing")
-    broken = json.dumps({"action": "done", "message": "OpenRouter error - 502",
+    broken = json.dumps({"action": "end_conversation", "message": "OpenRouter error - 502",
                          agent_model.SYNTHETIC_KEY: True,
                          agent_model.SYNTHETIC_REASON: agent_model.PROVIDER_FAILURE})
     ask = Replies([broken, FINISH])
@@ -955,7 +975,7 @@ def test_a_parse_failure_is_handed_back_rather_than_shown_as_an_answer():
     import agent_model
     manager = AgentManager(clock=Clock())
     record = manager.spawn("do the thing")
-    unreadable = json.dumps({"action": "done", "message": "no JSON object found",
+    unreadable = json.dumps({"action": "end_conversation", "message": "no JSON object found",
                              agent_model.SYNTHETIC_KEY: True,
                              agent_model.SYNTHETIC_REASON: agent_model.PARSE_FAILURE})
     ask = Replies([unreadable, FINISH])
@@ -1031,7 +1051,7 @@ def test_a_worker_never_prints():
     manager = AgentManager(clock=Clock())
     record = manager.spawn("do the thing")
     ask = Replies(["{unreadable", action("write_file", path="a.py"),
-                   action("respond", message="hello"),
+                   action("send_message", message="hello"),
                    action("write_file", path="a.py", content="x"), FINISH])
     out, err = io.StringIO(), io.StringIO()
     saved = sys.stdout, sys.stderr

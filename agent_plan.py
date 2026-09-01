@@ -515,7 +515,7 @@ _INCOMPLETE = (
     "{\"action\":\"plan\",\"operation\":\"update\",\"step\":N,"
     "\"status\":\"completed\"}. If a step turned out not to be needed, say so "
     "in its title and complete it, or replace the plan with \"create\". Do "
-    "not respond again until every step is completed."
+    "not call end_conversation again until every step is completed."
 )
 
 
@@ -535,7 +535,7 @@ def refusal(plan, action):
     reason recorded and the outstanding steps still on screen. Nothing here
     can loop forever and nothing here can be argued with.
     """
-    if action not in ("respond", "done"):
+    if action != "end_conversation":
         return ""
     if plan is None or not plan or plan.is_complete():
         return ""

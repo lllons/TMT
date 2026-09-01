@@ -593,12 +593,30 @@ REQUIRED_KEYS = {
     "run_python": ["path"], "run_file": ["path"], "create_folder": ["path"],
     "open_app": ["app"], "list_files": [], "search_files": ["query"],
     "read_lines": ["path"], "replace_lines": ["path", "start", "end", "content"],
-    "copy_file": ["path"], "delete_folder": ["path"], "respond": ["message"],
-    # Says what is about to happen and CANNOT end the task. Deliberately its
-    # own verb rather than a flag on respond: a forgotten flag ends the turn
-    # silently, and there is no flag to forget here.
-    "announce": ["message"],
-    "done": [],
+    "copy_file": ["path"],
+    "delete_folder": ["path"],
+    # The two verbs that talk to the user, and the whole of the difference
+    # between them is in their names. Both take one key and both send its text
+    # to the screen; only one of them ends anything.
+    #
+    # `send_message` says something and the turn goes on -- a progress note, a
+    # finding, a warning, anything the user should read while the work
+    # continues. It CANNOT end a task, whatever else rides along on it, and
+    # that is enforced in the loop rather than asked for in the prompt.
+    #
+    # `end_conversation` is the answer and the ending, and it is the only verb
+    # that ends one. It is what the completion gates hold: a plan with
+    # outstanding steps, a review that has not passed and a verification that
+    # has not run all refuse it and hand the model back a sentence saying so.
+    #
+    # They were `announce` and `respond`, and `respond` carried a `final` flag
+    # that made it mean either. A flag on the action that ends the task fails
+    # silently in the worst direction when it is forgotten -- "I'll read the
+    # parser first" ending the turn with the parser unread -- so the two
+    # meanings are two verbs now and neither can be written as the other.
+    # `agent_actions.canonical_action` still understands the old names.
+    "send_message": ["message"],
+    "end_conversation": ["message"],
     "git_status": [], "git_identity": [], "git_diff": [],
     "git_commit": ["message"], "git_push": [],
     # Understanding a repository before editing it. Each of these is the
@@ -670,7 +688,7 @@ REQUIRED_KEYS = {
     # it exists and the dispatcher has somewhere to send it, but it is
     # documented ONLY in agent_subprompts. The main agent's prompt never
     # mentions it, and the main loop's terminal check is
-    # `action in ("done", "respond")` -- which this is not -- so a main model
+    # `action == "end_conversation"` -- which this is not -- so a main model
     # that somehow emitted one gets an ordinary action result and the turn
     # carries on rather than ending on a worker's private report.
     "internal_response": ["response"],

@@ -183,7 +183,7 @@ def capture_post_chat(reply, usage=None, errors=()):
     return restore, calls
 
 
-REPLY = '{"action": "respond", "message": "ok"}'
+REPLY = '{"action": "end_conversation", "message": "ok"}'
 
 
 # --- ask_model: the model and max_tokens overrides ---------------------------

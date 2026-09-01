@@ -351,8 +351,11 @@ def test_an_action_with_no_progress_is_reminded_rather_than_failed():
          "events": [{"type": "file_read", "message": "Read a.py"}]})
     assert 'No "progress"' not in via_events, via_events
 
-    # The three that ARE the thing being said are never reminded.
-    for action in ("respond", "done", "announce"):
+    # The two that ARE the thing being said are never reminded. There used to
+    # be three; the rename collapsed them, and `_SPEAKS_FOR_ITSELF` is now the
+    # same two names the loop's own terminal test and the prompt's exception
+    # list use.
+    for action in ("send_message", "end_conversation"):
         message = agent_actions.build_result_message(action, "ok",
                                                      {"action": action})
         assert 'No "progress"' not in message, (action, message)

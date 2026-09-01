@@ -366,7 +366,7 @@ def test_a_runner_that_cannot_report_leaves_an_error_and_blocks():
     assert result.checks[0].errored
     assert result.status == V.ERROR
     assert V.refusal(state_settled(result), agent_plan.Plan(["a", "b", "c"]),
-                     "respond") != ""
+                     "end_conversation") != ""
 
 
 def state_settled(result):
@@ -396,7 +396,8 @@ def test_a_cancelled_run_is_not_a_passed_one():
         state.cancel("the user stopped it with Ctrl-C")
     assert state.state == V.CANCELLED, state.state
     assert not state.passed
-    assert V.refusal(state, agent_plan.Plan(["a", "b", "c"]), "respond") != ""
+    assert V.refusal(state, agent_plan.Plan(["a", "b", "c"]),
+                     "end_conversation") != ""
 
 
 def test_a_passed_check_is_reused_only_while_nothing_has_moved():
@@ -596,7 +597,7 @@ def completed(*positions):
 
 
 def answered(message):
-    return json.dumps({"action": "respond", "message": message})
+    return json.dumps({"action": "end_conversation", "message": message})
 
 
 VERIFY = json.dumps({"action": "verify"})
@@ -815,7 +816,7 @@ def test_the_completion_gate_reports_which_of_the_three_refused():
     answer, and a user shown the wrong line goes looking for the wrong thing."""
     import agent_session
     session = agent_session.Session()
-    respond = {"action": "respond", "message": "done"}
+    respond = {"action": "end_conversation", "message": "done"}
 
     session.plan.create(["Implement", "Test", "Explain"])
     session.verify.note_change("write_file", ("a.py",))

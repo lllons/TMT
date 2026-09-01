@@ -65,7 +65,7 @@ def call(action, text, **keys):
 
 
 def answered(message):
-    return json.dumps({"action": "respond", "message": message})
+    return json.dumps({"action": "end_conversation", "message": message})
 
 
 def planned(*steps):
@@ -357,7 +357,7 @@ def test_the_gate_reports_which_capability_actually_refused():
     session.begin_turn("add the feature /verify", "prompt")
     TMT.note_capability_choices(session)
     session.verify.note_change("write_file", ("a.py",))
-    held, line = TMT.completion_block(session, {"action": "respond",
+    held, line = TMT.completion_block(session, {"action": "end_conversation",
                                                 "message": "done"})
     assert held.startswith("BLOCKED"), held
     assert "verif" in line.lower(), line
@@ -365,7 +365,7 @@ def test_the_gate_reports_which_capability_actually_refused():
     session.begin_turn("add the feature", "prompt")
     TMT.note_capability_choices(session)
     session.verify.note_change("write_file", ("a.py",))
-    assert TMT.completion_block(session, {"action": "respond",
+    assert TMT.completion_block(session, {"action": "end_conversation",
                                           "message": "done"}) == ("", "")
 
 
@@ -377,7 +377,7 @@ def test_an_unauthorised_plan_cannot_gate_anything_because_it_cannot_exist():
     agent_actions.execute_action(
         {"action": "plan", "operation": "create", "steps": ["One", "Two"]},
         context)
-    assert agent_plan.refusal(context["plan"], "respond") == ""
+    assert agent_plan.refusal(context["plan"], "end_conversation") == ""
 
 
 # --- the scope --------------------------------------------------------------

@@ -469,13 +469,16 @@ def _prose_reply(full):
     about a task that had in fact been done.
 
     Nothing here is invented: the text shown is the model's own, trimmed and
-    marked when it had to be trimmed. It is still a `done`, so the turn ends
-    exactly where it ended before.
+    marked when it had to be trimmed. It is still an ending, so the turn ends
+    exactly where it ended before -- `end_conversation` is the verb that does
+    that now, and it is spelled here rather than translated so this module
+    produces the same shape the loop is built around.
     """
     text = " ".join(str(full).split())
     if len(text) > PROSE_REPLY_LIMIT:
         text = text[:PROSE_REPLY_LIMIT].rstrip() + " […]"
-    return json.dumps({"action": "done", "message": text, PROSE_KEY: True})
+    return json.dumps({"action": "end_conversation", "message": text,
+                       PROSE_KEY: True})
 
 
 # Marks an action object this module made up rather than one the model sent.
@@ -523,8 +526,15 @@ def is_prose(obj):
 
 
 def _made_up(message, reason=PARSE_FAILURE):
-    """A `done` carrying an explanation, marked as not the model's words."""
-    return json.dumps({"action": "done", "message": message,
+    """An ending carrying an explanation, marked as not the model's words.
+
+    `end_conversation`, because the loop has no other shape to receive a
+    failure in: this is the one path where TMT itself has to end a turn, and
+    it ends it with the verb that ends turns. The synthetic mark is what keeps
+    the completion gates out of the way -- there is no model behind this reply
+    to send back to, and refusing it would hide a provider failure.
+    """
+    return json.dumps({"action": "end_conversation", "message": message,
                         SYNTHETIC_KEY: True, SYNTHETIC_REASON: reason})
 
 

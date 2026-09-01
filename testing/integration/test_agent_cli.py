@@ -720,7 +720,7 @@ REAL_TURN = [
     json.dumps({"action": "write_file", "path": "notes.txt",
                 "content": "one\ntwo\nthree\n",
                 "progress": "Found the shared abstraction. Writing the change."}),
-    json.dumps({"action": "done", "message": "The change is written.",
+    json.dumps({"action": "end_conversation", "message": "The change is written.",
                 "progress": "Checking the result.",
                 "events": [{"type": "success", "message": "The file was created."}],
                 "next_step": "Review the changed files"}),
@@ -872,9 +872,9 @@ def test_a_turn_that_failed_still_leaves_its_question_in_the_context():
     attempts = TMT.MAX_INVALID_RETRIES + 1
     drawn, seen, console = drive_session(
         ["translate the readme", "did that work?", "quit"],
-        ['{"action": "respond" "message": "broken %d"}' % number
+        ['{"action": "end_conversation" "message": "broken %d"}' % number
          for number in range(attempts)]
-        + [json.dumps({"action": "done", "message": "Second turn answered."})])
+        + [json.dumps({"action": "end_conversation", "message": "Second turn answered."})])
 
     # It really did keep asking, and it really did stop.
     assert len(seen) == attempts + 1, len(seen)
@@ -899,7 +899,7 @@ def test_a_model_repeating_one_unreadable_reply_is_stopped_before_the_ceiling():
     turn."""
     drawn, seen, console = drive_session(
         ["translate the readme", "quit"],
-        ['{"action": "respond" "message": "stuck"}'] * 6)
+        ['{"action": "end_conversation" "message": "stuck"}'] * 6)
 
     assert "Circuit Breaker" in console.said(), console.said()
     # Three identical replies, and it stopped there rather than spending the
@@ -917,7 +917,7 @@ def test_an_unreadable_reply_is_handed_back_and_the_turn_carries_on():
         '{"action": "write_file" "path": "a.txt"}',      # no comma: unreadable
         json.dumps({"action": "write_file", "path": "notes.txt",
                     "content": "one\ntwo\n"}),
-        json.dumps({"action": "done", "message": "Wrote notes.txt."}),
+        json.dumps({"action": "end_conversation", "message": "Wrote notes.txt."}),
     ])
 
     # The work happened, in the same turn, with no second question asked.
@@ -934,7 +934,7 @@ def test_a_truncated_reply_is_handed_back_like_any_other_unreadable_one():
     drawn, files = run_turn([
         '{"action": "write_file", "path": "a.txt", "content": "half',
         json.dumps({"action": "write_file", "path": "whole.txt", "content": "x"}),
-        json.dumps({"action": "done", "message": "Recovered."}),
+        json.dumps({"action": "end_conversation", "message": "Recovered."}),
     ])
     assert files.get("whole.txt") == "x", files
     assert "a.txt" not in files, files            # the truncated one never ran
@@ -949,7 +949,7 @@ def test_arguments_the_action_cannot_use_end_the_action_and_not_the_program():
     drawn, files = run_turn([
         json.dumps({"action": "write_file", "path": 123, "content": "x"}),
         json.dumps({"action": "write_file", "path": "ok.txt", "content": "x"}),
-        json.dumps({"action": "done", "message": "Wrote ok.txt."}),
+        json.dumps({"action": "end_conversation", "message": "Wrote ok.txt."}),
     ])
     assert files.get("ok.txt") == "x", files
     assert "Wrote ok.txt." in drawn, drawn
@@ -962,40 +962,43 @@ def test_a_missing_key_and_an_unknown_action_are_both_handed_back():
         json.dumps({"action": "patch_file", "path": "a.txt", "search": "x"}),
         json.dumps({"action": "frobnicate", "path": "a.txt"}),
         json.dumps({"action": "write_file", "path": "fixed.txt", "content": "y"}),
-        json.dumps({"action": "done", "message": "Corrected twice."}),
+        json.dumps({"action": "end_conversation", "message": "Corrected twice."}),
     ])
     assert files.get("fixed.txt") == "y", files
     assert "Corrected twice." in drawn, drawn
 
 
-def test_an_announcement_is_shown_and_the_work_still_happens():
-    """The progress defect. `respond` ends the task, which is right for an
-    answer and wrong for the sentence a model writes before it starts, so
-    "I'll inspect the files first" ended the turn with nothing inspected and
-    nothing to show for it. `final: false` is how the two are told apart."""
+def test_a_message_is_shown_and_the_work_still_happens():
+    """The progress defect. The verb that ends a task is right for an answer
+    and wrong for the sentence a model writes before it starts, so "I'll
+    inspect the files first" ended the turn with nothing inspected and nothing
+    to show for it. `send_message` is the verb that says it without ending."""
     drawn, files = run_turn([
-        json.dumps({"action": "respond", "final": False,
+        json.dumps({"action": "send_message",
                     "message": "I'll inspect the files first."}),
         json.dumps({"action": "write_file", "path": "made.txt", "content": "z"}),
-        json.dumps({"action": "done", "message": "Inspected and written."}),
+        json.dumps({"action": "end_conversation", "message": "Inspected and written."}),
     ])
 
     assert "I'll inspect the files first." in drawn, drawn   # the user saw it
     assert files.get("made.txt") == "z", files               # and it carried on
     assert "Inspected and written." in drawn, drawn
-    # The announcement is not the answer, so it is not in the answer's box.
+    # The message is not the answer, so it is not in the answer's box.
     assert drawn.index("I'll inspect the files first.") < drawn.index("Inspected and written."), drawn
 
 
-def test_announce_says_what_is_coming_and_the_work_still_happens():
-    """The opening sentence, given its own verb. A model that writes "I'll look
-    at the files first" as a respond ends the task there with nothing looked
-    at; the same sentence as an announce is shown and the turn carries on."""
+def test_the_old_respond_with_final_false_still_says_what_is_coming():
+    """The behaviour this replaced still happens, because models still write
+    it. `respond` with `"final": false` was the old way to talk without
+    ending, and `canonical_action` translates it to a `send_message` before
+    anything in the loop looks at it -- so a reply written under the old rules
+    does exactly what it always did. A rename is not worth a lost answer, and
+    it is not worth a lost sentence either."""
     drawn, files = run_turn([
-        json.dumps({"action": "announce",
+        json.dumps({"action": "respond", "final": False,
                     "message": "I'll inspect the files first."}),
         json.dumps({"action": "write_file", "path": "made.txt", "content": "z"}),
-        json.dumps({"action": "done", "message": "Inspected and written."}),
+        json.dumps({"action": "end_conversation", "message": "Inspected and written."}),
     ])
 
     assert "I'll inspect the files first." in drawn, drawn
@@ -1003,32 +1006,33 @@ def test_announce_says_what_is_coming_and_the_work_still_happens():
     assert "Inspected and written." in drawn, drawn
 
 
-def test_announce_cannot_end_the_turn_however_it_is_written():
-    """The reason it is a separate verb rather than a flag. `respond` needs
-    "final": false and forgetting it ends the task silently, in the worst
-    direction. There is nothing to forget here: announce carries the keys that
-    would make a respond terminal and is still not terminal."""
+def test_send_message_cannot_end_the_turn_however_it_is_written():
+    """The reason it is a separate verb rather than a flag. The old shape was
+    `respond` plus `"final": false`, and forgetting the flag ended the task
+    silently, in the worst direction. There is nothing to forget now:
+    `send_message` carries the key that used to make a `respond` terminal and
+    is still not terminal, because the key is not read here or anywhere."""
     drawn, files = run_turn([
-        # "final": true is exactly what would END a respond. It must not end
-        # this, because announce has no terminal meaning to switch on.
-        json.dumps({"action": "announce", "message": "Starting now.",
+        # "final": true is exactly what would END the old verb. It must not
+        # end this: send_message has no terminal meaning to switch on.
+        json.dumps({"action": "send_message", "message": "Starting now.",
                     "final": True}),
         json.dumps({"action": "write_file", "path": "after.txt", "content": "q"}),
-        json.dumps({"action": "done", "message": "Ran to the end."}),
+        json.dumps({"action": "end_conversation", "message": "Ran to the end."}),
     ])
     assert "Starting now." in drawn, drawn
     assert files.get("after.txt") == "q", files
     assert "Ran to the end." in drawn, drawn
 
 
-def test_announce_leads_a_batch_without_finishing_it():
+def test_send_message_leads_a_batch_without_finishing_it():
     """A batch whose first entry speaks must still run the entries after it."""
     drawn, files = run_turn([
         json.dumps({"actions": [
-            {"action": "announce", "message": "Writing both files now."},
+            {"action": "send_message", "message": "Writing both files now."},
             {"action": "write_file", "path": "one.txt", "content": "1"},
             {"action": "write_file", "path": "two.txt", "content": "2"},
-            {"action": "done", "message": "Both written."},
+            {"action": "end_conversation", "message": "Both written."},
         ]}),
     ])
     assert "Writing both files now." in drawn, drawn
@@ -1036,49 +1040,49 @@ def test_announce_leads_a_batch_without_finishing_it():
     assert "Both written." in drawn, drawn
 
 
-def test_several_announcements_can_come_before_the_answer():
-    """Nothing about an announcement is once-only. A model that narrates two
-    steps before it finishes is doing what it was asked to do."""
+def test_several_messages_can_come_before_the_answer():
+    """Nothing about a message is once-only. A model that narrates two steps
+    before it finishes is doing what it was asked to do."""
     drawn, files = run_turn([
-        json.dumps({"action": "respond", "final": False, "message": "First I look."}),
-        json.dumps({"action": "respond", "final": False, "message": "Now I write."}),
+        json.dumps({"action": "send_message", "message": "First I look."}),
+        json.dumps({"action": "send_message", "message": "Now I write."}),
         json.dumps({"action": "write_file", "path": "two.txt", "content": "q"}),
-        json.dumps({"action": "done", "message": "Both said, one written."}),
+        json.dumps({"action": "end_conversation", "message": "Both said, one written."}),
     ])
     assert "First I look." in drawn and "Now I write." in drawn, drawn
     assert files.get("two.txt") == "q", files
     assert "Both said, one written." in drawn, drawn
 
 
-def test_a_result_still_reaches_the_model_after_an_announcement():
-    """An announcement must not break the chain the loop runs on: the action
-    after it still runs, and its result still comes back as the user turn the
-    model reads next."""
+def test_a_result_still_reaches_the_model_after_a_message():
+    """A message must not break the chain the loop runs on: the action after
+    it still runs, and its result still comes back as the user turn the model
+    reads next."""
     drawn, seen, _ = drive_session(
         ["look around", "quit"],
-        [json.dumps({"action": "respond", "final": False, "message": "Looking."}),
+        [json.dumps({"action": "send_message", "message": "Looking."}),
          json.dumps({"action": "list_files"}),
-         json.dumps({"action": "done", "message": "Looked."})])
+         json.dumps({"action": "end_conversation", "message": "Looked."})])
 
     assert len(seen) == 3, len(seen)
-    # The request after the announcement carries it as the assistant's turn
-    # and TMT's nudge as the user's, so the model is looking at what it said.
-    after_announcing = seen[1]
-    assert after_announcing[-2]["role"] == "assistant", after_announcing[-2]
-    assert "Looking." in after_announcing[-2]["content"], after_announcing[-2]
-    assert "not finished" in after_announcing[-1]["content"], after_announcing[-1]
+    # The request after the message carries it as the assistant's turn and
+    # TMT's nudge as the user's, so the model is looking at what it said.
+    after_speaking = seen[1]
+    assert after_speaking[-2]["role"] == "assistant", after_speaking[-2]
+    assert "Looking." in after_speaking[-2]["content"], after_speaking[-2]
+    assert "not finished" in after_speaking[-1]["content"], after_speaking[-1]
     # And the request after the action carries that action's real result.
     assert "Result:" in seen[2][-1]["content"], seen[2][-1]
 
 
-def test_an_announcement_followed_by_an_unreadable_reply_still_recovers():
+def test_a_message_followed_by_an_unreadable_reply_still_recovers():
     """The two failures together, which is the shape a real turn takes: the
     model says what it will do, then fumbles the JSON for doing it."""
     drawn, files = run_turn([
-        json.dumps({"action": "respond", "final": False, "message": "About to write."}),
+        json.dumps({"action": "send_message", "message": "About to write."}),
         '{"action": "write_file", "path" "broken.txt"}',
         json.dumps({"action": "write_file", "path": "good.txt", "content": "v"}),
-        json.dumps({"action": "done", "message": "Written after all."}),
+        json.dumps({"action": "end_conversation", "message": "Written after all."}),
     ])
     assert "About to write." in drawn, drawn
     assert files.get("good.txt") == "v", files
@@ -1094,8 +1098,8 @@ def test_a_retry_never_runs_the_action_that_already_ran_a_second_time():
     drawn, files = run_turn([
         json.dumps({"action": "write_file", "path": "log.txt", "content": ""}),
         json.dumps({"action": "append_file", "path": "log.txt", "content": "once\n"}),
-        '{"action": "done" "message": "unreadable"}',
-        json.dumps({"action": "done", "message": "Appended once."}),
+        '{"action": "end_conversation" "message": "unreadable"}',
+        json.dumps({"action": "end_conversation", "message": "Appended once."}),
     ])
     # Twice would read "once\nonce\n". The append ran before the unreadable
     # reply and is not re-sent with it: what goes back is the reply that could
@@ -1113,7 +1117,7 @@ def test_a_reply_tmt_made_up_is_shown_but_never_recorded_as_the_answer():
     made_up = agent_model._error_reply("HTTP 429 rate limited")
     drawn, seen, _ = drive_session(
         ["push it", "did that work?", "quit"],
-        [made_up, json.dumps({"action": "done", "message": "ok"})])
+        [made_up, json.dumps({"action": "end_conversation", "message": "ok"})])
 
     assert "429" in drawn, drawn                       # shown to the user
     second = seen[-1]
@@ -1138,7 +1142,7 @@ def test_an_invalid_entry_in_a_batch_is_handed_back_rather_than_ending_the_turn(
     ]})
     drawn, seen, console = drive_session(
         ["do the thing", "quit"],
-        [batch, json.dumps({"action": "done", "message": "Corrected."})])
+        [batch, json.dumps({"action": "end_conversation", "message": "Corrected."})])
 
     assert "Invalid action in batch" in console.said(), console.said()
     assert "Corrected." in drawn, drawn
@@ -1161,7 +1165,7 @@ def test_the_question_and_the_answer_reach_the_next_turns_request():
 
     def watching_model(messages, on_event=None):
         seen.append([dict(message) for message in messages])
-        return json.dumps({"action": "done", "message": "Done: %d." % len(seen)})
+        return json.dumps({"action": "end_conversation", "message": "Done: %d." % len(seen)})
 
     box = Workspace()
     screen = io.StringIO()
@@ -1199,7 +1203,7 @@ def test_the_question_and_the_answer_reach_the_next_turns_request():
     # forbidden shape in front of the model, in its own voice, immediately
     # before asking it not to use that shape.
     carried = json.loads(second[2]["content"])
-    assert carried["action"] == "respond", carried
+    assert carried["action"] == "end_conversation", carried
     assert carried["message"].startswith("Done: 1."), carried
 
     # And the question itself is in the terminal's own scrollback, because the
@@ -1212,7 +1216,7 @@ def test_a_turn_that_offers_no_suggestion_still_gets_a_true_one():
     off what the turn did rather than invented."""
     replies = [
         json.dumps({"action": "write_file", "path": "a.txt", "content": "x\n"}),
-        json.dumps({"action": "done", "message": "Written."}),
+        json.dumps({"action": "end_conversation", "message": "Written."}),
     ]
     drawn, _ = run_turn(replies)
     assert "Review the changed files" in drawn, drawn
@@ -1221,7 +1225,7 @@ def test_a_turn_that_offers_no_suggestion_still_gets_a_true_one():
 
 def test_an_over_long_suggestion_is_cut_to_five_words_before_it_is_shown():
     """The model does not get to decide the length."""
-    replies = [json.dumps({"action": "done", "message": "Done.",
+    replies = [json.dumps({"action": "end_conversation", "message": "Done.",
                            "next_step": "Please go and run the integration tests now"})]
     drawn, _ = run_turn(replies)
     assert "Please go and run the" in drawn, drawn
@@ -1234,7 +1238,7 @@ BATCH_TURN = [
          "progress": "Writing the first file."},
         {"action": "write_file", "path": "b.txt", "content": "two\n",
          "progress": "Writing the second file."},
-        {"action": "done", "message": "Both written.",
+        {"action": "end_conversation", "message": "Both written.",
          "next_step": "Review the new files"},
     ]}),
 ]
@@ -1276,7 +1280,7 @@ def test_a_slash_command_is_answered_by_tmt_and_never_becomes_a_request():
         drawn, seen, _ = drive_session(
             ["fix the bug", "/config", "/effort high", "/clear", "/bogus",
              "/usr/bin/python is broken", "quit"],
-            [json.dumps({"action": "done", "message": "Did it."})])
+            [json.dumps({"action": "end_conversation", "message": "Did it."})])
 
         # Two lines were tasks; four were commands and never left the loop.
         asked = [request[-1]["content"] for request in seen]
