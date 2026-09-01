@@ -1604,10 +1604,12 @@ def initial_progress(task=""):
     started by claiming the work was done would be wrong on its very first
     line, and would teach every later reader to discount it.
     """
-    said = " ".join(str(task or "").split())
-    if len(said) > 200:
-        said = said[:199].rstrip() + "…"
-    cleaned, _ = scrub(said) if said else ("", [])
+    # `_headline`, not a second truncation of its own. Two callers write the
+    # same task into the same file -- this one opens it, `finalize` later
+    # closes it -- and when they shortened it differently the close could
+    # never find what the open had written, so the task was listed as both
+    # outstanding and complete. One function, one string, one entry.
+    cleaned = _headline(task)
     document = Document(_skeleton(PROGRESS_TITLE, PROGRESS_SECTIONS))
     document.set("Current Status", "Status: Newly initialized.")
     document.set("Completed", "- [x] TMT project context initialized")
@@ -1807,9 +1809,19 @@ def _fold_task(document, said, plan, verify, review, wrote):
             document.add_line("Completed", "- [x] %s" % said)
             changed = changed or document.section("Completed") != before
             # And it stops being the current work, because it is not.
+            #
+            # Matched on the WHOLE open entry rather than on `said` being a
+            # substring of the line, so a line that merely mentions the same
+            # words is left alone and -- the failure this actually had -- the
+            # open item is still found when the two strings are not character
+            # for character identical. The open item is always `- [ ] ` plus
+            # the headline, because `_headline` is the only thing that writes
+            # one, so this is an exact comparison against a known shape rather
+            # than a search.
+            open_item = "- [ ] %s" % said
             current = _normalise(document.section("Currently Working On"))
             pruned = "\n".join(line for line in current.splitlines()
-                               if said not in line)
+                               if line.strip() != open_item)
             if _normalise(pruned) != current:
                 document.set("Currently Working On",
                              _normalise(pruned) or "Nothing in progress.")
@@ -1896,13 +1908,44 @@ def _status_line(plan, verify, review, did_work):
     return "Status: Active development -- %s." % ", ".join(parts)
 
 
+# How long a checklist entry may be. A progress file has to answer three
+# questions at a glance -- what is done, what is happening, what remains -- and
+# a 700-character instruction pasted into a bullet answers none of them. Found
+# by driving TMT on its own repository: the entry read "Everything for this
+# change is already staged, so commit exactly what is staged and then push to
+# main; do not name any paths yourself and do not build a path li…", which is
+# the task text rather than a description of the work.
+MAX_HEADLINE_CHARS = 120
+
+# Where an instruction stops being the request and starts being the detail of
+# how to carry it out. Cutting at the first of these keeps a whole clause
+# instead of a sentence sawn through at a character count.
+_CLAUSE_BREAK = re.compile(r"[.;] | -- ")
+
+
 def _headline(task):
-    """The user's task, as one short line fit to be a checklist item."""
+    """The user's task, as one short line fit to be a checklist item.
+
+    THE ONE PLACE a task becomes a progress entry, and it has to be, because
+    two callers write the same task into the same file: `initial_progress`
+    puts it under "Currently Working On" and `finalize` later moves it to
+    "Completed". They used to truncate at different lengths -- 200 and 160 --
+    so the strings never matched, the move never found the open item, and the
+    task ended up listed as BOTH outstanding and complete at once. Driving TMT
+    on its own repository produced exactly that, in the first progress file
+    the feature ever wrote.
+    """
     said = " ".join(str(task or "").split())
     if not said:
         return ""
-    if len(said) > 160:
-        said = said[:159].rstrip() + "…"
+    # The first clause, when there is one early enough to be the request
+    # rather than a fragment of it. "Commit what is staged and push to main;
+    # do not name any paths..." keeps the half that says what to do.
+    match = _CLAUSE_BREAK.search(said)
+    if match and match.start() <= MAX_HEADLINE_CHARS:
+        said = said[:match.start()].rstrip()
+    if len(said) > MAX_HEADLINE_CHARS:
+        said = said[:MAX_HEADLINE_CHARS - 1].rstrip() + "…"
     cleaned, _ = scrub(said)
     return cleaned if _informative(cleaned) else ""
 

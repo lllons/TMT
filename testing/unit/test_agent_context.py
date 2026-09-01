@@ -932,6 +932,56 @@ def test_a_finished_task_is_recorded_as_completed_and_an_unfinished_one_is_not()
         box.close()
 
 
+def test_a_task_is_never_listed_as_both_outstanding_and_complete():
+    """Found by driving TMT on its own repository, in the first progress file
+    the feature ever wrote. Two callers write the same task into the same
+    file -- `initial_progress` opens it and `finalize` closes it -- and they
+    truncated it at different lengths, so the close never matched what the
+    open had written and the entry appeared under BOTH headings at once."""
+    box = Project()
+    try:
+        box.use()
+        long_task = ("Everything for this change is already staged, so commit "
+                     "exactly what is staged and then push to main; do not "
+                     "name any paths yourself and do not build a path list, "
+                     "pass no paths at all to git_commit so it commits the "
+                     "staged index as it stands.")
+        context = agent_context.ProjectContext()
+        # ensure() writes the OPEN item through initial_progress...
+        context.ensure(long_task)
+        progress = context.progress()
+        assert long_task[:40] in progress.section("Currently Working On")
+        # ...and finalize must find and close that exact item.
+        agent_context.finalize(context, long_task, wrote=("src/app.py",))
+        progress = context.progress()
+        assert long_task[:40] in progress.section("Completed"), \
+            progress.section("Completed")
+        assert long_task[:40] not in progress.section("Currently Working On"), \
+            progress.section("Currently Working On")
+    finally:
+        box.close()
+
+
+def test_a_progress_entry_is_a_short_line_and_not_a_pasted_instruction():
+    """Sections 34 and 35. A progress file has to answer three questions at a
+    glance, and a 700-character instruction in a bullet answers none of them.
+    The first clause is kept where there is one, so what survives is the
+    request rather than a sentence sawn through at a character count."""
+    said = agent_context._headline(
+        "Everything for this change is already staged, so commit exactly what "
+        "is staged and then push to main; do not name any paths yourself and "
+        "do not build a path list, pass no paths at all to git_commit.")
+    assert len(said) <= agent_context.MAX_HEADLINE_CHARS, (len(said), said)
+    assert "push to main" in said, said
+    assert "do not name any paths" not in said, said
+    # A task with no clause break is still capped, and says it was cut.
+    long_one = agent_context._headline("x " * 300)
+    assert len(long_one) <= agent_context.MAX_HEADLINE_CHARS, len(long_one)
+    assert long_one.endswith("…"), long_one
+    # A short task is left exactly as it is.
+    assert agent_context._headline("Add dark mode") == "Add dark mode"
+
+
 def test_finalizing_preserves_a_users_own_prose_in_the_same_section():
     """Section 19 and section 37, at the end of a task rather than mid-way.
     The plan mirror replaces the mirror and nothing else."""
