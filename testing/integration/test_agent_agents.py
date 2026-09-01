@@ -588,7 +588,7 @@ def test_the_label_follows_the_work_and_ends_on_completed():
                       if name == AGENT_ACTIVITY_CHANGED else None)
     ask = Replies([
         action("read_lines", path="src/agent_ui.py", start=1, end=40, content=""),
-        action("find_text", query="render_response"),
+        action("grep", query="render_response"),
         FINISH,
     ])
     execute = Executor()
@@ -628,7 +628,7 @@ def test_one_workers_conversation_never_appears_in_anothers():
     manager = AgentManager(clock=Clock())
     first = manager.spawn("Rename old_function_name everywhere.")
     second = manager.spawn("Write the README section about the panel.")
-    first_ask = Replies([action("find_text", query="old_function_name"), FINISH])
+    first_ask = Replies([action("grep", query="old_function_name"), FINISH])
     second_ask = Replies([action("read_file", path="README.md"), FINISH])
     run(first, manager, first_ask, Executor("first result"))
     run(second, manager, second_ask, Executor("second result"))
@@ -765,13 +765,14 @@ def test_a_worker_cannot_spawn_workers_of_its_own():
 def test_the_note_agent_can_read_and_search():
     manager = AgentManager(clock=Clock())
     record = manager.spawn("where is the prompt assembled?", kind="note")
-    ask = Replies([action("find_text", query="get_system_prompt"),
+    ask = Replies([action("glob", pattern="agent_*.py"),
+                   action("grep", query="get_system_prompt"),
                    action("read_lines", path="agent_prompt.py", start=1, end=40),
                    action("internal_response", response="In agent_prompt.get_system_prompt.")])
     execute = Executor("agent_prompt.py:426")
     answer = run(record, manager, ask, execute, note=True)
     assert answer == "In agent_prompt.get_system_prompt."
-    assert execute.actions == ["find_text", "read_lines"], execute.actions
+    assert execute.actions == ["glob", "grep", "read_lines"], execute.actions
 
 
 def test_the_note_agent_is_refused_every_verb_that_changes_anything():

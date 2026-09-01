@@ -239,9 +239,10 @@ list_files - keys: none.
   {"action":"list_files"}
   {"actions":[{"action":"list_files"},{"action":"end_conversation","message":"Here is what is in the workspace."}]}
 
-search_files - keys: query. Optional: regex (bool), path (folder to limit the search to).
-  {"action":"search_files","query":"TODO"}
-  {"action":"search_files","query":"def \\w+_handler","regex":true,"path":"src"}
+glob - keys: pattern. Optional: path (subtree to search under), kind (files, dirs, any -- default files), limit. Finds FILES AND DIRECTORIES BY PATH PATTERN. Use it to discover which files exist, or to locate a file by name, before you read anything. `*` stops at a directory separator, `**/` means any depth, and a pattern with no `/` in it matches a name anywhere.
+  {"action":"glob","pattern":"*.py"}
+  {"action":"glob","pattern":"testing/**/*.py"}
+  {"action":"glob","pattern":"**/README.md"}
 
 read_lines - keys: path. Optional: start (default 1), end. Use this for large files.
   {"action":"read_lines","path":"src/app.py","start":1,"end":60}
@@ -303,9 +304,11 @@ tree - keys: none. Optional: path, depth, limit. The shape of the project: direc
   {"action":"tree"}
   {"action":"tree","path":"src","depth":2}
 
-find_text - keys: query. Optional: path, glob, context, limit. Finds an EXACT string, case sensitive, across every file at once. The query may span several lines, so a whole block can be located. Use it when you know the characters you are looking for.
-  {"action":"find_text","query":"self.workspace_root"}
-  {"action":"find_text","query":"def resolve(self):\n        return self._value","glob":"src/**/*.py","context":2}
+grep - keys: query. Optional: path, glob (restrict to matching paths), regex (bool), ignore_case (bool), context (lines either side), limit. SEARCHES FILE CONTENTS and reports path, line number and the matching line. Exact and case-sensitive by default; the query may span several lines. Use it when you know the text, symbol, function, class or configuration key you are looking for.
+  {"action":"grep","query":"end_conversation"}
+  {"action":"grep","query":"def run_file","glob":"agent_*.py"}
+  {"action":"grep","query":"Auto Update on Launch","ignore_case":true}
+  {"action":"grep","query":"def resolve(self):\n        return self._value","glob":"src/**/*.py","context":2}
 
 find_symbol - keys: name. Optional: kind, path, limit. Finds where a function, class, method, constant or type is DEFINED, with its kind and line. Python is parsed, so those answers are exact; other languages are matched lexically and are labelled as such.
   {"action":"find_symbol","name":"calculate_total"}
@@ -593,19 +596,20 @@ PREFERENCE_RULES = r"""=== EDITING PREFERENCES - FOLLOW IN THIS ORDER ===
 1. To CHANGE an existing file, use patch_file (search and replace). This is the default and it is almost always the right choice.
 2. NEVER use write_file on a file that already exists. write_file starts from scratch and silently destroys every line you did not retype. Use it only when the file does not exist yet, or when the user explicitly asks for a complete rewrite.
 3. The patch_file "search" text must be copied EXACTLY from the file - same spelling, spacing and indentation. Keep it short but unique; if that snippet appears more than once, extend it with the line above or below until it is unique.
-4. If patch_file returns "Search text not found", DO NOT fall back to write_file. Run read_lines or search_files on that file, copy the real text, and retry patch_file.
+4. If patch_file returns "Search text not found", DO NOT fall back to write_file. Run read_lines or grep on that file, copy the real text, and retry patch_file.
 5. Use replace_lines when the region is large, has tricky whitespace, or has no unique anchor. Always read_lines that range first so the numbers are correct.
 6. To add to the end of a file, use append_file - never read it and rewrite it with write_file.
 7. Several new files in one go: write_files. A single new file: write_file.
 8. Files under 8 KB are already pasted below - do not read them again, just act on them. For anything larger use read_lines with a range instead of read_file.
-9. Use search_files to locate the code before editing it, rather than guessing a path or dumping a whole file.
+9. Use grep to locate the code before editing it, rather than guessing a path or dumping a whole file.
 10. Prefer one batch over many turns: put independent steps in a single "actions" array."""
 
 TOOL_CHOICE_RULES = r"""=== CHOOSING A TOOL - ALWAYS TAKE THE NARROWEST ONE ===
 Every one of these answers a different question. Reading a whole file to find one line is the mistake they exist to stop, and so is scanning the workspace again for something you already asked about.
 
   What is in this project, and where?        -> tree
-  Where is this exact text?                  -> find_text
+  Which files exist, or where is this file?  -> glob
+  Where does this text or code appear?       -> grep
   Where is this function or class defined?   -> find_symbol
   What would break if I change this?         -> code_map
   The same edit in many files                -> replace_across
@@ -613,10 +617,9 @@ Every one of these answers a different question. Reading a whole file to find on
   What did earlier sessions learn here?      -> recall
   This is worth knowing next time            -> remember
   I know the file and I need the lines       -> read_lines
-  I need a loose or case-insensitive match    -> search_files
 
 Rules:
-1. find_text is EXACT and case sensitive. search_files is loose and case insensitive. Reach for find_text when you know the characters, search_files when you are hunting.
+1. glob finds FILES BY NAME; grep finds TEXT INSIDE FILES. Do not grep to discover a filename and do not glob to search code. The order that works is: glob to find candidate files, grep to find the lines, read_lines to read the region, then edit, then test. Reading the whole repository to find one line is the mistake these exist to prevent.
 2. Do not use tree to read code. It states sizes and paths and no contents; it is for deciding what to open.
 3. Use find_symbol before read_file when you want a definition. It gives you the file and the line, and then read_lines gives you the region -- two narrow actions instead of one large one.
 4. replace_across previews by default. Read the counts it reports, confirm they are what you intended, and only then send the same action again with "apply":true. Never send apply on the first attempt for a change you have not previewed.
@@ -675,7 +678,7 @@ These three keys may be added to any action you already use. They never replace 
 
 "progress" - one short sentence, required on every action that does work. Shown to the user before that action runs.
   {"action":"read_file","path":"agent_config.py","progress":"Checking the provider configuration before making changes."}
-  {"action":"search_files","query":"timeout","progress":"Finding every place the timeout is set."}
+  {"action":"grep","query":"timeout","progress":"Finding every place the timeout is set."}
   {"action":"patch_file","path":"src/net.py","search":"timeout=5","replace":"timeout=30","progress":"Raising the socket timeout to 30 seconds."}
   {"action":"run_file","path":"tests/run_all.py","progress":"Running the test suite against the change."}
 
@@ -1001,7 +1004,7 @@ def _workspace_snapshot():
         # user's source, which is what the allowance is for.
         #
         # NAMED rather than hidden. The paths are listed below, and nothing else
-        # is touched: `list_files`, `search_files`, `tree` and the index all
+        # is touched: `list_files`, `glob`, `grep`, `tree` and the index all
         # still see them exactly as they see any other file, because they walk
         # `iter_workspace_files` for themselves and this skip is local to the
         # snapshot. A model that wants the unbudgeted text can still read it.
@@ -1062,7 +1065,7 @@ def _workspace_snapshot():
             "read_lines."
         )
     if notes:
-        notes.append("Use list_files or search_files to find anything not shown.")
+        notes.append("Use list_files or glob to find anything not shown.")
     return ("\n".join(notes) + "\n" if notes else "") + "".join(shown)
 
 

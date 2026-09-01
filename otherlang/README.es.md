@@ -376,7 +376,8 @@ dentro autoriza la capacidad para esa tarea.
 | `replace_lines` | Reemplazar un rango exacto de líneas |
 | `append_file` | Añadir al final de un archivo |
 | `read_file` / `read_lines` | Leer un archivo entero, o un rango de líneas |
-| `search_files` | Búsqueda literal o por expresión regular, opcionalmente acotada a una carpeta |
+| `glob` | Encontrar archivos y directorios por un patrón de ruta |
+| `grep` | Buscar en el contenido de los archivos e informar de la ruta, el número de línea y la línea |
 | `copy_file` / `rename_file` / `delete_file` | Mover, renombrar, eliminar |
 | `create_folder` / `delete_folder` | Carpetas (el borrado recursivo hay que pedirlo explícitamente) |
 | `list_files` | Listar el espacio de trabajo |
@@ -467,13 +468,14 @@ necesita más el espacio — y `/plan` imprime lo mismo que texto corriente a cu
 
 ### Entender un repositorio
 
-Ocho acciones para orientarse en un código base sin leerlo entero. Cada una responde a una
+Nueve acciones para orientarse en un código base sin leerlo entero. Cada una responde a una
 pregunta, y a TMT se le dice que elija la más estrecha que encaje.
 
 | Acción | Propósito | Recurre a ella cuando |
 |---|---|---|
 | `tree` | Directorios, archivos, tamaños, anidamiento. No lee contenidos | Necesitas la forma del proyecto |
-| `find_text` | Búsqueda exacta y sensible a mayúsculas en todos los archivos a la vez. La consulta puede abarcar varias líneas | Sabes exactamente los caracteres que buscas |
+| `glob` | Archivos y directorios que encajan con un patrón de ruta. `*` se detiene en una `/`, `**/` significa cualquier profundidad, y un patrón sin `/` encaja con un nombre esté donde esté | Necesitas saber qué archivos existen, o dónde está uno |
+| `grep` | Buscar dentro de los archivos, informando de la ruta, el número de línea y la línea. Exacta y sensible a mayúsculas por defecto; la consulta puede abarcar varias líneas | Sabes el texto que buscas |
 | `find_symbol` | Dónde se *define* una función, clase, método, constante o tipo | Quieres una definición, no una mención |
 | `code_map` | Qué define esto, qué lo importa, qué importa él, dónde se referencia | Necesitas saber a qué afectaría un cambio |
 | `replace_across` | La misma edición exacta en muchos archivos | Estás renombrando algo que usa todo el proyecto |
@@ -489,8 +491,25 @@ Task> rename old_function_name to new_function_name across src
 Task> which tests should I run for what I just changed?
 ```
 
-`find_text` es exacta y sensible a mayúsculas; `search_files` es la laxa e insensible a
-mayúsculas. Ambas existen porque responden a preguntas distintas.
+**`glob` encuentra archivos por ruta o por nombre; `grep` encuentra texto dentro de los
+archivos.** Esa es toda la distinción, y es la que merece la pena tener clara: el orden
+que funciona es `glob` para encontrar los archivos candidatos, `grep` para encontrar las
+líneas dentro de ellos, `read_lines` para leer esa región, luego editar y luego probar —
+en vez de leerse un repositorio entero para dar con una sola línea.
+
+```json
+{"action": "glob", "pattern": "agent_*.py"}
+{"action": "glob", "pattern": "testing/**/*.py"}
+{"action": "grep", "query": "end_conversation"}
+{"action": "grep", "query": "def run_file", "glob": "agent_*.py"}
+{"action": "grep", "query": "timeout", "path": "src", "ignore_case": true}
+```
+
+`grep` es exacta y sensible a mayúsculas por defecto, como la herramienta de la que toma
+el nombre. `"ignore_case": true` la vuelve laxa, `"regex": true` lee la consulta como una
+expresión regular, `"context"` añade líneas a cada lado de cada coincidencia, y `"path"` o
+`"glob"` restringen qué archivos se leen siquiera. Nunca devuelve un archivo entero:
+obtienes la ruta, el número de línea y la línea, y `read_lines` te trae el resto.
 
 **`replace_across` hace una vista previa por defecto.** Informa de cuántos archivos y
 cuántas apariciones *cambiaría* y no escribe nada. Enviar la misma acción de nuevo con
@@ -1208,7 +1227,7 @@ ninguna variable global en ese camino.
 
 `read_only: true` significa que el agente puede inspeccionar este espacio de trabajo y no puede
 cambiarlo. Conserva todos los verbos de lectura — `read_file`, `read_lines`, `list_files`,
-`search_files`, `find_text`, `find_symbol`, `tree`, `code_map`, `related_tests`, `recall`,
+`glob`, `grep`, `find_symbol`, `tree`, `code_map`, `related_tests`, `recall`,
 `git_status`, `git_diff`, `git_identity` — y se le rechaza todo lo demás.
 
 **Se impone en tiempo de ejecución, no se pide en el prompt.** El rechazo ocurre antes de que la

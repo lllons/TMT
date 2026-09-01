@@ -37,8 +37,8 @@ def test_a_read_only_delegation_may_read_search_and_inspect():
     """The verbs an investigation is made of. If any of these were refused the
     constraint would not be "read-only", it would be "do nothing"."""
     constraints = D.DelegationConstraints(read_only=True)
-    for action in ("read_file", "read_lines", "list_files", "search_files",
-                   "find_text", "find_symbol", "tree", "code_map",
+    for action in ("read_file", "read_lines", "list_files", "glob", "grep",
+                   "find_symbol", "tree", "code_map",
                    "related_tests", "recall", "git_status", "git_diff",
                    "git_identity", "internal_response", "send_message"):
         assert D.refusal(constraints, action) == "", action

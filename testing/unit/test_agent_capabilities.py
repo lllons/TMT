@@ -365,8 +365,8 @@ def test_the_guard_says_nothing_about_any_other_action():
     """It gates three verbs and no others. Every ordinary tool keeps working
     exactly as it did, whatever was authorised."""
     granted = C.Capabilities("Build it")
-    for action in ("read_file", "write_file", "patch_file", "search_files",
-                   "find_text", "code_map", "run_file", "git_commit",
+    for action in ("read_file", "write_file", "patch_file", "grep",
+                   "glob", "code_map", "run_file", "git_commit",
                    "git_push", "spawn_agent", "respond", "done", "announce",
                    "tree", "related_tests", "remember", "delete_file"):
         assert C.refusal(granted, action) == "", action

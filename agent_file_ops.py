@@ -52,18 +52,32 @@ def workspace():
     return agent_config.ROOT_DIR
 
 
-def iter_workspace_files(root=None, limit=WORKSPACE_MAX_SCAN):
-    """Yield (relative, absolute) for workspace files, pruning machinery.
+def iter_workspace_entries(root=None, limit=WORKSPACE_MAX_SCAN, include_dirs=False):
+    """Yield (relative, absolute) for workspace entries, pruning machinery.
 
-    Returns early once `limit` entries have been examined. The caller is told
-    by comparing what it received against the limit: a truncated view that
-    claims to be complete is worse than no view.
+    The one walk in TMT. `iter_workspace_files` is this with the directories
+    left out and `glob` is this with them in, because two traversals would be
+    two sets of pruning rules, two scan ceilings and two answers to what counts
+    as machinery -- and only one of the two would be updated the day any of
+    those changes.
+
+    Paths come back relative to `root`, which is the workspace unless a caller
+    narrowed it. Returns early once `limit` entries have been examined; the
+    caller is told by comparing what it received against the limit, because a
+    truncated view that claims to be complete is worse than no view.
+
+    A directory counts against the budget only when it is being yielded, so
+    the files-only walk examines exactly what it always did.
     """
     root = Path(root or workspace())
     scanned = 0
     for current, dirnames, filenames in os.walk(root):
+        # Pruned in place, before anything below is yielded, so a node_modules
+        # or a .git is never descended into and never named.
         dirnames[:] = sorted(d for d in dirnames if d not in WORKSPACE_SKIP)
-        for name in sorted(filenames):
+        names = list(dirnames) if include_dirs else []
+        names += sorted(filenames)
+        for name in names:
             scanned += 1
             if scanned > limit:
                 return
@@ -73,12 +87,47 @@ def iter_workspace_files(root=None, limit=WORKSPACE_MAX_SCAN):
             except ValueError:
                 continue
 
+
+def iter_workspace_files(root=None, limit=WORKSPACE_MAX_SCAN):
+    """Yield (relative, absolute) for workspace files, pruning machinery.
+
+    The walk itself is `iter_workspace_entries`. This is kept as its own name
+    and its own signature because the prompt's workspace snapshot goes through
+    it on every request TMT makes, and a change here is a change to every one
+    of them.
+    """
+    return iter_workspace_entries(root, limit)
+
 def safe_path(user_path):
     root = workspace()
     target = (root / user_path).resolve()
     if root != target and root not in target.parents:
         raise ValueError(f"Blocked unsafe path: {user_path}")
     return target
+
+
+def within_workspace(p):
+    """True when p really lives inside the workspace once symlinks are resolved.
+
+    The containment test `safe_path` makes, with the refusal taken off: the
+    same question, answered as a bool. `safe_path` is for a path a caller NAMED
+    and must be refused; this is for an entry a walk arrived at, where the
+    honest answer is to leave it out. A directory symlink pointing out of the
+    tree is the case it exists for -- os.walk does not follow one, but a file
+    symlink is read where it points, and neither a search result nor a glob row
+    may ever name something outside the workspace.
+
+    It never raises. An OSError from resolve() -- a broken link, a path too
+    long, a parent that cannot be read -- reads as False, which is the safe
+    direction: an entry that cannot be shown to be inside is treated as
+    outside.
+    """
+    try:
+        target = Path(p).resolve()
+    except (OSError, ValueError, TypeError):
+        return False
+    root = workspace()
+    return root == target or root in target.parents
 
 def _decode_content(content):
     return content.replace("\\n", "\n").replace("\\t", "\t")
@@ -193,7 +242,7 @@ def list_files():
         return "\n".join(shown)
     return "\n".join(shown) + (
         f"\n... truncated: {len(shown)} of {len(names)}+ files shown. "
-        "Use search_files, or list a subfolder, to see the rest."
+        "Use glob, or list a subfolder, to see the rest."
     )
 
 def create_folder(path):
@@ -202,33 +251,6 @@ def create_folder(path):
         return f"Already exists: {path}"
     p.mkdir(parents=True, exist_ok=True)
     return f"Created folder: {path}"
-
-MAX_SEARCH_HITS = 100
-
-def search_files(query, regex=False, path=None):
-    try:
-        pattern = re.compile(query if regex else re.escape(query), re.IGNORECASE)
-    except re.error as error:
-        return f"Invalid regex: {error}"
-    root = safe_path(path) if path else workspace()
-    if not root.exists():
-        return f"Path not found: {path}"
-    targets = [root] if root.is_file() else [p for _, p in iter_workspace_files(root)]
-    hits = []
-    for p in targets:
-        if not p.is_file():
-            continue
-        try:
-            text = p.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for lineno, line in enumerate(text.splitlines(), 1):
-            if pattern.search(line):
-                hits.append(f"{p.relative_to(workspace())}:{lineno}: {line.strip()[:200]}")
-                if len(hits) >= MAX_SEARCH_HITS:
-                    hits.append(f"... stopped at {MAX_SEARCH_HITS} matches — narrow the query.")
-                    return "\n".join(hits)
-    return "\n".join(hits) if hits else f"No matches for: {query}"
 
 def read_lines(path, start=1, end=None):
     p = safe_path(path)
@@ -268,17 +290,16 @@ def replace_lines(path, start, end, content):
         p.write_text(new_content, encoding="utf-8")
         return f"Replaced lines {start}-{end} in {path}"
 
-# --- exact search, and bulk replace -----------------------------------------
+# --- bulk replace, and the pieces the search tools are built from ------------
 #
-# search_files above is the fuzzy one: case-insensitive, one line at a time.
-# These two are the exact ones. A model looking for the precise five lines it
-# is about to edit cannot use a case-insensitive line matcher to find them, and
-# it certainly cannot use one to decide what to rewrite.
+# `replace_across` is here, and so are the small helpers it shares with
+# `agent_grep` and `agent_glob`: the walk's target selection, the binary sniff,
+# the newline flattening, the glob compiler, the counted noun and the POSIX
+# path. They live here because this is the module that owns the workspace, and
+# because a second copy of any of them would be a second answer to a question
+# that has to have one -- what counts as binary, what `**` means, which files a
+# `glob` selects. The public names for them are a block further down.
 
-FIND_TEXT_MAX_HITS = 100        # match blocks rendered before find_text stops
-FIND_TEXT_HARD_MAX = 1000       # ceiling on a caller-supplied limit
-FIND_TEXT_MAX_CONTEXT = 10      # context lines either side, per match
-FIND_TEXT_MAX_LINE = 400        # characters of any one line put in the result
 REPLACE_LIST_MAX = 200          # per-file rows listed; the counts stay whole
 BINARY_SNIFF_BYTES = 4096       # how much of a file is examined for a NUL
 
@@ -348,7 +369,7 @@ def _glob_filter(pattern):
     return keep
 
 
-def _search_targets(path, glob):
+def search_targets(path, glob):
     """(files, hit_the_scan_ceiling) as (relative, absolute) pairs.
 
     safe_path's ValueError is allowed straight out: a caller that asked for
@@ -393,105 +414,56 @@ def _posix(relative):
     return str(relative).replace("\\", "/")
 
 
-def find_text(query, path=None, glob=None, context=0, limit=None):
-    """Exact, case-SENSITIVE search, including for a block spanning lines.
-
-    The tool for "where is this precise code", where search_files is the tool
-    for "where is something roughly like this". The distinction is the point:
-    a case-insensitive line matcher cannot tell `Path` from `path`, and cannot
-    find a five-line block at all, so a model that only has one of those ends
-    up editing on a guess.
-
-    Totals in the header are counted over every file examined, not over the
-    part that fitted in the result, because a header that reported the shown
-    figure would understate the work still out there every time it capped.
-    """
-    if not query:
-        return "find_text needs a 'query' -- there is nothing to look for."
-    needle = _to_lf(_decode_content(query))
-    if not needle:
-        return "find_text needs a 'query' -- there is nothing to look for."
-    try:
-        context = max(0, min(FIND_TEXT_MAX_CONTEXT, int(context or 0)))
-    except (TypeError, ValueError):
-        return "context must be a whole number of lines"
-    try:
-        cap = FIND_TEXT_MAX_HITS if limit in (None, "") else int(limit)
-    except (TypeError, ValueError):
-        return "limit must be a whole number of matches"
-    cap = max(1, min(FIND_TEXT_HARD_MAX, cap))
-
-    targets, scan_capped = _search_targets(path, glob)
-    if targets is None:
-        return f"Path not found: {path}"
-
-    blocks, total, files_hit, skipped_binary = [], 0, 0, 0
-    for relative, p in targets:
-        if not p.is_file():
-            continue
-        try:
-            data = p.read_bytes()
-        except OSError:
-            continue
-        if _looks_binary(data):
-            skipped_binary += 1
-            continue
-        text = _to_lf(data.decode("utf-8", "replace"))
-        if needle not in text:
-            continue
-        lines = text.split("\n")
-        if lines and lines[-1] == "":
-            lines.pop()
-        files_hit += 1
-        at = text.find(needle)
-        while at != -1:
-            total += 1
-            if total <= cap:
-                start = text.count("\n", 0, at) + 1
-                end = text.count("\n", 0, at + len(needle) - 1) + 1
-                blocks.append(_render_match(relative, lines, start, end, context))
-            at = text.find(needle, at + 1)
-
-    if not total:
-        head = f"No exact match for: {needle.splitlines()[0][:120]}"
-        notes = ["Matching here is case-sensitive; search_files is the "
-                 "case-insensitive one."]
-        if glob:
-            notes.append(f"Only paths matching {glob} were examined.")
-        if skipped_binary:
-            notes.append(f"{_plural(skipped_binary, 'binary file')} skipped.")
-        return "\n".join([head] + notes)
-
-    head = f"{_plural(total, 'match', 'matches')} in {_plural(files_hit, 'file')}"
-    if total > cap:
-        head += (f" -- showing the first {cap}, the limit for one result. "
-                 "Narrow the query, or pass a smaller 'glob'.")
-    out = [head, ""] + blocks
-    if skipped_binary:
-        out.append(f"({_plural(skipped_binary, 'binary file')} skipped.)")
-    if scan_capped:
-        out.append(f"(The walk stopped at {WORKSPACE_MAX_SCAN} entries, so "
-                   "files beyond that were never examined.)")
-    return "\n".join(out).rstrip()
+# --- the same helpers, under names another module may use --------------------
+#
+# `agent_grep` and `agent_glob` are separate modules and are still built out of
+# this one's answers: the same binary sniff, the same newline flattening, the
+# same glob compiler, the same counted noun. A private name imported across a
+# module boundary is a private name in name only, so the shared ones are given
+# public spellings here and the private ones are left exactly as they are for
+# the callers inside this file.
+#
+# They forward rather than alias so that the private name stays the single
+# definition. An alias would freeze whichever function object existed at import
+# time, which quietly breaks the tests that substitute one to watch the lock.
+#
+# This is the shape `agent_context` used to borrow `agent_memory._scrub`: thin
+# wrappers, no behaviour of their own, nothing inside this module changed.
 
 
-def _render_match(relative, lines, start, end, context):
-    """One match block: a locator line, then the matched lines and any context.
+def glob_to_regex(pattern):
+    """A path glob compiled to a regex. See `_glob_to_regex`."""
+    return _glob_to_regex(pattern)
 
-    `>` marks the match and `|` marks context, so the two read apart with ANSI
-    stripped -- colour is never allowed to be the only thing carrying it.
-    """
-    first = max(1, start - context)
-    last = min(len(lines), end + context)
-    out = [f"{_posix(relative)}:{start}:"]
-    for n in range(first, last + 1):
-        body = lines[n - 1]
-        if len(body) > FIND_TEXT_MAX_LINE:
-            body = body[:FIND_TEXT_MAX_LINE] + " ..."
-        marker = ">" if start <= n <= end else "|"
-        out.append(f"{n:>6} {marker} {body}")
-    out.append("")
-    return "\n".join(out)
+
+def glob_filter(pattern):
+    """A predicate over workspace-relative paths. See `_glob_filter`."""
+    return _glob_filter(pattern)
+
+
+def looks_binary(data):
+    """Whether these bytes are binary. See `_looks_binary`."""
+    return _looks_binary(data)
+
+
+def to_lf(text):
+    """Newlines flattened to LF. See `_to_lf`."""
+    return _to_lf(text)
+
+
+def plural(count, word, plural=None):
+    """A counted noun. See `_plural`."""
+    return _plural(count, word, plural)
+
+
+def posix(relative):
+    """One separator in every result. See `_posix`."""
+    return _posix(relative)
+
+
+def decode_content(content):
+    """A model's escaped `\\n` and `\\t` turned into the real characters."""
+    return _decode_content(content)
 
 
 def replace_across(search, replace, glob=None, path=None, apply=False):
@@ -514,7 +486,7 @@ def replace_across(search, replace, glob=None, path=None, apply=False):
                 "characters in every file.")
     payload = _to_lf(_decode_content(replace or ""))
 
-    targets, scan_capped = _search_targets(path, glob)
+    targets, scan_capped = search_targets(path, glob)
     if targets is None:
         return f"Path not found: {path}"
 

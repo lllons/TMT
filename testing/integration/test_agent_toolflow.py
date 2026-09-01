@@ -93,7 +93,8 @@ def test_every_new_tool_is_registered_and_reachable_by_the_model():
     try:
         calls = {
             "tree": {},
-            "find_text": {"query": "old_function_name"},
+            "glob": {"pattern": "*.py"},
+            "grep": {"query": "old_function_name"},
             "find_symbol": {"name": "old_function_name"},
             "code_map": {"target": "old_function_name"},
             "replace_across": {"search": "a", "replace": "b"},
@@ -116,7 +117,8 @@ def test_every_new_tool_declares_the_keys_it_needs():
     handed back for correction."""
     from agent_config import REQUIRED_KEYS
     expected = {
-        "tree": [], "find_text": ["query"], "find_symbol": ["name"],
+        "tree": [], "glob": ["pattern"], "grep": ["query"],
+        "find_symbol": ["name"],
         "replace_across": ["search", "replace"], "code_map": ["target"],
         "related_tests": [], "remember": ["note"], "recall": [],
     }
@@ -135,23 +137,29 @@ def test_the_whole_workflow_from_shape_to_change_to_tests_to_memory():
         shape = run("tree")
         assert "calc.py" in shape and "report.py" in shape, shape
 
-        # 2. Where is the thing defined?
+        # 2. Which files could hold it? `glob` answers by NAME, before
+        # anything is read.
+        found = run("glob", pattern="src/*.py")
+        assert "src/calc.py" in found.replace("\\", "/"), found
+        assert "tests/test_calc.py" not in found.replace("\\", "/"), found
+
+        # 3. Where is the thing defined?
         where = run("find_symbol", name="old_function_name")
         assert "src/calc.py" in where.replace("\\", "/"), where
         assert "structural" in where, where
 
-        # 3. Everywhere it is used.
-        uses = run("find_text", query="old_function_name")
+        # 4. Everywhere it is used. `grep` answers by CONTENT.
+        uses = run("grep", query="old_function_name")
         for name in ("src/calc.py", "src/report.py", "tests/test_calc.py"):
             assert name in uses.replace("\\", "/"), (name, uses)
 
-        # 4. What would change? Nothing is written yet.
+        # 5. What would change? Nothing is written yet.
         preview = run("replace_across", search="old_function_name",
                       replace="new_function_name")
         assert "old_function_name" in box.read("src/calc.py"), "preview wrote to disk"
         assert "would change" in preview.lower(), preview
 
-        # 5. Apply it, and the report matches what actually happened.
+        # 6. Apply it, and the report matches what actually happened.
         applied = run("replace_across", search="old_function_name",
                       replace="new_function_name", apply=True)
         assert "changed" in applied.lower(), applied
@@ -160,12 +168,12 @@ def test_the_whole_workflow_from_shape_to_change_to_tests_to_memory():
             assert "old_function_name" not in body, (name, body)
             assert "new_function_name" in body, (name, body)
 
-        # 6. The index notices the edit rather than answering from a stale cache.
+        # 7. The index notices the edit rather than answering from a stale cache.
         agent_index.build_index()
         mapped = run("code_map", target="new_function_name")
         assert "src/calc.py" in mapped.replace("\\", "/"), mapped
 
-        # 7. Write down what was learned, and read it back.
+        # 8. Write down what was learned, and read it back.
         run("remember", note="old_function_name was renamed to new_function_name.")
         remembered = run("recall")
         assert "new_function_name" in remembered, remembered
@@ -180,7 +188,8 @@ def test_the_tools_refuse_to_leave_the_workspace():
     try:
         outside = [
             ("tree", {"path": "../.."}),
-            ("find_text", {"query": "x", "path": "../.."}),
+            ("glob", {"pattern": "*", "path": "../.."}),
+            ("grep", {"query": "x", "path": "../.."}),
             ("find_symbol", {"name": "x", "path": "../.."}),
             ("replace_across", {"search": "a", "replace": "b",
                                 "path": "../..", "apply": True}),

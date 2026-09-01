@@ -270,7 +270,8 @@ Task> add the endpoint /plan /verify /review
 | `replace_lines` | 替换一个精确的行区间 |
 | `append_file` | 追加到文件末尾 |
 | `read_file` / `read_lines` | 读取整个文件，或一个行区间 |
-| `search_files` | 普通或正则搜索，可选限定到某个文件夹 |
+| `glob` | 按路径模式查找文件和目录 |
+| `grep` | 搜索文件内容，并报告路径、行号和那一行 |
 | `copy_file` / `rename_file` / `delete_file` | 移动、重命名、删除 |
 | `create_folder` / `delete_folder` | 文件夹（递归删除需显式选择） |
 | `list_files` | 列出工作区 |
@@ -330,12 +331,13 @@ Task> add the feature
 
 ### 理解一个仓库
 
-八个动作，用来在不通读全部代码的情况下摸清一个代码库。每一个回答一个问题，而 TMT 被要求选择其中范围最窄且合适的那一个。
+九个动作，用来在不通读全部代码的情况下摸清一个代码库。每一个回答一个问题，而 TMT 被要求选择其中范围最窄且合适的那一个。
 
 | 动作 | 用途 | 什么时候用它 |
 |---|---|---|
 | `tree` | 目录、文件、大小、层级。不读取任何内容 | 你需要项目的整体形状 |
-| `find_text` | 一次性跨每个文件的精确、区分大小写的搜索。查询串可以跨多行 | 你确切知道自己要找的字符 |
+| `glob` | 匹配某个路径模式的文件和目录。`*` 到 `/` 为止，`**/` 表示任意层级，而不含 `/` 的模式会匹配任何位置上的同名条目 | 你需要知道有哪些文件存在，或者某个文件在哪里 |
+| `grep` | 在文件内部搜索，报告路径、行号和那一行。默认精确且区分大小写；查询串可以跨多行 | 你知道自己要找的文本 |
 | `find_symbol` | 某个函数、类、方法、常量或类型在哪里被*定义* | 你要的是定义，不是提及 |
 | `code_map` | 什么定义了它、什么导入了它、它导入了什么、它在哪里被引用 | 你需要知道一处改动会影响什么 |
 | `replace_across` | 在多个文件中做完全相同的编辑 | 重命名整个项目都在用的东西 |
@@ -351,7 +353,17 @@ Task> rename old_function_name to new_function_name across src
 Task> which tests should I run for what I just changed?
 ```
 
-`find_text` 是精确且区分大小写的；`search_files` 则是宽松、不区分大小写的那个。两者并存，是因为它们回答的是不同的问题。
+**`glob` 按路径或名字找文件；`grep` 在文件内部找文本。** 全部的区别就在这里，而这也是值得弄明白的一点：真正管用的顺序是先用 `glob` 找出候选文件，再用 `grep` 找出其中的行，然后用 `read_lines` 读取那一段，接着编辑，最后测试 —— 而不是为了找一行而通读整个仓库。
+
+```json
+{"action": "glob", "pattern": "agent_*.py"}
+{"action": "glob", "pattern": "testing/**/*.py"}
+{"action": "grep", "query": "end_conversation"}
+{"action": "grep", "query": "def run_file", "glob": "agent_*.py"}
+{"action": "grep", "query": "timeout", "path": "src", "ignore_case": true}
+```
+
+`grep` 默认是精确且区分大小写的，就像它得名的那个工具一样。`"ignore_case": true` 让它变得宽松，`"regex": true` 把查询串当作正则表达式来读，`"context"` 会在每处匹配的前后各加上若干行，而 `"path"` 或 `"glob"` 则限定究竟哪些文件会被读取。它从不返回整个文件：你得到的是路径、行号和那一行，其余部分由 `read_lines` 取回。
 
 **`replace_across` 默认只做预览。** 它会报告它*将会*改动多少个文件和多少处出现，并且什么都不写。再次发送同一动作并带上 `"apply": true` 才会真正执行。行尾和编码会被保留，二进制文件会被跳过，而会让某个 Python 文件无法解析的替换会被拒绝而不是写入。
 
@@ -848,7 +860,7 @@ Task> spawn three agents to write multiply.py, divide.py and power.py, then wait
 
 #### `read_only`
 
-`read_only: true` 表示该智能体可以检视这个工作区，但不可以改动它。它保留每一个读取类动作 —— `read_file`、`read_lines`、`list_files`、`search_files`、`find_text`、`find_symbol`、`tree`、`code_map`、`related_tests`、`recall`、`git_status`、`git_diff`、`git_identity` —— 其余一律被拒绝。
+`read_only: true` 表示该智能体可以检视这个工作区，但不可以改动它。它保留每一个读取类动作 —— `read_file`、`read_lines`、`list_files`、`glob`、`grep`、`find_symbol`、`tree`、`code_map`、`related_tests`、`recall`、`git_status`、`git_diff`、`git_identity` —— 其余一律被拒绝。
 
 **在执行时强制执行，而不是在提示词里请求。** 拒绝发生在动作运行之前，在两个地方：`agent_worker` 在每个动作被调度前都会检查它，单动作路径和批处理路径都一样，而 `agent_actions.execute_action` 会在调度器处再检查一次。两者调用的是同一个函数，所以只有一条规则，却有两处执行它。
 

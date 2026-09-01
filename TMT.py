@@ -64,7 +64,7 @@ from agent_prompt import get_system_prompt, invalidate_prompt, validate_action
 from agent_execution import APP_REGISTRY, RUNNERS, open_app, run_file, run_python
 from agent_file_ops import (
     append_file, copy_file, create_folder, delete_file, delete_folder, list_files,
-    patch_file, read_file, read_lines, replace_lines, safe_path, search_files,
+    patch_file, read_file, read_lines, replace_lines, safe_path,
     write_file, write_files,
 )
 

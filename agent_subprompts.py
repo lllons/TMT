@@ -29,8 +29,8 @@ to 40 KB of file contents; measured in this repository that snapshot is 8220
 estimated tokens against the whole prompt's 18871 -- 44% of every request of
 every step, and the API is stateless, so it goes again each time. Five workers
 each carrying a copy multiplies it by five. A worker gets `agent_tree.tree()`
-instead: the paths and the sizes, no contents, and `read_lines`/`find_text` to
-fetch what it actually needs.
+instead: the paths and the sizes, no contents, and `glob`/`grep`/`read_lines`
+to fetch what it actually needs.
 
 That is a trade rather than a saving, and the honest form of it is written
 down here rather than implied. Measured on this repository the tree is 5296
@@ -97,7 +97,7 @@ WORKER_TREE_LIMIT = 800
 # Restated rather than imported because importing `agent_worker` here would
 # close a cycle: `agent_worker` imports this module to build its prompts.
 NOTE_VERBS = (
-    "list_files", "read_file", "read_lines", "search_files", "find_text",
+    "list_files", "read_file", "read_lines", "grep", "glob",
     "find_symbol", "tree", "code_map", "related_tests", "recall",
     "git_status", "git_diff", "git_identity",
     # `send_message` is on the list because the dispatcher's whitelist has it,
@@ -116,7 +116,7 @@ NOTE_VERBS = (
 # checks; this is what the prompt says about it, and there is a test that the
 # two agree.
 REVIEW_VERBS = (
-    "list_files", "read_file", "read_lines", "search_files", "find_text",
+    "list_files", "read_file", "read_lines", "grep", "glob",
     "find_symbol", "tree", "code_map", "related_tests", "recall",
     "git_status", "git_diff", "git_identity",
     "send_message", "internal_response",
@@ -212,8 +212,8 @@ _SHARED_OVERRIDES = """- OUTPUT FORMAT rule 5 says everything the user reads goe
 - The ACTIONS reference lists end_conversation. It is refused to you, and so is git_push. Emitting one costs you a step and hands you back a refusal.
 - The ACTIONS reference lists send_message, and that one is not refused - it runs, and it reaches nobody, which is worse. There is no screen showing your words. It costs you a step and hands back a note telling you the same thing this line does. Say it in your internal_response instead.
 - The ACTIONS reference lists delete_file and delete_folder. Both stop and wait for a human to confirm at the terminal, and you are running in the background with no terminal to be asked at, so both are refused to you as well. If something should be deleted, name it in your response and leave the deletion to the main agent.
-- EDITING PREFERENCES rule 8 and CHOOSING A TOOL rule 7 say that files under 8 KB are already pasted below. For you they are not. You are given the SHAPE of the workspace - paths and sizes, no contents at all - and nothing else. Read what you need with read_lines, find_text or read_file. Nothing is pasted and nothing is waiting for you further down.
-- That shape may be incomplete, and it says so in its own last lines when it is. A file missing from it is a file the tree did not reach, never a file that does not exist. Use list_files, find_text or tree with a "path" to look again rather than concluding something is absent.
+- EDITING PREFERENCES rule 8 and CHOOSING A TOOL rule 7 say that files under 8 KB are already pasted below. For you they are not. You are given the SHAPE of the workspace - paths and sizes, no contents at all - and nothing else. Read what you need with glob, grep, read_lines or read_file. Nothing is pasted and nothing is waiting for you further down.
+- That shape may be incomplete, and it says so in its own last lines when it is. A file missing from it is a file the tree did not reach, never a file that does not exist. Use list_files, glob or tree with a "path" to look again rather than concluding something is absent.
 - The PROGRESS section requires a "progress" sentence on every action that does work. It does not apply to you: nobody reads it. See below."""
 
 WORKER_OVERRIDES = """=== WHERE THE SHARED RULES DIFFER FOR YOU ===
@@ -372,7 +372,7 @@ NOTE_RULES = """=== HOW YOU WORK ===
 1. Your only purpose is to answer the one question you were given, by inspecting this workspace.
 2. These are the only actions available to you, and there are no others: %s. Anything else is refused before it is dispatched.
 3. You may not create, edit, patch, append, replace, delete, rename, copy, run, commit or push. You may not change the workspace in any way at all, including in ways that look harmless. Do not try to reach a change through a verb that is on your list.
-4. Take as many read and search actions as you need. The narrowest tool first: find_symbol for a definition, find_text for an exact string, tree for the shape, read_lines for a region. Reading whole files to find one line is the mistake those exist to prevent.
+4. Take as many read and search actions as you need. The narrowest tool first: glob for a file by name, grep for text inside files, find_symbol for a definition, tree for the shape, read_lines for a region. glob finds files and grep finds text in them, so use glob to decide what to look at and grep to find the line. Reading whole files to find one line is the mistake those exist to prevent.
 5. Finish with exactly one internal_response containing the answer.
 6. That response IS shown to the person who asked. Write it as an answer to their question, in plain sentences: what you found, where it is, and what it means for what they asked. Name the files and the line numbers you are talking about.
 7. Answer only what was asked. You are running beside other work; you are not reviewing it, not advising on it, and not reporting on its progress.
@@ -427,7 +427,7 @@ You were asked to verify tests. You cannot, and you say so rather than guessing.
 
 Nothing needed doing. That is a finished task, not a failed one.
   You were given: make sure the socket timeout in src/net.py is 30 seconds
-  You emit:  {"action":"find_text","query":"timeout","path":"src/net.py"}
+  You emit:  {"action":"grep","query":"timeout","path":"src/net.py"}
   The matches come back. Then:
   You emit:  {"action":"internal_response","response":"No change was needed: src/net.py line 41 already reads timeout=30. I changed nothing."}
 
@@ -460,7 +460,7 @@ A question the shape of the project answers.
 
 A question that needs a definition found, then read.
   You were asked: where is the retry limit set?
-  You emit:  {"action":"find_text","query":"retry"}
+  You emit:  {"action":"grep","query":"retry"}
   The matches come back, naming src/net.py line 12. Then:
   You emit:  {"action":"read_lines","path":"src/net.py","start":1,"end":30}
   Then:
@@ -468,7 +468,7 @@ A question that needs a definition found, then read.
 
 The workspace does not answer the question. Say so, and say what you looked at.
   You were asked: which database does this use?
-  You emit:  {"action":"find_text","query":"postgres"}
+  You emit:  {"action":"grep","query":"postgres","ignore_case":true}
   Nothing comes back. Then:
   You emit:  {"action":"internal_response","response":"I could not tell from the workspace. There is no reference to postgres, mysql, sqlite or a DATABASE_URL in any file, no ORM in the imports, and no migrations folder. If there is a database, it is configured somewhere outside this folder."}
 
@@ -493,7 +493,7 @@ Each of these is a review you might really be given. The brief is what reached y
 A change that is fine, and you checked before saying so.
   The brief: the user asked for a percent operator; the diff adds percent() to Calc.py and a test for it.
   You emit:  {"action":"read_lines","path":"Calc.py","start":1,"end":120}
-  Then:      {"action":"find_text","query":"percent","path":"tests"}
+  Then:      {"action":"grep","query":"percent","path":"tests"}
   Then:      {"action":"read_lines","path":"tests/test_calc.py","start":1,"end":60}
   Then:
   {"action":"internal_response","response":"{\"status\":\"PASS\",\"summary\":\"percent(a, b) is added to Calc.py and wired into main() beside the other four operators, with a test asserting percent(50, 10) == 5. I read the operator table and the test file; nothing else changed.\",\"issues\":[],\"requirements\":[{\"text\":\"A percent operator exists\",\"status\":\"satisfied\",\"note\":\"Calc.py line 61, and in the OPERATORS table at line 12\"},{\"text\":\"It is reachable from the command line\",\"status\":\"satisfied\",\"note\":\"main() dispatches through OPERATORS\"}],\"tests\":\"One case, the happy path. Division by zero is not a concern here since percent never divides by an argument.\"}"}
@@ -501,10 +501,10 @@ A change that is fine, and you checked before saying so.
 A change whose tests pass and whose behaviour is still wrong. This is the review that earns the feature.
   The brief: the user asked for refresh-token support; the diff adds token.py and routes.py changes; the session ran the suite.
   You emit:  {"action":"read_lines","path":"src/auth/token.py","start":100,"end":200}
-  Then:      {"action":"find_text","query":"expires_at"}
+  Then:      {"action":"grep","query":"expires_at"}
   Then:      {"action":"read_lines","path":"src/api/routes.py","start":50,"end":100}
   Then:
-  {"action":"internal_response","response":"{\"status\":\"FAIL\",\"summary\":\"Refresh tokens are issued and stored but never checked for expiry, and the /health route has been moved behind authentication. The suite passes because neither behaviour is tested.\",\"issues\":[{\"id\":\"R-001\",\"severity\":\"MAJOR\",\"title\":\"Refresh token expiry is never enforced\",\"description\":\"issue_refresh() writes an expires_at field at token.py line 131, and validate_refresh() at line 148 reads the token, checks the signature and the subject, and returns without ever comparing expires_at to the current time.\",\"file\":\"src/auth/token.py\",\"line\":148,\"evidence\":\"validate_refresh reads expires_at nowhere; find_text for expires_at returns only the write at line 131.\",\"why_it_matters\":\"An expired refresh token keeps minting access tokens indefinitely, so revocation by expiry does not work at all.\",\"suggested_fix\":\"Compare expires_at against now in validate_refresh and reject before issuing.\"},{\"id\":\"R-002\",\"severity\":\"MAJOR\",\"title\":\"/health is now behind authentication\",\"description\":\"routes.py line 72 moved /health inside the require_auth block added for the refresh endpoints.\",\"file\":\"src/api/routes.py\",\"line\":72,\"evidence\":\"The diff shows /health moving from the public group into the authenticated one; nothing in the request asked for that.\",\"why_it_matters\":\"Monitoring calls /health unauthenticated and will start failing on deploy.\",\"suggested_fix\":\"Move /health back outside require_auth.\"}],\"requirements\":[{\"text\":\"Refresh tokens are supported\",\"status\":\"partial\",\"note\":\"issued and validated, but expiry is not enforced\"},{\"text\":\"Existing behaviour preserved\",\"status\":\"not_satisfied\",\"note\":\"/health lost its public access\"}],\"tests\":\"14 cases, all happy path. Nothing covers an expired refresh token and nothing covers /health without credentials - the two failures above are exactly the two the tests do not reach.\"}"}
+  {"action":"internal_response","response":"{\"status\":\"FAIL\",\"summary\":\"Refresh tokens are issued and stored but never checked for expiry, and the /health route has been moved behind authentication. The suite passes because neither behaviour is tested.\",\"issues\":[{\"id\":\"R-001\",\"severity\":\"MAJOR\",\"title\":\"Refresh token expiry is never enforced\",\"description\":\"issue_refresh() writes an expires_at field at token.py line 131, and validate_refresh() at line 148 reads the token, checks the signature and the subject, and returns without ever comparing expires_at to the current time.\",\"file\":\"src/auth/token.py\",\"line\":148,\"evidence\":\"validate_refresh reads expires_at nowhere; grep for expires_at returns only the write at line 131.\",\"why_it_matters\":\"An expired refresh token keeps minting access tokens indefinitely, so revocation by expiry does not work at all.\",\"suggested_fix\":\"Compare expires_at against now in validate_refresh and reject before issuing.\"},{\"id\":\"R-002\",\"severity\":\"MAJOR\",\"title\":\"/health is now behind authentication\",\"description\":\"routes.py line 72 moved /health inside the require_auth block added for the refresh endpoints.\",\"file\":\"src/api/routes.py\",\"line\":72,\"evidence\":\"The diff shows /health moving from the public group into the authenticated one; nothing in the request asked for that.\",\"why_it_matters\":\"Monitoring calls /health unauthenticated and will start failing on deploy.\",\"suggested_fix\":\"Move /health back outside require_auth.\"}],\"requirements\":[{\"text\":\"Refresh tokens are supported\",\"status\":\"partial\",\"note\":\"issued and validated, but expiry is not enforced\"},{\"text\":\"Existing behaviour preserved\",\"status\":\"not_satisfied\",\"note\":\"/health lost its public access\"}],\"tests\":\"14 cases, all happy path. Nothing covers an expired refresh token and nothing covers /health without credentials - the two failures above are exactly the two the tests do not reach.\"}"}
 
 Real findings that do not block. Say so plainly rather than inflating them.
   {"action":"internal_response","response":"{\"status\":\"PASS_WITH_WARNINGS\",\"summary\":\"The parser change is correct and covered. Two smaller things are worth tidying and neither blocks.\",\"issues\":[{\"id\":\"R-001\",\"severity\":\"MINOR\",\"title\":\"Token validation is duplicated\",\"description\":\"parse.py line 88 repeats the length and charset checks that validate() already does at line 31.\",\"file\":\"src/parse.py\",\"line\":88,\"why_it_matters\":\"Two copies of one rule drift, and the second one is the one that will be missed.\",\"suggested_fix\":\"Call validate() from parse() instead.\"},{\"id\":\"R-002\",\"severity\":\"SUGGESTION\",\"title\":\"The new constant could name its unit\",\"description\":\"TIMEOUT = 30 at config.py line 9 does not say seconds.\",\"file\":\"src/config.py\",\"line\":9,\"suggested_fix\":\"TIMEOUT_SECONDS.\"}],\"requirements\":[{\"text\":\"Malformed tokens are rejected\",\"status\":\"satisfied\",\"note\":\"parse.py line 88, covered by three cases in test_parse.py\"}],\"tests\":\"Three cases including two negative ones. Adequate for this change.\"}"}
@@ -526,8 +526,8 @@ def _tree():
     """The shape of the workspace, or a sentence saying why there is none.
 
     Guarded because a prompt that cannot be built is an agent that cannot
-    start. A worker with no tree can still work -- it has list_files and
-    find_text -- where a worker that raised on import of its own prompt is
+    start. A worker with no tree can still work -- it has list_files, glob
+    and grep -- where a worker that raised on import of its own prompt is
     simply lost, and the failure would surface as an agent that dies the
     moment it is spawned.
     """

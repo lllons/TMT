@@ -877,7 +877,7 @@ def test_the_note_agent_can_read_and_search_but_cannot_change_anything():
     manager = agent_manager.AgentManager()
     try:
         script = Script(
-            json.dumps({"action": "find_text", "query": "MAX_RETRIES"}),
+            json.dumps({"action": "grep", "query": "MAX_RETRIES"}),
             json.dumps({"action": "read_lines", "path": "src/calc.py",
                         "start": 1, "end": 3}),
             json.dumps({"action": "write_file", "path": "src/calc.py",

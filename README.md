@@ -369,7 +369,8 @@ authorises the capability for that task.
 | `replace_lines` | Replace an exact line range |
 | `append_file` | Add to the end of a file |
 | `read_file` / `read_lines` | Read a whole file, or a line range |
-| `search_files` | Plain or regex search, optionally scoped to a folder |
+| `glob` | Find files and directories by path pattern |
+| `grep` | Search file contents and report path, line number and the line |
 | `copy_file` / `rename_file` / `delete_file` | Move, rename, remove |
 | `create_folder` / `delete_folder` | Folders (recursive delete is opt-in) |
 | `list_files` | List the workspace |
@@ -457,13 +458,14 @@ room more — and `/plan` prints the same thing as ordinary text at any width.
 
 ### Understanding a repository
 
-Eight actions for finding your way around a codebase without reading it all. Each
+Nine actions for finding your way around a codebase without reading it all. Each
 answers one question, and TMT is told to pick the narrowest one that fits.
 
 | Action | Purpose | Reach for it when |
 |---|---|---|
 | `tree` | Directories, files, sizes, nesting. Reads no contents | You need the shape of the project |
-| `find_text` | Exact, case-sensitive search across every file at once. The query may span several lines | You know the characters you are looking for |
+| `glob` | Files and directories matching a path pattern. `*` stops at a `/`, `**/` means any depth, and a pattern with no `/` matches a name anywhere | You need to know which files exist, or where one is |
+| `grep` | Search inside files, reporting path, line number and the line. Exact and case-sensitive by default; the query may span several lines | You know the text you are looking for |
 | `find_symbol` | Where a function, class, method, constant or type is *defined* | You want a definition, not a mention |
 | `code_map` | What defines this, what imports it, what it imports, where it is referenced | You need to know what a change would affect |
 | `replace_across` | The same exact edit in many files | Renaming something the whole project uses |
@@ -479,8 +481,25 @@ Task> rename old_function_name to new_function_name across src
 Task> which tests should I run for what I just changed?
 ```
 
-`find_text` is exact and case-sensitive; `search_files` is the loose, case-insensitive
-one. Both exist because they answer different questions.
+**`glob` finds files by path or name; `grep` finds text inside files.** That is the
+whole distinction, and it is the one worth getting right: the order that works is
+`glob` to find the candidate files, `grep` to find the lines in them, `read_lines` to
+read the region, then edit, then test — rather than reading a repository to find one
+line.
+
+```json
+{"action": "glob", "pattern": "agent_*.py"}
+{"action": "glob", "pattern": "testing/**/*.py"}
+{"action": "grep", "query": "end_conversation"}
+{"action": "grep", "query": "def run_file", "glob": "agent_*.py"}
+{"action": "grep", "query": "timeout", "path": "src", "ignore_case": true}
+```
+
+`grep` is exact and case-sensitive by default, like the tool it is named after.
+`"ignore_case": true` makes it loose, `"regex": true` reads the query as a regular
+expression, `"context"` adds lines either side of each match, and `"path"` or `"glob"`
+restricts which files are read at all. It never returns a whole file: you get the path,
+the line number and the line, and `read_lines` gets you the rest.
 
 **`replace_across` previews by default.** It reports how many files and occurrences it
 *would* change and writes nothing. Sending the same action again with `"apply": true`
@@ -1190,8 +1209,8 @@ global anywhere on the path.
 #### `read_only`
 
 `read_only: true` means the agent may inspect this workspace and may not change it. It
-keeps every reading verb — `read_file`, `read_lines`, `list_files`, `search_files`,
-`find_text`, `find_symbol`, `tree`, `code_map`, `related_tests`, `recall`,
+keeps every reading verb — `read_file`, `read_lines`, `list_files`, `glob`,
+`grep`, `find_symbol`, `tree`, `code_map`, `related_tests`, `recall`,
 `git_status`, `git_diff`, `git_identity` — and is refused everything else.
 
 **Enforced at execution time, not asked for in the prompt.** The refusal happens before

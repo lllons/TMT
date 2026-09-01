@@ -41,6 +41,8 @@ py-modules = [
     "agent_execution",
     "agent_file_ops",
     "agent_git",
+    "agent_glob",
+    "agent_grep",
     "agent_index",
     "agent_live_renderer",
     "agent_manager",

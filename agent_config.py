@@ -665,7 +665,7 @@ REQUIRED_KEYS = {
     "write_files": ["files"], "patch_file": ["path", "search", "replace"],
     "delete_file": ["path"], "read_file": ["path"], "rename_file": ["path"],
     "run_python": ["path"], "run_file": ["path"], "create_folder": ["path"],
-    "open_app": ["app"], "list_files": [], "search_files": ["query"],
+    "open_app": ["app"], "list_files": [],
     "read_lines": ["path"], "replace_lines": ["path", "start", "end", "content"],
     "copy_file": ["path"],
     "delete_folder": ["path"],
@@ -765,7 +765,22 @@ REQUIRED_KEYS = {
     # agent_worker: a worker recording a decision the main agent had not
     # reached would be writing the project's memory from inside a subtask.
     "project_context": ["operation"],
-    "tree": [], "find_text": ["query"], "find_symbol": ["name"],
+    # The two search verbs, and the whole of the difference between them is in
+    # what they look at: `glob` finds FILES BY PATH, `grep` finds TEXT INSIDE
+    # FILES. They replaced `search_files` and `find_text`, which split the same
+    # job along the wrong seam -- both searched contents, one loosely and one
+    # exactly, so a model had to choose between two spellings of one question
+    # and nothing at all answered "which files are there?".
+    #
+    # Only the needle is required. Everything that narrows the search -- a
+    # path, a glob, a kind, a limit, case sensitivity, context lines -- is
+    # optional, because a search with nothing to look for is the only one that
+    # cannot be run at all.
+    #
+    # `agent_actions.canonical_action` still understands the two old names, and
+    # nothing teaches them.
+    "grep": ["query"], "glob": ["pattern"],
+    "tree": [], "find_symbol": ["name"],
     "replace_across": ["search", "replace"], "code_map": ["target"],
     "related_tests": [], "remember": ["note"], "recall": [],
     # Delegating work to background agents. Only the main agent is taught

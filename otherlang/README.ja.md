@@ -270,7 +270,8 @@ Task> add the endpoint /plan /verify /review
 | `replace_lines` | 正確な行範囲を置き換えます |
 | `append_file` | ファイルの末尾に追記します |
 | `read_file` / `read_lines` | ファイル全体、または行範囲を読みます |
-| `search_files` | プレーンまたは正規表現の検索。フォルダに絞り込むこともできます |
+| `glob` | パスのパターンでファイルとディレクトリを見つけます |
+| `grep` | ファイルの内容を検索し、パス、行番号、その行を報告します |
 | `copy_file` / `rename_file` / `delete_file` | 移動、リネーム、削除 |
 | `create_folder` / `delete_folder` | フォルダ（再帰的な削除はオプトイン） |
 | `list_files` | ワークスペースの一覧 |
@@ -330,12 +331,13 @@ Task> add the feature
 
 ### リポジトリを理解する
 
-コードベース全体を読まずに中を把握するための 8 つのアクションです。それぞれが 1 つの問いに答えるもので、TMT は目的に合う最も狭いものを選ぶよう指示されています。
+コードベース全体を読まずに中を把握するための 9 つのアクションです。それぞれが 1 つの問いに答えるもので、TMT は目的に合う最も狭いものを選ぶよう指示されています。
 
 | アクション | 用途 | 使いどころ |
 |---|---|---|
 | `tree` | ディレクトリ、ファイル、サイズ、階層。内容は読みません | プロジェクトの形を知りたいとき |
-| `find_text` | 全ファイルを一度に、大文字小文字を区別して完全一致検索します。クエリは複数行にまたがっても構いません | 探している文字列が分かっているとき |
+| `glob` | パスのパターンに一致するファイルとディレクトリ。`*` は `/` の手前で止まり、`**/` は任意の深さを意味し、`/` を含まないパターンはどこにあるその名前にも一致します | どのファイルが存在するのか、あるいはあるファイルがどこにあるのかを知りたいとき |
+| `grep` | ファイルの中を検索し、パス、行番号、その行を報告します。既定では完全一致で大文字小文字を区別し、クエリは複数行にまたがっても構いません | 探しているテキストが分かっているとき |
 | `find_symbol` | 関数、クラス、メソッド、定数、型が *定義されている* 場所 | 言及ではなく定義を知りたいとき |
 | `code_map` | 何がこれを定義し、何がこれを import し、これが何を import し、どこから参照されているか | 変更が何に影響するかを知る必要があるとき |
 | `replace_across` | 多数のファイルにわたる同一の編集 | プロジェクト全体で使われているものをリネームするとき |
@@ -351,7 +353,17 @@ Task> rename old_function_name to new_function_name across src
 Task> which tests should I run for what I just changed?
 ```
 
-`find_text` は完全一致で大文字小文字を区別し、`search_files` は緩く大文字小文字を区別しません。どちらも存在するのは、答える問いが違うからです。
+**`glob` はパスや名前でファイルを見つけ、`grep` はファイルの中のテキストを見つけます。** 違いはそれだけであり、そしてそこは取り違えないでおく価値があります。うまくいく順序は、`glob` で候補となるファイルを見つけ、`grep` でその中の行を見つけ、`read_lines` でその範囲を読み、それから編集し、最後にテストする — 1 行を探すためにリポジトリを読み通すのではなく、という順序です。
+
+```json
+{"action": "glob", "pattern": "agent_*.py"}
+{"action": "glob", "pattern": "testing/**/*.py"}
+{"action": "grep", "query": "end_conversation"}
+{"action": "grep", "query": "def run_file", "glob": "agent_*.py"}
+{"action": "grep", "query": "timeout", "path": "src", "ignore_case": true}
+```
+
+`grep` は、その名前の由来となったツールと同じく、既定では完全一致で大文字小文字を区別します。`"ignore_case": true` を付けると緩くなり、`"regex": true` はクエリを正規表現として読み、`"context"` は各マッチの前後に行を加え、`"path"` や `"glob"` はそもそもどのファイルを読むかを絞り込みます。ファイル全体が返ってくることは決してありません。得られるのはパスと行番号とその行で、残りは `read_lines` が取ってきます。
 
 **`replace_across` は既定でプレビューします。** 何ファイル、何か所を変更する *はずか* を報告するだけで、何も書きません。同じアクションを `"apply": true` を付けて再送すると実行されます。改行コードとエンコーディングは保たれ、バイナリファイルはスキップされ、Python ファイルをパース不能にしてしまう置換は書き込まれずに拒否されます。
 
@@ -848,7 +860,7 @@ Task> spawn three agents to write multiply.py, divide.py and power.py, then wait
 
 #### `read_only`
 
-`read_only: true` は、そのエージェントがこのワークスペースを調べてよく、変更してはならないことを意味します。読み取り系の動詞 — `read_file`、`read_lines`、`list_files`、`search_files`、`find_text`、`find_symbol`、`tree`、`code_map`、`related_tests`、`recall`、`git_status`、`git_diff`、`git_identity` — はすべて残り、それ以外はすべて拒否されます。
+`read_only: true` は、そのエージェントがこのワークスペースを調べてよく、変更してはならないことを意味します。読み取り系の動詞 — `read_file`、`read_lines`、`list_files`、`glob`、`grep`、`find_symbol`、`tree`、`code_map`、`related_tests`、`recall`、`git_status`、`git_diff`、`git_identity` — はすべて残り、それ以外はすべて拒否されます。
 
 **プロンプトでのお願いではなく、実行時に強制されます。** 拒否はアクションが実行される前に、2 か所で行われます。`agent_worker` は単一アクションの経路でもバッチの経路でも、ディスパッチ前にすべてのアクションを検査し、`agent_actions.execute_action` がディスパッチャでもう一度検査します。どちらも同じ関数に問い合わせるので、規則は 1 つ、それを強制する場所が 2 つという形になります。
 

@@ -236,7 +236,8 @@ def test_the_ordinary_tools_are_untouched_by_any_of_this():
     no commands in it still has every normal action."""
     context = granted("Build me a dashboard")
     for obj in ({"action": "list_files"},
-                {"action": "search_files", "query": "def "},
+                {"action": "glob", "pattern": "*.py"},
+                {"action": "grep", "query": "def "},
                 {"action": "tree"},
                 {"action": "git_status"}):
         out = agent_actions.execute_action(obj, context)

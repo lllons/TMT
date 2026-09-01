@@ -391,7 +391,8 @@ qui contient une tâche autorise la capacité pour cette tâche.
 | `replace_lines` | Remplacer une plage de lignes exacte |
 | `append_file` | Ajouter à la fin d'un fichier |
 | `read_file` / `read_lines` | Lire un fichier entier, ou une plage de lignes |
-| `search_files` | Recherche simple ou par expression régulière, éventuellement limitée à un dossier |
+| `glob` | Trouver des fichiers et des répertoires par motif de chemin |
+| `grep` | Chercher dans le contenu des fichiers et indiquer le chemin, le numéro de ligne et la ligne |
 | `copy_file` / `rename_file` / `delete_file` | Déplacer, renommer, supprimer |
 | `create_folder` / `delete_folder` | Dossiers (la suppression récursive est explicite) |
 | `list_files` | Lister l'espace de travail |
@@ -486,13 +487,14 @@ texte ordinaire, quelle que soit la largeur.
 
 ### Comprendre un dépôt
 
-Huit actions pour se repérer dans une base de code sans la lire en entier. Chacune
+Neuf actions pour se repérer dans une base de code sans la lire en entier. Chacune
 répond à une question, et il est demandé à TMT de choisir la plus étroite qui convienne.
 
 | Action | Rôle | Y recourir quand |
 |---|---|---|
 | `tree` | Répertoires, fichiers, tailles, imbrication. Ne lit aucun contenu | Vous avez besoin de la forme du projet |
-| `find_text` | Recherche exacte, sensible à la casse, dans tous les fichiers d'un coup. La requête peut couvrir plusieurs lignes | Vous connaissez les caractères que vous cherchez |
+| `glob` | Fichiers et répertoires correspondant à un motif de chemin. `*` s'arrête à un `/`, `**/` signifie n'importe quelle profondeur, et un motif sans `/` correspond à un nom où qu'il se trouve | Vous devez savoir quels fichiers existent, ou où se trouve l'un d'eux |
+| `grep` | Chercher à l'intérieur des fichiers, en indiquant le chemin, le numéro de ligne et la ligne. Exact et sensible à la casse par défaut ; la requête peut couvrir plusieurs lignes | Vous connaissez le texte que vous cherchez |
 | `find_symbol` | Où une fonction, une classe, une méthode, une constante ou un type est *défini* | Vous voulez une définition, pas une mention |
 | `code_map` | Ce qui définit ceci, ce qui l'importe, ce qu'il importe, où il est référencé | Vous devez savoir ce qu'un changement affecterait |
 | `replace_across` | La même modification exacte dans de nombreux fichiers | Renommer quelque chose que tout le projet utilise |
@@ -508,9 +510,26 @@ Task> rename old_function_name to new_function_name across src
 Task> which tests should I run for what I just changed?
 ```
 
-`find_text` est exact et sensible à la casse ; `search_files` est la recherche souple et
-insensible à la casse. Les deux existent parce qu'elles répondent à des questions
-différentes.
+**`glob` trouve les fichiers par chemin ou par nom ; `grep` trouve le texte à l'intérieur
+des fichiers.** C'est là toute la distinction, et c'est celle qu'il vaut la peine de bien
+saisir : l'ordre qui fonctionne, c'est `glob` pour trouver les fichiers candidats, `grep`
+pour trouver les lignes qu'ils contiennent, `read_lines` pour lire la région, puis
+modifier, puis tester — plutôt que de lire tout un dépôt pour trouver une seule ligne.
+
+```json
+{"action": "glob", "pattern": "agent_*.py"}
+{"action": "glob", "pattern": "testing/**/*.py"}
+{"action": "grep", "query": "end_conversation"}
+{"action": "grep", "query": "def run_file", "glob": "agent_*.py"}
+{"action": "grep", "query": "timeout", "path": "src", "ignore_case": true}
+```
+
+`grep` est exact et sensible à la casse par défaut, comme l'outil dont il porte le nom.
+`"ignore_case": true` le rend souple, `"regex": true` lit la requête comme une expression
+régulière, `"context"` ajoute des lignes de part et d'autre de chaque correspondance, et
+`"path"` ou `"glob"` restreint les fichiers qui sont lus. Il ne renvoie jamais un fichier
+entier : vous obtenez le chemin, le numéro de ligne et la ligne, et `read_lines` vous
+donne le reste.
 
 **`replace_across` fait une prévisualisation par défaut.** Il indique combien de fichiers
 et d'occurrences il *changerait* et n'écrit rien. Renvoyer la même action avec
@@ -1260,7 +1279,7 @@ chemin.
 
 `read_only: true` signifie que l'agent peut inspecter cet espace de travail et n'a pas le
 droit de le modifier. Il conserve tous les verbes de lecture — `read_file`, `read_lines`,
-`list_files`, `search_files`, `find_text`, `find_symbol`, `tree`, `code_map`,
+`list_files`, `glob`, `grep`, `find_symbol`, `tree`, `code_map`,
 `related_tests`, `recall`, `git_status`, `git_diff`, `git_identity` — et tout le reste lui
 est refusé.
 

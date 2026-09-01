@@ -1,10 +1,16 @@
-"""Tests for the exact search and the bulk replace.
+"""Tests for `replace_across`, the bulk edit.
 
-These two actions are the ones a model reaches for when it is about to edit
-something, so what they get wrong it then writes down. The tests run against
-real directories on a real disk, because every hazard here -- a binary file, a
-CRLF file, a path pointing out of the workspace -- is a property of the disk
-and not of a mock.
+This file used to hold the `find_text` tests as well, and was called
+`test_agent_search.py` for that reason. `find_text` and `search_files` were
+replaced by `grep`, whose tests live in `test_agent_grep.py`; what stayed here
+is the one action that WRITES, which is why the file kept the history and the
+name changed rather than the other way round.
+
+`replace_across` is the action a model reaches for when it is about to edit
+many files at once, so what it gets wrong it then writes down. The tests run
+against real directories on a real disk, because every hazard here -- a binary
+file, a CRLF file, a path pointing out of the workspace -- is a property of the
+disk and not of a mock.
 """
 
 import os
@@ -34,7 +40,7 @@ class Workspace:
 
     def __init__(self, files=None):
         self.previous_root = agent_config.ROOT_DIR
-        self.path = Path(tempfile.mkdtemp(prefix="tmt_search_")).resolve()
+        self.path = Path(tempfile.mkdtemp(prefix="tmt_replace_")).resolve()
         for name, body in (files or {}).items():
             self.write(name, body)
         agent_config.set_workspace_root(self.path)
@@ -56,185 +62,6 @@ class Workspace:
     def close(self):
         agent_config.ROOT_DIR = self.previous_root
         remove_tree(self.path)
-
-
-# --- find_text: locating exact code -----------------------------------------
-
-def test_find_text_reports_the_path_and_the_line_number():
-    box = Workspace(files={"src/a.py": "one\ntwo\nTARGET here\nfour\n"})
-    try:
-        out = agent_file_ops.find_text("TARGET")
-        assert "src/a.py:3:" in out, out
-        assert "     3 > TARGET here" in out, out
-        assert "1 match in 1 file" in out, out
-    finally:
-        box.close()
-
-
-def test_find_text_matches_a_block_spanning_several_lines():
-    """The stated reason this exists: search_files works a line at a time and
-    cannot find the five lines a model is about to replace."""
-    body = "head\ndef f():\n    a = 1\n    return a\ntail\n"
-    box = Workspace(files={"m.py": body, "other.py": "def f():\n    pass\n"})
-    try:
-        out = agent_file_ops.find_text("def f():\n    a = 1\n    return a")
-        assert "1 match in 1 file" in out, out
-        assert "m.py:2:" in out, out
-        # every line of the block is marked as match, not as context
-        assert "     2 > def f():" in out, out
-        assert "     3 >     a = 1" in out, out
-        assert "     4 >     return a" in out, out
-        assert "other.py" not in out, out
-    finally:
-        box.close()
-
-
-def test_find_text_context_lines_are_marked_apart_from_the_match():
-    """Colour is never the message, so the two have to read apart in plain
-    text: `>` is the match, `|` is the surrounding."""
-    box = Workspace(files={"a.txt": "one\ntwo\nHIT\nfour\nfive\n"})
-    try:
-        out = agent_file_ops.find_text("HIT", context=1)
-        assert "     2 | two" in out, out
-        assert "     3 > HIT" in out, out
-        assert "     4 | four" in out, out
-        assert "one" not in out, out
-        assert "five" not in out, out
-    finally:
-        box.close()
-
-
-def test_find_text_with_no_context_shows_only_the_match():
-    box = Workspace(files={"a.txt": "one\nHIT\nthree\n"})
-    try:
-        out = agent_file_ops.find_text("HIT")
-        assert "HIT" in out
-        assert "one" not in out, out
-        assert "three" not in out, out
-    finally:
-        box.close()
-
-
-def test_find_text_filters_by_glob():
-    box = Workspace(files={"src/deep/a.py": "NEEDLE\n",
-                           "src/b.py": "NEEDLE\n",
-                           "docs/c.md": "NEEDLE\n",
-                           "top.py": "NEEDLE\n"})
-    try:
-        out = agent_file_ops.find_text("NEEDLE", glob="src/**/*.py")
-        assert "src/deep/a.py" in out, out
-        assert "src/b.py" in out, out
-        assert "docs/c.md" not in out, out
-        assert "top.py" not in out, out
-        assert "2 matches in 2 files" in out, out
-        # a bare pattern means "anywhere", which is what a model intends by it
-        every = agent_file_ops.find_text("NEEDLE", glob="*.py")
-        assert "3 matches in 3 files" in every, every
-        assert "docs/c.md" not in every, every
-    finally:
-        box.close()
-
-
-def test_find_text_never_dumps_a_binary_file():
-    box = Workspace(files={"good.txt": "NEEDLE\n",
-                           "blob.bin": b"NEEDLE\x00\x01\x02rubbish"})
-    try:
-        out = agent_file_ops.find_text("NEEDLE")
-        assert "good.txt" in out, out
-        assert "blob.bin" not in out, out
-        assert "rubbish" not in out, out
-        assert "1 match in 1 file" in out, out
-        assert "1 binary file skipped" in out, out
-    finally:
-        box.close()
-
-
-def test_find_text_does_not_search_pruned_directories():
-    """Same rule as the walk: machinery is never descended into, so a match
-    inside node_modules is not a match at all."""
-    box = Workspace(files={"src/a.py": "NEEDLE\n",
-                           "node_modules/pkg/index.js": "NEEDLE\n",
-                           ".git/config": "NEEDLE\n",
-                           "__pycache__/x.txt": "NEEDLE\n"})
-    try:
-        out = agent_file_ops.find_text("NEEDLE")
-        assert "1 match in 1 file" in out, out
-        assert "src/a.py" in out, out
-        assert "node_modules" not in out, out
-        assert ".git" not in out, out
-        assert "__pycache__" not in out, out
-    finally:
-        box.close()
-
-
-def test_find_text_states_the_real_total_and_says_when_it_capped():
-    """The header counts everything found; the cap only governs what is shown.
-    A header reporting the shown figure would understate the work left every
-    single time it truncated."""
-    box = Workspace(files={"a.txt": "hit\nhit\nhit\nhit\nhit\n"})
-    try:
-        out = agent_file_ops.find_text("hit", limit=2)
-        assert "5 matches in 1 file" in out, out
-        assert "showing the first 2" in out, out
-        assert out.count("> hit") == 2, out
-    finally:
-        box.close()
-
-
-def test_find_text_totals_are_real_across_files():
-    box = Workspace(files={"a.txt": "hit x hit\n", "b.txt": "hit\n",
-                           "c.txt": "nothing\n"})
-    try:
-        out = agent_file_ops.find_text("hit")
-        assert "3 matches in 2 files" in out, out
-    finally:
-        box.close()
-
-
-def test_find_text_is_case_sensitive_where_search_files_is_not():
-    """The whole reason for a second search action. search_files stays as it
-    was -- these are two different questions, not two spellings of one."""
-    box = Workspace(files={"a.py": "Alpha = 1\n"})
-    try:
-        missed = agent_file_ops.find_text("alpha")
-        assert "No exact match" in missed, missed
-        assert "case-insensitive" in missed, missed
-        assert "a.py" in agent_file_ops.find_text("Alpha")
-        assert "a.py" in agent_file_ops.search_files("alpha")
-    finally:
-        box.close()
-
-
-def test_find_text_refuses_a_path_outside_the_workspace():
-    box = Workspace(files={"a.txt": "x\n"})
-    try:
-        refused = False
-        try:
-            agent_file_ops.find_text("x", path="../..")
-        except ValueError:
-            refused = True
-        assert refused, "a path above the root must be refused, not searched"
-    finally:
-        box.close()
-
-
-def test_find_text_can_be_pointed_at_one_subtree():
-    box = Workspace(files={"src/a.txt": "NEEDLE\n", "other/b.txt": "NEEDLE\n"})
-    try:
-        out = agent_file_ops.find_text("NEEDLE", path="src")
-        assert "src/a.txt" in out, out
-        assert "other/b.txt" not in out, out
-        assert "1 match in 1 file" in out, out
-    finally:
-        box.close()
-
-
-def test_find_text_refuses_an_empty_query():
-    box = Workspace(files={"a.txt": "x\n"})
-    try:
-        assert "nothing to look for" in agent_file_ops.find_text("")
-    finally:
-        box.close()
 
 
 # --- replace_across: the bulk edit ------------------------------------------

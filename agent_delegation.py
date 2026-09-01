@@ -68,8 +68,12 @@ report requirement can never widen or narrow what a worker is allowed, and
 # three lists are read-only for three different reasons, and a shared name
 # would make a change to one silently a change to the others.
 READ_ONLY_ACTIONS = frozenset({
-    # Reading the workspace.
-    "list_files", "read_file", "read_lines", "search_files", "find_text",
+    # Reading the workspace. `grep` reads file contents and `glob` reads file
+    # names; neither writes, and they replaced `search_files` and `find_text`,
+    # which are gone from TMT entirely. A verb absent from this set is refused,
+    # so both new names have to be named here for a read-only delegation to be
+    # able to search at all.
+    "list_files", "read_file", "read_lines", "grep", "glob",
     "find_symbol", "tree", "code_map", "related_tests",
     # Reading what TMT remembers. `recall` reads; `remember` writes, and is
     # absent for that reason.

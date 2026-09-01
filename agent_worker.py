@@ -85,7 +85,7 @@ MAX_INVALID_RETRIES = 6
 # construction: there is no verb in here that writes a file, runs a program,
 # reaches a network or changes git.
 NOTE_ACTIONS = frozenset({
-    "list_files", "read_file", "read_lines", "search_files", "find_text",
+    "list_files", "read_file", "read_lines", "grep", "glob",
     "find_symbol", "tree", "code_map", "related_tests", "recall",
     "git_status", "git_diff", "git_identity",
     "send_message", "internal_response",
@@ -439,7 +439,8 @@ def _activity_label(action, obj):
     except Exception:
         label = str(action).replace("_", " ").title()
     target = ""
-    for key in ("path", "query", "name", "target", "search", "app", "message"):
+    for key in ("path", "query", "name", "target", "search", "pattern", "app",
+                "message"):
         value = obj.get(key) if isinstance(obj, dict) else None
         if isinstance(value, str) and value.strip():
             target = value.strip()
@@ -463,7 +464,7 @@ def _result_message(action, result):
                 "fixes the exact syntax error above." % text)
     if action == "patch_file" and "Search text not found" in text:
         return ("FAILED: %s\nThe search string did not match exactly. Use "
-                "find_text or read_lines, then retry." % text)
+                "grep or read_lines, then retry." % text)
     return ("Result: %s\nOutput your next action, or internal_response when "
             "the task is done." % text)
 
@@ -475,7 +476,7 @@ def _result_message(action, result):
 #
 # A whitelist rather than "every action that is not a mutation", because the
 # question is not "did this fail to write" but "did this look at a file", and
-# `create_folder` answers no to both. `find_text` and `find_symbol` take an
+# `create_folder` answers no to both. `grep` and `find_symbol` take an
 # optional path that narrows the search rather than naming the thing read, so
 # they are deliberately absent: a search over the whole workspace would
 # otherwise record the workspace root as a file that was inspected.

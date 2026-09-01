@@ -321,11 +321,33 @@ def test_every_other_registered_action_passes_through_untouched():
         assert agent_actions.canonical_action({"action": name}) == name, name
 
 
-def test_the_legacy_table_holds_exactly_the_two_names_a_lookup_can_settle():
-    """`respond` is deliberately absent from it: its meaning depends on a key,
-    so it is decided in code above the lookup. A table entry for it would be a
-    second answer to the same question, and the wrong one half the time."""
-    assert agent_actions._LEGACY_ACTIONS == {"announce": SEND, "done": END}
+def test_the_legacy_table_holds_exactly_the_four_names_a_lookup_can_settle():
+    """Two renames' worth of names, and no more. This test exists so the net
+    cannot grow silently: every entry is a name the model is no longer taught
+    and TMT still answers, so an addition nobody argued for is an old spelling
+    quietly staying alive.
+
+    `announce` and `done` are the speaking verbs this file is about.
+    `search_files` and `find_text` are the two search actions `grep` replaced,
+    and they are here for the same reason the other two are -- a model reaching
+    for a name it learned would otherwise spend its retry budget being told the
+    name is wrong.
+
+    `respond` is deliberately absent from all four: its meaning depends on a
+    key, so it is decided in code above the lookup. A table entry for it would
+    be a second answer to the same question, and the wrong one half the time.
+
+    The table settles the SPELLING only. `search_files` was case-insensitive
+    and `grep` is not, so half of what that name meant lived in a default
+    rather than in a key -- `adopt_verb` is what puts it back, and the wiring
+    tests are where that is pinned.
+    """
+    assert agent_actions._LEGACY_ACTIONS == {
+        "announce": SEND,
+        "done": END,
+        "search_files": "grep",
+        "find_text": "grep",
+    }
 
 
 # --- send_message does not finalize -----------------------------------------

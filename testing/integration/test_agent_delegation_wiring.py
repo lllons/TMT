@@ -221,7 +221,7 @@ def test_a_read_only_delegation_can_still_read_the_file_it_may_not_write():
         answer = run(record, manager, [
             act("read_file", path="target.txt"),
             act("list_files"),
-            act("search_files", query="original"),
+            act("grep", query="original"),
             act("internal_response", response="target.txt says 'original'")])
         assert "original" in answer, answer
         assert not record.violations, record.violations

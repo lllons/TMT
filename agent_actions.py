@@ -8,7 +8,7 @@ from agent_config import MUTATING_ACTIONS
 from agent_execution import open_app, run_file
 from agent_file_ops import (
     append_file, copy_file, create_folder, delete_file, delete_folder, list_files,
-    patch_file, read_file, read_lines, replace_lines, safe_path, search_files,
+    patch_file, read_file, read_lines, replace_lines, safe_path,
     write_file, write_files,
 )
 
@@ -1360,7 +1360,6 @@ def execute_action(obj, context=None):
     if action == "delete_file": return delete_file(obj["path"])
     if action == "read_file": return read_file(obj["path"])
     if action == "list_files": return list_files()
-    if action == "search_files": return search_files(obj["query"], regex=obj.get("regex", False), path=obj.get("path"))
     if action == "read_lines": return read_lines(obj["path"], obj.get("start", 1), obj.get("end"))
     if action == "replace_lines": return replace_lines(obj["path"], obj["start"], obj["end"], obj.get("content", ""))
     if action == "copy_file": return copy_file(obj["path"], obj.get("to") or obj.get("new_path") or obj.get("dest", ""))
@@ -1456,9 +1455,21 @@ def execute_action(obj, context=None):
     if action == "tree":
         return _run_tool("agent_tree", lambda m: m.tree(
             obj.get("path"), obj.get("depth"), obj.get("limit")))
-    if action == "find_text":
-        return _run_tool("agent_file_ops", lambda m: m.find_text(
+    # The two search verbs. Both go through `_run_tool` for its two guarantees,
+    # and both need them: a module missing from a frozen editable install comes
+    # back as a sentence the model can work around rather than an exception
+    # that ends the session, and `safe_path` refusing a path outside the
+    # workspace comes back as words rather than a traceback. Their `path` key
+    # is the one the model is most likely to point somewhere it may not go.
+    if action == "glob":
+        return _run_tool("agent_glob", lambda m: m.glob(
+            obj["pattern"], path=obj.get("path"), kind=obj.get("kind"),
+            limit=obj.get("limit")))
+    if action == "grep":
+        return _run_tool("agent_grep", lambda m: m.grep(
             obj["query"], path=obj.get("path"), glob=obj.get("glob"),
+            regex=bool(obj.get("regex", False)),
+            ignore_case=bool(obj.get("ignore_case", False)),
             context=obj.get("context", 0), limit=obj.get("limit")))
     if action == "find_symbol":
         return _run_tool("agent_symbols", lambda m: m.find_symbol(
@@ -1539,7 +1550,24 @@ END_CONVERSATION = "end_conversation"
 # through exactly the gates that verb goes through: `respond` becomes
 # `end_conversation`, which the plan, the review and the verification all hold
 # on precisely as they held `respond`.
-_LEGACY_ACTIONS = {"announce": SEND_MESSAGE, "done": END_CONVERSATION}
+#
+# The two search verbs are here for the same reason and under the same rules.
+# `search_files` and `find_text` were one loose search and one exact one, and
+# both are now `grep`, which does either. Nothing teaches the old names -- they
+# are in no prompt, no tool list and no error message -- but they were the
+# commonest verbs in TMT for a long time, so a model reaching for one out of
+# habit is answered rather than made to spend a retry on a spelling. `grep`
+# reads the workspace and nothing else, so there is no gate for this to walk
+# round.
+#
+# The translation is of the MEANING again, and for `search_files` the spelling
+# is not the whole of it: see `adopt_verb`, which turns `ignore_case` on.
+_LEGACY_ACTIONS = {
+    "announce": SEND_MESSAGE,
+    "done": END_CONVERSATION,
+    "search_files": "grep",
+    "find_text": "grep",
+}
 
 # The keys that used to make `respond` mean "and keep going". False-ish here
 # meant the message was not the final one, so a `respond` carrying one is a
@@ -1568,10 +1596,18 @@ def adopt_verb(obj):
     dispatcher cannot drift: `canonical_action` decides WHAT it means, and
     this is what makes the object say it.
 
-    It also fills in the one key the rename created a hole in. `done` required
-    no keys and `end_conversation` requires `message`, so renaming alone left
-    a bare `{"action":"done"}` failing validation -- translated, and then
-    refused for a key it never had to carry.
+    It also fills in the keys a rename left a hole in, and there are two.
+
+    `done` required no keys and `end_conversation` requires `message`, so
+    renaming alone left a bare `{"action":"done"}` failing validation --
+    translated, and then refused for a key it never had to carry.
+
+    `search_files` matched case-INSENSITIVELY and `grep` does not, so
+    translating that one's spelling alone would silently change what the reply
+    MEANS: a model that wrote "todo" expecting to find "TODO" would get a
+    different answer under a name it never chose. `ignore_case` is turned on
+    for it, and only when the model did not write the key itself. `find_text`
+    was already exact, so it is translated as it stands.
 
     The reply the model actually wrote is untouched by this: the loops keep
     `raw` and put that in the conversation, so the record still shows the
@@ -1587,6 +1623,8 @@ def adopt_verb(obj):
     if (adopted == END_CONVERSATION and was != END_CONVERSATION
             and "message" not in obj):
         obj["message"] = LEGACY_EMPTY_MESSAGE
+    if was == "search_files" and "ignore_case" not in obj:
+        obj["ignore_case"] = True
     return obj
 
 
@@ -1600,6 +1638,11 @@ def canonical_action(obj):
     the MEANING rather than the spelling is what makes the old flag safe to
     delete -- a reply written under the old rules still does exactly what it
     did.
+
+    `search_files` and `find_text` both become `grep`. This answers the verb
+    only; `adopt_verb` is what puts `search_files`'s case-insensitivity back on
+    the object, because that half of its meaning lived in a default rather than
+    in a key.
 
     Anything already using the current names, and every other action in TMT,
     is returned untouched. Not a dict, or no action at all, comes back as ""
@@ -1618,7 +1661,7 @@ def canonical_action(obj):
     return _LEGACY_ACTIONS.get(action, action)
 
 
-READ_ONLY_ACTIONS = ("list_files", "read_file", "search_files", "read_lines", "git_diff")
+READ_ONLY_ACTIONS = ("list_files", "read_file", "grep", "glob", "read_lines", "git_diff")
 
 # What the model is told when it did work without saying what the work was.
 #
@@ -1666,7 +1709,7 @@ def build_result_message(action, result, obj=None):
     if "SyntaxError" in result_str:
         return f"FAILED with SyntaxError: {result_str}\nOutput a corrected action that fixes the exact syntax error above."
     if action == "patch_file" and "Search text not found" in result_str:
-        return f"FAILED: {result_str}\nThe search string didn't match exactly. Use search_files or read_lines, then retry."
+        return f"FAILED: {result_str}\nThe search string didn't match exactly. Use grep or read_lines, then retry."
     if action == "replace_lines" and "Invalid range" in result_str:
         return f"FAILED: {result_str}\nUse read_lines on this file first, then retry replace_lines."
     if "not found" in result_str.lower() and action in ("read_file", "run_python", "patch_file", "read_lines", "copy_file"):
@@ -1684,10 +1727,10 @@ def build_result_message(action, result, obj=None):
 
 ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     "write_file", "append_file", "write_files", "patch_file", "delete_file", "read_file",
-    "list_files", "search_files", "read_lines", "replace_lines", "copy_file",
+    "list_files", "read_lines", "replace_lines", "copy_file",
     "delete_folder", "rename_file", "create_folder", "run_python", "run_file",
     "open_app", "git_status", "git_diff", "git_identity", "git_commit", "git_push",
-    "tree", "find_text", "find_symbol", "replace_across", "code_map",
+    "tree", "grep", "glob", "find_symbol", "replace_across", "code_map",
     "related_tests", "remember", "recall", "plan", "review", "verify",
     # "Project Context", which is what the transcript should say: the row is
     # about the project's own memory, not about the conversation's context
@@ -1751,7 +1794,10 @@ _EVENT_KIND_FOR_ACTION = {
     "copy_file": "file_create",
     "delete_file": "file_delete", "delete_folder": "file_delete",
     "read_file": "file_read", "read_lines": "file_read",
-    "list_files": "file_read", "search_files": "file_read",
+    # Both searches read the workspace and change nothing in it, so they take
+    # the kind every other reading verb takes. `glob` reads names rather than
+    # contents, which is a difference in what is read and not in what happens.
+    "list_files": "file_read", "grep": "file_read", "glob": "file_read",
     "run_python": "command", "run_file": "command", "open_app": "command",
     "git_status": "tool", "git_diff": "tool", "git_identity": "tool",
     "git_commit": "milestone", "git_push": "milestone",
@@ -1898,7 +1944,11 @@ def _describe(action, obj, result):
         # was labelled with that one line, which says less than the truth and
         # implies it was all of it. Describe the request instead, which is the
         # part that is known.
-        target = obj.get("path") or obj.get("query") or obj.get("app") or ""
+        # `pattern` is last because it belongs to one action: without it a
+        # `glob` row is the bare word "Glob", which says a search happened and
+        # not what was looked for.
+        target = (obj.get("path") or obj.get("query") or obj.get("pattern")
+                  or obj.get("app") or "")
         label = ACTION_LABELS.get(action, action)
         if action == "read_lines":
             # The one read whose extent is a fact rather than a guess, so it
