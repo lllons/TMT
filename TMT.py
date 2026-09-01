@@ -53,6 +53,7 @@ from agent_ui import (
     wrap_lines,
 )
 import agent_commands
+import agent_context
 import agent_manager
 import agent_panel
 from agent_session import Session
@@ -526,6 +527,61 @@ def completion_block(session, obj):
     return "", ""
 
 
+def persist_context(session, task, history, transcript=None):
+    """Write this task's real outcome into the project's memory. Returns "".
+
+    Called at both `end_conversation` sites, and the position is the whole
+    point: AFTER `completion_block` has let the ending through and AFTER
+    `execute_action` has run it. So the order a task actually goes in is
+
+        work -> verify -> review -> persist -> end
+
+    and this can never release an answer that the plan, the verification or
+    the review was holding. It is not asked until all three have agreed, and
+    nothing looks at what it returns.
+
+    It is deliberately NOT reached from `send_message`. A model saying "I have
+    implemented the feature" is a sentence, not evidence, and a message that
+    finalised the record would let a task be written down as finished halfway
+    through doing it. What gets recorded here comes from the state objects --
+    the plan's own steps, a verification result built from exit codes, a
+    parsed review verdict -- and from the paths the transcript actually saw
+    written.
+
+    Guarded to "" whatever happens. A read-only checkout, a file somebody
+    replaced with a directory, a memory module that will not import: none of
+    them may stop an answer the user has already waited for.
+    """
+    try:
+        wrote = agent_session_files(history)
+        outcome = session.context.finalize(
+            task, plan=session.plan, verify=session.verify,
+            review=session.review, wrote=wrote)
+    except Exception:
+        return ""
+    # Said only when it failed, and only then. A note written successfully is
+    # housekeeping the user did not ask to watch; a note that could NOT be
+    # written is the difference between this session being remembered and not.
+    if transcript is not None and outcome.status == agent_context.FAILED:
+        transcript.emit_kind("warning", str(outcome))
+    return ""
+
+
+def agent_session_files(history):
+    """Which paths this turn measurably touched, from the transcript's events.
+
+    `agent_session.files_touched` rather than a second walk of the same
+    events: it is already the rule for "what did this turn do", it reads the
+    events the transcript printed, and it contributes nothing rather than a
+    guess for an event that names no path.
+    """
+    try:
+        import agent_session
+        return agent_session.files_touched(history)
+    except Exception:
+        return ()
+
+
 def is_send_message(obj):
     """Whether this reply talks to the user WITHOUT ending the task.
 
@@ -711,6 +767,13 @@ def main(argv=None):
     # two so a setting toggled in the menu is live on the next launch rather
     # than written and never read -- the exact bug refresh_effort exists for.
     agent_config.refresh_auto_update()
+    # And the project context, beside them and for the same reason: a
+    # setting written by the menu and never re-read lasts one session and
+    # quietly reverts. It is read in BOTH places the other three are --
+    # here at launch and again in `_return_to_menu` -- because Settings is
+    # reachable mid-session through `/back`, and a toggle that only took
+    # effect at the next launch would look like a switch that does nothing.
+    agent_config.refresh_project_context()
     # Once per launch, and never again in this session. It returns immediately
     # when the terminal cannot drive a menu, so a piped or scripted run reaches
     # the agent exactly as it did before this screen existed.
@@ -869,6 +932,11 @@ def _return_to_menu(session, manager, prompt_box, pad, root):
     agent_config.refresh_model()
     agent_config.refresh_effort()
     agent_config.refresh_auto_update()
+    # And the project context, beside them and for the same reason. This is
+    # the site that makes the toggle actually work mid-session: Settings is
+    # reachable from here, so a user who turns the context off in the menu
+    # they just came back from expects the very next task to obey it.
+    agent_config.refresh_project_context()
     # The menu owned the screen and has just let it go. The session opens
     # again the way it opened the first time -- cleared, header at the top --
     # and the pad is counted again from the row the cursor is now on, which is
@@ -1093,11 +1161,55 @@ def _session_loop(root):
                    # from the user's typed line and from nothing the model,
                    # a worker or a tool result produced.
                    "capabilities": session.capabilities,
+                   # This project's persistent memory, so the
+                   # `project_context` action can reach it. Unlike the four
+                   # above, this object is NOT retired by `begin_turn` and is
+                   # the same one for the whole session -- it belongs to the
+                   # project rather than to the task -- so the warning that
+                   # goes with those four does not apply to it. It resolves
+                   # its own root per call, so it needs nothing here to keep
+                   # it pointed at the right workspace.
+                   "context": session.context,
                    # The user's own words, verbatim. The reviewer treats this
                    # as the source of truth and checks the implementation
                    # against it, so it must be what was actually asked rather
                    # than the model's account of what was asked.
                    "task": task}
+        # The first-prompt initialisation, and it is HERE rather than at
+        # launch on purpose: a directory appearing in somebody's project
+        # because they started a program and then changed their mind is
+        # litter. The user has now actually asked for something, the workspace
+        # is settled, and this is the last moment before the prompt is built
+        # -- which matters, because the prompt is built out of what this
+        # writes.
+        #
+        # It runs on every turn and is cheap after the first: `ensure`
+        # remembers the root it succeeded for and does nothing but compare it.
+        # What it is NOT is once-per-session, because the user can delete the
+        # directory while TMT is running, and because the context resolves its
+        # own root per call -- so if the workspace ever did move, a new project
+        # would get its own context rather than inheriting the last one's.
+        # (Today nothing moves it mid-session: `set_workspace_root` has one
+        # non-test call site, in `resolve_workspace`, and `/back` does not
+        # touch it. The per-call resolution is what makes that safe to change
+        # rather than a feature being exercised now.)
+        started = session.context.ensure(task)
+        if started.status == agent_context.CREATED:
+            # Into the scrollback, like any other permanent line, and taking
+            # its rows from the pad so the box does not move. A directory
+            # appearing in the user's own project is a thing they are told
+            # about once, on the turn it happens.
+            pad.take(2 + (render_command(
+                agent_commands.Result(started.message)) or 0))
+        elif started.status == agent_context.FAILED and session.context.announce():
+            # Said ONCE, and the task carries on regardless. A read-only
+            # checkout is not a reason to refuse work the user asked for; it
+            # is a reason to tell them nothing will be remembered -- and to
+            # tell them that one time rather than at the top of every question
+            # for the rest of the session, which is what a bare check here
+            # would do, because a context that cannot be made fails again on
+            # every turn.
+            console.print(f"[yellow]{started.message}[/yellow]")
         # The authorisation is read BEFORE the prompt is built, because the
         # prompt is built out of it: an unauthorised capability is not
         # described at all. `begin_turn` adopts it as well, which is where it
@@ -1113,7 +1225,7 @@ def _session_loop(root):
         # task. `pinned` is how much of that the loop's own trimming must
         # leave alone -- everything up to and including the task.
         messages, pinned = session.begin_turn(
-            task, get_system_prompt(session.capabilities))
+            task, get_system_prompt(session.capabilities, session.context))
         # After `begin_turn`, never before: retiring the review resets every
         # field on it, so a choice recorded a few lines earlier -- where the
         # push authority is decided -- would be wiped by the retirement that
@@ -1223,7 +1335,16 @@ def _session_loop(root):
                 # Rebuilt from THIS turn's authorisation every round, so a
                 # prompt dropped by a mutating action comes back teaching the
                 # same capabilities it taught before rather than all of them.
-                messages[0]["content"] = get_system_prompt(session.capabilities)
+                #
+                # The project context goes with it, and this call site is the
+                # one that matters more than the one above: a `project_context`
+                # write in round three has to be visible to round four, or the
+                # model reads its own note as missing and writes it again. The
+                # cache key carries a hash of the block, so an unchanged
+                # context still hits the cache exactly as it did before and a
+                # changed one builds a new entry rather than serving the old.
+                messages[0]["content"] = get_system_prompt(session.capabilities,
+                                                           session.context)
                 messages = trim_messages(messages, pinned)
                 state = {"error": None, "next_step": turn_state["next_step"],
                          "progress_seen": turn_state["progress_seen"],
@@ -1377,6 +1498,12 @@ def _session_loop(root):
                             invalidate_prompt()
                         note_work(session, sub_action, sub_obj)
                         if sub_action == END_CONVERSATION:
+                            # The project's memory, written before the answer
+                            # goes out and after every gate has agreed to let
+                            # it. Both terminal paths do this and neither can
+                            # be reached without `completion_block` having
+                            # returned an empty refusal a few lines above.
+                            persist_context(session, task, history, transcript)
                             # Said before the answer, so an answer the review
                             # never approved is never read without the reason
                             # it was let out anyway.
@@ -1493,6 +1620,10 @@ def _session_loop(root):
                     # "no JSON object found in response".
                     if is_synthetic(obj):
                         turn_state["outcome"] = str(result)
+                    # The project's memory, in the same place relative to the
+                    # answer as on the batch path: after every gate agreed,
+                    # before the answer is drawn.
+                    persist_context(session, task, history, transcript)
                     # The same warning the batch path gives, in the same place
                     # relative to the answer: before it.
                     for released in release_warnings(session):

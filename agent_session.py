@@ -31,6 +31,7 @@ import json
 
 import agent_capabilities
 import agent_config
+import agent_context
 import agent_models
 import agent_plan
 import agent_review
@@ -266,6 +267,23 @@ class Session:
         # anywhere -- and unlike the three states below it, nothing would be
         # drawn on screen to notice it by.
         self.capabilities = agent_capabilities.Capabilities()
+        # This project's persistent memory: TMT_Context/notes.md and
+        # TMT_Context/progress.md, in the workspace. Beside the four above it
+        # and built once like them -- and it is the ONE that `begin_turn` does
+        # not retire, which is the whole difference between it and the rest.
+        #
+        # A plan, a review, a verification and an authorisation all belong to
+        # ONE TASK, so carrying any of them into the next question would gate
+        # or excuse an unrelated one. This belongs to the PROJECT. Retiring it
+        # between turns would empty the memory at the start of every question,
+        # which is precisely the amnesia it exists to end.
+        #
+        # It holds no path. The context resolves its own root from
+        # agent_config.ROOT_DIR on every call, so the object follows the
+        # workspace wherever the workspace goes and two projects can never
+        # share one -- which is why there is nothing here to reset when the
+        # user moves, and nothing to leak when they come back.
+        self.context = agent_context.for_session()
 
     # --- what the next request runs under ---------------------------------
 
@@ -553,6 +571,15 @@ class Session:
         # standing would be a permission granted for a task the session has
         # just been told to forget.
         self.capabilities.retire()
+        # `self.context` is deliberately NOT retired here, and the omission is
+        # the decision rather than an oversight. The four above belong to one
+        # task and would gate or excuse an unrelated question if they survived;
+        # the project context belongs to the PROJECT, and `/clear` means
+        # "forget the conversation" and not "forget what this project is".
+        # There is a test asserting a cleared session still has it, and
+        # `ProjectContext` has no `retire` at all -- so an edit that added one
+        # here beside the other four would fail loudly rather than quietly
+        # emptying the memory every time the user tidied up.
         self._turns = []
 
     def __len__(self):

@@ -269,7 +269,17 @@ def test_installation_state_does_not_follow_the_workspace():
         box.use()
         for path in (agent_config.KEY_FILE, agent_config.GIT_IDENTITY_FILE,
                      agent_config.GIT_IDENTITY_LOCAL_FILE,
-                     agent_config.EFFORT_FILE):
+                     agent_config.EFFORT_FILE,
+                     # The project-context SETTING, named here deliberately.
+                     # The context FILES it controls are the one thing TMT
+                     # writes into the workspace on purpose -- they are notes
+                     # about the user's project, in the user's project -- and
+                     # keeping the switch in this list is what stops that
+                     # exception quietly widening into the switch following
+                     # the workspace too. A per-project on/off would mean TMT
+                     # behaved differently in each directory with nothing on
+                     # screen to say why.
+                     agent_config.PROJECT_CONTEXT_FILE):
             assert Path(path).resolve().parent == INSTALL_DIR, path
             assert box.path not in Path(path).resolve().parents
     finally:

@@ -232,6 +232,32 @@ def _is_informative(text):
     return bool(re.search(r"[A-Za-z0-9]", remainder))
 
 
+# The same two functions, under names another module may call. They exist
+# because `agent_context` writes markdown into the user's own repository --
+# files that get committed and pushed -- and it needs exactly this filter. A
+# second copy of a secret scrubber over there would be a second thing to keep
+# current, and the failure mode of the copy falling behind is a real credential
+# written into a file somebody publishes.
+#
+# Thin wrappers rather than a rename, so nothing inside this module changes and
+# every existing call site keeps meaning what it meant. The privacy of `_scrub`
+# was never about the redaction being secret; it was about it belonging to the
+# notebook. It belongs to both now, and says so here.
+
+def scrub(text):
+    """(cleaned, reasons) with anything credential-shaped removed.
+
+    The public name for `_scrub`. See its docstring for what is redacted and
+    why redaction rather than refusal.
+    """
+    return _scrub(str(text or ""))
+
+
+def is_informative(text):
+    """Whether anything but redaction markers and punctuation survived."""
+    return _is_informative(str(text or ""))
+
+
 # --- the file ---------------------------------------------------------------
 
 def _empty(workspace):

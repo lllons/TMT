@@ -21,6 +21,12 @@ DESIGN_PRINCIPLES.md
 .tmt_model
 .tmt_effort
 .tmt_autoupdate
+# Whether the persistent project context is on. TMT's own state, so it is
+# ignored here beside the other per-install choices. The context DIRECTORY it
+# controls -- TMT_Context/ -- is deliberately NOT ignored anywhere: those two
+# markdown files are notes about the project, in the project, meant to be read
+# and committed like any other documentation.
+.tmt_context
 
 # The code index and the project notebook. Both live beside the install, and
 # when TMT is run ON TMT the install and the workspace are the same directory,

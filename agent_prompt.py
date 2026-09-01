@@ -468,6 +468,46 @@ Rules:
 9. Do not run the test suite yourself with run_file when verify would do it. run_file gives up after ten seconds and knows nothing about which tests matter; verify runs the project's own command with the time it needs and reports the exit code.
 10. Background agents cannot verify and cannot see the result. It is yours, exactly as the plan and the review are."""
 
+CONTEXT_REFERENCE = r"""=== THE PROJECT'S MEMORY - ONE ACTION, AND IT OUTLIVES THIS CONVERSATION ===
+This project has a TMT_Context/ directory in its own root, holding two markdown files that survive the end of this conversation, the end of this session and the end of this process. They are already in your system prompt above, under PROJECT CONTEXT. They are also ordinary files the user can open, read, edit and commit.
+
+  notes.md     HOW THIS PROJECT WORKS. Architecture, entry points, the build command, the test command, configuration, conventions, constraints, things that break easily.
+  progress.md  WHAT HAS BEEN DONE, WHAT IS BEING DONE, AND WHAT REMAINS. Completed work, the current task, what is outstanding, the last real test result, decisions worth keeping.
+
+project_context - keys: operation. Then, for note and progress: section, content. Optional: mode.
+  {"action":"project_context","operation":"note","section":"Architecture","content":"Commands are registered in `src/commands/__init__.py`; each one is a module under `src/commands/`.","progress":"Recording where commands are registered so the next session does not have to find it again."}
+  {"action":"project_context","operation":"progress","section":"Important Decisions","content":"- Retries use the existing backoff helper rather than a new one, so both call sites stay in step.","progress":"Recording the decision behind the retry design."}
+  {"action":"project_context","operation":"note","section":"Testing","mode":"replace","content":"Tests run with `python run_tests.py`. There is no pytest configuration.","progress":"Correcting the test command - the old note named pytest, which this project does not use."}
+  {"action":"project_context","operation":"check","progress":"Checking whether the notes still name files that exist."}
+  {"action":"project_context","operation":"show","progress":"Reading what TMT already knows about this project."}
+
+The operations:
+  note      writes one section of notes.md. Section: Project Overview, Architecture, Important Files, Build, Testing, Configuration, Dependencies, Constraints, Known Issues, TMT Notes.
+  progress  writes one section of progress.md. Section: Current Status, Completed, Currently Working On, Remaining, Tests, Verification, Important Decisions, Known Issues, Next Steps.
+  check     lists paths the notes name that are NOT in the workspace any more. Use it when a note surprises you.
+  show      reports what the context holds and how big it is. You have already been given the content; this is for when you want the shape.
+
+The modes, for note and progress:
+  append   adds to the section, keeping what is there. The default, and almost always right.
+  replace  rewrites that ONE section. This is how you correct something stale. It cannot touch any other section.
+  line     adds one list item, and does nothing if that exact line is already there.
+
+A write NEVER replaces a file. It replaces at most one section, and every other section - including sections you have never heard of, which the user wrote - comes back exactly as it was. There is no operation that hands over a whole file, and there is no key that does it."""
+
+CONTEXT_RULES = r"""=== USING THE PROJECT'S MEMORY, AND KEEPING IT WORTH HAVING ===
+1. READ IT BEFORE YOU EXPLORE. The context is already in your prompt. If it says the entry point is `src/cli.py`, open that file - do not re-derive the project's layout with tree, code_map and six searches. This is the whole point of the feature: the second task in a project should be faster than the first.
+2. THE REPOSITORY IS TRUE; THE CONTEXT IS ONLY REMEMBERED. Where they disagree, the code wins, always. A note saying a file exists is not evidence that it exists. If you find the context is wrong, CORRECT IT with a note or progress operation using mode replace - do not work around it silently and leave the next session to hit the same wall.
+3. NEVER INVENT ANYTHING TO PUT IN IT. This is the same rule as everywhere else and it matters more here, because these files are read as fact months from now. If you did not confirm it, either do not write it or write what you actually know: "The build command has not been confirmed" is useful; a guessed build command is worse than an empty section.
+4. NEVER WRITE A SECRET. No API keys, no tokens, no passwords, no private keys, no values out of a .env. Write the NAME and the requirement: "Requires the API_KEY environment variable" - never the key itself. TMT redacts credential-shaped text on the way in, and you must not rely on that catching everything.
+5. IT IS NOT A CHAT LOG. Do not record that you opened a file, ran a search, or thought about something. Record what will still be worth knowing next month.
+   BAD:  {"action":"project_context","operation":"progress","section":"Completed","content":"- Read agent_prompt.py and searched for get_system_prompt"}
+   GOOD: {"action":"project_context","operation":"note","section":"Architecture","content":"The system prompt is assembled in `agent_prompt.get_system_prompt`, from module-level constants."}
+6. RECORD WHAT HAPPENED, NOT WHAT YOU MEANT TO DO. Do not mark work complete before it is complete. "- [ ] Add password reset" while you are writing it; "- [x] Add password reset" once it is written and checked. A progress file that claims work nobody did is worse than no progress file.
+7. TEST RESULTS ARE ONLY EVER REAL ONES. Write a number into the Tests section only when a test run actually produced it, and write what it said. "39 passed, 3 failed" if that is what happened. Never "all tests passing" when they are not, and never a figure you did not see.
+8. DO NOT WRITE AFTER EVERY ACTION. Update at checkpoints that mean something: you learned how a part of the project works, you finished a piece of work, tests ran, a decision was made, the task is ending. A file rewritten twenty times in one task is twenty writes nobody wanted.
+9. THE USER'S OWN WORDS ARE NOT YOURS TO REMOVE. They may have written half of these files by hand. Add to a section; replace a section only when you are correcting something you have just proved wrong. If a section holds their prose and your fact, append.
+10. THE END OF A TASK IS THE MOMENT TO RECORD IT. Before your final end_conversation, ask whether anything you learned this task is worth the next session knowing - a piece of architecture, a constraint, a decision, what is now outstanding. TMT records the mechanical part for you (the plan's state, what verification ran, what the review found); what it cannot record for you is what you understood."""
+
 REVIEW_REFERENCE = r"""=== THE REVIEW - ONE ACTION, AND IT IS NOT YOURS TO GRADE ===
 When you have implemented something substantial, a SEPARATE agent reviews it. It did not write your code, it cannot see this conversation, and it reads the repository for itself: your original request, your plan, the git diff, the files you changed, the code around them and the tests. It is read-only - it reports, it never edits - so every change it asks for is yours to make.
 
@@ -714,8 +754,56 @@ def repository_root():
         return ""
 
 
-def get_system_prompt(capabilities=None):
+def _context_block(context):
+    """The project's persistent memory, as prompt text, or "".
+
+    Guarded to "" at every step. A missing module, a context object of the
+    wrong shape, an unreadable file, a raise from inside the budgeting -- all
+    of them produce a prompt with no PROJECT CONTEXT section in it, which is
+    exactly the prompt every request had before this feature existed. A memory
+    that cannot be read must never be able to stop the request that would have
+    carried it.
+    """
+    if context is None:
+        return ""
+    try:
+        return context.for_prompt() or ""
+    except Exception:
+        return ""
+
+
+def _context_key(block):
+    """A cache key for a context block: its length and its hash.
+
+    The prompt cache is keyed on the capabilities and nothing else, which was
+    correct while every section was either a constant or the workspace
+    snapshot -- and the snapshot has its own invalidation. This block is
+    neither: two markdown files in the workspace change when the model writes
+    a note, when verification finishes, and when the USER edits them in
+    another window, and none of those goes through `invalidate_prompt`.
+
+    So the block itself is part of the key. A context that has not changed
+    hits the cache exactly as before; one that has changed builds a new entry
+    rather than serving a prompt describing a memory that has moved. Hashed
+    rather than stored whole because a dict key holding several kilobytes of
+    markdown per capability combination is a copy of the file for every
+    permission set the session used.
+    """
+    if not block:
+        return ""
+    return "%d:%x" % (len(block), hash(block) & 0xFFFFFFFF)
+
+
+def get_system_prompt(capabilities=None, context=None):
     """The main agent's prompt, teaching only the capabilities it may use.
+
+    `context` is the session's `agent_context.ProjectContext`, or None. When
+    there is one and it has anything in it, what it holds is put in the prompt
+    as a PROJECT CONTEXT section and the two teaching sections come with it --
+    there is no point telling a model how to correct a memory it has not been
+    shown. When there is not one, the prompt is byte for byte what it was
+    before this feature existed, which is what keeps every existing caller and
+    every existing test meaning what it meant.
 
     `capabilities` is the turn's `agent_capabilities.Capabilities`, and None
     means nothing is authorised. That is the same direction
@@ -740,7 +828,9 @@ def get_system_prompt(capabilities=None):
         _cached_snapshot = None
         _prompt_dirty = False
     allowed = agent_capabilities.allowed_actions(capabilities)
-    key = tuple(allowed)
+    # Built before the key, because it is part of the key. See `_context_key`.
+    context_block = _context_block(context)
+    key = (tuple(allowed), _context_key(context_block))
     if key in _cached_prompts:
         return _cached_prompts[key]
     if _cached_snapshot is None:
@@ -801,6 +891,18 @@ def get_system_prompt(capabilities=None):
     tool_choice, workflow = TOOL_CHOICE_RULES, WORKFLOW_RULES
     if agent_capabilities.PLAN in allowed:
         tool_choice, workflow = _with_plan_rules(tool_choice, workflow)
+    # The project's own memory, and how to keep it. Included only when there
+    # IS one with something in it -- teaching a model to correct a file it has
+    # not been shown costs ~1.5k tokens on every request and invites a call
+    # that can only come back saying there is nothing there.
+    #
+    # It is NOT a capability and is deliberately not in the block above: the
+    # three up there are authorised per prompt because each spends the user's
+    # money or the user's minutes, and this writes two markdown files. What
+    # governs it is a setting, which `_context_block` has already consulted by
+    # returning "" when it is off.
+    if context_block:
+        sections.extend([CONTEXT_REFERENCE, CONTEXT_RULES])
     sections.extend([
         ORCHESTRATION_REFERENCE,
         DELEGATION_RULES,
@@ -811,10 +913,23 @@ def get_system_prompt(capabilities=None):
         GIT_RULES,
         f"Workspace root: {agent_config.ROOT_DIR}",
         _repository_line(),
+        # BEFORE the snapshot, and that order is the feature rather than a
+        # layout choice. What this block says is "here is what was worked out
+        # about this project last time"; what the snapshot says is "here is
+        # the project". Reading the memory first is what lets a model open the
+        # two files it needs instead of rediscovering the repository, which is
+        # the whole reason the memory exists.
+        context_block,
         f"=== CURRENT WORKSPACE FILES AND CONTENTS ===\n{snapshot}",
         "Reminder: reply with one JSON object only. Start with { and end with }.",
     ])
-    _cached_prompts[key] = "\n\n".join(sections).strip()
+    # Empties dropped rather than joined. Every other entry in the list is a
+    # constant or an f-string that always has content; the context block is
+    # the first that can legitimately be "" -- no context, or the setting off
+    # -- and joining it anyway would put a blank gap in the prompt of every
+    # run that does not use the feature. A prompt with no project context must
+    # be byte for byte the prompt that existed before there was such a thing.
+    _cached_prompts[key] = "\n\n".join(part for part in sections if part).strip()
     return _cached_prompts[key]
 
 
@@ -856,8 +971,26 @@ def _workspace_snapshot():
     """
     shown, skipped_large, inlined_bytes, seen = [], 0, 0, 0
     truncated_by = ""
+    context_files = []
     for relative, path in iter_workspace_files(limit=WORKSPACE_MAX_SCAN):
         seen += 1
+        # TMT's own notes about this project are already in the prompt, a few
+        # sections above, in the budgeted form the context block builds. Inlining
+        # them again here would put the same text in twice -- measured at ~440
+        # tokens for a freshly created pair and up to ~4k once they have been
+        # written in, since the snapshot inlines anything under 8 KB whole and
+        # takes no notice of a budget. Worse than the duplication, it spends the
+        # snapshot's 40 KB allowance on TMT's own writing instead of on the
+        # user's source, which is what the allowance is for.
+        #
+        # NAMED rather than hidden. The paths are listed below, and nothing else
+        # is touched: `list_files`, `search_files`, `tree` and the index all
+        # still see them exactly as they see any other file, because they walk
+        # `iter_workspace_files` for themselves and this skip is local to the
+        # snapshot. A model that wants the unbudgeted text can still read it.
+        if _is_context_file(relative):
+            context_files.append(str(relative).replace("\\", "/"))
+            continue
         try:
             size = path.stat().st_size
         except OSError:
@@ -877,9 +1010,24 @@ def _workspace_snapshot():
             continue
         shown.append(f"\n--- {relative} ---\n{body}\n")
         inlined_bytes += size
-    if not shown and not skipped_large:
+    if not shown and not skipped_large and not context_files:
         return "(empty workspace)"
     notes = []
+    if context_files:
+        # Said out loud, because a file that is present and not shown must not
+        # look absent. The sentence also says where its content IS, so a model
+        # reading the snapshot is pointed at the section it was already given
+        # rather than left to read the file for itself.
+        many = len(context_files) > 1
+        notes.append(
+            "%s not inlined here: %s. %s already above, under PROJECT "
+            "CONTEXT, in a budgeted form. Read %s with read_file if you need "
+            "the whole of %s."
+            % ("These files are" if many else "This file is",
+               ", ".join(sorted(context_files)[:6]),
+               "Their content is" if many else "Its content is",
+               "them" if many else "it",
+               "them" if many else "it"))
     if truncated_by:
         notes.append(
             f"Only the first {len(shown)} files are shown here; the listing "
@@ -899,6 +1047,27 @@ def _workspace_snapshot():
     if notes:
         notes.append("Use list_files or search_files to find anything not shown.")
     return ("\n".join(notes) + "\n" if notes else "") + "".join(shown)
+
+
+def _is_context_file(relative):
+    """Whether a workspace-relative path is one of TMT's own project notes.
+
+    Asked of the top directory name only, so a `TMT_Context` somebody happens
+    to have nested inside their source is left alone -- the one this means is
+    the one at the root of the workspace, which is the only one TMT writes.
+
+    Guarded and imported lazily for the reason `_run_tool` gives: an editable
+    install freezes its module list, and a module that is invisible to the
+    entry point must degrade to "this is an ordinary file" rather than take
+    the whole prompt down with it.
+    """
+    try:
+        import agent_context
+        wanted = agent_context.CONTEXT_DIR_NAME
+    except Exception:
+        return False
+    parts = str(relative).replace("\\", "/").split("/")
+    return len(parts) > 1 and parts[0] == wanted
 
 
 def _repository_line():

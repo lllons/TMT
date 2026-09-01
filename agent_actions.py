@@ -942,6 +942,133 @@ def _git_push(agent_git, obj):
         f"({result.get('remote_url_host', 'unknown host')}): {result.get('summary', '')}"
     )
 
+# --- the project's persistent context ---------------------------------------
+#
+# `project_context` reaches TMT_Context/notes.md and TMT_Context/progress.md,
+# the two markdown files in the user's own repository that carry what TMT knows
+# about this project between sessions. One verb with an "operation", the shape
+# `plan` and `review_agenda` already use, because every operation acts on the
+# same pair of files.
+#
+# Three of the four operations are reads or narrow writes. There is deliberately
+# NO operation that replaces a file, and no key that carries one: every write
+# names a section, and `agent_context.Document` puts back every byte outside
+# that section. A model that could hand over a whole file could destroy a
+# user's own notes in one call, and no amount of prompt wording makes that safe.
+
+CONTEXT_OPERATIONS = ("show", "note", "progress", "check")
+
+_NO_CONTEXT_STATE = (
+    "The persistent project context is not available in this run, so there is "
+    "nothing to read or write. Carry on with the task; nothing is lost except "
+    "what would have been remembered for next time."
+)
+
+_CONTEXT_OFF = (
+    "Persistent project context is turned off in Settings, so TMT_Context is "
+    "neither read nor written. Do not try again this session -- the setting is "
+    "the user's and only they can change it, in the Settings menu."
+)
+
+_CONTEXT_USAGE = (
+    "FAILED: %r is not a project_context operation. Use one of: "
+    "show (read what is remembered), note (record how the project works, in "
+    "notes.md), progress (record what was done or what remains, in "
+    "progress.md), check (list notes that name paths which no longer exist)."
+)
+
+_CONTEXT_NEEDS_SECTION = (
+    "FAILED: a %s operation needs a \"section\" and \"content\". The sections "
+    "are: %s."
+)
+
+
+def _context_state(context):
+    """The project context for this session, or None when there is not one.
+
+    `(context or {}).get(...)` for the reason `_manager`, `_plan_state` and
+    `_review_state` give: a background agent's context has no such key at all,
+    and neither has an install where the session never wired one in. Both come
+    back as words rather than as a KeyError that ends the turn.
+
+    That absence is also the whole of the worker isolation for this verb.
+    `agent_worker` refuses `project_context` outright, and even if it did not,
+    a worker's context carries no `context` key -- so the two-sided isolation
+    `plan`, `review` and `verify` have is here too, by construction rather than
+    by wording.
+    """
+    return (context or {}).get("context")
+
+
+def _project_context(context, obj):
+    """Run one `project_context` operation against this project's memory.
+
+    The operation names are read here rather than in `agent_context` so that
+    module stays a document model with a filesystem behind it, and every
+    failure comes back as a sentence: a call the model got wrong is a mistake
+    to correct on its next step, exactly like a patch whose search string did
+    not match, and never a reason to stop the task.
+    """
+    state = _context_state(context)
+    if state is None:
+        return _NO_CONTEXT_STATE
+    try:
+        import agent_context
+    except Exception as error:
+        # The frozen-module-list failure `_run_tool` guards against, answered
+        # the same way: an unavailable memory is reported and the task carries
+        # on, because nothing about this feature is worth failing a turn for.
+        return "The persistent project context is unavailable: %s" % error
+    if not agent_context.enabled():
+        return _CONTEXT_OFF
+    operation = str(obj.get("operation") or "").strip().lower()
+    if operation not in CONTEXT_OPERATIONS:
+        return _CONTEXT_USAGE % (obj.get("operation"),)
+
+    if operation == "show":
+        if not state.available:
+            return ("There is no project context yet for %s. It is created on "
+                    "the first task of a session; if this is that task it may "
+                    "not have been written when you asked." % state.root)
+        return state.describe()
+
+    if operation == "check":
+        stale = state.stale_notes()
+        if not stale:
+            return ("Every path the notes name still exists in the workspace. "
+                    "That is not proof the notes are right -- only that they "
+                    "are not obviously out of date.")
+        return ("These paths are named in %s/%s but are not in the workspace: "
+                "%s.\nRead the repository to find out what replaced them, then "
+                "correct the note with a project_context note operation. Do "
+                "not act on a path that is not there."
+                % (agent_context.CONTEXT_DIR_NAME, agent_context.NOTES_NAME,
+                   ", ".join(stale)))
+
+    sections = (agent_context.NOTES_SECTIONS if operation == "note"
+                else agent_context.PROGRESS_SECTIONS)
+    section = str(obj.get("section") or "").strip()
+    content = obj.get("content") or obj.get("text") or obj.get("note") or ""
+    if not section or not str(content).strip():
+        return _CONTEXT_NEEDS_SECTION % (operation, ", ".join(sections))
+    # "append" unless the model says otherwise, which is the safe default in
+    # the one direction that matters: appending cannot lose a line somebody
+    # else wrote, and replacing can. A model that means to correct a stale
+    # note says `"mode": "replace"` and is then replacing one SECTION, never a
+    # file.
+    mode = str(obj.get("mode") or "append").strip().lower()
+    if mode not in ("append", "replace", "line"):
+        return ("FAILED: %r is not a mode. Use append (add to the section, "
+                "the default), replace (rewrite that one section, for "
+                "correcting something stale) or line (add one list item, "
+                "skipped if it is already there)." % mode)
+    if operation == "note":
+        result = state.update_notes(section, content, mode=mode)
+    else:
+        result = state.update_progress(section, content, mode=mode)
+    return str(result) if result.ok else "FAILED: %s" % result
+
+
 def execute_action(obj, context=None):
     """Run one action object and return its result.
 
@@ -1030,6 +1157,20 @@ def execute_action(obj, context=None):
     # action", which would be a true statement that sends the reader looking
     # for a typo. This one names where the verb lives and who may use it.
     if action == "review_agenda": return _REVIEW_AGENDA_ELSEWHERE
+    # The project's persistent memory. It DOES write files -- two markdown
+    # files in the workspace -- but deliberately not to MUTATING_ACTIONS: the
+    # cached system prompt describes the project's SOURCE, and TMT_Context is
+    # TMT's notes about that source rather than part of it. Invalidating on
+    # every note would rebuild the whole workspace snapshot (~8k tokens of walk
+    # and inlining) to say exactly the same thing about exactly the same files.
+    #
+    # It is not in _CAPABILITY_ACTIONS either, and that is the deliberate
+    # difference from the three above it: those spend a user's money and a
+    # user's minutes, so they are authorised per prompt. This writes two files
+    # the user can read and delete, so it is governed by a setting instead --
+    # and the setting is checked inside the handler rather than here, so a run
+    # with the feature off gets a sentence explaining that rather than silence.
+    if action == "project_context": return _project_context(context, obj)
     # Verification. It writes no file of TMT's, so it is not in
     # MUTATING_ACTIONS and the cached prompt still describes the workspace --
     # but it DOES run the project's own commands, which is why it goes through
@@ -1275,6 +1416,11 @@ ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     "open_app", "git_status", "git_diff", "git_identity", "git_commit", "git_push",
     "tree", "find_text", "find_symbol", "replace_across", "code_map",
     "related_tests", "remember", "recall", "plan", "review", "verify",
+    # "Project Context", which is what the transcript should say: the row is
+    # about the project's own memory, not about the conversation's context
+    # window, and those are two different things a user could reasonably
+    # confuse if the label were shorter.
+    "project_context",
     # Registered here although only the reviewer can carry it out, so an agent
     # that emits it anyway is named in words rather than by its raw verb. Every
     # other registered action has an entry; a missing one shows the reader
@@ -1406,6 +1552,18 @@ _REPORTED_ACTIONS = frozenset((
     # sentence this set is for, and describing the request instead would put
     # the bare word "Verify" in the transcript where the evidence belongs.
     "verify",
+    # Its result is TMT's own sentence about what the call did -- "Recorded
+    # under 'Architecture' in notes.md.", "FAILED: ..." -- so its first line
+    # can be shown, and a refused operation is read as the warning it is by
+    # the same markers every other action uses. Without it the transcript
+    # would say "Project Context" and nothing else, which does not distinguish
+    # a note that was written from one that was refused.
+    #
+    # No `action_event` override, unlike `review` and `verify`: this action's
+    # result never quotes anything a model or a program wrote, so there is no
+    # borrowed prose for the marker scan to trip over. Every word in it is
+    # this module's or `agent_context`'s.
+    "project_context",
 ))
 
 

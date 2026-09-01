@@ -135,7 +135,25 @@ REVIEW_ACTIONS = frozenset(NOTE_ACTIONS | {AGENDA_ACTION})
 # the main agent edits the files under it, which is a result about a tree that
 # never existed -- the same hazard `review` refuses to start into.
 WORKER_FORBIDDEN = frozenset({"git_push", "end_conversation", "plan",
-                              "review", "verify"})
+                              "review", "verify",
+                              # The project's persistent memory, refused for
+                              # the reason the three above it are: it is the
+                              # main agent's account of the project, written
+                              # to files the user reads and commits, and a
+                              # worker that could write it would be recording
+                              # a conclusion from inside a subtask -- before
+                              # the agent that delegated the subtask had
+                              # reached one, and without the whole task in
+                              # front of it.
+                              #
+                              # Two-sided, exactly as those are: it is absent
+                              # from every background prompt as well, so a
+                              # worker is neither taught the verb nor allowed
+                              # it. And a background agent's action context
+                              # carries no "context" key at all, so even
+                              # reaching `execute_action` directly finds
+                              # nothing to write to.
+                              "project_context"})
 
 # Refused to every background agent, for a different reason from the verbs
 # above: these two are not the wrong shape for a worker, they are unreachable

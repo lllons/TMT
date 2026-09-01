@@ -108,7 +108,7 @@ def test_every_command_in_the_table_has_a_summary_and_a_usage_line():
     """The completion list and the error messages read from these, so a
     command added without them would offer a blank row or crash a refusal."""
     assert set(agent_commands.names()) == {"context", "config", "clear",
-                                           "effort", "model", "note",
+                                           "effort", "model", "note", "notes",
                                            "agents", "back", "plan", "verify",
                                            "review"}
     for name in agent_commands.names():
@@ -121,8 +121,15 @@ def test_every_command_in_the_table_has_a_summary_and_a_usage_line():
 def test_typing_a_slash_offers_the_commands_and_narrows_as_you_type():
     assert [name for name, _ in agent_commands.completions("/")] == [
         "/context", "/config", "/clear", "/effort", "/model", "/note",
-        "/agents", "/back", "/plan", "/verify", "/review"]
+        "/notes", "/agents", "/back", "/plan", "/verify", "/review"]
     assert [name for name, _ in agent_commands.completions("/mo")] == ["/model"]
+    # `/note` and `/notes` share a prefix, and both are offered until the
+    # trailing "s" settles it. They are two different questions -- one asks
+    # about the workspace, one reads what was already learned about it -- so
+    # the completion list has to show both rather than hiding the longer one.
+    assert [name for name, _ in agent_commands.completions("/not")] == [
+        "/note", "/notes"]
+    assert [name for name, _ in agent_commands.completions("/notes")] == ["/notes"]
     assert [name for name, _ in agent_commands.completions("/b")] == ["/back"]
     assert [name for name, _ in agent_commands.completions("/c")] == [
         "/context", "/config", "/clear"]
@@ -341,7 +348,13 @@ def test_no_command_ever_prints_a_credential():
     previous = agent_credentials.credential
     try:
         agent_credentials.credential = lambda provider_id=None: fake
-        for line in ("/context", "/config", "/clear", "/effort", "/model"):
+        # `/notes` is in this list because it PRINTS A STORED FILE, which
+        # makes it the one command here whose output TMT did not write itself.
+        # Everything else reports settled facts about the session; this reads
+        # markdown a model and a user have been editing, and a credential that
+        # got past the write-side scrubber would come straight back out here.
+        for line in ("/context", "/config", "/clear", "/effort", "/model",
+                     "/notes"):
             text = agent_commands.dispatch(line, session(turns=2)).text()
             assert fake not in text, line
             for fragment in (fake[:12], fake[-12:], fake[8:24]):

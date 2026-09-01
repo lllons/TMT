@@ -1040,8 +1040,21 @@ def test_note_is_a_command_with_a_summary_and_a_usage_line_like_the_others():
     assert "note" in agent_commands.names()
     assert agent_commands.SUMMARY["note"]
     assert agent_commands.USAGE["note"].startswith("/note")
-    assert [name for name, _ in agent_commands.completions("/n")] == ["/note"]
-    assert agent_commands.suggestion("/n") == "ote"
+    # `/n` offers BOTH, because `/notes` exists now and is a different
+    # question: `/note` asks the workspace something, `/notes` reads what
+    # earlier sessions already worked out about it. This used to assert that
+    # `/n` completed to `/note` alone and suggested "ote", and both of those
+    # became wrong the moment a second n-command existed -- so what is pinned
+    # now is the ambiguity being handled correctly rather than the old
+    # single-candidate answer.
+    assert [name for name, _ in agent_commands.completions("/n")] == [
+        "/note", "/notes"]
+    # Nothing is drawn while two candidates remain: a suggestion that guesses
+    # is worse than none, because the user reads it as what Tab will do.
+    assert agent_commands.suggestion("/n") == ""
+    # A prefix that IS unambiguous still suggests, so the mechanism is intact
+    # rather than merely quiet.
+    assert agent_commands.suggestion("/ag") == "ents"
 
 
 def test_a_note_run_without_a_register_makes_its_own_and_still_answers():

@@ -516,6 +516,80 @@ def set_auto_update(enabled):
     return value
 
 
+# --- persistent project context ---------------------------------------------
+#
+# Whether TMT keeps a TMT_Context/ directory in the project it is working on:
+# notes.md, which is how the project works, and progress.md, which is what has
+# been done and what remains. The files themselves live in the WORKSPACE, which
+# is the one piece of state here that deliberately does not follow the rule the
+# rest of this section keeps -- they are notes about the user's project, in the
+# user's project, meant to be read, edited and committed by them. The SETTING
+# lives here, beside the others, because it is TMT's and applies everywhere.
+
+PROJECT_CONTEXT_FILE = INSTALL_DIR / ".tmt_context"
+
+# On. The whole value of the feature is in the second session, so an opt-in
+# default would mean nobody ever reached the session where it paid -- and what
+# it costs when nobody wants it is one directory of two readable markdown files
+# that a user can delete with no consequence at all.
+DEFAULT_PROJECT_CONTEXT = True
+
+PROJECT_CONTEXT = DEFAULT_PROJECT_CONTEXT
+
+# The same two vocabularies the auto-update setting reads, and the same reason:
+# the file is one word so it can be read and edited by hand, and it is read
+# forgivingly so hand-editing it is not a trap.
+_PROJECT_CONTEXT_OFF = ("off", "0", "false", "no", "disabled")
+_PROJECT_CONTEXT_ON = ("on", "1", "true", "yes", "enabled")
+
+
+def read_saved_project_context():
+    """Whether the project context is on, from disk, defaulting to on.
+
+    Every failure is the default, which is the rule `read_saved_effort` and
+    `read_saved_auto_update` already follow: a missing file is a fresh
+    installation, an unreadable one is somebody's permissions, and a file
+    edited by hand into nonsense is a typo. None is a reason to stop TMT
+    starting, and none is evidence that the user wanted the feature off.
+    """
+    try:
+        stored = PROJECT_CONTEXT_FILE.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return DEFAULT_PROJECT_CONTEXT
+    if stored in _PROJECT_CONTEXT_OFF:
+        return False
+    if stored in _PROJECT_CONTEXT_ON:
+        return True
+    return DEFAULT_PROJECT_CONTEXT
+
+
+def refresh_project_context():
+    """Re-read the stored setting. Called at startup, beside refresh_effort."""
+    global PROJECT_CONTEXT
+    PROJECT_CONTEXT = read_saved_project_context()
+    return PROJECT_CONTEXT
+
+
+def set_project_context(enabled):
+    """Persist the setting and make it live. Returns what was stored.
+
+    Raises on a failed write, exactly as `set_auto_update` does and for the
+    same reason: every OTHER path through this setting defaults quietly, which
+    is right for a read, but a toggle the user just pressed that silently did
+    not persist would show ON in the menu and be OFF on the next launch.
+
+    Turning it OFF stops TMT creating, reading or updating any TMT_Context
+    directory. It deletes nothing: files already written belong to the project
+    and to whoever wrote them, and a setting is not consent to remove them.
+    """
+    global PROJECT_CONTEXT
+    value = bool(enabled)
+    PROJECT_CONTEXT_FILE.write_text(("on" if value else "off") + "\n",
+                                    encoding="utf-8")
+    PROJECT_CONTEXT = value
+    return value
+
+
 def effort_names():
     """The levels, in the order they escalate rather than alphabetically."""
     return sorted(EFFORT_LEVELS,
@@ -672,6 +746,25 @@ REQUIRED_KEYS = {
     # same two-sided isolation `plan` and `review` have. A worker that could
     # verify would be producing the evidence for its own work.
     "verify": [],
+    # The project's own persistent memory: TMT_Context/notes.md, which is how
+    # this project works, and TMT_Context/progress.md, which is what has been
+    # done and what remains. One verb with an "operation" for the reason `plan`
+    # has one -- every operation acts on the same pair of files, and a model
+    # choosing between `context_note` and `context_progress` would be choosing
+    # between two spellings of one thing.
+    #
+    # NOT a capability. `plan`, `review` and `verify` are authorised per prompt
+    # by the user's own words because each of them spends real money or real
+    # minutes; this writes two markdown files. It is governed by a SETTING
+    # instead -- agent_config.PROJECT_CONTEXT, default on -- which is the right
+    # shape for something that should be on all the time and off for the whole
+    # of a session when it is off at all.
+    #
+    # Registered here and dispatched in agent_actions, documented in
+    # agent_prompt.CONTEXT_REFERENCE, and refused to background agents by
+    # agent_worker: a worker recording a decision the main agent had not
+    # reached would be writing the project's memory from inside a subtask.
+    "project_context": ["operation"],
     "tree": [], "find_text": ["query"], "find_symbol": ["name"],
     "replace_across": ["search", "replace"], "code_map": ["target"],
     "related_tests": [], "remember": ["note"], "recall": [],

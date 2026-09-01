@@ -487,6 +487,36 @@ def _resolve(argument, catalogue):
     return typed
 
 
+def _notes(argument, session):
+    """What TMT remembers about THIS PROJECT, as opposed to this conversation.
+
+    Deliberately not `/context`, and the two are worth telling apart in the
+    user's head: `/context` is how full the model's window is right now and
+    goes away when the session does; this is two markdown files in the
+    project's own root that outlive the session, the process and the machine.
+    Folding the second into the first would have put a permanent thing and a
+    momentary one under one heading.
+
+    Read-only, like `/plan` and `/review`. The files are ordinary markdown and
+    the user's editor is a better place to change them than a slash command --
+    and unlike the plan there is nothing to refuse, because they are theirs.
+    """
+    try:
+        import agent_context
+    except Exception as error:
+        # Reported in words for the reason `_plan` gives: an editable install
+        # freezes its module list, and a module that is invisible to the entry
+        # point must not take a slash command down with it.
+        return Result("Project context is unavailable",
+                      ["The project context module could not be loaded.",
+                       str(error)], ok=False)
+    context = getattr(session, "context", None) if session is not None else None
+    if context is None:
+        context = agent_context.ProjectContext()
+    return Result("Project Context",
+                  [line for line in context.describe().splitlines()])
+
+
 def _agents(argument, session, manager=None):
     """What the background agents are doing, as text rather than as a panel.
 
@@ -748,6 +778,11 @@ _HANDLERS = {
     "effort": _effort,
     "model": _model,
     "note": _note,
+    # Beside `/note` because both are about what TMT knows rather than about
+    # what it is doing, and their names sit next to each other for a reason
+    # worth stating: `/note` ASKS a question about the workspace, `/notes`
+    # READS what was already worked out about it in earlier sessions.
+    "notes": _notes,
     "agents": _agents,
     "back": _back,
     "plan": _plan,
@@ -768,6 +803,7 @@ SUMMARY = {
     "effort": "how much work TMT spends on one task",
     "model": "which model answers",
     "note": "ask about the workspace without changing it",
+    "notes": "what TMT remembers about this project between sessions",
     "plan": "the steps TMT is working through for this task",
     "verify": "what was actually run to check this task's work",
     "review": "what the independent review found",
@@ -782,6 +818,7 @@ USAGE = {
     "effort": "/effort [low|medium|high]",
     "model": "/model [<model id or name>]",
     "note": "/note <question about this workspace>",
+    "notes": "/notes",
     "plan": "/plan",
     "verify": "/verify",
     "review": "/review",

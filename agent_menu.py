@@ -169,12 +169,23 @@ SETTINGS_ITEMS = (
     # off the wrong thing.
     ("autoupdate", "Auto Update on Launch",
      "Check for a newer TMT after the launch screen"),
+    # The second switch, beside the first and drawn the same way. Its detail
+    # names WHERE the files go, because that is the thing about it a user
+    # needs to know before deciding: this one writes into their project rather
+    # than into TMT's own directory, which is true of nothing else in here.
+    ("projectcontext", "Project Context",
+     "Keep TMT_Context/notes.md and progress.md in each project"),
     ("back", "Back", "Return to the menu"),
 )
 
 # What the toggle reads as. Words rather than a glyph, so the row survives the
 # escapes being stripped -- the rule every state in TMT is drawn by.
 AUTO_UPDATE_LABELS = ("OFF", "ON")
+
+# The same two words for the second switch. A separate name rather than a
+# shared one so that either row can change its wording without silently
+# changing the other's.
+PROJECT_CONTEXT_LABELS = ("OFF", "ON")
 
 # One per keystroke, and the only thing the key screen ever echoes. ASCII on
 # purpose: it is drawn on every terminal, including the ones that cannot carry
@@ -1481,6 +1492,58 @@ def toggle_auto_update():
     return auto_update_text()
 
 
+def project_context_text():
+    """"ON" or "OFF" for the project context, read from disk each time.
+
+    The same shape as `auto_update_text` and for the same two reasons: read
+    rather than cached so the row is right immediately after a toggle without
+    anything having to invalidate anything, and guarded to the default so a
+    settings file that cannot be read draws a menu rather than stopping one.
+    """
+    try:
+        return PROJECT_CONTEXT_LABELS[
+            bool(agent_config.read_saved_project_context())]
+    except Exception:
+        return PROJECT_CONTEXT_LABELS[
+            bool(agent_config.DEFAULT_PROJECT_CONTEXT)]
+
+
+def toggle_project_context():
+    """Flip the setting and return what it now says. Never raises.
+
+    A failed write is reported by leaving the row where it was rather than by
+    stopping the menu, exactly as `toggle_auto_update` does: the user is
+    standing in Settings and the honest signal that nothing happened is that
+    nothing changed on the row they are looking at.
+
+    Turning it off deletes nothing. Any TMT_Context directory already written
+    belongs to the project and to whoever wrote it, and a setting is not
+    consent to remove somebody's notes.
+    """
+    try:
+        agent_config.set_project_context(
+            not agent_config.read_saved_project_context())
+    except Exception:
+        pass
+    return project_context_text()
+
+
+def _settings_suffix(entry):
+    """The value drawn on the right of a Settings row, or "" for a screen.
+
+    A lookup rather than a chain of conditionals because there are two
+    switches now and there will be a third: the row that opens a screen has no
+    value to state, and the row that IS a value states it here. Both switches
+    read their setting from disk per frame, so this is also what makes a
+    toggle show its new state on the very next pass of `_drive`.
+    """
+    if entry == "autoupdate":
+        return "  " + auto_update_text()
+    if entry == "projectcontext":
+        return "  " + project_context_text()
+    return ""
+
+
 def render_settings_menu_frame(selected=0, stream=None, model_id=None, size=None, phase=None):
     """Settings: what TMT talks to, with which key, as which model."""
     stream = sys.stdout if stream is None else stream
@@ -1510,8 +1573,7 @@ def render_settings_menu_frame(selected=0, stream=None, model_id=None, size=None
         # would make a reader look in two places to find out what Enter does.
         _option_row(index == selected, item[1], item[2], stream, phase, width,
                     label_width,
-                    suffix=("  " + auto_update_text()
-                            if item[0] == "autoupdate" else ""))
+                    suffix=_settings_suffix(item[0]))
         for index, item in enumerate(SETTINGS_ITEMS)
     )
     lines.append("")
@@ -3517,7 +3579,13 @@ def settings_screen(stream=None, key_reader=None, region=None, active_id=None,
             entry = SETTINGS_ITEMS[state["selected"]][0]
             if entry == "back":
                 return "done"
-            if entry == "autoupdate":
+            if entry == "projectcontext":
+                # Toggled in place beside the updater, and for the same
+                # reason: it is a switch rather than a screen. `_drive`
+                # rebuilds the frame on its next pass and `project_context_text`
+                # re-reads the file, so the row shows the new value at once.
+                toggle_project_context()
+            elif entry == "autoupdate":
                 # Toggled in place: it is a switch, not a screen, and it is
                 # the only entry here that does not open one. The frame is
                 # rebuilt on the next pass of `_drive`, which re-reads the
