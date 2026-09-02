@@ -66,6 +66,24 @@ STRIKE = "\033[9m"
 # stripped still reads the sentence. Colour is never the message here either.
 LIME = "\033[38;2;123;181;35m"
 
+# Inline code in a rendered reply: a bright, warm cyan -- warm because the
+# green side of cyan sits nearer the ramp than the blue side does, so it reads
+# as a neighbour of the palette rather than as a second one.
+#
+# **This is the one colour in TMT that is NOT a position on the red -> orange
+# -> green ramp, and it is deliberate.** Everything the ramp colours is a
+# QUANTITY: how far along, how urgent, how done. A path, a flag or a symbol in
+# the middle of a sentence is not a quantity and has no position to take -- it
+# is a different KIND of text, and the whole reason to mark it is that it is
+# not prose. Giving it a ramp position would say something false about it,
+# which is the thing the palette rule exists to prevent.
+#
+# It obeys everything else the lime obeys: static, so two frames of a reply
+# stay byte-identical and the repaint is still skipped; and never the only
+# signal, because the backticks are kept, so a terminal with no colour and a
+# reader with the escapes stripped both still see `path/to.py` for what it is.
+CYAN = "\033[38;2;79;209;197m"
+
 # The activity readout drawn hard against the right edge of the status row,
 # opposite the progress bar: a turning glyph, elapsed time and token count.
 ACTIVITY_GLYPHS = ("✻", "✽", "✻")

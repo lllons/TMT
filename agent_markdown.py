@@ -6,22 +6,31 @@ as a row of pipes, a code block with its fences. This turns that into
 something meant for a person -- and it is the same subset GitHub renders, so
 what a model writes for a web page reads correctly here.
 
-**Weights, and exactly one colour.** DESIGN_PRINCIPLES puts the gradient on
-the instruments -- the bar, the thinking word, the wordmark -- and keeps it
-off the surfaces that are read rather than watched, which is exactly what a
-reply is. Italic, strike and dim are therefore weights and nothing more.
+**Weights, and two colours.** DESIGN_PRINCIPLES puts the gradient on the
+instruments -- the bar, the thinking word, the wordmark -- and keeps it off
+the surfaces that are read rather than watched, which is exactly what a reply
+is. Italic, strike and dim are therefore weights and nothing more. Two marks
+are lit, and each is lit for a different reason:
 
-Bold is the one exception, and it is a narrow one: it is drawn in `LIME`, the
-gradient's own lime stop muted toward the neutral, so the word a model chose
-to stress is the word the eye lands on. It takes a POSITION ON THE EXISTING
-RAMP rather than a colour of its own, it never animates -- two frames of the
-same reply are still the same bytes, which is what lets `LiveRegion` skip the
-repaint -- and it is always `BOLD + LIME` rather than the colour alone, so a
-terminal with no colour still shows the emphasis as weight.
+- **Bold is `BOLD + LIME`**, the gradient's own lime stop muted toward the
+  neutral, so the word a model chose to stress is the word the eye lands on.
+  It takes a POSITION ON THE EXISTING RAMP rather than a hue of its own, and
+  it is always the weight AND the colour, so a terminal with no colour still
+  shows the emphasis.
+- **Inline code is `CYAN`**, and this is the one thing in TMT that is off the
+  ramp entirely. The ramp colours quantities -- how far along, how urgent, how
+  done -- and a path or a flag in the middle of a sentence is not a quantity
+  and has no position to take. It is a different KIND of text, which is the
+  whole reason to mark it, and giving it a ramp position would say something
+  false about it.
+
+Neither animates: two frames of the same reply are still the same bytes, which
+is what lets `LiveRegion` skip the repaint.
 
 **Every rendered line still reads with no styling at all**, which is the rule
-none of this may become an exception to, and it is why inline code keeps its
-backticks rather than being marked some other way.
+none of this may become an exception to. It is why bold keeps its weight and
+why inline code keeps its backticks -- each has something that survives the
+colour being taken away.
 
 **Spans first, wrapping second.** Inline markup is parsed into (text, style)
 runs before anything is measured, so a bold phrase that straddles a line
@@ -35,25 +44,31 @@ width and a stream to ask about encoding, and returns rows.
 import re
 
 from agent_ui import (
-    BOLD, DIM, ITALIC, LIME, RESET, STRIKE, clip_to_width, display_width,
+    BOLD, CYAN, DIM, ITALIC, LIME, RESET, STRIKE, clip_to_width, display_width,
     encodable, plain_output, wrap_words,
 )
 
-# The four weights a span can carry. A set of these travels with the text
-# rather than an escape, which is what lets the wrap measure the words.
+# The marks a span can carry. A set of these travels with the text rather than
+# an escape, which is what lets the wrap measure the words.
 STRONG, EM, STRUCK, QUIET = "strong", "em", "struck", "quiet"
+CODE = "code"
 
-# Bold is the one mark that carries a colour, and it carries the weight too.
-# `BOLD + LIME` rather than `LIME`: the colour is what a reader notices and the
-# weight is what survives a terminal that has none, so dropping either one
-# would lose the emphasis for somebody. The order is fixed here rather than
-# decided per call, because two frames of the same text have to be the same
-# bytes for the repaint to be skipped.
+# Two marks carry a colour and the rest are weights.
 #
-# QUIET is applied last in `_paint`, so bold inside a block quote is still
-# dim -- a quotation recedes as a whole, and a lime word inside one would
-# pull the eye to the part of the reply that is being quoted rather than said.
-_STYLES = {STRONG: BOLD + LIME, EM: ITALIC, STRUCK: STRIKE, QUIET: DIM}
+# STRONG is `BOLD + LIME` rather than `LIME`: the colour is what a reader
+# notices and the weight is what survives a terminal that has none, so
+# dropping either one would lose the emphasis for somebody. CODE is the cyan
+# alone, because it keeps its backticks and those are what survive instead.
+#
+# The order is fixed here rather than decided per call, because two frames of
+# the same text have to be the same bytes for the repaint to be skipped. CODE
+# comes after STRONG so a path inside a bold table header reads as a path, and
+# QUIET comes last of all, so anything inside a block quote is still dim -- a
+# quotation recedes as a whole, and a lit word inside one would pull the eye
+# to the part of the reply that is being quoted rather than said.
+_ORDER = (STRONG, EM, STRUCK, CODE, QUIET)
+_STYLES = {STRONG: BOLD + LIME, EM: ITALIC, STRUCK: STRIKE, CODE: CYAN,
+           QUIET: DIM}
 
 # What each block draws with, and the ASCII it falls back to on a console
 # that cannot encode the first choice. Checked per stream rather than assumed
@@ -139,11 +154,13 @@ def _spans(text):
         if found.start() > position:
             out.append((text[position:found.start()], frozenset()))
         if found.group("code"):
-            # The backticks stay. Every other mark here is replaced by a
-            # weight; this one has no weight to replace it with that is not
-            # already emphasis, and a reader who sees `path/to.py` knows what
-            # it is. Removing them would lose that with the escapes stripped.
-            out.append((found.group("code"), frozenset({QUIET})))
+            # The backticks stay, even though this now carries a colour --
+            # BECAUSE it carries a colour and nothing else. Bold keeps its
+            # weight when the colour is refused; this has no weight to keep
+            # that is not already emphasis, so the backticks are what is left
+            # on a plain console and with the escapes stripped. A reader who
+            # sees `path/to.py` knows what it is either way.
+            out.append((found.group("code"), frozenset({CODE})))
         elif found.group("both"):
             body = found.group("both_text") or found.group("both_text2") or ""
             out.append((body, frozenset({STRONG, EM})))
@@ -194,8 +211,7 @@ def _paint(spans, stream):
         if run:
             # A deterministic order, so two frames of the same text are the
             # same bytes -- which is what lets a repaint be skipped.
-            opened = "".join(_STYLES[name] for name in (STRONG, EM, STRUCK, QUIET)
-                             if name in styles)
+            opened = "".join(_STYLES[name] for name in _ORDER if name in styles)
             body = "".join(run)
             out.append((opened + body + RESET) if opened else body)
 

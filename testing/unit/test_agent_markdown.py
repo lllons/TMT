@@ -25,7 +25,7 @@ import time
 
 import agent_markdown as M
 from agent_ui import (
-    DIM, LIME, _gradient, display_width, strip_ansi, wrap_words,
+    CYAN, DIM, LIME, _gradient, display_width, strip_ansi, wrap_words,
 )
 
 
@@ -358,6 +358,53 @@ def test_one_run_of_escapes_per_phrase_rather_than_one_per_word():
     painted = M.render("A **long bold phrase here** ends.", 60, Console())[0]
     assert painted.count(LIME) == 1, repr(painted)
     assert strip_ansi(painted).strip() == "A long bold phrase here ends.", painted
+
+
+# --- inline code is the other lit mark --------------------------------------
+
+def test_inline_code_is_cyan_and_bold_is_still_lime():
+    """Two marks, two colours, one line. They have to be told apart at a
+    glance or there was no point colouring either of them."""
+    painted = M.render("Edit `agent_ui.py` and set **LIME** now.", 70,
+                       Console())[0]
+    assert CYAN in painted and LIME in painted, repr(painted)
+    assert painted.index(CYAN) < painted.index(LIME), repr(painted)
+    assert strip_ansi(painted).strip() == "Edit `agent_ui.py` and set LIME now."
+
+
+def test_the_cyan_is_deliberately_off_the_ramp():
+    """The one colour in TMT that is not a position on red -> orange -> green.
+
+    The ramp colours QUANTITIES -- how far along, how urgent, how done -- and a
+    path in the middle of a sentence is not a quantity and has no position to
+    take. This test exists so that is a decision somebody made rather than a
+    colour that drifted, and it fails if the cyan is ever quietly moved onto
+    the ramp.
+    """
+    ramp = {_gradient(step) for step in range(0, 101)}
+    assert CYAN not in {"\033[38;2;%d;%d;%dm" % rgb for rgb in ramp}
+    # And it is warm: nearer the green side of cyan than the blue side, which
+    # is what keeps it reading as a neighbour of the palette.
+    red, green, blue = (int(part) for part in
+                        re.match(r"\033\[38;2;(\d+);(\d+);(\d+)m", CYAN).groups())
+    assert green > blue > red, (red, green, blue)
+
+
+def test_code_keeps_its_backticks_because_it_has_no_weight_to_keep():
+    """Bold survives a colourless terminal as weight. This has none, so the
+    backticks are what is left -- on a plain console and with the escapes
+    stripped."""
+    plain = M.render("Edit `agent_ui.py` now.", 70,
+                     Console(encoding="cp1252", tty=False))[0]
+    assert "\033[" not in plain, repr(plain)
+    assert "`agent_ui.py`" in plain, plain
+
+
+def test_code_inside_a_quotation_still_recedes():
+    """A quotation recedes as a whole. A lit path inside one would pull the
+    eye to the part of the reply being quoted rather than said."""
+    painted = M.render("> run `pytest` first", 60, Console())[0]
+    assert painted.rindex(DIM) > painted.rindex(CYAN), repr(painted)
 
 
 # --- what the renderer used to get wrong ------------------------------------
