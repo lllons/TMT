@@ -53,14 +53,18 @@ The decision sequence, and why each step is where it is:
    not a failure.
 2. **The restart guard.** Asked before any network call, because a process
    that may not apply an update can still answer the cheap questions.
-3. **A dirty working tree -> BLOCKED_DIRTY, and nothing is fetched.** This is
-   the one ordering decision worth arguing about, so it is written down rather
-   than asserted: checking dirtiness first costs the user the knowledge that
-   an update exists, and buys them no network call on every launch of a
-   checkout they are working in. Anyone who has ever edited TMT is in that
-   case every time they start it, and a fetch they can do nothing with is a
-   second of startup spent to tell them something they cannot act on. The
-   trade is deliberate and it is the one an editor of TMT feels.
+3. **A dirty working tree -> BLOCKED_DIRTY, AFTER the fetch.** This ordering
+   was the other way round until 2026-09-02 and the reversal is deliberate, so
+   both sides are written down. Checking dirtiness first bought a launch with
+   no network call in a checkout somebody was editing; what it cost was that
+   such a checkout dropped out of the update loop **silently and permanently**
+   -- it never fetched, so it never knew, so it never said. One stray file in
+   an installation was enough, and the user's only symptom was an agent that
+   quietly stopped keeping current. Now every launch of every checkout asks
+   the same question and reports the same answer, whichever way TMT was
+   installed, and a dirty tree changes only what may be APPLIED. The refusal
+   names the waiting commits and how to take them. **Nothing about what may be
+   TOUCHED changed: a tree with uncommitted work is still never written to.**
 4. **No upstream -> NO_UPSTREAM.** Asked of git rather than guessed at, and a
    detached HEAD lands here too: there is no branch, so there is nothing to
    track, so there is nothing to compare against.
@@ -422,7 +426,16 @@ def _engine(root, git):
         return None, _result(
             NOT_A_REPO,
             "TMT was not installed as a git checkout, so it cannot update itself.",
-            detail=_clean(probe.stderr) or str(target))
+            # The one status here a user can do something about, so it says
+            # what. Both supported installs leave a checkout -- npm clones one
+            # into ~/.tmtcode, and `pip install -e .` runs from the clone you
+            # made -- and a copied folder or a `pip install .` into
+            # site-packages is the case that lands here and stays on whatever
+            # version it was made from.
+            detail="%s is a copy rather than a clone, so there is nothing to "
+                   "update from. Installing with `npm install -g tmtcode`, or "
+                   "from a git clone with `pip install -e .`, gives a TMT that "
+                   "keeps itself current." % target)
     resolved = Path(top).resolve()
     if resolved != engine.root:
         # Installed into a subdirectory of a larger checkout: the repository
@@ -539,13 +552,6 @@ def _check_and_update(root, git, allow_restart, env):
         return _result(ERROR, "TMT could not read its own repository.",
                        detail=_clean(error), before=before)
 
-    # Step 3. Before the fetch, deliberately. See the module docstring.
-    if not state.get("clean", False):
-        return _result(
-            BLOCKED_DIRTY,
-            "Update skipped: TMT's own folder has uncommitted changes.",
-            detail=_dirty_detail(state), before=before, after=before)
-
     upstream = _upstream(engine)
     if not upstream:
         return _result(
@@ -605,6 +611,23 @@ def _check_and_update(root, git, allow_restart, env):
             "An update is waiting; TMT will apply it on the next launch.",
             detail="%d new commit(s) on %s, not applied: this launch has "
                    "already restarted once." % (behind, upstream),
+            before=before, after=before, ahead=ahead, behind=behind)
+
+    # Step 6a. The tree, asked here rather than before the fetch. The state was
+    # read at the top and has not changed since; what moved is the moment it is
+    # ACTED on, and the difference is the whole of what the user is told. See
+    # the module docstring: an edited checkout used to drop out of the update
+    # loop silently and permanently, and now it is told what is waiting for it.
+    # Nothing about what may be TOUCHED changed -- a dirty tree is still never
+    # written to.
+    if not state.get("clean", False):
+        waiting = ("%d new commit(s) on %s, not applied: commit or stash to "
+                   "take it." % (behind, upstream))
+        changed = _dirty_detail(state)
+        return _result(
+            BLOCKED_DIRTY,
+            "An update is waiting; TMT's own folder has uncommitted changes.",
+            detail=waiting + ((" " + changed) if changed else ""),
             before=before, after=before, ahead=ahead, behind=behind)
 
     # Step 7. The weakest command that does the job.

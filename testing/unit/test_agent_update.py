@@ -481,14 +481,18 @@ def test_a_diverged_checkout_is_refused_and_keeps_its_own_commit():
         box.close()
 
 
-def test_a_dirty_checkout_is_refused_before_anything_is_fetched():
-    """Two properties in one test because they are one decision.
+def test_a_dirty_checkout_is_told_what_is_waiting_and_is_never_written_to():
+    """The user's edit survives, and they are told an update exists.
 
-    The user's edit has to survive, and the network must not be touched to
-    find that out. The ordering is the deliberate trade written down in the
-    module docstring: it costs the user the knowledge that an update exists,
-    and it buys them no network call on every launch of a checkout they are
-    working in -- which is every launch, for anyone who has ever edited TMT.
+    The second half is the reversal of 2026-09-02. This test used to assert
+    that NOTHING was fetched, which bought a launch with no network call in a
+    checkout somebody was editing -- and cost that checkout its place in the
+    update loop, silently and for as long as the file stayed modified. It
+    fetches now, so every install asks the same question on every launch and
+    reports the same answer; what a dirty tree still refuses is the APPLY.
+
+    `merge` is the assertion that matters and it is unchanged. Nothing may be
+    written to a tree with uncommitted work in it.
     """
     if not git_ready():
         return
@@ -500,12 +504,35 @@ def test_a_dirty_checkout_is_refused_before_anything_is_fetched():
         engine = box.engine()
         result = U.check_and_update(git=engine)
         assert result.status == U.BLOCKED_DIRTY, result.as_dict()
-        assert "fetch" not in engine.subcommands(), engine.calls
+        # It looked, which is the change...
+        assert "fetch" in engine.subcommands(), engine.calls
+        assert result.behind == 1, result.as_dict()
+        # ...and it did not touch anything, which is not.
         assert "merge" not in engine.subcommands(), engine.calls
         assert box.head() == head
         assert (box.install / "README.md").read_text(encoding="utf-8") == \
             "the user was in the middle of something\n"
+        # The refusal names both halves: what is waiting, and what is in the
+        # way. A user who is told neither cannot act on either.
         assert "README.md" in result.detail, result.detail
+        assert "1 new commit" in result.detail, result.detail
+        assert "stash" in result.detail, result.detail
+    finally:
+        box.close()
+
+
+def test_a_dirty_checkout_that_is_level_says_so_rather_than_blaming_the_edit():
+    """Before the reversal every launch of an edited checkout said "update
+    skipped", whether or not there was an update to skip -- which reads as
+    something being withheld when the true answer is that there is nothing to
+    withhold. Now the tree is only mentioned when it is actually in the way."""
+    if not git_ready():
+        return
+    box = Sandbox()
+    try:
+        box.write("README.md", "edited, but level with the remote\n")
+        result = U.check_and_update(root=box.install)
+        assert result.status == U.CURRENT, result.as_dict()
     finally:
         box.close()
 
@@ -513,11 +540,17 @@ def test_a_dirty_checkout_is_refused_before_anything_is_fetched():
 def test_an_untracked_file_counts_as_dirty_too():
     """`clean` is not "no modified tracked files": a fast-forward that brings
     in a path the user already has as an untracked file fails in the middle,
-    and the refusal is cheaper than the recovery."""
+    and the refusal is cheaper than the recovery.
+
+    The remote is advanced because since 2026-09-02 the tree is only judged
+    once there is something to apply -- a checkout with a stray file and
+    nothing waiting for it is simply up to date, which is the true answer.
+    """
     if not git_ready():
         return
     box = Sandbox()
     try:
+        box.advance_remote()
         box.write("scratch.txt", "notes\n")
         result = U.check_and_update(root=box.install)
         assert result.status == U.BLOCKED_DIRTY, result.as_dict()
@@ -717,6 +750,48 @@ def test_the_update_source_is_the_install_directory_and_not_the_workspace():
         agent_git.TMTGit = real_engine
         agent_config.ROOT_DIR = real_root
         remove_tree(elsewhere)
+
+
+def test_how_tmt_was_installed_makes_no_difference_to_where_it_updates_from():
+    """npm, `pip install -e .` and a bare clone are one path, not three.
+
+    Each of them leaves TMT's modules in a git checkout and each runs this
+    same function against `INSTALL_DIR`, which is derived from where the code
+    actually sits -- so `~/.tmtcode` (npm), `C:\\Coding\\TMT` (a clone) and
+    anywhere else are the same case with a different path in it. There is no
+    npm-specific update path and this asserts the absence: the only thing that
+    decides where the update comes from is where TMT is.
+    """
+    if not git_ready():
+        return
+    # Two installations at two paths, standing in for the two install methods.
+    # Neither is told which it is, because nothing in the updater asks.
+    for attempt in ("as npm would leave it", "as a clone would"):
+        box = Sandbox()
+        try:
+            box.advance_remote()
+            result = U.check_and_update(root=box.install)
+            assert result.status == U.UPDATED, (attempt, result.as_dict())
+        finally:
+            box.close()
+
+
+def test_an_install_that_cannot_update_says_what_would():
+    """The one status a user can act on, so it has to say how.
+
+    A copied folder and a non-editable `pip install .` both land here, and
+    both stay on whatever version they were made from forever. Reporting the
+    fact without the remedy leaves somebody wondering why their agent never
+    changes.
+    """
+    plain = Path(tempfile.mkdtemp(prefix="tmt_not_a_checkout_"))
+    try:
+        result = U.check_and_update(root=plain)
+        assert result.status == U.NOT_A_REPO, result.as_dict()
+        assert "npm install -g tmtcode" in result.detail, result.detail
+        assert "pip install -e ." in result.detail, result.detail
+    finally:
+        remove_tree(plain)
 
 
 # --- the pure decisions ----------------------------------------------------

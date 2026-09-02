@@ -71,6 +71,12 @@ TMT_Context/
 # Working notes for the assistant. Per-checkout, not source.
 CLAUDE.local.md
 
+# The publishing runbook: what the maintainer types to put this on npm, written
+# for one person on one machine. It names PATH entries, a local clone and an
+# npm account, so it is notes rather than documentation -- the README is where
+# the install is documented for everybody else.
+PUBLISHING.md
+
 # Recon notes for the multi-agent work: machine-generated subsystem maps, kept
 # beside CLAUDE.local.md as working material rather than source.
 MULTIAGENT_RECON.md

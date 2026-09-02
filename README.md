@@ -203,16 +203,23 @@ installation has not been configured yet, and otherwise the ordinary start scree
 
 ### When TMT will and will not update itself
 
+**Every launch asks the same question, whichever way TMT was installed.** npm,
+`pip install -e .` and running from a clone all leave TMT's code in a git checkout, and
+the updater looks at whichever directory TMT's own code is in — so there is no
+npm-specific update path and nothing to configure. The one install that cannot update
+is one that is not a checkout at all: a copied folder, or a non-editable `pip install .`
+into site-packages. That case says so, and names the two installs that do keep current.
+
 It updates only when the update is unambiguously safe, and it never touches your work.
 
 | What it finds | What it does |
 |---|---|
 | already current | nothing. No pull, no restart |
 | remote ahead, clean tree, fast-forward possible | fast-forwards, then restarts |
-| **uncommitted local changes** | refuses, and says so. Your changes are untouched |
+| **uncommitted local changes** | tells you an update is waiting and how many commits, and applies nothing. Your changes are untouched |
 | **the branch has diverged** — local and remote both moved | refuses. Local commits are never discarded |
 | no upstream configured, or a detached HEAD | says it cannot tell, and continues |
-| not a git checkout at all | continues |
+| not a git checkout at all | says this install cannot update itself, and how to install one that can |
 | no network, no git, a bad remote, a failed merge | reports the failure and continues |
 
 It works on the branch you already have checked out and never creates, switches or
@@ -228,6 +235,11 @@ An npm install updates itself like any other: `~/.tmtcode` is an ordinary shallo
 clone with an upstream, so it is a checkout the updater can fast-forward rather than a
 folder somebody copied. Reinstalling with npm is not how you update TMT — launching it
 is.
+
+A checkout you have edited still checks and still reports; what it will not do is apply
+anything on top of your changes. That ordering was the other way round until 2026-09-02,
+and an edited checkout used to skip the check entirely — which meant it quietly stopped
+being told about updates for as long as the edit sat there.
 
 ### Restarting
 
