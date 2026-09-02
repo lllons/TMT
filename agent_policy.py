@@ -612,6 +612,16 @@ _GIT_CONFIG_REASON = (
     "tool."
 )
 
+_GIT_REMOTE_REASON = (
+    "DENIED: `git remote %s` changes where a remote name points, and where a "
+    "push GOES is part of the same guarantee as whether it may happen. A push "
+    "is authorised by the user's own words in the task text; repointing "
+    "`origin` first would send that authorised push somewhere they never "
+    "named. Reading remotes is allowed -- `git remote`, `git remote -v`, "
+    "`git remote show origin`. Changing one is the user's to do, outside this "
+    "tool."
+)
+
 _GIT_INLINE_CONFIG_REASON = (
     "DENIED: `git %s` sets git configuration for the length of one command. "
     "That is a configuration write, which TMT never makes, and it is also a "
@@ -678,7 +688,37 @@ def _git_refusal(name, args):
         return Decision(DENY, _GIT_COMMIT_REASON, RULE_GIT)
     if subcommand == "config" and not _git_config_reads(rest):
         return Decision(DENY, _GIT_CONFIG_REASON, RULE_GIT)
+    if subcommand == "remote" and _git_remote_writes(rest):
+        # WHERE A PUSH GOES is part of the push guarantee, and this is the
+        # gap that shape leaves if only `push` itself is guarded. `git remote
+        # set-url origin <somewhere else>` pushes nothing; it repoints the
+        # name that the NEXT push resolves through -- and that next push can
+        # be a perfectly ordinary `git_push`, authorised by the user's own
+        # words, going somewhere they never named. The command that does the
+        # damage is not the command that needs the authority, which is why
+        # guarding the verb alone is not enough.
+        #
+        # Reading a remote is left alone: `git remote`, `-v` and `show` say
+        # where things point and change nothing, and that is worth having.
+        return Decision(DENY, _GIT_REMOTE_REASON % (rest[0],), RULE_GIT)
     return None
+
+
+# The `git remote` operands that change where a name points. Everything else
+# it takes -- nothing at all, `-v`, `show`, `get-url` -- only reports.
+_GIT_REMOTE_WRITES = frozenset({
+    "add", "set-url", "remove", "rm", "rename", "set-head", "set-branches",
+    "prune", "update",
+})
+
+
+def _git_remote_writes(rest):
+    """Whether this `git remote` changes a remote rather than reporting one."""
+    for argument in rest:
+        if argument.startswith("-"):
+            continue
+        return argument.lower() in _GIT_REMOTE_WRITES
+    return False
 
 
 # --- step 4: every path an argument names -----------------------------------

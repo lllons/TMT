@@ -482,6 +482,47 @@ def test_the_git_config_read_forms_are_allowed_because_they_can_only_read():
                                                  decision.reason)
 
 
+def test_changing_where_a_remote_points_is_refused_with_the_push_itself():
+    """WHERE a push goes is part of the same guarantee as whether it may
+    happen, and guarding the verb alone leaves that gap wide open.
+
+    `git remote set-url origin <somewhere else>` pushes nothing. It repoints
+    the name the NEXT push resolves through -- and that next push can be a
+    perfectly ordinary `git_push`, authorised by the user's own words in the
+    task text, landing somewhere they never named. The command that does the
+    damage is not the command that carries the authority.
+
+    Found by sweeping every spelling of a push I could think of through the
+    real tool: twenty-six were refused and this one ran."""
+    with Workspace():
+        for line in ("git remote set-url origin http://elsewhere/x",
+                     "git remote add other http://elsewhere/x",
+                     "git remote remove origin", "git remote rm origin",
+                     "git remote rename origin upstream",
+                     "git remote set-head origin main",
+                     "git remote set-branches origin main",
+                     "git remote prune origin",
+                     "git remote -v set-url origin http://elsewhere/x"):
+            decision = verdict(line)
+            assert decision.verdict == P.DENY, (line, decision.verdict)
+            assert decision.rule == P.RULE_GIT, (line, decision.rule)
+            # Boundary, so no saved rule can ever hand it back.
+            assert decision.is_boundary(), line
+            assert "where a remote name points" in decision.reason, decision.reason
+
+
+def test_reading_the_remotes_is_still_an_ordinary_safe_read():
+    """The refusal above is about changing one. Saying where things point
+    changes nothing and is worth having -- a model that cannot ask which
+    remote it is on writes worse commit messages, not safer ones."""
+    with Workspace():
+        for line in ("git remote", "git remote -v", "git remote show origin",
+                     "git remote get-url origin"):
+            decision = verdict(line)
+            assert decision.verdict == P.ALLOW, (line, decision.verdict,
+                                                 decision.reason)
+
+
 def test_git_dash_c_is_a_configuration_write_and_a_way_to_hand_git_a_program():
     """`git -c core.sshCommand=...` sets configuration for the length of one
     command, and it is also the inline-code refusal arriving through an option

@@ -958,12 +958,26 @@ def test_the_running_region_draws_exactly_one_plan_column():
 def test_a_box_with_neither_a_manager_nor_a_session_is_the_box_it_always_was():
     """The rule the panel was built under and this must not break: a session
     without any of this costs exactly nothing -- no import, no frame change,
-    no extra repaint."""
+    no extra repaint.
+
+    Compared BELOW THE CAPTION, and that is not a weakening. The caption's
+    left end carries a running clock, so the top row differs whenever two
+    frames are taken either side of a second -- by design, since showing the
+    time is what it is for. The stability that matters to the repaint is the
+    box itself: `LiveRegion` skips a paint when the frame is unchanged, and it
+    is the BOX being byte-identical that keeps the caret still.
+
+    Compared whole, this test was flaky at about one run in a thousand -- it
+    passed three times in isolation and failed once inside a full-suite run,
+    which is exactly what a once-a-second tick looks like. Measured rather
+    than guessed: 4000 frames of an untouched box produced two distinct
+    values, differing only in `13:00:12` against `13:00:13`."""
     box = menu().PromptBox(stream=Terminal(), instream=Stdin())
     assert box.panel() is None
     before = box.lines(menu().LineEditor(), size=(100, 24))
     after = box.lines(menu().LineEditor(), size=(100, 24))
-    assert before == after, "two frames of an untouched box differed"
+    assert before[1:] == after[1:], "two frames of an untouched box differed"
+    assert len(before) == len(after), (len(before), len(after))
 
 
 # --- the way in without the column -----------------------------------------
