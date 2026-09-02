@@ -19,15 +19,38 @@
 
 ## Quick start
 
+**With npm — two commands, no clone and no pip step:**
+
 ```bash
 npm install -g tmtcode
 tmtcode
 ```
 
-That is the whole of it. There is no separate clone and no pip step. The install puts
-the `tmtcode` command on your PATH; the first time you run it, it downloads TMT into
-`~/.tmtcode` — about twenty seconds, and it says so while it happens — and then starts
-normally and asks for your API key.
+That is the whole of it. The install puts the `tmtcode` command on your PATH; the first
+time you run it, it downloads TMT into `~/.tmtcode` — about twenty seconds, and it says
+so while it happens — and then starts normally and asks for your API key.
+
+**From a clone — pip puts the command on your PATH:**
+
+```bash
+git clone https://github.com/lllons/TMT.git
+cd TMT
+python -m pip install -e .        # installs TMT and puts `tmtcode` on your PATH
+tmtcode
+```
+
+Windows: `py`. macOS/Linux: `python3`. Use `python -m pip install -e ".[live]"` to add
+`requests` and `rich` for streaming and colour — TMT runs without them.
+
+The clone stays where it is and is TMT's home, not your project: after installing, `cd`
+to your work and run `tmtcode` there. `pip uninstall -y tmtcode` reverses it.
+
+**Or run the clone with no install at all,** from anywhere:
+
+```bash
+python /path/to/TMT/TMT.py                    # the current directory is the project
+python /path/to/TMT/TMT.py ~/Projects/MyWebsite
+```
 
 Run it from any directory on the system. **The directory you run it in becomes the
 project TMT works on.**
@@ -51,9 +74,9 @@ Task> commit the changes and push to main
 
 `quit` or `exit` to leave. Ctrl-C cancels the current task without closing TMT.
 
-Installing from a clone with pip, pointing TMT at a directory other than the current
-one, and what to do when `tmtcode` will not start are in [Install](docs/install.md)
-and [The workspace](docs/workspace.md).
+Pointing TMT at a directory other than the current one, and what to do when `tmtcode`
+will not start, are in [Install](docs/install.md) and
+[The workspace](docs/workspace.md).
 
 ## What it can do
 
@@ -144,6 +167,107 @@ Everything TMT does, one file per part of it, in [`docs/`](docs/):
 | [Slash commands](docs/commands.md) | every command, `/back`, effort levels, completion, and what is never printed |
 | [Configuration](docs/configuration.md) | the environment variables and settings files, and their defaults |
 | [Tests](docs/tests.md) | running the suite, where it lives, and the one test that is not deterministic |
+
+## Every tool TMT can use
+
+Forty-five actions. You never name one — TMT picks them itself from what you asked for,
+and is told to choose the narrowest tool that answers the question. Each group links to
+the page that explains it.
+
+**Files** — [Files and apps](docs/files.md)
+
+| Tool | What it does |
+|---|---|
+| `write_file` | Create a file, or overwrite one |
+| `write_files` | Create several files in one action |
+| `patch_file` | Search-and-replace inside a file — the default for an edit |
+| `replace_lines` | Replace an exact line range |
+| `append_file` | Add to the end of a file |
+| `read_file` | Read a whole file |
+| `read_lines` | Read a line range, with the line numbers |
+| `list_files` | List the workspace |
+| `copy_file` | Copy a file |
+| `rename_file` | Rename or move a file |
+| `delete_file` | Delete a file, after asking you at the terminal |
+| `create_folder` | Create a folder |
+| `delete_folder` | Delete a folder — recursive is opt-in, and it asks |
+
+**Finding your way around a repository** — [Understanding a repository](docs/repository-tools.md)
+
+| Tool | What it does |
+|---|---|
+| `glob` | Find files and directories by path pattern |
+| `grep` | Search inside files, reporting path, line number and the line |
+| `tree` | Directories, files, sizes and nesting. Reads no contents |
+| `find_symbol` | Where a function, class, method, constant or type is *defined* |
+| `code_map` | What defines this, what imports it, what it imports, where it is referenced |
+| `replace_across` | The same exact edit in many files. Previews unless told to apply |
+| `related_tests` | Reads the git diff and names the tests worth running |
+| `remember` | Store a durable note about this project, secrets refused |
+| `recall` | Read those notes back |
+
+**Running things** — [Running commands](docs/bash.md), and [Apps](docs/files.md)
+
+| Tool | What it does |
+|---|---|
+| `bash` | The one execution action. Runs a command line, or `start`s, `status`es, `logs` and `stop`s a long-running job |
+| `open_app` | Open Notepad, or Explorer with a file selected. Nothing else |
+
+**The web** — research rather than browsing. Both are read-only, and both are refused to the `/note` agent and to the reviewer.
+
+| Tool | What it does |
+|---|---|
+| `web_search` | Ask a search backend about an error message or an API |
+| `web_fetch` | Read one page of documentation as text |
+
+**Git** — [Git](docs/git.md)
+
+| Tool | What it does |
+|---|---|
+| `git_status` | What has changed |
+| `git_diff` | The diff, whole or for named paths |
+| `git_identity` | Which co-author address is in force, and where it came from |
+| `git_commit` | Commit, with you as the author and TMT as co-author |
+| `git_push` | Push — only when your own words asked for one |
+
+**The three capabilities** — each does nothing unless your prompt names it. [Capabilities](docs/capabilities.md)
+
+| Tool | What it does |
+|---|---|
+| `plan` | Write and maintain this task's plan — [The plan](docs/plan.md) |
+| `review` | Start the independent reviewer — [Independent review](docs/review.md) |
+| `verify` | Run this repository's own checks — [Verification](docs/verification.md) |
+
+**The project's memory** — [Project context](docs/project-context.md)
+
+| Tool | What it does |
+|---|---|
+| `project_context` | Read and update `TMT_Context/notes.md` and `progress.md` |
+
+**Background agents** — the main agent only; a worker has no register to reach. [Background agents](docs/background-agents.md)
+
+| Tool | What it does |
+|---|---|
+| `spawn_agent` | Start a background worker, optionally under a contract |
+| `agent_status` | What every agent is doing |
+| `agent_result` | The report one agent produced |
+| `wait_for_agent` | Block until one finishes |
+| `wait_for_agents` | Block until all of them finish |
+| `kill_agent` | Stop one |
+
+**Talking to you** — [Talking to you](docs/messaging.md)
+
+| Tool | What it does |
+|---|---|
+| `send_message` | Say something; the task carries on afterwards |
+| `end_conversation` | Say the last thing. The only action that ends a task |
+
+**Used only by background agents, never by the main one**
+
+| Tool | What it does |
+|---|---|
+| `internal_response` | A worker's report back to the main agent, which is how it ends |
+| `review_agenda` | The reviewer's own checklist, drawn under the progress bar |
 
 ## License
 
