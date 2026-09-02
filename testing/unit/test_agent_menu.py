@@ -796,6 +796,236 @@ def test_no_tip_in_the_catalogue_can_overflow_the_row_it_is_drawn_in():
                     assert detail in lines[-1], (columns, gesture, lines[-1])
 
 
+# --- the Danger Zone --------------------------------------------------------
+#
+# Nothing in this section is allowed to reach the real `agent_uninstall`.
+# Every test either injects a module or replaces `uninstall_screen`, because
+# the one thing these screens do for real is delete TMT -- and a test that
+# typed the word would delete the suite it was running from.
+
+class Text:
+    """A scripted reader for the screens that take typed characters."""
+
+    def __init__(self, *strokes):
+        self.queue = list(strokes)
+        self.calls = 0
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        if not self.queue:
+            raise AssertionError("the screen asked for stroke %d; the script "
+                                 "provided %d" % (self.calls, self.calls - 1))
+        return self.queue.pop(0)
+
+
+class FakePlan:
+    """A plan shaped like `agent_uninstall`'s, with nothing behind it."""
+
+    def __init__(self, refusal="", possible=True):
+        self.root = Path(os.sep + "probe" + os.sep + "install")
+        self.checkout = True
+        self.tracked = ("TMT.py", "agent_config.py")
+        self.kept = ("CLAUDE.local.md",)
+        self.commands = (("The npm command `tmtcode`", ["npm"]),)
+        self.is_workspace = False
+        self.refusal = refusal
+        self.notes = ("your notes stay where they are",)
+        self._possible = possible
+
+    @property
+    def possible(self):
+        return self._possible and not self.refusal
+
+
+class FakeReport:
+    def __init__(self, root):
+        self.root = root
+        self.removed, self.kept, self.failures, self.commands = 2, 1, (), ()
+
+    def lines(self):
+        return ["2 file(s) removed from %s." % self.root,
+                "1 file(s) kept: everything git ignores."]
+
+
+class FakeUninstall:
+    """Stands in for the module. Records whether it was asked to do it."""
+
+    def __init__(self, plan=None):
+        self._plan = plan or FakePlan()
+        self.executed = []
+
+    def plan(self, root=None):
+        return self._plan
+
+    def execute(self, plan, run=None):
+        self.executed.append(plan)
+        return FakeReport(plan.root)
+
+
+def test_the_danger_zone_is_the_last_row_before_back():
+    """Position is the design. Everything above it changes what TMT does
+    next; this one ends TMT, so it does not sit between two preferences --
+    and Back stays last, where every other screen keeps it."""
+    keys = [item[0] for item in menu().SETTINGS_ITEMS]
+    assert keys[-2:] == ["danger", "back"], keys
+    assert keys.count("danger") == 1
+
+
+def test_the_danger_screen_opens_on_back_and_says_what_it_would_take():
+    """The cursor never starts on the row that removes the program: an Enter
+    carried in from the screen before has to land on the way out. And the
+    warning is read with the escapes stripped, because colour is never the
+    message -- least of all here."""
+    stream = Console()
+    frame = "\n".join(visible(line) for line
+                      in menu().render_danger_frame(1, stream, size=(80, 24)))
+    assert "Danger Zone" in frame, frame
+    assert "can be undone" in frame, frame
+    assert "git ignores stays" in frame, frame
+    # Row two is the selected one, and row two is Back.
+    marked = [line for line in frame.splitlines() if line.startswith(" >")]
+    assert marked and "Back" in marked[0], frame
+
+    # Driven, rather than asserted from the constant: Enter on the screen as
+    # it opens must return without anything having been uninstalled.
+    saved = menu().uninstall_screen
+    called = []
+    try:
+        menu().uninstall_screen = lambda **kwargs: called.append(True) or True
+        done = menu().danger_screen(stream=stream, key_reader=Keys("enter"),
+                                    region=menu().LiveRegion(stream))
+    finally:
+        menu().uninstall_screen = saved
+    assert done is False, done
+    assert not called, "Enter on the opening row must not start an uninstall"
+
+
+def test_the_uninstall_screen_shows_the_plan_it_would_carry_out():
+    """The counted facts, not a sentence promising something. What is drawn
+    and what `execute` is handed have to be the same object, or a user agrees
+    to one thing and gets another."""
+    frame = "\n".join(visible(line) for line in menu().render_uninstall_frame(
+        FakePlan(), 0, "", Console(), size=(80, 30)))
+    assert "2 file(s) TMT installed" in frame, frame
+    assert "1 file(s) git ignores" in frame, frame
+    assert "The npm command" in frame, frame
+    assert menu().UNINSTALL_WORD in frame, frame
+    assert "your notes stay where they are" in frame, frame
+
+
+def test_nothing_happens_until_the_word_is_typed_exactly():
+    """The gap between pressing Enter twice and typing a word that means it
+    is the whole safety of this screen."""
+    stream = Console()
+    module = FakeUninstall()
+    # A word that is not the word, then Esc.
+    reader = Text("n", "o", "\r", "\x1b")
+    done = menu().uninstall_screen(stream=stream, key_reader=reader,
+                                   region=menu().LiveRegion(stream),
+                                   module=module)
+    assert done is False
+    assert module.executed == [], "a wrong word must not remove anything"
+
+
+def test_escape_leaves_tmt_exactly_where_it_is():
+    stream = Console()
+    module = FakeUninstall()
+    done = menu().uninstall_screen(stream=stream, key_reader=Text("\x1b"),
+                                   region=menu().LiveRegion(stream),
+                                   module=module)
+    assert done is False and module.executed == []
+
+
+def test_typing_the_word_removes_tmt_and_the_screen_reports_what_happened():
+    """And what it hands `execute` is the plan that was drawn, by identity."""
+    stream = Console()
+    module = FakeUninstall()
+    strokes = list(menu().UNINSTALL_WORD.lower()) + ["\r", "\r"]
+    done = menu().uninstall_screen(stream=stream, key_reader=Text(*strokes),
+                                   region=menu().LiveRegion(stream),
+                                   module=module)
+    assert done is True
+    assert module.executed == [module._plan], module.executed
+    assert module.executed[0] is module._plan, "the plan shown is the plan run"
+    # The report replaces the question rather than sitting under it: there is
+    # nothing left to answer.
+    frame = "\n".join(visible(line) for line in menu().render_uninstall_frame(
+        module._plan, 0, "", Console(), size=(80, 24),
+        report=FakeReport(module._plan.root)))
+    assert "TMT has been removed" in frame, frame
+    assert "2 file(s) removed" in frame, frame
+    assert menu().UNINSTALL_WORD not in frame, frame
+
+
+def test_a_refused_plan_cannot_be_typed_past():
+    """A home directory, a missing install: the screen says why and the word
+    does nothing, rather than the refusal being a message the user can get
+    around by typing harder."""
+    stream = Console()
+    module = FakeUninstall(FakePlan(refusal="That is your home directory."))
+    strokes = list(menu().UNINSTALL_WORD) + ["\r", "\x1b"]
+    done = menu().uninstall_screen(stream=stream, key_reader=Text(*strokes),
+                                   region=menu().LiveRegion(stream),
+                                   module=module)
+    assert done is False
+    assert module.executed == []
+    frame = "\n".join(visible(line) for line in menu().render_uninstall_frame(
+        module._plan, 0, "", Console(), size=(80, 24)))
+    assert "That is your home directory." in frame, frame
+    assert menu().UNINSTALL_WORD not in frame, "no word to type past a refusal"
+
+
+def test_an_uninstall_closes_tmt_rather_than_returning_to_a_menu():
+    """There is no Settings to come back to and no program behind it. The
+    answer is a sentinel object rather than a string, because Settings answers
+    with a model id and any string could one day be one."""
+    stream = Console()
+    saved = menu().uninstall_screen
+    try:
+        menu().uninstall_screen = lambda **kwargs: True
+        # Counted from the list rather than written out, so a row added
+        # above Danger Zone does not turn this into a test of whichever entry
+        # ends up five presses down.
+        rows = [item[0] for item in menu().SETTINGS_ITEMS]
+        # Down to Danger Zone, Enter to open it, Up to the uninstall row,
+        # Enter again. The stub stands in for the screen that would do it.
+        steps = ["down"] * rows.index("danger") + ["enter", "up", "enter"]
+        answer = menu().settings_screen(stream=stream,
+                                        key_reader=Keys(*steps),
+                                        region=menu().LiveRegion(stream),
+                                        active_id="z-ai/glm-5.2:free")
+    finally:
+        menu().uninstall_screen = saved
+    assert answer is menu().UNINSTALLED, answer
+    assert not isinstance(menu().UNINSTALLED, str), "a model id could be one"
+
+
+def test_the_danger_screens_fit_a_narrow_terminal_and_degrade_to_ascii():
+    """Both frames, at every width, on a colour terminal and on a console
+    that can encode none of the decoration."""
+    for stream in (Console(), Console(encoding="cp1252", tty=False)):
+        for columns in (120, 80, 60, 40, 30):
+            frames = [menu().render_danger_frame(0, stream, size=(columns, 24)),
+                      menu().render_uninstall_frame(FakePlan(), 3, "no", stream,
+                                                    size=(columns, 30)),
+                      menu().render_uninstall_frame(
+                          FakePlan(), 0, "", stream, size=(columns, 30),
+                          report=FakeReport("C:\\probe"))]
+            limit = max(24, columns - 1)
+            for frame in frames:
+                # Every row except the last. `_footer` is the one thing no
+                # menu screen fits to width -- its three hints are 41 columns
+                # and always have been -- so these two screens overflow at 30
+                # and 40 exactly as Settings and the launch screen already do.
+                # Asserting otherwise here would be asking two new frames to
+                # fix a component they share with every old one.
+                for line in frame[:-1]:
+                    # Measured with the escapes stripped: a painted row is
+                    # full of them and they occupy no columns.
+                    assert menu().display_width(visible(line)) <= limit, (
+                        columns, visible(line))
+
+
 def test_the_settled_facts_are_in_the_header_and_the_moving_ones_on_the_box():
     """Each fact once, in the place that can keep it true. The date and the
     workspace were settled before the first request and cannot change while

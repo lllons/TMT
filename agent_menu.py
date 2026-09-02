@@ -175,8 +175,44 @@ SETTINGS_ITEMS = (
     # than into TMT's own directory, which is true of nothing else in here.
     ("projectcontext", "Project Context",
      "Keep TMT_Context/notes.md and progress.md in each project"),
+    # Last before Back, and it is the position that does the work: everything
+    # above it changes what TMT does next, and this ends TMT. A row that can
+    # remove the program does not sit between two rows that set a preference,
+    # and the cursor starts at the top, so nobody arrives on it.
+    ("danger", "Danger Zone", "Uninstall TMT from this machine"),
     ("back", "Back", "Return to the menu"),
 )
+
+# The one thing in the Danger Zone, and Back beside it. A section with a
+# single entry looks like an oversight until you read what the entry is: the
+# room around it IS the warning, and a screen of its own is what stops an
+# Enter meant for the row above landing on this one.
+DANGER_ITEMS = (
+    ("uninstall", "Uninstall TMT", "Remove TMT's files and the tmtcode command"),
+    ("back", "Back", "Leave everything as it is"),
+)
+
+# What has to be typed to go through with it. A word rather than a key: this
+# is the only action in TMT that removes TMT, and the gap between "pressed
+# Enter twice" and "typed a word that means it" is the whole safety of the
+# screen. It is compared case-insensitively -- the deliberateness is in the
+# nine characters, not in the shift key.
+UNINSTALL_WORD = "UNINSTALL"
+
+
+class _Uninstalled(object):
+    """The answer Settings gives when there is no TMT left to go back to.
+
+    A sentinel object rather than a string, because `settings_screen` returns
+    a model id and any string could one day be one. Identity cannot collide
+    with a model, so `chosen is UNINSTALLED` is exact and stays exact.
+    """
+
+    def __repr__(self):
+        return "<uninstalled>"
+
+
+UNINSTALLED = _Uninstalled()
 
 # What the toggle reads as. Words rather than a glyph, so the row survives the
 # escapes being stripped -- the rule every state in TMT is drawn by.
@@ -1663,6 +1699,220 @@ def render_settings_menu_frame(selected=0, stream=None, model_id=None, size=None
     lines.append("")
     lines.append(_footer(stream, ("{up}/{down} Navigate", "Enter Select", "Esc Back")))
     return _fit_height(lines, rows, keep_tail=1)
+
+
+def render_danger_frame(selected=0, stream=None, size=None, phase=None):
+    """The Danger Zone: what is in here, and what it costs.
+
+    The heading says what the section is for before the rows say what it does,
+    because a user who arrived by pressing Enter on the wrong row has to be
+    able to read their way out. Esc is on the footer as it is everywhere else,
+    and Back is a row of its own as well -- the way out is never only a key
+    somebody has to know.
+    """
+    stream = sys.stdout if stream is None else stream
+    columns, rows = _terminal(size)
+    phase = gradient_phase() if phase is None else phase
+    width = _content_width(columns)
+    label_width = max(display_width(item[1]) for item in DANGER_ITEMS)
+
+    lines = ["", " " + _paint("Danger Zone", stream, phase), ""]
+    for text in _wrap_words(
+            "Nothing in here can be undone. TMT's own files go, and so does "
+            "the tmtcode command; anything git ignores stays, which is your "
+            "notes and TMT's saved key.", max(10, width - 1)):
+        lines.append(_dim(" " + text, stream))
+    lines.append(_rule(stream, phase, width))
+    lines.extend(
+        _option_row(index == selected, item[1], item[2], stream, phase, width,
+                    label_width)
+        for index, item in enumerate(DANGER_ITEMS)
+    )
+    lines.append("")
+    lines.append(_footer(stream, ("{up}/{down} Navigate", "Enter Select", "Esc Back")))
+    return _fit_height(lines, rows, keep_tail=1)
+
+
+def render_uninstall_frame(plan, typed=0, message="", stream=None, size=None,
+                           phase=None, report=None):
+    """What an uninstall would remove, and the word that starts it.
+
+    The plan is drawn as counted facts -- how many files go, how many stay,
+    which commands are there to remove -- because the alternative is a
+    sentence promising something, and this is the screen where a promise and
+    what actually happens have to be the same list. `report` swaps it for
+    what happened, which is the same shape read back.
+    """
+    stream = sys.stdout if stream is None else stream
+    columns, rows = _terminal(size)
+    phase = gradient_phase() if phase is None else phase
+    width = _content_width(columns)
+    heading = "Uninstall TMT" if report is None else "TMT has been removed"
+    lines = ["", " " + _paint(heading, stream, phase), ""]
+
+    if report is not None:
+        for row in report.lines():
+            for text in _wrap_words(row, max(10, width - 1)):
+                lines.append(fit_to_width(" " + text, width))
+        lines.append("")
+        lines.append(_footer(stream, ("Enter Close TMT",)))
+        return _fit_height(lines, rows, keep_tail=1)
+
+    lines.append(_field("Removing", str(plan.root), stream, width, name_width=11))
+    lines.append(_rule(stream, phase, width))
+    if plan.refusal:
+        for text in _wrap_words(plan.refusal, max(10, width - 1)):
+            lines.append(fit_to_width(" " + text, width))
+        lines.append("")
+        lines.append(_footer(stream, ("Esc Back",)))
+        return _fit_height(lines, rows, keep_tail=1)
+
+    lines.append(_field("Removes", "%d file(s) TMT installed" % len(plan.tracked),
+                        stream, width, name_width=11))
+    lines.append(_field("Keeps", "%d file(s) git ignores" % len(plan.kept),
+                        stream, width, name_width=11))
+    for label, _argv in plan.commands:
+        lines.append(_field("Removes", label, stream, width, name_width=11))
+    lines.append("")
+    for note in plan.notes:
+        for text in _wrap_words(note, max(10, width - 1)):
+            lines.append(_dim(" " + text, stream))
+    lines.append("")
+    # The mask is the api-key screen's: one mark per character, built from how
+    # much was typed rather than from what. Here it is not secrecy -- it is
+    # that the row must not become somewhere a half-typed word looks finished.
+    marks = _glyphs(stream)["dot"] * typed
+    # Three tiers, measured on the plain text and painted afterwards -- the
+    # word carries the gradient, so the row cannot be fitted once it is built.
+    # It gives up the instruction before it gives up the word: somebody who
+    # can see UNINSTALL and a caret can work out what to do with them, where
+    # "Type UNINST" is a screen that has told them nothing.
+    for template in ("Type %s and press Enter:  ", "Type %s:  ", "%s:  "):
+        if display_width(" " + (template % UNINSTALL_WORD) + marks) <= width:
+            lines.append(" " + (template % _paint(UNINSTALL_WORD, stream, phase))
+                         + marks)
+            break
+    else:
+        lines.append(fit_to_width(" " + UNINSTALL_WORD, width))
+    if message:
+        lines.append(_dim(" " + fit_to_width(message, max(1, width - 1)), stream))
+    lines.append("")
+    lines.append(_footer(stream, ("Esc Back",)))
+    return _fit_height(lines, rows, keep_tail=1)
+
+
+def uninstall_screen(stream=None, key_reader=None, region=None, module=None):
+    """Ask for the word, and remove TMT when it is typed. True when it was.
+
+    The plan is built once, before the question, and it is what the frame
+    shows AND what `execute` is handed -- so a user cannot agree to one thing
+    and get another. Esc anywhere before the word returns having done nothing.
+
+    Once it has run, the only key that does anything is Enter, and what it
+    does is leave: the program has just deleted itself, so there is nowhere
+    for this screen to go back to.
+    """
+    stream = sys.stdout if stream is None else stream
+    if key_reader is None:
+        if not is_interactive(stream):
+            return False
+        key_reader = _default_text_reader()
+    region = LiveRegion(stream) if region is None else region
+    if module is None:
+        try:
+            import agent_uninstall as module
+        except Exception:
+            # A module that cannot be imported must not take the screen down
+            # with it -- the same rule every lazily-imported capability here
+            # follows. There is simply nothing to offer.
+            return False
+
+    plan = module.plan()
+    typed, message, report = [], "", None
+    while True:
+        region.paint(render_uninstall_frame(plan, len(typed), message, stream,
+                                            report=report))
+        kind, value = _next_text_key(key_reader)
+        if kind == "end":
+            return report is not None
+        if report is not None:
+            # Anything at all closes it. There is no state left to protect and
+            # no screen behind this one that still exists.
+            if kind == "key" and value in ("enter", "esc", "interrupt", "eof"):
+                return True
+            continue
+        if kind == "char":
+            typed.extend(iter_graphemes(value))
+            message = ""
+            continue
+        if kind != "key":
+            continue
+        if value in ("esc", "interrupt"):
+            return False
+        if value == "backspace":
+            if typed:
+                typed.pop()
+            message = ""
+            continue
+        if value == "enter":
+            if "".join(typed).strip().upper() != UNINSTALL_WORD:
+                typed, message = [], (
+                    "That is not the word. Type %s exactly, or press Esc to "
+                    "leave TMT where it is." % UNINSTALL_WORD)
+                continue
+            if not plan.possible:
+                typed, message = [], (
+                    plan.refusal or "There is nothing here for TMT to remove.")
+                continue
+            # Painted before it starts, because removing a few hundred files
+            # and running two package managers is seconds rather than an
+            # instant, and a screen that sat still through it would read as a
+            # program that had stopped.
+            region.paint(render_uninstall_frame(plan, len(typed),
+                                                "Removing TMT...", stream))
+            report = module.execute(plan)
+            typed, message = [], ""
+    return report is not None
+
+
+def danger_screen(stream=None, key_reader=None, region=None, text_reader=None):
+    """The Danger Zone. True when TMT was uninstalled, False otherwise."""
+    stream = sys.stdout if stream is None else stream
+    if key_reader is None:
+        if not is_interactive(stream):
+            return False
+        key_reader = _default_reader()
+    if text_reader is None:
+        text_reader = key_reader
+    region = LiveRegion(stream) if region is None else region
+    # Back, not Uninstall. The cursor never starts on the row that ends the
+    # program: an Enter carried in from the screen before must land on the way
+    # out rather than on the way through.
+    state = {"selected": len(DANGER_ITEMS) - 1, "done": False}
+
+    def render():
+        return render_danger_frame(state["selected"], stream)
+
+    def on_key(key):
+        if key in (None, "esc", "quit", "interrupt"):
+            return "done"
+        if key == "up":
+            state["selected"] = (state["selected"] - 1) % len(DANGER_ITEMS)
+        elif key == "down":
+            state["selected"] = (state["selected"] + 1) % len(DANGER_ITEMS)
+        elif key == "enter":
+            entry = DANGER_ITEMS[state["selected"]][0]
+            if entry == "back":
+                return "done"
+            if entry == "uninstall":
+                if uninstall_screen(stream=stream, key_reader=text_reader,
+                                    region=region):
+                    state["done"] = True
+                    return "done"
+        return None
+
+    _drive(render, key_reader, region, on_key)
+    return state["done"]
 
 
 def render_help_frame(stream=None, size=None, phase=None):
@@ -3686,6 +3936,14 @@ def settings_screen(stream=None, key_reader=None, region=None, active_id=None,
                                       region=region, active_id=state["model"])
                 if chosen:
                     state["model"], state["changed"] = chosen, chosen
+            elif entry == "danger":
+                if danger_screen(stream=stream, key_reader=key_reader,
+                                 region=region, text_reader=text_reader):
+                    # TMT has just removed itself. There is no Settings to
+                    # come back to and no menu behind it, so the answer goes
+                    # straight out to `run_startup`, which closes.
+                    state["changed"] = UNINSTALLED
+                    return "done"
         return None
 
     _drive(render, key_reader, region, on_key)
@@ -3769,6 +4027,12 @@ def run_startup(stream=None, key_reader=None, model_id=None, workspace=None,
                 chosen = settings_screen(stream=stream, key_reader=key_reader,
                                          region=region, active_id=model_id,
                                          text_reader=text_reader)
+                if chosen is UNINSTALLED:
+                    # Identity, not truthiness: Settings answers with a model
+                    # id and this is the one answer that is not one. TMT has
+                    # been removed, so there is no menu to redraw and nothing
+                    # left to start.
+                    return "exit"
                 if chosen:
                     model_id = chosen
             elif choice == "help":

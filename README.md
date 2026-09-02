@@ -94,6 +94,31 @@ python /path/to/TMT/TMT.py ~/Projects/MyWebsite
 
 Windows: `py`. macOS/Linux: `python3`.
 
+### Uninstalling
+
+Settings → `Danger Zone` → `Uninstall TMT`, then type `UNINSTALL`. It works the
+same way whichever install you have.
+
+It removes every file TMT installed and the checkout they live in, then takes the
+`tmtcode` command off your PATH — `npm uninstall -g tmtcode` and
+`pip uninstall -y tmtcode`, whichever of the two is actually there.
+
+**It keeps everything git ignores.** Your own notes, TMT's saved API key, its logs: none
+of that was shipped by TMT and none of it is TMT's to delete. The screen shows both
+counts before anything happens, and the report afterwards names the directory so you can
+remove it yourself if you want nothing left at all.
+
+The word has to be typed rather than a key pressed, the cursor opens on `Back`, and the
+screen states what it would take before it takes it. This is the one action in TMT that
+removes TMT.
+
+By hand it is the same two steps:
+
+```bash
+npm uninstall -g tmtcode      # or: pip uninstall -y tmtcode
+rm -rf ~/.tmtcode             # or wherever your checkout is
+```
+
 ## The two directories
 
 TMT keeps its own installation and your project strictly apart. They are separate

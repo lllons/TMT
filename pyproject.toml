@@ -68,6 +68,7 @@ py-modules = [
     "agent_testsel",
     "agent_tips",
     "agent_tree",
+    "agent_uninstall",
     "agent_ui",
     "agent_update",
     "agent_verify",
