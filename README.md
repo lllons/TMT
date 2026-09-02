@@ -45,9 +45,15 @@ npm install -g tmtcode
 tmtcode
 ```
 
-That is the whole of it. There is no separate clone and no pip step: installing puts
-the `tmtcode` command on your PATH and puts TMT itself in `~/.tmtcode`, and the first
-`tmtcode` asks for your API key exactly as it always has.
+That is the whole of it. There is no separate clone and no pip step. The install puts
+the `tmtcode` command on your PATH; the first time you run it, it downloads TMT into
+`~/.tmtcode` — about twenty seconds, and it says so while it happens — and then starts
+normally and asks for your API key.
+
+**The setup is on first run and not in an install hook, deliberately.** npm 11.19 and
+later refuse a package's install scripts unless you opt in, so a package that did its
+setup in a `postinstall` would report "added 1 package" and leave nothing installed.
+TMT has no install scripts at all, which means nothing your npm can block.
 
 Needs **Node 14+** to install, and **Python 3.8+** and **git** on PATH to run — TMT is
 a Python program, and the npm package is a launcher rather than a copy of it.
@@ -93,6 +99,57 @@ python /path/to/TMT/TMT.py ~/Projects/MyWebsite
 ```
 
 Windows: `py`. macOS/Linux: `python3`.
+
+### If `tmtcode` does not start
+
+**`ModuleNotFoundError: No module named 'TMT'`** — something else called `tmtcode` is
+on your PATH ahead of this one, almost always an old `pip install -e .` whose clone has
+since been moved or deleted. The traceback names it: look for a path ending in
+`Scripts	mtcode.exe` or `bin/tmtcode`. Remove it and the npm command takes over:
+
+```bash
+pip uninstall -y tmtcode
+```
+
+**`tmtcode: TMT is not installed yet and could not be installed now`** — the first run
+tried to download TMT and could not. The message says which of the three reasons it
+was: no git on PATH, no network, or something already sitting at `~/.tmtcode` that is
+not a TMT checkout. TMT never clones over a directory it did not make.
+
+**Nothing happens, or the command is not found** — the npm global bin directory is not
+on your PATH. `npm bin -g` (older npm) or `npm prefix -g` prints where it puts
+commands.
+
+You can always do the download by hand; the launcher will use whatever is there:
+
+```bash
+git clone https://github.com/lllons/TMT.git ~/.tmtcode
+```
+
+### Uninstalling
+
+Settings → `Danger Zone` → `Uninstall TMT`, then type `UNINSTALL`. It works the
+same way whichever install you have.
+
+It removes every file TMT installed and the checkout they live in, then takes the
+`tmtcode` command off your PATH — `npm uninstall -g tmtcode` and
+`pip uninstall -y tmtcode`, whichever of the two is actually there.
+
+**It keeps everything git ignores.** Your own notes, TMT's saved API key, its logs: none
+of that was shipped by TMT and none of it is TMT's to delete. The screen shows both
+counts before anything happens, and the report afterwards names the directory so you can
+remove it yourself if you want nothing left at all.
+
+The word has to be typed rather than a key pressed, the cursor opens on `Back`, and the
+screen states what it would take before it takes it. This is the one action in TMT that
+removes TMT.
+
+By hand it is the same two steps:
+
+```bash
+npm uninstall -g tmtcode      # or: pip uninstall -y tmtcode
+rm -rf ~/.tmtcode             # or wherever your checkout is
+```
 
 ## The two directories
 

@@ -16,8 +16,30 @@ from collections import deque
 from agent_ui import (
     GRADIENT_TICK, clip_to_width, cycle_text, display_width, encodable,
     gradient_phase, iter_graphemes, pad_to_width, plain_output, safe_write,
-    wrap_lines,
+    visible_width, wrap_lines, wrap_words,
 )
+
+
+def _rendered_body(body, columns, stream):
+    """The reply as it arrives, rendered as markdown and wrapped on words.
+
+    Rendered every frame rather than once at the end, because this box IS the
+    reply for as long as it is arriving -- and markdown that only appeared
+    after the answer settled would mean the text visibly rearranged itself at
+    the moment the user finished reading it. Partial markup costs nothing:
+    an unclosed `**` is two asterisks until the closing pair arrives, which is
+    what it means anyway.
+
+    Imported inside the function for the reason every optional capability in
+    this project is: a module that cannot be loaded must not take the live
+    region down with it. The fallback keeps the word wrap, which is the half
+    of this the reader would actually miss.
+    """
+    try:
+        import agent_markdown
+        return agent_markdown.render(body, columns, stream) or [""]
+    except Exception:
+        return wrap_words(body, columns) or [""]
 
 SYMBOL_POOL = (
     "↖", "↗", "↘", "↙", "↑", "↓", "↔", "↕", "↩", "↪", "↰", "↱", "↲", "↳", "↺", "↻",
@@ -563,7 +585,7 @@ class LiveRelay:
         frame = ASCII_FRAME if plain_output(self.region.stream) else FRAME
         chrome = display_width(frame["left"]) + display_width(frame["right"]) + 2
         inner = max(10, columns - chrome)
-        wrapped = wrap_lines(body, inner)[-max(1, visible):]
+        wrapped = _rendered_body(body, inner, self.region.stream)[-max(1, visible):]
         # Undecorated on purpose. This box holds the reply as it arrives, and
         # a reply is read rather than watched: the gradient belongs on the
         # instruments -- the bar, the thinking word -- not on the border of
@@ -573,7 +595,14 @@ class LiveRelay:
         rule = frame["rule"] * (inner + chrome - 2)
         left, right = frame["left"], frame["right"]
         lines = [frame["top"] + rule + frame["top_end"]]
-        lines.extend(f"{left} {pad_to_width(line, inner)} {right}" for line in wrapped)
+        # Padded by what the row SHOWS. A rendered row carries escapes and
+        # `pad_to_width` measures the string it is handed, so padding the
+        # styled text would count every escape as a column and leave the
+        # right-hand edge of the box ragged as the reply arrives.
+        lines.extend("%s %s%s %s"
+                     % (left, line,
+                        " " * max(0, inner - visible_width(line)), right)
+                     for line in wrapped)
         lines.append(frame["bottom"] + rule + frame["bottom_end"])
         return lines
 

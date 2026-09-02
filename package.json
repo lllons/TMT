@@ -1,6 +1,6 @@
 {
   "name": "tmtcode",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Too Many Tools — a CLI coding agent. Install once, run from any project.",
   "keywords": [
     "cli",
@@ -32,9 +32,6 @@
     "LICENSE",
     "README.md"
   ],
-  "scripts": {
-    "postinstall": "node scripts/postinstall.js"
-  },
   "preferGlobal": true,
   "os": [
     "darwin",

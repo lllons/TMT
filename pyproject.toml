@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tmtcode"
-version = "0.1.0"
+version = "0.1.1"
 description = "A CLI coding agent that works on whichever project directory you run it in."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -47,6 +47,7 @@ py-modules = [
     "agent_index",
     "agent_live_renderer",
     "agent_manager",
+    "agent_markdown",
     "agent_memory",
     "agent_menu",
     "agent_model",
@@ -68,6 +69,7 @@ py-modules = [
     "agent_testsel",
     "agent_tips",
     "agent_tree",
+    "agent_uninstall",
     "agent_ui",
     "agent_update",
     "agent_verify",
