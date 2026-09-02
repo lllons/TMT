@@ -127,6 +127,31 @@ def test_inline_code_keeps_its_backticks():
     assert "`agent_ui.py`" in text, text
 
 
+def test_an_underscore_inside_a_word_is_not_emphasis():
+    """GitHub's rule, and the one that matters most in THIS project: every
+    module here is called `agent_something.py`.
+
+    Found live rather than by reading. The first reply ever drawn through this
+    renderer was TMT's own commit message about the renderer, and it came out
+    as "agent", an italic "live", and "renderer.py". A filename is not a
+    typographic instruction.
+    """
+    for untouched in ("agent_live_renderer.py calls _rendered_body",
+                      "snake_case_names_stay_plain", "file__name__thing",
+                      "read agent_markdown.render_rows next"):
+        rows = M.render(untouched, 78, Console())
+        assert visible(rows)[0].strip() == untouched, rows
+        assert "\033[3m" not in rows[0], repr(rows[0])
+
+    # And emphasis at a word boundary still works, which is what stops the
+    # fix from being "underscores never mean anything".
+    for styled, reads in (("a _real_ emphasis", "a real emphasis"),
+                          ("__strong__ here", "strong here")):
+        rows = M.render(styled, 78, Console())
+        assert visible(rows)[0].strip() == reads, rows
+        assert "\033[" in rows[0], repr(rows[0])
+
+
 def test_a_link_keeps_the_address_it_points_at():
     """A terminal cannot be clicked, so a link whose URL had been swallowed
     would be a link the reader cannot follow."""

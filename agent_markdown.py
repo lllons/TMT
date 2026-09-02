@@ -52,11 +52,22 @@ _MARKS = {
 # Inline markup, longest marker first so `**` is never read as two `*`.
 # Code is matched before everything else because its content is literal: a
 # `*` inside backticks is an asterisk, not emphasis.
+# An underscore INSIDE a word is not emphasis, which is GitHub's rule and is
+# not a detail here: every module in this project is called
+# `agent_something.py`. Without the boundary, `agent_live_renderer.py` renders
+# as "agent", an italic "live", and "renderer.py" -- and that is not a
+# hypothetical. It is what the FIRST live reply drawn through this renderer
+# looked like, in the commit message describing the renderer itself.
+#
+# `*` is deliberately left alone: intraword `*` really is emphasis in GFM, and
+# nothing in this project is named with one.
 _INLINE = re.compile(
     r"(?P<code>`+[^`]*`+)"
-    r"|(?P<strong>\*\*(?P<strong_text>[^*]+)\*\*|__(?P<strong_text2>[^_]+)__)"
+    r"|(?P<strong>\*\*(?P<strong_text>[^*]+)\*\*"
+    r"|(?<![^\W_])(?<!_)__(?P<strong_text2>[^_]+)__(?![^\W_]))"
     r"|(?P<struck>~~(?P<struck_text>[^~]+)~~)"
-    r"|(?P<em>\*(?P<em_text>[^*\n]+)\*|_(?P<em_text2>[^_\n]+)_)"
+    r"|(?P<em>\*(?P<em_text>[^*\n]+)\*"
+    r"|(?<![^\W_])(?<!_)_(?P<em_text2>[^_\n]+)_(?![^\W_])(?!_))"
     r"|(?P<link>\[(?P<link_text>[^\]]*)\]\((?P<link_url>[^)\s]+)[^)]*\))"
 )
 
