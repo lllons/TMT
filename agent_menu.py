@@ -34,7 +34,7 @@ from agent_ui import (
     wrap_lines,
 )
 
-FALLBACK_VERSION = "0.1.0"
+FALLBACK_VERSION = "0.1.1"
 
 # Five rows of block capitals: T (8 columns), M (10), T (8), single-spaced.
 LOGO = (

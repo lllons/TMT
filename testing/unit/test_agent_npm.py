@@ -1,4 +1,4 @@
-"""Tests for the npm install path: the package, the launcher, the postinstall.
+"""Tests for the npm install path: the package, the launcher, the setup.
 
 TMT is a Python program and this is the one part of it written in JavaScript,
 so almost nothing here can be tested by running it -- the suite has no node and
@@ -6,19 +6,25 @@ must not need one. What it can do is check the things that are wrong on
 somebody else's machine and silent on this one, and every test here is one of
 those:
 
-  The two halves must agree about where TMT lives.  `scripts/postinstall.js`
+  The two halves must agree about where TMT lives.  `scripts/install.js`
       clones into a directory and `bin/tmtcode.js` looks for TMT in one, and
       they are two separate literals in two separate files. Drift there
       installs perfectly and then says "installation not found" forever.
 
   The package must stay thin.  `files` ships the launcher and nothing else; the
-      Python tree is fetched by the postinstall as a git checkout, because a
-      copy under `node_modules` is wiped by npm and would take the user's API
-      key, logs and settings with it.
+      Python tree is fetched as a git checkout on first run, because a copy
+      under `node_modules` is wiped by npm and would take the user's API key,
+      logs and settings with it.
 
-  The postinstall must never destroy anything.  It runs unattended, on install,
-      against a directory in somebody's home. It is allowed to clone, fetch and
-      fast-forward; it is not allowed to remove, reset, clean or force. This is
+  There must be no install script to block.  npm 11.19 and later refuse a
+      package's install scripts unless the user opts in, and TMT shipped with
+      a postinstall that did the whole setup -- so `npm install -g tmtcode`
+      reported success and left no TMT on the disk. The setup happens on first
+      launch now, where no package manager's policy can skip it.
+
+  The setup must never destroy anything.  It runs unattended against a
+      directory in somebody's home. It may clone; it may not remove, reset,
+      clean or force. This is
       `test_the_updater_never_runs_a_destructive_command`'s rule, applied to the
       other program in this repository that touches git.
 
@@ -46,10 +52,10 @@ import agent_menu
 INSTALL_DIR = Path(agent_config.__file__).resolve().parent
 PACKAGE_JSON = INSTALL_DIR / "package.json"
 LAUNCHER = INSTALL_DIR / "bin" / "tmtcode.js"
-POSTINSTALL = INSTALL_DIR / "scripts" / "postinstall.js"
+SETUP = INSTALL_DIR / "scripts" / "install.js"
 
 # What the launcher looks for to decide a directory really is TMT, and what
-# the postinstall runs to make one. Both are the entry point pyproject already
+# the setup runs to make one. Both are the entry point pyproject already
 # declares, which is the point: three install paths, one program.
 MARKER = "TMT.py"
 
@@ -127,33 +133,33 @@ def test_the_npm_version_is_the_version_tmt_reports_under_it():
 
 
 def test_the_package_points_at_this_repository():
-    """The postinstall clones from a URL and package.json advertises one. A
+    """The setup clones from a URL and package.json advertises one. A
     package that installed a different repository than it links to would be
     the worst kind of wrong, so both are checked against pyproject's."""
     data = package()
     home = pyproject().get("urls", {}).get("Homepage")
     assert data["homepage"] == home, (data["homepage"], home)
     assert data["repository"]["url"].endswith(home.split("://")[-1] + ".git"), data
-    source = POSTINSTALL.read_text(encoding="utf-8")
+    source = SETUP.read_text(encoding="utf-8")
     clone_from = re.search(r'const REPO = "([^"]+)"', source)
     assert clone_from, source[:200]
     assert clone_from.group(1) == home + ".git", clone_from.group(1)
 
 
-# --- the launcher and the postinstall agree ---------------------------------
+# --- the launcher and the setup agree ---------------------------------------
 
 def test_both_scripts_agree_where_tmt_lives():
     """The one drift that installs cleanly and is broken forever after: the
-    postinstall clones into one directory and the launcher looks in another,
+    setup clones into one directory and the launcher looks in another,
     so `npm install -g tmtcode` succeeds and every `tmtcode` afterwards says
     "installation not found"."""
-    for script in (LAUNCHER, POSTINSTALL):
+    for script in (LAUNCHER, SETUP):
         source = script.read_text(encoding="utf-8")
         assert HOME_EXPRESSION in source, script.name
         assert "TMT_HOME" in source, script.name
     # And the fallback home is never inside node_modules, however it is
     # spelled -- that is the decision the whole design rests on.
-    for script in (LAUNCHER, POSTINSTALL):
+    for script in (LAUNCHER, SETUP):
         assert "node_modules" not in script.read_text(encoding="utf-8"), script.name
 
 
@@ -174,16 +180,16 @@ def test_the_launcher_looks_for_the_entry_point_this_repository_has():
     assert 'requires-python = ">=3.8"' in requires
 
 
-def test_the_postinstall_checks_for_the_same_python_the_launcher_does():
-    """Two version tests, and they have to be the same test. A postinstall
-    that accepted 3.7 would report success and leave a launcher that then
-    refuses to start."""
-    assert "sys.version_info >= (3, 8)" in POSTINSTALL.read_text(encoding="utf-8")
+def test_the_setup_checks_for_the_same_python_the_launcher_does():
+    """Two version tests, and they have to be the same test. A setup that
+    accepted 3.7 would report success and leave a launcher that then refuses
+    to start."""
+    assert "sys.version_info >= (3, 8)" in SETUP.read_text(encoding="utf-8")
 
 
-# --- what the postinstall may never do --------------------------------------
+# --- what the setup may never do --------------------------------------------
 
-def test_the_postinstall_never_runs_a_destructive_command():
+def test_the_setup_never_runs_a_destructive_command():
     """It runs unattended, at install time, against a directory in somebody's
     home. The same rule the updater keeps and for the same reason: it may
     clone, fetch and fast-forward, and it may not remove, reset, clean, force
@@ -193,41 +199,72 @@ def test_the_postinstall_never_runs_a_destructive_command():
     Read out of the script's own source, exactly as
     `test_the_updater_never_runs_a_destructive_command` reads the updater's.
     """
-    source = POSTINSTALL.read_text(encoding="utf-8")
+    source = SETUP.read_text(encoding="utf-8")
     code = "\n".join(line for line in source.splitlines()
                      if not line.lstrip().startswith(("*", "//", "/*")))
     for forbidden in ('"reset"', '"clean"', '"--hard"', '"--force"', '"-f"',
-                      '"pull"', "rmSync", "rmdirSync", "unlinkSync", "rimraf",
-                      "rm -rf"):
+                      '"pull"', '"merge"', "rmSync", "rmdirSync", "unlinkSync",
+                      "rimraf", "rm -rf"):
         assert forbidden not in code, (forbidden, code)
-    # What it IS allowed to do, named so that removing one is a deliberate act.
-    assert '"clone"' in code and '"fetch"' in code
-    assert '"merge", "--ff-only"' in code or '"--ff-only"' in code
+    # One git command, and it is the one that creates rather than changes.
+    # Updating an existing checkout is TMT's own job on its launch screen;
+    # doing it here would mean a fetch on every single start.
+    assert '"clone"' in code
 
 
-def test_the_postinstall_refuses_a_directory_that_is_not_a_tmt_checkout():
+def test_the_setup_refuses_a_directory_that_is_not_a_tmt_checkout():
     """`~/.tmtcode` might be somebody's own directory. The script has to leave
     it alone and say so rather than clone over it, and it decides what a TMT
     checkout is by looking for TMT's own files plus a .git."""
-    source = POSTINSTALL.read_text(encoding="utf-8")
+    source = SETUP.read_text(encoding="utf-8")
     assert "is not a TMT checkout" in source, source[:200]
     for name in (MARKER, "agent_config.py", ".git"):
         assert '"%s"' % name in source, name
 
 
-def test_a_failed_setup_does_not_fail_the_npm_install():
-    """No network, no git, no Python: none of them is a reason for
-    `npm install -g tmtcode` to end in a red error nobody can act on. The
-    script exits 0 and leaves the launcher to explain itself, which it can do
-    every time the user types the command rather than once, in a wall of npm
-    output."""
-    source = POSTINSTALL.read_text(encoding="utf-8")
-    assert "process.exit(0)" in source
-    assert "process.exit(1)" not in source
-    # And the launcher is the one that reports it, in words with a way out.
+def test_the_package_declares_no_install_script_to_be_blocked():
+    """THE BUG THIS EXISTS FOR, and it was reported from a real machine.
+
+    npm 11.19 and later refuse a package's install scripts unless the user
+    opts in. TMT's whole setup WAS a postinstall, so `npm install -g tmtcode`
+    said "added 1 package", warned about scripts "not yet covered by
+    allowScripts", and left no TMT anywhere on the disk -- and the command it
+    had just installed pointed at nothing.
+
+    So there is no install hook at all now. A package with no scripts cannot
+    have them blocked, and the setup happens on first launch instead, where
+    no package manager's policy reaches it.
+    """
+    data = package()
+    assert "scripts" not in data or not data["scripts"], data.get("scripts")
+    assert not (INSTALL_DIR / "scripts" / "postinstall.js").exists(), (
+        "a file named postinstall.js is run as one by npm, which is the "
+        "version dependence this change removed")
+
+
+def test_the_launcher_installs_tmt_when_there_is_none():
+    """The other half of the same fix: the command has to be able to make the
+    thing it launches. Read out of the source, because the alternative is a
+    test that clones this repository over the network."""
+    source = LAUNCHER.read_text(encoding="utf-8")
+    assert 'require("../scripts/install.js")' in source, source[:400]
+    assert "setup.ensure(" in source, source
+    # And it says so while it happens: twenty seconds of silence on a first
+    # run reads as a command that has hung.
+    assert "First run" in SETUP.read_text(encoding="utf-8")
+
+
+def test_a_setup_that_cannot_be_done_is_explained_rather_than_hidden():
+    """No git, no network, an occupied directory: each has to come back as a
+    sentence with a way out, and as a non-zero exit -- the command really did
+    fail, and a script wrapping it has to be able to tell."""
     launcher = LAUNCHER.read_text(encoding="utf-8")
-    assert "installation not found" in launcher
-    assert "npm install -g tmtcode" in launcher
+    assert "could not be installed now" in launcher, launcher[:400]
+    assert "git clone https://github.com/lllons/TMT.git" in launcher
+    assert "TMT_HOME" in launcher
+    setup = SETUP.read_text(encoding="utf-8")
+    assert "git-scm.com" in setup, "a missing git names where to get one"
+    assert "is not a TMT checkout" in setup
 
 
 def test_the_launcher_hands_back_the_exit_code_and_the_signal():
@@ -246,7 +283,7 @@ def test_both_scripts_are_clean_utf8_text():
     """The same guard every module in this repository has. A stray byte from
     a shell heredoc has corrupted source here before, and these two files are
     read by a program that is not Python and would report it differently."""
-    for script in (LAUNCHER, POSTINSTALL, PACKAGE_JSON):
+    for script in (LAUNCHER, SETUP, PACKAGE_JSON):
         raw = script.read_bytes()
         assert b"\x00" not in raw, script.name
         text = raw.decode("utf-8")            # raises if it is not clean
@@ -266,7 +303,7 @@ def test_the_launcher_keeps_the_line_endings_the_shebang_needs():
     `.gitattributes` pins the three paths, and this is the alarm if the pin is
     removed or a file is added beside them without one.
     """
-    for script in (LAUNCHER, POSTINSTALL, PACKAGE_JSON):
+    for script in (LAUNCHER, SETUP, PACKAGE_JSON):
         assert b"\r" not in script.read_bytes(), script.name
     rules = (INSTALL_DIR / ".gitattributes").read_text(encoding="utf-8")
     for pattern in ("bin/*.js text eol=lf", "scripts/*.js text eol=lf",
@@ -281,9 +318,9 @@ def test_node_accepts_both_scripts_when_node_is_available():
     second runtime would cost more than the check is worth."""
     node = shutil.which("node")
     if not node:
-        assert LAUNCHER.is_file() and POSTINSTALL.is_file()
+        assert LAUNCHER.is_file() and SETUP.is_file()
         return
-    for script in (LAUNCHER, POSTINSTALL):
+    for script in (LAUNCHER, SETUP):
         done = subprocess.run([node, "--check", str(script)],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               timeout=60)
