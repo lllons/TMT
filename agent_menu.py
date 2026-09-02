@@ -161,6 +161,12 @@ SETTINGS_ITEMS = (
     ("provider", "AI Provider", "Which service answers a request"),
     ("key", "API Key", "The credential that service is given"),
     ("model", "Model", "Which model TMT runs on"),
+    # A second credential, and a separate one on purpose: the model provider
+    # and the search backend are unrelated services, so a user can run on
+    # OpenRouter and search with Brave. It sits below Model because it is the
+    # optional one -- TMT does not start without a provider key and works
+    # perfectly well without this.
+    ("websearch", "Web Search", "The key TMT searches the web with"),
     # The one entry here that is a switch rather than a screen: Enter toggles
     # it in place and there is nothing further in. Its detail names what it
     # does NOT control, because that is the thing about it that is easy to get
@@ -539,6 +545,59 @@ def _check_credential(provider_id, key):
     return "Saved. " + message
 
 
+def identify_provider(key):
+    """Which service a pasted key belongs to, or "" when it is not a key.
+
+    Every provider's own `looks_like_key` is asked, and the LONGEST matching
+    prefix wins. That tie-break is the whole of it: OpenAI's prefix is `sk-`,
+    which also matches an OpenRouter `sk-or-` key and an Anthropic `sk-ant-`
+    one, so "the first that accepts it" would file both under OpenAI.
+
+    This exists so the first-run screen can take a key without asking which
+    service it is for first. Asking would be a question the key already
+    answers, and -- worse, given the screen refuses a key it cannot recognise
+    -- it would let a user paste a perfectly good Anthropic key into a field
+    checking for OpenRouter's prefix and be told it was not a key.
+    """
+    text = (key or "").strip()
+    if not text:
+        return ""
+    best, best_length = "", -1
+    for name in provider_ids():
+        check = getattr(_adapter(name), "looks_like_key", None)
+        if not callable(check):
+            continue
+        try:
+            ok, _reason = check(text)
+        except Exception:
+            continue
+        if not ok:
+            continue
+        prefix = getattr(_adapter(name), "key_prefix", "") or ""
+        if len(prefix) > best_length:
+            best, best_length = name, len(prefix)
+    return best
+
+
+def _not_a_key_message(provider_id, key):
+    """Why a pasted string was refused, and what to do about it.
+
+    The provider's own reason where there is one, because it is specific --
+    "that contains a space, so part of the key is probably missing" tells a
+    user what happened to their paste. The key itself is never quoted.
+    """
+    check = getattr(_adapter(provider_id), "looks_like_key", None)
+    reason = ""
+    if callable(check):
+        try:
+            ok, said = check(key)
+            reason = "" if ok else (said or "")
+        except Exception:
+            reason = ""
+    reason = reason or "That does not look like an API key."
+    return reason + " Paste a key, or press Esc to go back to the menu."
+
+
 def _store_key(provider_id, key):
     """Save a typed key and report the outcome. Returns (message, saved)."""
     shape = _shape_warning(provider_id, key)
@@ -547,6 +606,103 @@ def _store_key(provider_id, key):
         return problem or "The key was not saved.", False
     message = _check_credential(provider_id, key)
     return (message + "  " + shape if shape else message), True
+
+
+# --- web search ------------------------------------------------------------
+#
+# The same two screens the model provider has -- pick one, then paste its key
+# -- over a different store. They are separate screens rather than a widened
+# provider screen because the two credentials are unrelated: a user can run
+# TMT on OpenRouter and search with Brave, and a chooser that mixed them would
+# suggest otherwise.
+
+def _web():
+    """agent_web, or None when it cannot be loaded.
+
+    Imported inside the call for `_credentials`' reason: a menu that cannot
+    draw is worth less than an agent that still starts, and this module is the
+    newest in TMT, so it is the one most likely to be missing from a frozen
+    editable install.
+    """
+    try:
+        import agent_web
+        return agent_web
+    except Exception:
+        return None
+
+
+def search_backend_ids():
+    """The search backends TMT offers, or () when there are none to offer."""
+    module = _web()
+    return tuple(module.BACKENDS) if module else ()
+
+
+def search_backend_label(backend):
+    module = _web()
+    if not module:
+        return str(backend)
+    return module.BACKEND_LABELS.get(backend, str(backend))
+
+
+def search_backend_note(backend):
+    module = _web()
+    return module.BACKEND_NOTES.get(backend, "") if module else ""
+
+
+def search_key_url(backend):
+    module = _web()
+    return module.key_url(backend) if module else ""
+
+
+def search_key_hint(backend=None):
+    """A safe description of the search key in force. Never the key."""
+    module = _web()
+    if not module:
+        return "unavailable"
+    try:
+        backend = backend or module.active_backend()
+        if not backend:
+            return "not set"
+        return "%s  %s" % (module.BACKEND_LABELS.get(backend, backend),
+                           module.masked(backend))
+    except Exception:
+        return "not set"
+
+
+def search_backend_has_key(backend):
+    module = _web()
+    try:
+        return bool(module and module.has_credential(backend))
+    except Exception:
+        return False
+
+
+def _store_search_key(backend, key):
+    """Save a typed search key and report the outcome. Returns (message, saved).
+
+    Shaped exactly like `_store_key`, including the order: store first, then
+    ask the backend about it. A key that was written and rejected is still
+    written -- TMT does not decide a credential is invalid on the backend's
+    behalf, and the user may be looking at a quota problem rather than a typo.
+    """
+    module = _web()
+    if not module:
+        return "TMT cannot store a search key on this installation.", False
+    try:
+        module.save_credential(backend, key)
+    except ValueError as error:
+        return str(error), False
+    except OSError as error:
+        return "The key could not be written: %s" % error, False
+    try:
+        _ok, message = module.check_key(backend, key)
+    except Exception as error:
+        message = "Saved. TMT could not check it (%s)." % error.__class__.__name__
+    if key and key in message:
+        # Belt and braces, exactly as _check_credential does it: nothing that
+        # came back may carry the key onto a screen.
+        message = message.replace(key, "the key")
+    return message, True
 
 
 def render_banner(stream=None, phase=None, columns=None):
@@ -1584,6 +1740,103 @@ def render_key_frame(provider_id, typed=0, message="", stream=None, size=None,
     return _fit_height(lines, rows, keep_tail=1)
 
 
+def render_search_frame(selected=0, active_id=None, stream=None, size=None, phase=None):
+    """The search-backend chooser: which service answers a web_search.
+
+    Built from `render_provider_frame` row for row, because it is the same
+    question about a different credential and two screens that answer the same
+    shape of question should not look like two different programs.
+    """
+    stream = sys.stdout if stream is None else stream
+    columns, rows = _terminal(size)
+    phase = gradient_phase() if phase is None else phase
+    width = _content_width(columns)
+    ids = search_backend_ids()
+    module = _web()
+    active_id = active_id or (module.active_backend() if module else "")
+
+    lines = [
+        "",
+        " " + _paint("Web Search", stream, phase),
+        "",
+        _dim(fit_to_width(" The service TMT searches the web with. One key", width), stream),
+        _dim(fit_to_width(" is enough; search is off until one has one.", width), stream),
+    ]
+    if not ids:
+        lines.append(_rule(stream, phase, width))
+        for text in _wrap_words(
+                "Web search is unavailable on this installation: agent_web "
+                "could not be loaded.", max(10, width - 1)):
+            lines.append(fit_to_width(" " + text, width))
+        lines.append("")
+        lines.append(_footer(stream, ("Esc Back",)))
+        return _fit_height(lines, rows, keep_tail=1)
+
+    label_width = max(display_width(search_backend_label(name)) for name in ids)
+    lines.append(_rule(stream, phase, width))
+    for index, name in enumerate(ids):
+        state = "key set" if search_backend_has_key(name) else "no key"
+        lines.append(_option_row(
+            index == selected, search_backend_label(name),
+            pad_to_width(state, 8) + " " + search_backend_note(name),
+            stream, phase, width, label_width,
+            suffix="  (active)" if name == active_id else ""))
+    # Where to get one, for the row the cursor is on. It belongs to the row
+    # rather than the screen because each backend has its own signup page, and
+    # a screen that says "paste a key" without saying where one comes from has
+    # asked for something the user has no way to obtain.
+    if 0 <= selected < len(ids):
+        url = search_key_url(ids[selected])
+        if url:
+            lines.append("")
+            lines.append(_dim(fit_to_width(" Get a key at %s" % url, width), stream))
+    lines.append("")
+    lines.append(_footer(stream, ("{up}/{down} Navigate", "Enter Select", "Esc Back")))
+    return _fit_height(lines, rows, keep_tail=1)
+
+
+def render_search_key_frame(backend, typed=0, message="", stream=None, size=None,
+                            phase=None, done=False):
+    """The masked search-key screen.
+
+    `typed` is a COUNT and never the characters, exactly as `render_key_frame`
+    takes one: the frame is built from how much was typed and has no access to
+    what was typed, so no drawing path can put a key on screen.
+    """
+    stream = sys.stdout if stream is None else stream
+    columns, rows = _terminal(size)
+    phase = gradient_phase() if phase is None else phase
+    width = _content_width(columns)
+    label = search_backend_label(backend)
+    url = search_key_url(backend)
+
+    lines = [
+        "",
+        " " + _paint("Search Key", stream, phase)
+        + _dim("  %s  %s" % (_glyphs(stream)["dot"], label), stream),
+        "",
+        _dim(fit_to_width(" Stored beside TMT and git-ignored, in plain text so", width), stream),
+        _dim(fit_to_width(" it can be edited by hand. Not sent to the model provider.", width), stream),
+    ]
+    if url:
+        lines.append(_dim(fit_to_width(" Get a key at %s" % url, width), stream))
+    lines.append(_field("Current", search_key_hint(backend), stream, width))
+    lines.append(_rule(stream, phase, width))
+    if not done:
+        entry = (MASK_CHAR * typed if typed
+                 else "paste or type it; only %s is echoed" % MASK_CHAR)
+        row = fit_to_width(" " + pad_to_width("Key", 6) + entry, width)
+        lines.append(row if typed else _dim(row, stream))
+    lines.append("")
+    for text in (_wrap_words(message, width - 1) if message else [""]):
+        lines.append(fit_to_width(" " + text, width))
+    lines.append("")
+    hints = ("Enter Continue", "Esc Back") if done else (
+        "Enter Save", "Backspace Delete", "Esc Back")
+    lines.append(_footer(stream, hints))
+    return _fit_height(lines, rows, keep_tail=1)
+
+
 def auto_update_text():
     """"ON" or "OFF" for the launch updater, read from disk each time.
 
@@ -1664,6 +1917,13 @@ def _settings_suffix(entry):
     return ""
 
 
+# The name column of the summary block at the top of Settings: the longest
+# label in it, plus one, so there is always a gap between a name and its value.
+_SETTINGS_FIELD_NAMES = ("Provider", "API Key", "Model", "Web Search")
+_SETTINGS_FIELD_WIDTH = max(display_width(name)
+                            for name in _SETTINGS_FIELD_NAMES) + 1
+
+
 def render_settings_menu_frame(selected=0, stream=None, model_id=None, size=None, phase=None):
     """Settings: what TMT talks to, with which key, as which model."""
     stream = sys.stdout if stream is None else stream
@@ -1678,10 +1938,24 @@ def render_settings_menu_frame(selected=0, stream=None, model_id=None, size=None
         "",
         " " + _paint("Settings", stream, phase),
         "",
+        # All four share a name column one wider than the longest label. The
+        # default of 10 was exactly the width of "Web Search", which drew it
+        # as `Web Searchnot set` -- a label and its value with no gap at all.
+        # The number is derived here rather than written out again, so the
+        # next label added to this block cannot reintroduce that.
         _field("Provider", provider_label(provider_id) if provider_id else "not set",
-               stream, width),
-        _field("API Key", provider_key_hint(provider_id), stream, width),
-        _field("Model", agent_models.describe(model_id), stream, width),
+               stream, width, name_width=_SETTINGS_FIELD_WIDTH),
+        _field("API Key", provider_key_hint(provider_id), stream, width,
+               name_width=_SETTINGS_FIELD_WIDTH),
+        _field("Model", agent_models.describe(model_id), stream, width,
+               name_width=_SETTINGS_FIELD_WIDTH),
+        # The fourth summary, beside the three that were already here and for
+        # the same reason: each of these states the value behind a screen you
+        # would otherwise have to go into to see. "not set" is the honest
+        # reading for an installation with no search key, and it is the common
+        # one -- search is the only thing in this block TMT runs fine without.
+        _field("Web Search", search_key_hint(), stream, width,
+               name_width=_SETTINGS_FIELD_WIDTH),
         _rule(stream, phase, width),
     ]
     lines.extend(
@@ -3814,7 +4088,8 @@ def provider_screen(stream=None, key_reader=None, region=None, active_id=None):
     return _drive(render, key_reader, region, on_key) or None
 
 
-def api_key_screen(provider_id=None, stream=None, key_reader=None, region=None):
+def api_key_screen(provider_id=None, stream=None, key_reader=None, region=None,
+                   opening="", identify=False):
     """Take an API key for one provider. Returns its id when one was saved.
 
     A mask is echoed, one character per keystroke; the key itself is never
@@ -3837,7 +4112,10 @@ def api_key_screen(provider_id=None, stream=None, key_reader=None, region=None):
             return None
         key_reader = _default_text_reader()
     region = LiveRegion(stream) if region is None else region
-    typed, message, saved = [], "", False
+    # `opening` is the first thing on the screen rather than a separate frame:
+    # the user pressed Start, so the sentence they need is "a key is wanted",
+    # in the place every other outcome of this screen is already printed.
+    typed, message, saved = [], opening, False
 
     while True:
         region.paint(render_key_frame(provider_id, len(typed), message, stream, done=saved))
@@ -3874,6 +4152,25 @@ def api_key_screen(provider_id=None, stream=None, key_reader=None, region=None):
             if not key:
                 message = "Nothing was typed. Paste the key, or press Esc to go back."
                 continue
+            if identify:
+                # The first-run path. What was pasted has to BE a key before
+                # anything is stored, and the key itself says which service it
+                # belongs to -- so a recognised key switches the screen to its
+                # own provider rather than being refused for the prefix of
+                # whichever one happened to be showing.
+                #
+                # This is the one place a shape check REFUSES. Everywhere else
+                # it is a warning beside a key that was stored anyway, because
+                # key formats change and TMT does not get to decide a
+                # credential is invalid. Here there is nothing yet to keep, an
+                # unusable key would send the user into a session that cannot
+                # reach a model, and Esc is always a way back to the menu -- so
+                # asking again costs nothing and saves a broken first run.
+                found = identify_provider(key)
+                if not found:
+                    typed, message = [], _not_a_key_message(provider_id, key)
+                    continue
+                provider_id = found
             # Storing and checking both take a moment; say so rather than
             # leave a screen that looks as though the key did nothing.
             region.paint(render_key_frame(
@@ -3910,6 +4207,160 @@ def provider_setup(stream=None, key_reader=None, region=None, text_reader=None):
         if api_key_screen(chosen, stream=stream, key_reader=text_reader, region=region):
             _select_provider(chosen)
             return chosen
+
+
+def search_backend_screen(stream=None, key_reader=None, region=None, active_id=None):
+    """Choose the search backend. Returns the chosen id, or None when nothing was.
+
+    Choosing here saves nothing on its own, exactly as `provider_screen`
+    saves nothing: `search_setup` records the choice once it knows there is a
+    key for it, so backing out of the key screen cannot leave TMT pointed at a
+    backend it has no key for.
+    """
+    stream = sys.stdout if stream is None else stream
+    if key_reader is None:
+        if not is_interactive(stream):
+            return None
+        key_reader = _default_reader()
+    region = LiveRegion(stream) if region is None else region
+    ids = search_backend_ids()
+    module = _web()
+    active_id = active_id or (module.active_backend() if module else "")
+    state = {"selected": ids.index(active_id) if active_id in ids else 0}
+
+    def render():
+        return render_search_frame(state["selected"], active_id, stream)
+
+    def on_key(key):
+        if key in (None, "esc", "quit", "interrupt"):
+            return ""         # cancelled; turned into None on the way out
+        if not ids:
+            # Nothing to choose between. Enter and Esc leave, which is what
+            # the footer offers, rather than trapping the user on a screen
+            # whose only content is why it is empty.
+            return "" if key == "enter" else None
+        if key == "up":
+            state["selected"] = (state["selected"] - 1) % len(ids)
+        elif key == "down":
+            state["selected"] = (state["selected"] + 1) % len(ids)
+        elif key == "enter":
+            return ids[state["selected"]]
+        return None
+
+    return _drive(render, key_reader, region, on_key) or None
+
+
+def search_key_screen(backend=None, stream=None, key_reader=None, region=None):
+    """Take a search key for one backend. Returns its id when one was saved.
+
+    The same loop `api_key_screen` runs, over the same `_next_text_key` -- so
+    a paste arrives here exactly as it arrives there, line break and all, and
+    the fix that made a pasted provider key land is the same fix that makes a
+    pasted search key land. A paste that is genuinely more than one line says
+    so rather than doing nothing.
+    """
+    stream = sys.stdout if stream is None else stream
+    module = _web()
+    backend = backend or (module.active_backend() if module else "")
+    backend = backend or (search_backend_ids() or ("",))[0]
+    if not backend:
+        return None
+    if key_reader is None:
+        if not is_interactive(stream):
+            return None
+        key_reader = _default_text_reader()
+    region = LiveRegion(stream) if region is None else region
+    typed, message, saved = [], "", False
+
+    while True:
+        region.paint(render_search_key_frame(backend, len(typed), message, stream,
+                                             done=saved))
+        kind, value = _next_text_key(key_reader)
+        if kind == "end":
+            return backend if saved else None
+        if kind == "":
+            continue          # unrecognised, or an animation tick
+        if saved:
+            return backend            # the outcome has been read
+        if kind == "char":
+            typed.extend(iter_graphemes(value))
+            message = ""
+            continue
+        if kind == "block":
+            message = ("That paste is %d lines. A key is one line: paste just "
+                       "the key, or press Esc to go back."
+                       % (value.count("\n") + 1))
+            continue
+        if value in ("esc", "interrupt"):
+            return None
+        if value == "backspace":
+            if typed:
+                typed.pop()
+            message = ""
+            continue
+        if value == "enter":
+            key = "".join(typed).strip()
+            if not key:
+                message = "Nothing was typed. Paste the key, or press Esc to go back."
+                continue
+            region.paint(render_search_key_frame(
+                backend, len(typed),
+                "Saving, and asking %s about it..." % search_backend_label(backend),
+                stream))
+            message, saved = _store_search_key(backend, key)
+            if saved:
+                typed = []    # nothing is kept in memory once it is stored
+
+
+def search_setup(stream=None, key_reader=None, region=None, text_reader=None):
+    """Pick a search backend and take its key. Returns the id, or None.
+
+    `provider_setup`'s shape, with one difference that matters: it ALWAYS
+    offers the key screen. A provider that already has a key needs nothing
+    further, but the commonest reason to open this screen for a backend that
+    already has one is to replace a key that has stopped working -- so
+    choosing a configured backend here opens the field rather than closing
+    the screen.
+    """
+    stream = sys.stdout if stream is None else stream
+    scripted = key_reader is not None
+    if key_reader is None:
+        if not is_interactive(stream):
+            return None
+        key_reader = _default_reader()
+    if text_reader is None and scripted:
+        text_reader = key_reader
+    region = LiveRegion(stream) if region is None else region
+    module = _web()
+    while True:
+        chosen = search_backend_screen(stream=stream, key_reader=key_reader,
+                                       region=region)
+        if not chosen:
+            return None
+        # CHOOSING IS SELECTING, when there is already a key to select. The
+        # first version only ever recorded a backend as a side effect of
+        # saving a key into it, so a user with two keys who moved the cursor
+        # to the other one and pressed Enter, then Esc, changed nothing at all
+        # -- and the only way to switch was to re-type a key they had already
+        # given. The row draws "(active)" and the screen accepts Enter, so it
+        # reads as a chooser; this makes it one.
+        already = search_backend_has_key(chosen)
+        if already and module is not None:
+            try:
+                module.save_backend(chosen)
+            except Exception:
+                # A preference that could not be written is not a reason to
+                # refuse the key screen behind it.
+                pass
+        if search_key_screen(chosen, stream=stream, key_reader=text_reader,
+                             region=region):
+            return chosen
+        if already:
+            # Esc after choosing a backend that already had a key keeps the
+            # choice: the user came here to switch, not to replace.
+            return chosen
+        # Otherwise Esc comes back to the list rather than out of setup, so a
+        # user with no key to hand is never trapped.
 
 
 def settings_screen(stream=None, key_reader=None, region=None, active_id=None,
@@ -3964,6 +4415,13 @@ def settings_screen(stream=None, key_reader=None, region=None, active_id=None,
             elif entry == "key":
                 api_key_screen(current_provider(), stream=stream,
                                key_reader=text_reader, region=region)
+            elif entry == "websearch":
+                # Chained exactly as `provider` is: choose the backend, then
+                # paste its key. Nothing is returned to Settings because
+                # nothing here changes the model, and the row's own summary
+                # is re-read from disk on the next frame.
+                search_setup(stream=stream, key_reader=key_reader, region=region,
+                             text_reader=text_reader)
             elif entry == "model":
                 chosen = model_screen(stream=stream, key_reader=key_reader,
                                       region=region, active_id=state["model"])
@@ -4079,8 +4537,19 @@ def run_startup(stream=None, key_reader=None, model_id=None, workspace=None,
                 if resuming or provider_is_configured():
                     return "start"
                 cursor = "start"
-                provider_setup(stream=stream, key_reader=key_reader,
-                               region=region, text_reader=text_reader)
+                # STRAIGHT TO THE KEY, not to the provider chooser. Pressing
+                # Start says "begin work"; the one thing standing in the way is
+                # a credential, and asking which service it is for first is a
+                # question the key itself answers -- `identify=True` reads the
+                # provider off what was pasted and switches to it. Settings
+                # still has the chooser for anyone who wants to pick first.
+                chosen = api_key_screen(
+                    current_provider() or PROVIDER_ORDER[0], stream=stream,
+                    key_reader=text_reader, region=region, identify=True,
+                    opening="TMT needs an API key before it can start. "
+                            "Paste one here.")
+                if chosen:
+                    _select_provider(chosen)
                 if provider_is_configured():
                     return "start"
                 # Nothing was configured -- Esc, or a key the user did not

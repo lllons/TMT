@@ -969,14 +969,29 @@ def _teaching_only(prompt):
     the same trap this repository already met with the tips catalogue: "is this
     string in the prompt" is always yes for anything written in any file here.
 
-    The listing is REMOVED rather than the prompt being truncated at it. The
-    first version of this helper cut everything from the marker onwards, and a
-    mutation that leaked the bash reference AFTER the workspace section
-    survived it -- a blind spot at the end of the very prompt being checked.
-    Taking out exactly the section that is not teaching leaves the rest under
-    test.
+    The listing is REMOVED rather than the prompt being truncated at it. An
+    earlier version cut everything from the marker onwards, and a mutation
+    that leaked the bash reference AFTER the workspace section survived it --
+    a blind spot at the end of the very prompt being checked.
+
+    The span is found IN THE PROMPT rather than by rebuilding the section and
+    subtracting it. Rebuilding looked tidier and was order-dependent: the
+    background prompts are CACHED, so one built while a fixture had moved
+    `ROOT_DIR` to a temporary workspace carries that workspace's listing,
+    while `_shape_section()` called at assert time reads whatever the root is
+    by then. When the two differ the subtraction silently removes nothing, the
+    listing stays in, and the test fails on a filename -- which is the very
+    thing it was rewritten to stop doing. It passed alone and failed in a full
+    run, which is what that class of bug always looks like.
     """
-    return prompt.replace(agent_subprompts._shape_section(), "")
+    marker = "=== THE SHAPE OF THE WORKSPACE ==="
+    start = prompt.find(marker)
+    if start == -1:
+        return prompt
+    # The listing runs to the closing reminder, which is the last thing every
+    # background prompt says. Without that anchor the tail would be lost again.
+    end = prompt.find("Reminder: reply with one JSON object only", start)
+    return prompt[:start] + (prompt[end:] if end != -1 else "")
 
 
 def test_bash_is_taught_in_the_main_prompt_and_in_no_background_one():

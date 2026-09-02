@@ -803,30 +803,42 @@ def test_no_tip_in_the_catalogue_can_overflow_the_row_it_is_drawn_in():
 # asking for an API key. The menu comes first now and Start is what asks.
 
 class Configured:
-    """`provider_is_configured` and `provider_setup`, both replaced.
+    """`provider_is_configured` and the two ways TMT asks for a key.
 
     Patched together because they are one decision: whether TMT can reach a
     model, and what happens when it cannot. `answers` is read in order, so a
     test can say "not configured, then configured" and drive the setup
     succeeding without a real credential store anywhere near it.
+
+    BOTH `provider_setup` and `api_key_screen` are replaced, and that is not
+    belt and braces -- they are two different doors to the same question.
+    Settings opens `provider_setup` (choose a service, then paste its key);
+    pressing Start opens `api_key_screen` directly, because at that point the
+    only thing missing is a credential and the key itself says which service
+    it belongs to. Stubbing only the first let the REAL key screen run inside
+    these tests and eat the scripted keystrokes, which is how this stub
+    announced that the Start path had changed.
     """
 
     def __init__(self, *answers):
         self.answers = list(answers)
         self.calls = []
-        self.saved = (menu().provider_is_configured, menu().provider_setup)
+        self.saved = (menu().provider_is_configured, menu().provider_setup,
+                      menu().api_key_screen)
         menu().provider_is_configured = self._configured
         menu().provider_setup = self._setup
+        menu().api_key_screen = self._setup
 
     def _configured(self):
         return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
 
-    def _setup(self, **kwargs):
+    def _setup(self, *args, **kwargs):
         self.calls.append(kwargs)
         return None
 
     def close(self):
-        menu().provider_is_configured, menu().provider_setup = self.saved
+        (menu().provider_is_configured, menu().provider_setup,
+         menu().api_key_screen) = self.saved
 
 
 def test_the_menu_is_the_first_screen_even_when_nothing_is_configured():

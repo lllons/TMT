@@ -570,7 +570,11 @@ class Provider:
         if any(character.isspace() for character in key):
             return False, "That contains a space, so part of the key is probably missing."
         if len(key) < self.key_min_length:
-            return False, f"That is too short to be a {self.label} key."
+            # "for a X key" rather than "to be a X key": every label that
+            # starts with a vowel made the old wording read "a OpenAI key",
+            # and this sentence is now the commonest refusal on the first-run
+            # screen rather than a rare aside in Settings.
+            return False, f"That is too short for a {self.label} key."
         if self.key_prefix and not key.startswith(self.key_prefix):
             return False, f"{self.label} keys normally start with {self.key_prefix}."
         return True, ""

@@ -115,12 +115,13 @@ def drive_console(provider_id, text):
     return result, visible(out.getvalue())
 
 
-def drive_reader(provider_id, reads, store=None):
+def drive_reader(provider_id, reads, store=None, opening="", identify=False):
     """Run the real screen against an injected reader. Returns (result, frames).
 
     `store` replaces `_store_key`, so a test that presses Enter measures what
     the field handed over without writing a credential or asking a provider
-    about one.
+    about one. `opening` and `identify` are the first-run screen's two extra
+    parameters, off by default so every existing caller is unchanged.
     """
     m = menu()
     out = Terminal()
@@ -129,7 +130,8 @@ def drive_reader(provider_id, reads, store=None):
         m._store_key = store
     try:
         result = m.api_key_screen(provider_id, stream=out, region=m.LiveRegion(out),
-                                  key_reader=Scripted(reads))
+                                  key_reader=Scripted(reads), opening=opening,
+                                  identify=identify)
     finally:
         m._store_key = saved
     return result, visible(out.getvalue())
@@ -241,6 +243,91 @@ def test_a_block_leaves_what_was_already_typed_alone():
     typed half a key by hand must not lose it to a mistaken paste."""
     _, frames = drive_reader("openrouter", ["abcdef", "line one\nline two", "esc"])
     assert masked(frames) == 6, frames
+
+
+# --- pressing Start with no key ---------------------------------------------
+
+def test_a_pasted_key_says_which_service_it_belongs_to():
+    """The first-run screen takes a key without asking which provider it is
+    for, because the key answers that itself. The tie-break is the whole of
+    it: OpenAI's prefix is `sk-`, which also matches an OpenRouter `sk-or-`
+    key and an Anthropic `sk-ant-` one, so "first match wins" would file both
+    under OpenAI."""
+    m = menu()
+    for key, expected in (
+            ("sk-or-v1-0123456789abcdef0123456789abcdef", "openrouter"),
+            ("sk-ant-api03-0123456789abcdef0123456789ab", "anthropic"),
+            ("sk-proj-0123456789abcdef0123456789abcdef", "openai"),
+            ("AIzaSyA0123456789abcdef0123456789abcdef", "gemini")):
+        assert m.identify_provider(key) == expected, key
+    for not_a_key in ("", "   ", "hello world", "short", "x" * 10,
+                      "a sentence someone pasted by mistake"):
+        assert m.identify_provider(not_a_key) == "", repr(not_a_key)
+
+
+def test_the_first_run_screen_refuses_what_is_not_a_key_and_asks_again():
+    """What the user asked for in as many words: a message saying a key is
+    wanted, the next thing typed taken as one, and anything that is not a key
+    refused rather than stored.
+
+    This is the ONE place a shape check refuses. Everywhere else it is a
+    warning beside a key that was stored anyway, because formats change and
+    TMT does not get to decide a credential is invalid -- but here nothing is
+    stored yet, an unusable key means a session that cannot reach a model, and
+    Esc is always a way back to the menu."""
+    stored = []
+
+    def store(provider_id, key):
+        stored.append((provider_id, key))
+        return "Saved.", True
+
+    good = "sk-or-v1-0123456789abcdef0123456789abcdef"
+    result, frames = drive_reader(
+        "openrouter",
+        ["not a key at all", "enter",      # refused: it has spaces in it
+         "sk-", "enter",                   # refused: too short
+         good, "enter", "esc"],            # accepted
+        store=store, opening="TMT needs an API key before it can start.",
+        identify=True)
+    assert "TMT needs an API key before it can start." in frames
+    assert "part of the key is probably missing" in frames
+    assert "too short" in frames
+    # Nothing was stored until something that IS a key arrived.
+    assert stored == [("openrouter", good)], stored
+    assert result == "openrouter"
+
+
+def test_a_key_for_another_provider_switches_to_that_provider():
+    """A user pressing Start meets whichever provider happens to be current.
+    Refusing an Anthropic key there for having the wrong prefix would be
+    refusing a perfectly good key because of a question nobody asked."""
+    stored = []
+
+    def store(provider_id, key):
+        stored.append((provider_id, key))
+        return "Saved.", True
+
+    anthropic = "sk-ant-api03-0123456789abcdef0123456789ab"
+    result, _frames = drive_reader("openrouter", [anthropic, "enter", "esc"],
+                                   store=store, identify=True)
+    assert stored == [("anthropic", anthropic)], stored
+    assert result == "anthropic"
+
+
+def test_without_identify_the_screen_behaves_exactly_as_it_always_did():
+    """The refusal is opt-in. Settings keeps the documented rule -- a shape
+    check is a doubt, never a verdict -- so a key TMT does not recognise is
+    still stored there, with the doubt reported beside it."""
+    stored = []
+
+    def store(provider_id, key):
+        stored.append((provider_id, key))
+        return "Saved.", True
+
+    result, _frames = drive_reader("openrouter", ["definitely-not-a-key", "enter", "esc"],
+                                   store=store)
+    assert stored == [("openrouter", "definitely-not-a-key")], stored
+    assert result == "openrouter"
 
 
 # --- the rule itself --------------------------------------------------------

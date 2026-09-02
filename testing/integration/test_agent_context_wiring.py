@@ -202,7 +202,18 @@ def test_an_existing_context_is_loaded_rather_than_rebuilt():
 
 def test_with_the_setting_off_no_context_is_created_and_the_prompt_is_unchanged():
     """Section 39 through the loop. OFF has to reach every one of the six
-    wiring points, not only the one the loop calls first."""
+    wiring points, not only the one the loop calls first.
+
+    The screen assertion excludes the header's TIP ROW, and it has to. The tip
+    rotates through a catalogue of thirty-three on every launch, one of them
+    reads "TMT_Context/notes.md is what TMT remembers about this project", and
+    the cursor is a real file this suite steps -- so the whole-screen check
+    failed roughly one run in thirty-three, on a tip that is a sentence about
+    the feature rather than the feature being used. Same shape as the
+    documentation filename that broke the bash prompt test: a substring
+    absent from a screen that carries rotating content is not a property, it
+    is a coincidence.
+    """
     box = Workspace(git=True)
     setting = Setting(False)
     try:
@@ -215,7 +226,9 @@ def test_with_the_setting_off_no_context_is_created_and_the_prompt_is_unchanged(
     system = seen[0][0]["content"]
     assert "PROJECT CONTEXT" not in system, system[-2000:]
     assert "project_context" not in system, system[-2000:]
-    assert "TMT_Context" not in drawn, drawn[-2000:]
+    on_screen = "\n".join(row for row in drawn.splitlines()
+                          if "Tip · " not in row and "Tip * " not in row)
+    assert "TMT_Context" not in on_screen, on_screen[-2000:]
 
 
 # --- the prompt -------------------------------------------------------------

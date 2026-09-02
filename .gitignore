@@ -45,6 +45,18 @@ DESIGN_PRINCIPLES.md
 # commits is half of what protects it, the file permissions being the other
 # half.
 .tmt_search.json
+# The file the key is written THROUGH. `os.replace` normally removes it in the
+# same breath, but a failed move -- a read-only target, another process holding
+# the file open, a crash between the write and the rename -- leaves it on disk
+# with the key in clear text. `.tmt_providers.json.tmp` is ignored for exactly
+# this reason and this one was not, which mattered the moment anything started
+# writing it: when TMT is run on TMT the install and the workspace are the same
+# directory, so it would appear in this repository's own git status.
+.tmt_search.json.tmp
+# And the copy kept when the store is found damaged. It holds whatever keys
+# were in the file before it broke, in clear text, for exactly the same reason
+# the two above do.
+.tmt_search.json.damaged
 
 # The context directory itself. In a project TMT is WORKING ON, these two
 # markdown files are notes about that project, in that project, meant to be

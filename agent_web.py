@@ -118,6 +118,23 @@ BACKEND_URLS = {
     "serper": "https://google.serper.dev/search",
 }
 
+# Where a key comes from, for the settings screen to print. A screen that says
+# "paste a key" without saying where one is obtained has asked for something
+# the user has no way to get.
+KEY_URLS = {
+    "tavily": "https://app.tavily.com",
+    "brave": "https://brave.com/search/api/",
+    "serper": "https://serper.dev",
+}
+
+# One line each about what the backend IS, so the chooser is a decision rather
+# than three names. Kept short: the row it sits on is fitted to the terminal.
+BACKEND_NOTES = {
+    "tavily": "built for agents; clean snippets",
+    "brave": "independent index",
+    "serper": "Google results",
+}
+
 # Which backends can honour a recency hint, and how they spell it. A backend
 # that is not here IGNORES the hint, and the result says so -- inventing a
 # filter the API cannot apply would be answering a narrower question than the
@@ -174,6 +191,202 @@ def credential(backend):
 def configured_backends():
     """Every backend with a key, in preference order."""
     return tuple(name for name in BACKENDS if credential(name))
+
+
+def has_credential(backend):
+    """Whether one backend has a key here."""
+    return bool(credential(backend))
+
+
+def key_url(backend):
+    """Where a key for this backend is obtained, or ""."""
+    return KEY_URLS.get(backend, "")
+
+
+def masked(backend):
+    """A safe description of the stored key, never the key.
+
+    Shows too little to reconstruct one and enough to tell two apart, and it
+    names the SOURCE for `agent_credentials.masked`'s reason: an environment
+    variable outranking the key the user just typed is otherwise silent, and
+    a user who cannot see why their new key did nothing has no way to find
+    out.
+    """
+    if not backend or backend not in BACKENDS:
+        return "not set"
+    from_env = os.environ.get(KEY_ENV[backend], "").strip()
+    key = from_env or _read_search_file()["keys"].get(backend, "").strip()
+    if not key:
+        return "not set"
+    return "%s  from %s" % (
+        _mask_body(key), KEY_ENV[backend] if from_env else SEARCH_FILE.name)
+
+
+def _mask_body(key):
+    """The visible part of a masked key. Three tiers, not two.
+
+    `agent_credentials.masked` has three and this had two, and the missing one
+    was the short case: a key of eight characters or fewer came back WHOLE,
+    which is the opposite of what the function above claims. It is reachable --
+    `masked` masks an environment variable as well as the stored key, and that
+    is arbitrary user content, so a truncated paste or a typo drew itself in
+    full on two screens.
+
+    A real backend key is long, so this is about the accident rather than the
+    normal case; but a mask that shows everything when the value is short is a
+    mask that fails exactly when the value is most likely to be something the
+    user did not mean to put there.
+    """
+    if len(key) <= 8:
+        return "..."
+    if len(key) < 20:
+        return "..." + key[-4:]
+    return key[:4] + "..." + key[-4:]
+
+
+def _restrict(path):
+    """Owner-only permissions, where the filesystem has them. Never raises.
+
+    The same courtesy `agent_credentials._restrict` pays the provider store:
+    staying out of commits is half of what protects a credential and the file
+    mode is the other half.
+    """
+    try:
+        os.chmod(str(path), 0o600)
+    except OSError:
+        pass
+
+
+def _write_search_file(document):
+    """Persist the settings file with owner-only permissions.
+
+    Written to a neighbouring temporary file, restricted, then moved into
+    place, exactly as the provider store is: the file is never briefly
+    world-readable, and an interrupted write cannot leave half a file where
+    the credential was.
+    """
+    path = Path(SEARCH_FILE)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n",
+                         encoding="utf-8")
+    _restrict(temporary)
+    os.replace(str(temporary), str(path))
+    _restrict(path)
+    return document
+
+
+def save_credential(backend, key):
+    """Store a key for one backend and make it the one in use.
+
+    RAISES rather than reporting quietly, which is the opposite of every read
+    in this module and is deliberate: `agent_config.set_auto_update` is the
+    precedent. A read that fails should fall back to "not configured", but a
+    key the user has just pasted that silently did not persist would show as
+    set on this screen and be gone on the next launch -- worse than an error
+    they can see.
+
+    Every other backend's key is preserved. The file is read at the moment of
+    the write, so a key added in another window is not lost by this one.
+    """
+    name = str(backend).strip().lower()
+    if name not in BACKENDS:
+        raise ValueError("Not a search backend TMT offers: %r" % (backend,))
+    text = str(key or "").strip()
+    if not text:
+        raise ValueError("An empty key cannot be stored.")
+    _preserve_damaged_file()
+    document = _read_search_file()
+    document["keys"][name] = text
+    document["backend"] = name
+    return _write_search_file(document)
+
+
+def _preserve_damaged_file():
+    """Move an unreadable store aside before anything writes over it.
+
+    `_read_search_file` reads a damaged file as "nothing configured", which is
+    right for a READ -- the caller's question is whether there is a usable key.
+    Combined with a whole-document write it silently destroyed every other
+    backend's key: one stray byte in the file and the next save wrote a fresh
+    document containing only the key just typed.
+
+    Nothing here can repair the file, and guessing at its contents would be
+    worse than losing it. What it can do is not be the thing that throws it
+    away: the damaged bytes are kept beside the store so a user who had two
+    keys in there can get them back out by hand.
+    """
+    path = Path(SEARCH_FILE)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return                      # nothing there, which is not damage
+    try:
+        loaded = json.loads(raw)
+        if isinstance(loaded, dict):
+            return                  # readable; leave it exactly as it is
+    except ValueError:
+        pass
+    try:
+        os.replace(str(path), str(path) + ".damaged")
+    except OSError:
+        pass
+
+
+def save_backend(backend):
+    """Persist which backend to prefer, without touching any key."""
+    name = str(backend).strip().lower()
+    if name not in BACKENDS:
+        raise ValueError("Not a search backend TMT offers: %r" % (backend,))
+    document = _read_search_file()
+    document["backend"] = name
+    return _write_search_file(document)
+
+
+def clear_credential(backend):
+    """Forget one backend's key. Returns True when there was one to forget.
+
+    An environment variable is NOT cleared and cannot be from here, so the
+    answer says so: a user who removes a key and still sees search working
+    needs to know which of the two is speaking.
+    """
+    name = str(backend).strip().lower()
+    if name not in BACKENDS:
+        raise ValueError("Not a search backend TMT offers: %r" % (backend,))
+    document = _read_search_file()
+    had = bool(document["keys"].pop(name, ""))
+    if document["backend"] == name:
+        document["backend"] = ""
+    _write_search_file(document)
+    return had
+
+
+def check_key(backend, key):
+    """Ask the backend about a key, and report what it said.
+
+    TMT never decides that a key is valid; only the backend can. This spends
+    ONE search from the user's quota, which is the same trade
+    `agent_menu._check_credential` already makes for a provider key: finding
+    out now beats finding out in the middle of a task.
+    """
+    label = BACKEND_LABELS.get(backend, backend)
+    try:
+        # Inside the try: an unknown backend here would otherwise raise a
+        # KeyError out of a function whose whole job is to report in words.
+        call, _parse = _BACKEND_CALLS[backend]
+        status, _final, _headers, body = call(key, "tmt web search check", 1, "")
+    except WebError as error:
+        # The REASON only, never the exception's own text. `_check_credential`
+        # states the rule -- an exception message can carry a request, and a
+        # request to Tavily carries the key in its body -- and this branch was
+        # the one place in the new code that interpolated the exception.
+        return False, "Saved. TMT could not reach %s (%s)." % (
+            label, str(error).split("(")[0].strip() or "the request failed")
+    except Exception as error:
+        return False, "Saved. TMT could not check it with %s (%s)." % (
+            label, error.__class__.__name__)
+    if status == 200:
+        return True, "Saved. %s accepted it." % label
+    return False, "Saved, but " + _status_message(backend, status, body)
 
 
 def active_backend():
