@@ -30,12 +30,21 @@ Five things here are deliberate and are the ones to read before changing it:
   copy kept here for a broken install still matches. A second hand-drawn logo
   is a second logo to get wrong, and the day they disagree is the day TMT has
   two wordmarks.
-- **The logo holds still and only the subtitle moves.** The subtitle is the
-  instrument -- it is the thing saying "this program is alive and waiting for
-  you" -- and it is the only part of the frame that changes between ticks. A
-  wordmark that is a different colour every frame is not a wordmark, which is
-  the reason `BRAND_PHASE` exists, and an animating logo would also mean every
-  repaint rewrites every row for a change nobody asked to see.
+- **The whole screen moves while it is waiting, and stops once it has
+  settled.** The wordmark and the subtitle both ride the red -> orange -> green
+  cycle, off one phase taken from the caller's clock, so they move together
+  rather than drifting apart. This is the launch screen and it is an attract
+  screen: nothing here is being read yet, so the wordmark is free to be the
+  thing that says the program is alive.
+  The cost usually argued against an animating logo -- that every repaint
+  rewrites every row -- is not paid here, because the subtitle was already
+  oscillating and `LiveRegion` repaints every row whenever any row differs.
+  The frame was being rewritten each tick either way.
+  A SETTLED state stops both, and that half is load-bearing rather than
+  taste: "Up to date." is a fact, a fact that pulses looks like it is still
+  deciding, and a frame that stops changing is a frame `LiveRegion` skips.
+  The header's wordmark still takes the fixed `BRAND_PHASE`, because that one
+  is printed once into scrollback and can never be repainted at all.
 - **Colour is never the message, so the oscillation has three forms.** With
   truecolor it is the gradient sweeping along the text. With ANSI but no
   colour it is a slow dim/normal/bold pulse. With neither it does not animate
@@ -67,11 +76,13 @@ from agent_ui import (
 SPLASH_TICK = GRADIENT_TICK
 
 # Where the wordmark's gradient starts, and how far along the scale it runs.
-# The same fixed phase the header's wordmark takes and for the same reason: a
-# logo that is a different colour every launch is not a logo. It starts past
-# red because red is the error end of the scale and a launch is not an error,
-# and it spans far enough to reach green so the full red -> orange -> green
-# identity is visible across the letters.
+# While the screen is waiting or working the running cycle is ADDED to this,
+# so the colour sweeps along the letters; once a state has settled this is the
+# whole phase and the wordmark holds the still gradient it has always had.
+# It starts past red because red is the error end of the scale and a launch is
+# not an error, and it spans far enough to reach green so the full
+# red -> orange -> green identity is visible across the letters at once rather
+# than one hue at a time.
 LOGO_PHASE = 0.15
 LOGO_SPREAD = 0.85
 
@@ -334,6 +345,25 @@ def _pulse(text, stream, moment):
     return (weight + text + RESET) if weight else text
 
 
+def _cycle_phase(moment, phase=None):
+    """Where the shared red -> orange -> green cycle stands at `moment`.
+
+    Taken from the CALLER'S clock rather than read from a hidden one, which is
+    the property the whole screen rests on: two frames rendered for the same
+    moment are the same bytes, so `LiveRegion` skips a repaint that would not
+    have changed anything, and a test can drive the animation without waiting
+    for real time to pass. `gradient_phase()` reads `time.monotonic()` itself
+    and would take both of those away.
+
+    The subtitle and the wordmark both come through here, so they move on one
+    cycle rather than on two that drift apart.
+    """
+    if phase is not None:
+        return phase
+    from agent_ui import GRADIENT_CYCLE
+    return (float(moment) % GRADIENT_CYCLE) / GRADIENT_CYCLE
+
+
 def paint_subtitle(text, stream, state=WAITING, moment=None, phase=None):
     """The subtitle, painted with whatever oscillation this terminal can carry.
 
@@ -356,13 +386,8 @@ def paint_subtitle(text, stream, state=WAITING, moment=None, phase=None):
         return text
     if _supports_color(stream):
         # A there-and-back sweep, so the line can oscillate forever without
-        # snapping from green back to red. `gradient_phase` walks exactly that
-        # cycle; the phase is taken from the caller's clock so a test can drive
-        # the animation without waiting for one.
-        if phase is None:
-            from agent_ui import GRADIENT_CYCLE
-            phase = (float(moment) % GRADIENT_CYCLE) / GRADIENT_CYCLE
-        return cycle_text(text, stream, phase, spread=0.6)
+        # snapping from green back to red.
+        return cycle_text(text, stream, _cycle_phase(moment, phase), spread=0.6)
     if _has_ansi(stream):
         return _pulse(text, stream, moment)
     return text
@@ -506,6 +531,14 @@ def render_splash_frame(state=None, stream=None, size=None, moment=None,
     height = max(1, rows - 1)
 
     logo, logo_width = logo_for(columns, stream)
+    # The wordmark rides the cycle while the screen is waiting or working, and
+    # holds still once something has settled. One rule for the whole frame:
+    # the screen moves while it is still going to do something, and stops when
+    # it has. That is `paint_subtitle`'s rule applied to the other element, and
+    # it is what keeps a settled frame byte-identical between ticks -- so the
+    # repaint is still skipped on exactly the screens that are being read.
+    animated = state.state in (WAITING,) + _WORKING
+    base = LOGO_PHASE + (_cycle_phase(moment, phase) if animated else 0.0)
     body = []
     for index, row in enumerate(logo):
         # Measured on the plain row and painted afterwards, never the other
@@ -515,8 +548,7 @@ def render_splash_frame(state=None, stream=None, size=None, moment=None,
         # paint second -- for the same reason.
         painted = row
         if _supports_color(stream):
-            painted = cycle_text(row, stream,
-                                 LOGO_PHASE + index * LOGO_ROW_SPREAD,
+            painted = cycle_text(row, stream, base + index * LOGO_ROW_SPREAD,
                                  spread=LOGO_SPREAD)
         body.append(_pad_left(row, width) + painted)
     if logo:

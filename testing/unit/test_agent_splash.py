@@ -499,18 +499,45 @@ def test_two_frames_at_the_same_moment_are_byte_identical():
             == agent_splash.render_splash_frame(state, stream, (80, 24), 1.7))
 
 
-def test_only_the_subtitle_row_moves_between_two_moments():
-    """The logo holds still and only the subtitle moves. A wordmark that is a
-    different colour every frame is not a wordmark, and an animating logo
-    would mean every repaint rewrites every row for a change nobody asked to
-    see."""
+def test_the_wordmark_moves_with_the_subtitle_while_the_screen_waits():
+    """The launch screen is an attract screen: nothing on it is being read
+    yet, so the wordmark rides the same red -> orange -> green cycle the
+    subtitle does and says the program is alive.
+
+    This test asserted the opposite until the wordmark was asked to move, and
+    it is kept rather than deleted because the half that matters is unchanged:
+    the movement is COLOUR ONLY. Every row still reads the same with the
+    escapes stripped, which is the rule the whole interface keeps.
+    """
     state = agent_splash.SplashState()
     stream = Tty()
     first = agent_splash.render_splash_frame(state, stream, (80, 24), 0.0)
     second = agent_splash.render_splash_frame(state, stream, (80, 24), 0.9)
     moved = [index for index, (a, b) in enumerate(zip(first, second)) if a != b]
-    assert len(moved) == 1, moved
-    assert "Press Enter to Continue" in visible(second[moved[0]])
+    # The ten logo rows and the subtitle, rather than the subtitle alone.
+    assert len(moved) > 1, moved
+    assert any("Press Enter to Continue" in visible(second[index])
+               for index in moved), moved
+    assert any(set(visible(second[index]).strip()) <= set("█ ")
+               and visible(second[index]).strip() for index in moved), moved
+    # Nothing but the colour changed on any of them.
+    for index in moved:
+        assert visible(first[index]) == visible(second[index]), index
+
+
+def test_a_settled_wordmark_holds_still_so_the_repaint_is_skipped():
+    """The other half of the rule, and the load-bearing half. A fact that
+    pulses looks like it is still deciding -- and a frame that stops changing
+    is a frame `LiveRegion` never repaints, which is what keeps a screen being
+    read cheap and its cursor still."""
+    stream = Tty()
+    for name in (agent_splash.CURRENT, agent_splash.UPDATED,
+                 agent_splash.BLOCKED, agent_splash.FAILED,
+                 agent_splash.SKIPPED, agent_splash.DONE):
+        state = agent_splash.SplashState(name)
+        early = agent_splash.render_splash_frame(state, stream, (80, 24), 0.0)
+        later = agent_splash.render_splash_frame(state, stream, (80, 24), 1.7)
+        assert early == later, name
 
 
 def test_the_detail_is_drawn_as_its_own_row_under_the_subtitle():
