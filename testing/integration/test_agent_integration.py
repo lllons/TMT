@@ -59,13 +59,29 @@ def test_deleting_is_refused_to_a_background_agent_for_the_real_reason():
             assert "internal_response" in refusal, (action, refusal)
 
     # It is checked AHEAD of the other two sets, or the sentence would name
-    # whichever of them happened to match first. Matched on the whole phrase
-    # rather than on the word "terminal", which the ordinary worker refusal
-    # also carries -- "your only terminal verb is internal_response" -- and
-    # which therefore proves nothing about which branch answered.
+    # whichever of them happened to match first. Not matched on the word
+    # "terminal", which the ordinary worker refusal also carries -- "your only
+    # terminal verb is internal_response" -- and which therefore proves nothing
+    # about which branch answered.
     push = agent_worker._refusal("git_push", None, agent_worker.WORKER_FORBIDDEN)
     assert "no terminal to be asked at" not in push, push
     assert "terminal verb is internal_response" in push, push
+
+    # Nor on the whole phrase any more, which is what changed when `bash`
+    # arrived: its own forbidden-verb sentence says a command may need
+    # approving "and you have no terminal to be asked at" too. Two branches
+    # now give the same true reason for different verbs, so what separates
+    # them is each branch's own first sentence -- checked here so a future
+    # edit that collapsed the two is caught by the branch that would have
+    # lost its wording rather than by nothing at all.
+    command = agent_worker._refusal("bash", None, agent_worker.WORKER_FORBIDDEN)
+    assert "no terminal to be asked at" in command, command
+    assert "Commands are the main agent's to run" in command, command
+    assert "waits for a human to confirm" not in command, command
+    for action in ("delete_file", "delete_folder"):
+        said = agent_worker._refusal(action, None, agent_worker.WORKER_FORBIDDEN)
+        assert "waits for a human to confirm" in said, (action, said)
+        assert "Commands are the main agent's to run" not in said, (action, said)
 
 
 def test_neither_delete_verb_is_offered_to_the_note_agent():

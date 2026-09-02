@@ -787,7 +787,7 @@ def test_the_note_agent_is_refused_every_verb_that_changes_anything():
         ("create_folder", {"path": "src"}),
         ("rename_file", {"path": "a.py", "new_name": "b.py"}),
         ("replace_across", {"search": "a", "replace": "b", "apply": True}),
-        ("run_file", {"path": "run_tests.py"}),
+        ("bash", {"command": "python run_tests.py"}),
         ("git_commit", {"message": "x"}),
         ("git_push", {}),
         ("remember", {"note": "x"}),
@@ -811,12 +811,16 @@ def test_the_note_whitelist_holds_no_verb_that_changes_the_workspace():
     import agent_config
     for name in agent_worker.NOTE_ACTIONS:
         assert name not in agent_config.MUTATING_ACTIONS, name
-    for name in ("run_file", "run_python", "git_commit", "git_push", "open_app",
+    for name in ("bash", "git_commit", "git_push", "open_app",
                  "remember", "replace_across", "end_conversation",
                  # The old spellings are not on it either. They are not on any
                  # list: the translation happens first, so a whitelist naming
                  # them would be a second, drifting copy of the same fact.
-                 "respond", "done", "announce"):
+                 # `run_file` and `run_python` joined that group when `bash`
+                 # replaced them, and they are the pair it would be easiest to
+                 # leave behind, because a note agent that could run one would
+                 # be executing code to answer a question about the workspace.
+                 "respond", "done", "announce", "run_file", "run_python"):
         assert name not in agent_worker.NOTE_ACTIONS, name
 
 

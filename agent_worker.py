@@ -111,12 +111,12 @@ AGENDA_ACTION = "review_agenda"
 # the blacklist.
 #
 # It is NOTE_ACTIONS plus `find_symbol`'s companions and nothing that writes.
-# The reviewer is deliberately not given `run_file`: a reviewer that runs the
-# code is a reviewer that changes what it is reviewing -- a test run writes
-# caches, a script writes files -- and it would also be reading a result it
-# produced rather than the one the implementing agent produced. What actually
-# ran this turn is put in its brief as an observed fact instead, and judging
-# what that proves is its job.
+# The reviewer is deliberately not given `bash`: a reviewer that runs the code
+# is a reviewer that changes what it is reviewing -- a test run writes caches,
+# a build writes artefacts -- and it would also be reading a result it produced
+# rather than the one the implementing agent produced. What actually ran this
+# turn is put in its brief as an observed fact instead, and judging what that
+# proves is its job.
 #
 # `review` itself is absent, so a reviewer cannot start a review of its own.
 #
@@ -149,8 +149,20 @@ REVIEW_ACTIONS = frozenset(NOTE_ACTIONS | {AGENDA_ACTION})
 # would also run the project's whole test suite on a background thread while
 # the main agent edits the files under it, which is a result about a tree that
 # never existed -- the same hazard `review` refuses to start into.
+#
+# `bash` because running a command is the one capability in TMT that can need a
+# human, and a background agent is the one place there is never one. A command
+# the policy asks about is answered at the terminal, and a worker has no
+# terminal to be asked at -- so a worker given the verb would meet either a
+# refusal it cannot resolve or, far worse, an approval question that defaulted
+# to yes on a thread nobody is watching. It is also the widest verb there is: a
+# build writes anything a build writes, on a background thread, under the main
+# agent's feet. Refused here in code as well as being absent from every
+# background prompt, and deliberately absent from
+# `agent_delegation.READ_ONLY_ACTIONS` too, so nothing can reach it by any of
+# the three routes.
 WORKER_FORBIDDEN = frozenset({"git_push", "end_conversation", "plan",
-                              "review", "verify",
+                              "review", "verify", "bash",
                               # The project's persistent memory, refused for
                               # the reason the three above it are: it is the
                               # main agent's account of the project, written
@@ -246,6 +258,29 @@ _NOT_A_WORKER_VERB = (
     "You are a background agent and have no user to answer; your only "
     "terminal verb is internal_response."
 )
+
+# The forbidden verbs that need a reason of their own, and why each does.
+#
+# `_NOT_A_WORKER_VERB` is about having no user to answer, which is true of
+# `end_conversation` and near enough true of the rest -- they are the main
+# agent's contract with a person. It is simply not true of `bash`, and a model
+# told the wrong reason reasonably looks for another route to the same effect:
+# that is the mistake `WORKER_NEEDS_TERMINAL` was given its own sentence to
+# avoid, and a worker told it "has no user to answer" when it asked to run the
+# tests would sensibly go looking for some other way to run them. So it is
+# told the real thing, and told what to do instead.
+#
+# One entry rather than a table for every verb: the others are covered
+# correctly enough by the default, and inventing six sentences nobody has
+# watched a model read would be guessing at which half it acts on.
+_WHY_FORBIDDEN = {
+    "bash": ("Commands are the main agent's to run: one may need a human to "
+             "approve it and you have no terminal to be asked at, and a build "
+             "you started in the background would be writing under the main "
+             "agent while it edits. Say in your internal_response exactly "
+             "which command you would have run and why, and let the main "
+             "agent run it."),
+}
 
 _NOT_A_NOTE_VERB = (
     "You are answering one question by reading the workspace and may not "
@@ -668,7 +703,7 @@ def _refusal(action, allowed, forbidden, read_only=_NOT_A_NOTE_VERB):
         # cannot happen, it reports the path instead.
         return _REFUSED % (action, _NEEDS_A_TERMINAL)
     if action in forbidden:
-        return _REFUSED % (action, _NOT_A_WORKER_VERB)
+        return _REFUSED % (action, _WHY_FORBIDDEN.get(action, _NOT_A_WORKER_VERB))
     if allowed is not None and action not in allowed:
         return _REFUSED % (action, read_only)
     return ""

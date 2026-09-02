@@ -488,7 +488,7 @@ def test_an_event_never_reports_an_outcome_the_action_did_not_have():
     success or failure when it is the action's own report; a program's output
     is data. Scanning it for words like "failed" called a fully green test run
     a failure, which is a lie told confidently."""
-    green = agent_actions.action_event("run_python", {"path": "run_tests.py"},
+    green = agent_actions.action_event("bash", {"command": "python run_tests.py"},
                                        "180 passed, 0 failed")
     assert green.kind == "command", green.kind
 

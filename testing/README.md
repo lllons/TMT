@@ -28,9 +28,12 @@ on Windows through a pipe. `PYTHONDONTWRITEBYTECODE=1` as well for a mutation ru
 make the interpreter load the previous one's bytecode.
 
 The suite takes a couple of minutes. Most of that is real sleeping in the live-renderer
-tests. TMT's own `run_file` gives up at ten seconds, so TMT cannot verify its own suite
-*through that action* — but `verify` can, through `agent_execution.run_command`, which
-allows a check five minutes. Ask it to verify with `/verify` in the task text.
+tests. TMT can run its own suite two ways now that `bash` has replaced `run_file`, and
+both want a timeout said out loud: `bash` defaults to 120 seconds and takes up to 600
+(`agent_sandbox.DEFAULT_TIMEOUT` / `MAX_TIMEOUT`), which is a default the whole suite
+sits right on top of — pass a `timeout` rather than find out. `verify` goes through
+`agent_execution.run_command` and allows a check five minutes; ask for it with `/verify`
+in the task text.
 
 There is no per-test timeout. A test that blocks on input hangs the whole run.
 

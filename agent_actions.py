@@ -5,7 +5,7 @@ from collections import Counter
 
 import agent_ui
 from agent_config import MUTATING_ACTIONS
-from agent_execution import open_app, run_file
+from agent_execution import RUNNERS, open_app
 from agent_file_ops import (
     append_file, copy_file, create_folder, delete_file, delete_folder, list_files,
     patch_file, read_file, read_lines, replace_lines, safe_path,
@@ -624,7 +624,7 @@ def _agent_modules():
 _NO_VERIFY_STATE = (
     "Verification is not available here, so 'verify' did nothing and nothing "
     "has been verified. Do not claim the work was verified. Check what you can "
-    "with run_file and the file tools, and say in your final message that no "
+    "with bash and the file tools, and say in your final message that no "
     "verification ran."
 )
 
@@ -1326,6 +1326,47 @@ def _project_context(context, obj):
     return str(result) if result.ok else "FAILED: %s" % result
 
 
+# --- running commands -------------------------------------------------------
+#
+# One verb, and it is the only way a model runs anything at all. It goes
+# through `_run_tool` for both of that helper's guarantees, and this branch
+# needs them more than any other: `agent_bash` pulls in the parser, the policy
+# and the sandbox behind it, so it is the deepest import in the program, and a
+# module missing from a frozen editable install has to come back as a sentence
+# the model can work around rather than an exception that ends the session. A
+# ValueError -- the workspace sandbox refusing a cwd or a redirect target --
+# comes back as words for the same reason.
+#
+# Everything about what may run is decided inside `agent_bash`; nothing about
+# it is decided here. This function's whole job is to hand over the model's
+# keys and the ONE thing the model cannot supply: the approval callable, which
+# the session loop puts in the context and which is how an ASK verdict reaches
+# a human. Absent -- a piped run, a test, a background agent's context -- it
+# stays None, and `agent_bash` answers an approval nobody can give with no.
+# That is the existing rule for raw terminal input in this program, arriving
+# where it matters most.
+
+
+def _bash(context, obj):
+    """Run one command line, or report why it did not run."""
+    # The legacy net's refusal, checked before anything else. `adopt_verb` puts
+    # it here when it could translate a `run_file`'s VERB but not its meaning
+    # -- a file whose extension has no known runner -- because inventing a
+    # command for it is the one thing that must not happen. It can only ever
+    # refuse, so a model writing the key itself buys nothing but a refusal.
+    blocked = obj.get(LEGACY_BLOCKED_KEY)
+    if isinstance(blocked, str) and blocked.strip():
+        return blocked
+    return _run_tool("agent_bash", lambda m: m.bash(
+        command=obj.get("command"),
+        operation=obj.get("operation") or "run",
+        cwd=obj.get("cwd"),
+        timeout=obj.get("timeout"),
+        id=obj.get("id"),
+        network=obj.get("network"),
+        approve=(context or {}).get("approve")))
+
+
 def execute_action(obj, context=None):
     """Run one action object and return its result.
 
@@ -1333,10 +1374,17 @@ def execute_action(obj, context=None):
     Callers that pass nothing get the safe default: no push authority.
     """
     # Translated here as well as in the loops, so a caller that reaches this
-    # function directly -- a worker, a test, anything -- gets the same two
-    # verbs the loop does. `or obj["action"]` keeps the old behaviour for an
-    # object with no action at all: a KeyError, raised where it always was.
-    action = canonical_action(obj) or obj["action"]
+    # function directly -- a worker, a test, anything -- gets the same verbs
+    # the loop does. `adopt_verb` rather than `canonical_action`, because a
+    # rename is not always the whole translation: `run_file` carries a `path`
+    # and `bash` needs a `command` built from it, and `search_files` needs its
+    # case-insensitivity put back. Naming the verb and leaving the keys behind
+    # got the object HALF translated -- renamed, then refused for a key it was
+    # never given -- which is the shape of half-net this comment's own promise
+    # was written to rule out. `or obj["action"]` keeps the old behaviour for
+    # an object with no action at all: a KeyError, raised where it always was.
+    adopt_verb(obj)
+    action = obj.get("action") or obj["action"]
     # The delegation contract's SECOND layer, asked before anything is
     # dispatched. `agent_worker` has already refused every mutating verb for a
     # read-only delegation before it got here; this is what refuses one that
@@ -1372,7 +1420,7 @@ def execute_action(obj, context=None):
         old.rename(new)
         return f"Renamed {obj['path']} to {new_name}"
     if action == "create_folder": return create_folder(obj["path"])
-    if action in ("run_python", "run_file"): return run_file(obj["path"])
+    if action == "bash": return _bash(context, obj)
     if action == "open_app": return open_app(obj["app"], file_path=obj.get("path"), url=obj.get("url"))
     if action == "git_status": return _run_git(_git_status)
     if action == "git_diff": return _run_git(lambda agent_git: _git_diff(agent_git, obj))
@@ -1562,11 +1610,27 @@ END_CONVERSATION = "end_conversation"
 #
 # The translation is of the MEANING again, and for `search_files` the spelling
 # is not the whole of it: see `adopt_verb`, which turns `ignore_case` on.
+#
+# `run_file` and `run_python` are here under the same rules and for the same
+# reason, and they are the widest translation of the three. They ran ONE FILE
+# by its extension; `bash` runs a command line. So the meaning of
+# `{"action":"run_file","path":"x.py"}` is not "bash with a path", it is the
+# command that file's extension names -- `python x.py` -- which is why
+# `adopt_verb` builds it from `agent_execution.RUNNERS` rather than moving a
+# key across. Taught nowhere, exactly like the other four: no prompt mentions
+# them, no tool list offers them, no error suggests them.
+#
+# It cannot become a bypass. What comes out is an ordinary `bash` action and it
+# goes through everything a `bash` action goes through -- the parser, the
+# policy, the approval, the sandbox -- so a legacy verb reaches nothing a
+# current one does not.
 _LEGACY_ACTIONS = {
     "announce": SEND_MESSAGE,
     "done": END_CONVERSATION,
     "search_files": "grep",
     "find_text": "grep",
+    "run_file": "bash",
+    "run_python": "bash",
 }
 
 # The keys that used to make `respond` mean "and keep going". False-ish here
@@ -1589,6 +1653,83 @@ _NOT_FINAL = ("false", "no", "0", "")
 LEGACY_EMPTY_MESSAGE = "done"
 
 
+# Where the net puts a refusal it has to make. `_bash` reads it before it does
+# anything else and returns the sentence; nothing else in TMT looks at it.
+#
+# A key on the action object rather than a raised error, because this is the
+# `hand_back` shape the whole loop is built on: the model gets a sentence
+# saying what went wrong and what to write instead, and spends one step. It can
+# only ever REFUSE -- there is no value of it that makes something run -- so a
+# model writing it itself fails safe.
+LEGACY_BLOCKED_KEY = "_legacy_blocked"
+
+_LEGACY_RUN_REFUSED = (
+    "FAILED: run_file and run_python are gone -- commands run through the bash "
+    "action now. TMT could not translate that one for you because %s. Emit "
+    "{\"action\":\"bash\",\"command\":\"...\"} with the command that runs it."
+)
+
+# Whether a path can go into a command line as it stands. A WHITELIST of the
+# characters that are certainly ordinary, so anything else -- a space, a
+# backslash, a pipe, a glob character, an operator -- is quoted rather than
+# left for the parser to interpret. A blacklist here would be a list of
+# metacharacters somebody has to keep in step with `agent_shell`, and the day
+# it fell behind would be the day a filename ran a second command.
+_LEGACY_PLAIN_PATH = re.compile(r"[^A-Za-z0-9_./-]")
+
+
+def _legacy_extension(path):
+    """The file extension of a path, lowercased, or "".
+
+    Split by hand rather than with `os.path` because a model writes either
+    separator on either platform, and `posixpath.splitext` on `src\\x.py` finds
+    a directory that is not there. A dot before the last separator is part of a
+    directory name and is not this file's extension.
+    """
+    dot = path.rfind(".")
+    separator = max(path.rfind("/"), path.rfind("\\"))
+    return path[dot:].lower() if dot > separator + 1 else ""
+
+
+def _legacy_bash_command(obj):
+    """(command, refusal) for a legacy run_file. Exactly one is non-empty.
+
+    The one place the old verb's meaning is turned into a command line, and the
+    one place it can honestly fail. `RUNNERS` says what runs a `.py` and what
+    runs a `.go`; it says nothing about a `.zzz`, and it no longer says
+    anything about `.c`, `.cpp` or `.java` either, because the compile-and-run
+    paths that used to handle those went with `run_file`.
+
+    **A file type with no runner becomes a refusal, never a guess.** Handing
+    `bash` a command TMT invented for a file type it does not know would be
+    fabricating the one thing a model would then act on, and it is the kind of
+    invention that runs rather than merely misleads.
+
+    The path is quoted rather than escaped, and only when it needs it. TMT
+    parses this line itself a moment later, so an unquoted backslash in a
+    Windows path is an escape character and `src\\x.py` would arrive as
+    `srcx.py` -- a file not found, from a translation nobody asked for. Single
+    quotes are the one quoting form that is literal all the way through, so a
+    path that contains one is refused rather than escaped by guesswork.
+    """
+    path = obj.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return "", _LEGACY_RUN_REFUSED % "it named no path to run"
+    path = path.strip()
+    extension = _legacy_extension(path)
+    runner = RUNNERS.get(extension)
+    if not runner:
+        return "", _LEGACY_RUN_REFUSED % (
+            "'%s' has no runner TMT knows about (it knows %s)" % (extension, ", ".join(RUNNERS))
+            if extension else
+            "that path has no extension for TMT to choose a runner from")
+    if "'" in path:
+        return "", _LEGACY_RUN_REFUSED % (
+            "that path contains a quote and TMT will not guess how to escape it")
+    quoted = "'%s'" % path if _LEGACY_PLAIN_PATH.search(path) else path
+    return " ".join(part.replace("{file}", quoted) for part in runner), ""
+
+
 def adopt_verb(obj):
     """Rewrite this reply to the verb in force now. Returns it, mutated.
 
@@ -1596,7 +1737,7 @@ def adopt_verb(obj):
     dispatcher cannot drift: `canonical_action` decides WHAT it means, and
     this is what makes the object say it.
 
-    It also fills in the keys a rename left a hole in, and there are two.
+    It also fills in the keys a rename left a hole in, and there are three.
 
     `done` required no keys and `end_conversation` requires `message`, so
     renaming alone left a bare `{"action":"done"}` failing validation --
@@ -1608,6 +1749,13 @@ def adopt_verb(obj):
     different answer under a name it never chose. `ignore_case` is turned on
     for it, and only when the model did not write the key itself. `find_text`
     was already exact, so it is translated as it stands.
+
+    `run_file` carried a `path` and `bash` carries a `command`, and the gap
+    between them is not a rename at all -- it is the runner table. `x.py` meant
+    `python x.py` and `main.go` meant `go run main.go`, so that is what is
+    built, from `agent_execution.RUNNERS`. When it cannot be built honestly the
+    object is left carrying a refusal instead of a command; see
+    `_legacy_bash_command`.
 
     The reply the model actually wrote is untouched by this: the loops keep
     `raw` and put that in the conversation, so the record still shows the
@@ -1625,6 +1773,12 @@ def adopt_verb(obj):
         obj["message"] = LEGACY_EMPTY_MESSAGE
     if was == "search_files" and "ignore_case" not in obj:
         obj["ignore_case"] = True
+    if was in ("run_file", "run_python") and "command" not in obj:
+        command, refused = _legacy_bash_command(obj)
+        if refused:
+            obj[LEGACY_BLOCKED_KEY] = refused
+        else:
+            obj["command"] = command
     return obj
 
 
@@ -1639,10 +1793,11 @@ def canonical_action(obj):
     delete -- a reply written under the old rules still does exactly what it
     did.
 
-    `search_files` and `find_text` both become `grep`. This answers the verb
-    only; `adopt_verb` is what puts `search_files`'s case-insensitivity back on
-    the object, because that half of its meaning lived in a default rather than
-    in a key.
+    `search_files` and `find_text` both become `grep`, and `run_file` and
+    `run_python` both become `bash`. This answers the verb only; `adopt_verb`
+    is what puts `search_files`'s case-insensitivity and `run_file`'s command
+    back on the object, because in both cases half of the old verb's meaning
+    lived somewhere other than in a key.
 
     Anything already using the current names, and every other action in TMT,
     is returned untouched. Not a dict, or no action at all, comes back as ""
@@ -1712,7 +1867,13 @@ def build_result_message(action, result, obj=None):
         return f"FAILED: {result_str}\nThe search string didn't match exactly. Use grep or read_lines, then retry."
     if action == "replace_lines" and "Invalid range" in result_str:
         return f"FAILED: {result_str}\nUse read_lines on this file first, then retry replace_lines."
-    if "not found" in result_str.lower() and action in ("read_file", "run_python", "patch_file", "read_lines", "copy_file"):
+    # Deliberately not `bash`. "not found" in a command's output is the
+    # program's own words -- `cat` on a missing file, a compiler on a missing
+    # header -- and "check the file path with list_files" is advice about the
+    # wrong thing. It is the same rule that keeps `bash` out of
+    # `_REPORTED_ACTIONS`: a command's output is data, not a report on the
+    # action.
+    if "not found" in result_str.lower() and action in ("read_file", "patch_file", "read_lines", "copy_file"):
         return f"FAILED: {result_str}\nCheck the file path with list_files and retry."
     if action in READ_ONLY_ACTIONS:
         message = f"Result:\n{result_str}\nNow output an end_conversation action that naturally answers the user's question using this data."
@@ -1728,7 +1889,7 @@ def build_result_message(action, result, obj=None):
 ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     "write_file", "append_file", "write_files", "patch_file", "delete_file", "read_file",
     "list_files", "read_lines", "replace_lines", "copy_file",
-    "delete_folder", "rename_file", "create_folder", "run_python", "run_file",
+    "delete_folder", "rename_file", "create_folder", "bash",
     "open_app", "git_status", "git_diff", "git_identity", "git_commit", "git_push",
     "tree", "grep", "glob", "find_symbol", "replace_across", "code_map",
     "related_tests", "remember", "recall", "plan", "review", "verify",
@@ -1798,7 +1959,11 @@ _EVENT_KIND_FOR_ACTION = {
     # the kind every other reading verb takes. `glob` reads names rather than
     # contents, which is a difference in what is read and not in what happens.
     "list_files": "file_read", "grep": "file_read", "glob": "file_read",
-    "run_python": "command", "run_file": "command", "open_app": "command",
+    # The one verb that runs anything, and the kind `run_file` and `run_python`
+    # held before it. A command is not a file operation whatever it does to
+    # files: what the user is watching is a process starting, and the row says
+    # so.
+    "bash": "command", "open_app": "command",
     "git_status": "tool", "git_diff": "tool", "git_identity": "tool",
     "git_commit": "milestone", "git_push": "milestone",
     # A milestone rather than a tool, and it earns it: a plan step changing
@@ -1833,10 +1998,14 @@ _FAILURE_MARKERS = (
 # The actions whose result is a report on the action, and so can be read for
 # whether it worked. Every other action's result is data -- file content, the
 # output of a program someone ran -- where these words mean nothing about the
-# action itself. Scanning those produced a real false alarm: `run_python` on
-# the test suite returns "180 passed, 0 failed", and a substring search called
-# a fully green run a failure. An event that misreports what happened is worse
-# than no event, so the list is stated rather than inferred.
+# action itself. Scanning those produced a real false alarm: running the test
+# suite returns "180 passed, 0 failed", and a substring search called a fully
+# green run a failure. An event that misreports what happened is worse than no
+# event, so the list is stated rather than inferred.
+#
+# `bash` is the sharpest case of that and is deliberately absent. Its result is
+# whatever a program printed, which is the definition of data here -- and it is
+# the very output the false alarm above was found in.
 _REPORTED_ACTIONS = frozenset((
     "write_file", "write_files", "append_file", "patch_file", "replace_lines",
     "delete_file", "delete_folder", "create_folder", "copy_file", "rename_file",
@@ -1946,9 +2115,13 @@ def _describe(action, obj, result):
         # part that is known.
         # `pattern` is last because it belongs to one action: without it a
         # `glob` row is the bare word "Glob", which says a search happened and
-        # not what was looked for.
+        # not what was looked for. `command` is there for the same reason and
+        # matters more -- a bash row is the one row a user scrolls back to in
+        # order to find out what was actually run, and "Bash" alone answers
+        # nothing. It is the command the model asked for; what TMT parsed it
+        # into is in the result.
         target = (obj.get("path") or obj.get("query") or obj.get("pattern")
-                  or obj.get("app") or "")
+                  or obj.get("app") or obj.get("command") or "")
         label = ACTION_LABELS.get(action, action)
         if action == "read_lines":
             # The one read whose extent is a fact rather than a guess, so it

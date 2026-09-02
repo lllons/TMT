@@ -658,17 +658,59 @@ MUTATING_ACTIONS = {
     # costs one rebuild, while an applied replacement that did not would leave
     # the model reasoning about files it had itself just rewritten.
     "replace_across",
+    # For `replace_across`'s reason exactly, and more so. The set is consulted
+    # by action NAME, and most of what `bash` is used for writes: `make`, a
+    # build, a formatter, `> file`, a script the model just wrote. TMT cannot
+    # tell those from `ls` by the name alone, and `TMT.note_work` reads this
+    # set to make a passed review and a passed verification STALE -- so
+    # leaving it out means a command that rewrote the tree leaves a review
+    # standing that approved the tree before it.
+    #
+    # The cost is the same cost the preview above accepts: an `ls` re-gates an
+    # answer it did not need to re-gate, and rebuilds a prompt cache it did
+    # not need to rebuild. That is a wasted round; the other way round is a
+    # review whose subject moved underneath it, which is the thing the gate
+    # exists to prevent. `run_file` was left out of this set and its whole
+    # blast radius was one file with one known runner; `bash` is not that.
+    "bash",
 }
 
 REQUIRED_KEYS = {
     "write_file": ["path", "content"], "append_file": ["path", "content"],
     "write_files": ["files"], "patch_file": ["path", "search", "replace"],
     "delete_file": ["path"], "read_file": ["path"], "rename_file": ["path"],
-    "run_python": ["path"], "run_file": ["path"], "create_folder": ["path"],
+    "create_folder": ["path"],
     "open_app": ["app"], "list_files": [],
     "read_lines": ["path"], "replace_lines": ["path", "start", "end", "content"],
     "copy_file": ["path"],
     "delete_folder": ["path"],
+    # The one way a model runs anything. It replaced `run_file` and
+    # `run_python`, which ran ONE FILE by its extension from a fixed table --
+    # the wrong shape for almost everything a coding agent actually has to do,
+    # and the reason a model that wanted to run a build had nowhere to go.
+    #
+    # NO REQUIRED KEYS, and that is the `plan` precedent rather than an
+    # omission. Which keys an operation needs depends on which operation it is:
+    # `run` and `start` need a `command`, and `status`, `logs` and `stop` need
+    # an `id` instead. Requiring `command` here would refuse three of the five
+    # outright, and requiring `operation` would refuse the commonest shape there
+    # is -- `{"action":"bash","command":"pytest"}`, where the operation is the
+    # default. So REQUIRED_KEYS answers the one question it can answer for
+    # every operation at once (nothing is universally required) and
+    # `agent_bash` names the missing key for the operation actually asked for.
+    #
+    # Deliberately NOT in MUTATING_ACTIONS, exactly as `run_file` was not. A
+    # command CAN write -- a build writes, a test run writes caches -- but that
+    # set is also what `TMT.note_work` reads to make a passed review and a
+    # passed verification stale, so putting `bash` in it would re-gate the final
+    # answer on every `ls` and every `git log`. What a command did to the
+    # workspace is visible in its own output, which the model has just read.
+    #
+    # Registered here and dispatched in agent_actions; refused outright to every
+    # background agent by `agent_worker.WORKER_FORBIDDEN`, and absent from
+    # `agent_delegation.READ_ONLY_ACTIONS` -- a read-only worker running a build
+    # is not read-only, and a worker cannot be asked to approve anything.
+    "bash": [],
     # The two verbs that talk to the user, and the whole of the difference
     # between them is in their names. Both take one key and both send its text
     # to the screen; only one of them ends anything.

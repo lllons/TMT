@@ -321,11 +321,13 @@ def test_every_other_registered_action_passes_through_untouched():
         assert agent_actions.canonical_action({"action": name}) == name, name
 
 
-def test_the_legacy_table_holds_exactly_the_four_names_a_lookup_can_settle():
-    """Two renames' worth of names, and no more. This test exists so the net
+def test_the_legacy_table_holds_exactly_the_six_names_the_net_still_answers():
+    """Three renames' worth of names, and no more. This test exists so the net
     cannot grow silently: every entry is a name the model is no longer taught
     and TMT still answers, so an addition nobody argued for is an old spelling
-    quietly staying alive.
+    quietly staying alive. It is named deliberately and it grew deliberately --
+    the count in the name is the point, and the two that were added are named
+    below with what they are for.
 
     `announce` and `done` are the speaking verbs this file is about.
     `search_files` and `find_text` are the two search actions `grep` replaced,
@@ -333,20 +335,31 @@ def test_the_legacy_table_holds_exactly_the_four_names_a_lookup_can_settle():
     for a name it learned would otherwise spend its retry budget being told the
     name is wrong.
 
-    `respond` is deliberately absent from all four: its meaning depends on a
+    `run_file` and `run_python` are the two the guarded `bash` tool replaced.
+    They are the newest pair and the only ones whose translation is not a
+    spelling: the old verbs took a `path` and TMT chose the runner, so
+    `adopt_verb` has to build `{"command": "python x.py"}` out of
+    `agent_execution.RUNNERS` before the object is a valid `bash` action, and
+    an extension with no known runner becomes a refusal sentence rather than a
+    guessed command. So this table settles their NAME and not their meaning;
+    what they mean is pinned in the tests below and in the wiring tests.
+
+    `respond` is deliberately absent from all six: its meaning depends on a
     key, so it is decided in code above the lookup. A table entry for it would
     be a second answer to the same question, and the wrong one half the time.
 
-    The table settles the SPELLING only. `search_files` was case-insensitive
-    and `grep` is not, so half of what that name meant lived in a default
-    rather than in a key -- `adopt_verb` is what puts it back, and the wiring
-    tests are where that is pinned.
+    The table settles the SPELLING only, for the search pair too:
+    `search_files` was case-insensitive and `grep` is not, so half of what that
+    name meant lived in a default rather than in a key -- `adopt_verb` is what
+    puts it back, and the wiring tests are where that is pinned.
     """
     assert agent_actions._LEGACY_ACTIONS == {
         "announce": SEND,
         "done": END,
         "search_files": "grep",
         "find_text": "grep",
+        "run_file": "bash",
+        "run_python": "bash",
     }
 
 
@@ -609,7 +622,7 @@ def test_none_of_the_three_gates_holds_an_ordinary_action():
     refusal is asking it to do."""
     plan, review, verification = (unfinished_plan(), failing_review(),
                                   unrun_verification())
-    for action in ("read_file", "patch_file", "run_file", "git_diff", "plan",
+    for action in ("read_file", "patch_file", "bash", "git_diff", "plan",
                    "review", "verify", "spawn_agent", "internal_response"):
         assert agent_plan.refusal(plan, action) == "", action
         assert agent_review.refusal(review, None, action) == "", action

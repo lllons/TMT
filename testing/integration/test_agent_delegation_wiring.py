@@ -142,7 +142,7 @@ MUTATIONS = (
     ("delete_folder", {"path": "sub", "recursive": True}),
     ("write_files", {"files": [{"path": "one.txt", "content": "one"}]}),
     ("replace_across", {"search": "original", "replace": "gone", "apply": True}),
-    ("run_file", {"path": "writer.py"}),
+    ("bash", {"command": "python writer.py"}),
     ("git_commit", {"message": "should never happen"}),
     ("remember", {"note": "should never be stored"}),
     ("open_app", {"app": "notepad", "path": "target.txt"}),
@@ -151,10 +151,11 @@ MUTATIONS = (
 FILES = {
     "target.txt": "original\n",
     "sub/inner.txt": "inner\n",
-    # A script that writes a file if it is ever run. `run_file` is the general
-    # code-execution path a worker has, and section 7 is about exactly this:
-    # a delegation must not be able to mutate the workspace by running a
-    # program instead of by calling a writing verb.
+    # A script that writes a file if it is ever run. `bash` is the general
+    # code-execution path a worker has -- it replaced `run_file`, and it is a
+    # wider one, because a command can be anything -- and section 7 is about
+    # exactly this: a delegation must not be able to mutate the workspace by
+    # running a program instead of by calling a writing verb.
     "writer.py": "open('escaped.txt','w').write('a program wrote this')\n",
 }
 
@@ -207,6 +208,33 @@ def test_the_same_mutations_in_a_BATCH_are_refused_the_same_way():
             run(record, manager, [batch, FINISH])
             assert _unchanged(box), "%s changed the workspace in a batch" % action
             assert record.violations, "%s in a batch recorded no violation" % action
+    finally:
+        box.close()
+
+
+def test_the_legacy_execution_verbs_are_translated_into_a_refusal_not_a_run():
+    """The one route into execution that does not name `bash`.
+
+    `run_file` and `run_python` are gone as verbs, but the legacy net still
+    translates them so a model written against the old names ends its turn
+    instead of burning its retries. `_adopt_verb` runs BEFORE the contract is
+    consulted, so what the contract sees is `bash` -- which is what makes this
+    worth pinning rather than assuming: an order the other way round would put
+    a name no whitelist mentions in front of a whitelist check, and a
+    fail-closed check would refuse it correctly today and record a violation
+    naming a verb that no longer exists. The disk is the assertion either way.
+    """
+    box = Workspace(files=FILES)
+    try:
+        for action, keys in (("run_file", {"path": "writer.py"}),
+                             ("run_python", {"path": "writer.py"})):
+            manager = AgentManager(clock=Clock())
+            record = spawn(manager, constraints={"read_only": True})
+            answer = run(record, manager, [act(action, **keys), FINISH])
+            assert answer == "done", (action, answer)
+            assert not box.exists("escaped.txt"), "%s ran the script" % action
+            assert record.violations, "%s recorded no violation" % action
+            assert record.violations[0]["operation"] == "bash", record.violations
     finally:
         box.close()
 
@@ -925,7 +953,7 @@ def test_violations_reach_the_main_agent_even_when_no_report_was_asked_for():
     manager = AgentManager(clock=clock)
     record = _finished(manager, clock, {"read_only": True},
                        violations=(D.violation("write_file", ["a.py"]),
-                                   D.violation("run_file", [])))
+                                   D.violation("bash", [])))
     said = agent_actions._agent_result(manager, {"id": record.id})
     assert "Constraint violations: 2 write operations blocked" in said, said
 

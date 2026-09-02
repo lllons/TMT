@@ -52,12 +52,22 @@ report requirement can never widen or narrow what a worker is allowed, and
 # Spelled out here rather than derived from `agent_config.MUTATING_ACTIONS`,
 # and that is deliberate. MUTATING_ACTIONS answers a different question -- "does
 # this invalidate the cached system prompt?" -- and it is correctly narrower:
-# `run_file` executes a program that can write anything, `git_commit` changes
-# the repository, `open_app` launches an application on the user's desktop, and
+# `bash` runs a command that can write anything, `git_commit` changes the
+# repository, `open_app` launches an application on the user's desktop, and
 # `remember` writes to TMT's own store. None of those are in MUTATING_ACTIONS
 # and all four must be refused here. Deriving one from the other would tie a
 # security boundary to a cache-invalidation set, and the day somebody narrowed
 # the cache set for a good reason they would widen this without noticing.
+#
+# `bash` is the sharpest illustration there is of why this set is a whitelist
+# and not a hint. It is the widest verb in TMT, it is what replaced `run_file`
+# and `run_python`, and adding it here would make "read-only" mean a worker
+# that may run a build -- which is not read-only in any sense a user would
+# recognise. A read-only worker is also the one caller that cannot answer the
+# approval question the command policy asks, so the verb would be unusable
+# even where it was not unsafe. Its absence from this set is the second of the
+# three refusals it gets; `agent_worker.WORKER_FORBIDDEN` is the first and no
+# background prompt teaching it is the third.
 #
 # There is a test that this set and MUTATING_ACTIONS are disjoint, and another
 # naming each of those four verbs explicitly.
@@ -90,14 +100,14 @@ READ_ONLY_ACTIONS = frozenset({
     "send_message", "internal_response",
 })
 
-# The four verbs most likely to be reached for by a model that has been told it
-# may not write a file, and the reason each is refused. Used to make the
-# refusal say something a model can act on rather than "not permitted": a
-# worker told only that `run_file` is unavailable reasonably tries `open_app`
-# next.
+# The verbs most likely to be reached for by a model that has been told it may
+# not write a file, and the reason each is refused. Used to make the refusal
+# say something a model can act on rather than "not permitted": a worker told
+# only that `bash` is unavailable reasonably tries `open_app` next.
 _WHY_REFUSED = {
-    "run_file": "it executes a program, and a program can write anything",
-    "run_python": "it executes a program, and a program can write anything",
+    "bash": "it runs a command, and a command can write anything -- and the "
+            "approval a command sometimes needs has to be answered by a human "
+            "at the terminal, which a background agent does not have",
     "open_app": "it launches an application outside this workspace",
     "git_commit": "committing changes the repository",
     "remember": "it writes to TMT's own memory store",

@@ -20,6 +20,10 @@ dist/
 DESIGN_PRINCIPLES.md
 .tmt_model
 .tmt_effort
+# The commands the user has allowed or denied the bash tool, per workspace and
+# globally. TMT's own state, and per-machine: a rule one person approved on
+# their checkout is not a rule anyone else agreed to.
+.tmt_bash_rules.json
 .tmt_autoupdate
 # Whether the persistent project context is on. TMT's own state, so it is
 # ignored here beside the other per-install choices.
@@ -46,6 +50,11 @@ TMT_Context/
 # path are worthless to anyone else and the notebook is per-machine.
 .tmt_index/
 .tmt_memory/
+# The home the bash tool gives a command: HOME, TEMP and every package
+# manager's cache point here, so npm, pip and cargo write their caches inside
+# it instead of into the user's own. Same collision as the two above -- when
+# TMT is run on TMT this is the workspace -- and the same answer.
+.tmt_sandbox/
 
 # Working notes for the assistant. Per-checkout, not source.
 CLAUDE.local.md

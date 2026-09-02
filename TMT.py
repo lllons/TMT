@@ -39,6 +39,7 @@ from agent_actions import READ_ONLY_ACTIONS, ACTION_LABELS, MAX_TURNS, action_ev
 # terminal check and the dispatcher's own branch must be the same string,
 # and two copies of it are two chances for the turn to stop ending.
 from agent_actions import END_CONVERSATION, SEND_MESSAGE, adopt_verb as _adopt_verb
+from agent_actions import LEGACY_BLOCKED_KEY
 # The paths an action named, taken from the request rather than parsed back
 # out of the result. Imported rather than reimplemented: `note_work` needs
 # exactly the list the transcript's own events are built from, and a second
@@ -61,7 +62,7 @@ from agent_live_renderer import LiveRelay
 from agent_setup import ensure_api_key, ensure_git_identity
 from agent_splash import run_splash
 from agent_prompt import get_system_prompt, invalidate_prompt, validate_action
-from agent_execution import APP_REGISTRY, RUNNERS, open_app, run_file, run_python
+from agent_execution import APP_REGISTRY, RUNNERS, open_app
 from agent_file_ops import (
     append_file, copy_file, create_folder, delete_file, delete_folder, list_files,
     patch_file, read_file, read_lines, replace_lines, safe_path,
@@ -325,7 +326,10 @@ def verify_held_line(session):
 # program's output for the word "failed" is what once labelled a green test
 # run a failure -- so what is recorded is the fact that it ran and what it
 # was, and the reviewer is the one that reads the output and judges it.
-_VERIFYING_ACTIONS = ("run_file", "run_python")
+#
+# One verb rather than the two it used to be: `run_file` and `run_python` are
+# gone and `bash` is the only way anything runs now.
+_VERIFYING_ACTIONS = ("bash",)
 
 
 def note_work(session, action, obj):
@@ -350,11 +354,34 @@ def note_work(session, action, obj):
     review = getattr(session, "review", None)
     if review is not None:
         try:
+            # Not `elif`. Every other verb is one thing or the other -- a
+            # write, or a run -- and `bash` is both: `make` rewrites the tree
+            # AND is the run whose result the reviewer is shown. An `elif`
+            # here made the first branch swallow it, so every command silently
+            # stopped appearing under "WHAT VERIFICATION ACTUALLY RAN" the
+            # moment `bash` joined MUTATING_ACTIONS. The two records answer
+            # different questions and a verb is allowed to be in both.
             if action in MUTATING_ACTIONS:
                 paths = _paths_named(action, obj)
                 review.note_change(action, paths)
-            elif action in _VERIFYING_ACTIONS:
-                review.note_run(action, str((obj or {}).get("path") or ""))
+            if action in _VERIFYING_ACTIONS:
+                # What ran, in the model's own words -- and only when it ran.
+                #
+                # The `path` fallback that used to sit behind `command` was
+                # not the safety net it read as. A legacy `run_file` that
+                # `adopt_verb` COULD translate always carries `command`, so
+                # the fallback was never reached for it; the only object that
+                # ever got there was one `adopt_verb` REFUSED -- an extension
+                # with no runner -- which carries a path, carries no command,
+                # and never ran at all. So the fallback's single live effect
+                # was to record a refused command as verification, and that
+                # record is quoted verbatim to the reviewer under the heading
+                # "WHAT VERIFICATION ACTUALLY RAN". Fabricating a run in the
+                # one readout whose whole job is to say what really happened
+                # is the worst place in TMT to do it.
+                detail = (obj or {}).get("command")
+                if detail and not (obj or {}).get(LEGACY_BLOCKED_KEY):
+                    review.note_run(action, str(detail))
         except Exception:
             pass
     # The same observation, to the state that gates on evidence. It has to be
@@ -395,6 +422,74 @@ def _panel_refresh(live_panel):
         except Exception:
             pass
     return refresh
+
+
+# How the approval question ends. The question itself is composed by
+# `agent_bash`, which knows what is being asked; this is the half that knows
+# what the keys are, and the two are kept apart on purpose -- a policy module
+# that told the user which letter to press would be deciding a terminal's
+# interface, and a terminal that restated the policy would be holding a second
+# copy of it.
+_APPROVE_KEYS = ("Type y and Enter to run it once, a to allow `%s` in this "
+                 "project from now on, or anything else to refuse:")
+_APPROVE_ONCE = "Type y and Enter to run it, or anything else to refuse:"
+
+
+def _command_approval(prompt_box, live_panel, pad):
+    """The callable that puts a bash command's ASK verdict to the user.
+
+    It lives in the action context rather than being imported by `agent_bash`
+    for the reason every other capability in that dict does: reading a terminal
+    is the SESSION's, and a module that reached for one itself would be doing
+    it from a background agent's thread, from a piped run and from the test
+    suite as well -- where there is no terminal, no way to answer, and no
+    per-test timeout to rescue a read that blocks forever. A context with no
+    `approve` key is therefore the honest state of a run with nobody watching,
+    and `agent_bash` answers an approval nobody can give with no.
+
+    `is_interactive` is the same gate raw keyboard input goes through
+    everywhere else in TMT, and it is asked first: any doubt that a human is
+    there means no.
+
+    The type-ahead reader is stopped for the length of the question and started
+    again afterwards. That is not tidiness -- it is the one thing that would
+    actually break: it reads stdin on its own thread for the whole of a turn,
+    and two readers on one stdin take it in turns to swallow the user's
+    characters. `delete_file`'s bare `input()` has that defect today.
+
+    The question is written through the live region's `write_above` rather
+    than printed, because printing past a live region leaves its repaint
+    arithmetic pointing at rows that have moved.
+
+    A Ctrl-C at the prompt is deliberately NOT caught: it means the user wants
+    the turn to stop, and the loop already knows how to end one.
+    """
+    def approve(question, pattern=""):
+        if not agent_menu.is_interactive(sys.stdout):
+            return False
+        typed = getattr(prompt_box, "typeahead", None)
+        stopped = bool(typed is not None and typed.active and typed.stop())
+        try:
+            text = "%s\n%s" % (question, _APPROVE_KEYS % pattern
+                               if pattern else _APPROVE_ONCE)
+            pad.spend(text)
+            relay = live_panel.get("relay")
+            if relay is not None:
+                relay.write_above(text)
+            else:
+                console.print(text)
+            # The raw answer, for `agent_bash` to read: it owns what "yes" and
+            # "always" mean, and this returns what was typed rather than an
+            # interpretation of it.
+            return input().strip().lower()
+        except (EOFError, OSError):
+            # The terminal went away between the check and the read. Nothing
+            # was approved.
+            return False
+        finally:
+            if stopped:
+                typed.start()
+    return approve
 
 
 def note_capability_choices(session):
@@ -1174,7 +1269,18 @@ def _session_loop(root):
                    # as the source of truth and checks the implementation
                    # against it, so it must be what was actually asked rather
                    # than the model's account of what was asked.
-                   "task": task}
+                   "task": task,
+                   # How an ASK verdict from the command policy reaches a
+                   # human. It is HERE, in the context, rather than imported
+                   # by `agent_bash`, because reading a terminal is the
+                   # session's and only the session knows whether there is
+                   # one: a module that reached for stdin itself would do it
+                   # from a background agent's thread, from a piped run and
+                   # from the suite as well. A context without this key is
+                   # the honest state of a run with nobody to ask -- which is
+                   # exactly what a worker's own context looks like -- and
+                   # `agent_bash` answers an approval nobody can give with no.
+                   "approve": _command_approval(prompt_box, live_panel, pad)}
         # The first-prompt initialisation, and it is HERE rather than at
         # launch on purpose: a directory appearing in somebody's project
         # because they started a program and then changed their mind is

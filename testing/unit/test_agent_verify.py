@@ -472,7 +472,7 @@ def test_the_gate_only_ever_holds_a_terminal_action():
     # gating it would silence the model through exactly the wait -- a whole
     # test suite running -- that the user most wants narrated.
     for action in ("read_file", "write_file", "verify", "review", "plan",
-                   "run_file", "git_commit", "send_message"):
+                   "bash", "git_commit", "send_message"):
         assert V.refusal(state, plan, action) == "", action
 
 

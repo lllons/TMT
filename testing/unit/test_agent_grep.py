@@ -417,7 +417,7 @@ def test_a_glob_with_no_separator_in_it_means_anywhere():
 
 
 def test_a_path_carrying_a_glob_star_is_promoted_to_the_glob():
-    """The model will write grep("run_file", path="*.py") and that must work.
+    """The model will write grep("run_command", path="*.py") and that must work.
     There is no workspace in which a directory literally named `*.py` is the
     useful reading, and refusing the shorthand costs a whole turn to say so."""
     box = Workspace(files={"src/a.py": "NEEDLE\n", "b.md": "NEEDLE\n"})

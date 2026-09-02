@@ -211,19 +211,27 @@ def test_a_worker_is_told_it_cannot_talk_to_anyone_and_must_do_real_work():
 
 
 def test_a_worker_is_told_plainly_that_it_cannot_verify_the_test_suite():
-    """run_file gives up at 10 seconds and a real suite takes far longer, so a
-    worker asked to verify tests gets a timeout. The danger is not the
-    timeout, it is a worker reporting a pass it never saw -- the main agent
-    commits on that."""
+    """A worker has no execution verb at all: `bash` is in WORKER_FORBIDDEN and
+    the two file-runners it replaced are gone, so nothing ever comes back to a
+    worker about whether what it wrote works. The danger is not the missing
+    capability, it is a worker reporting a pass it never saw -- the main agent
+    commits on that.
+
+    The rule used to be arithmetic -- `run_file` gave up at ten seconds and a
+    real suite takes minutes -- and it is now a capability, so the prompt says
+    the stronger thing and this test asserts the stronger thing. A worker told
+    "the runner times out" reasonably goes looking for a longer runner; one
+    told commands are the main agent's alone has nowhere to look.
+    """
     box = Project(files=PROJECT)
     try:
         worker = agent_subprompts.worker_prompt()
-        assert "YOU CANNOT RUN THE TEST SUITE." in worker
-        # Both halves of the arithmetic, so the model can see WHY rather than
-        # only being told. The ceiling is a number; the suite's cost is stated
-        # beside it, and either one alone leaves the rule looking arbitrary.
-        assert "10 seconds" in worker, worker
-        assert "takes minutes" in worker, worker
+        assert "YOU CANNOT RUN ANYTHING." in worker
+        # WHY, not only what, so the rule does not read as arbitrary: whose the
+        # capability is, and how wide the gap is. Either half alone leaves a
+        # model guessing at the shape of what it may not do.
+        assert "Executing commands is the main agent's alone" in worker, worker
+        assert "builds, tests, installs or runs a program" in worker, worker
         assert "do not report a pass or a failure you did not see" in worker
         assert "say what you did instead" in worker
         assert "A fabricated green run" in worker

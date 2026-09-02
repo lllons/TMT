@@ -12,10 +12,13 @@ Three groups earn their keep.
 
 **The whitelist.** `READ_ONLY_ACTIONS` is asserted disjoint from
 `agent_config.MUTATING_ACTIONS` and asserted to exclude the four verbs that
-are mutation paths without being in that set -- `run_file`, `git_commit`,
+are mutation paths without being in that set -- `bash`, `git_commit`,
 `open_app` and `remember`. Those four are the whole reason this is its own
 list rather than a derivation, and a future edit that "tidied" it into one
-would fail here rather than in production.
+would fail here rather than in production. `bash` took `run_file`'s place in
+that four when the one guarded command tool replaced the two execution verbs;
+it is the sharpest of the four, because a command can write anything and no
+inspection of the command line can see it coming.
 
 **Validation.** Every refusal comes back as a sentence and produces no
 constraints at all, because a delegation started under half a contract is the
@@ -65,13 +68,22 @@ def test_the_four_mutation_paths_that_are_not_file_writes_are_refused_too():
 
     None of these four is in that set, because that set answers a different
     question -- does this invalidate the cached prompt -- and all four can make
-    a persistent change: a program can write anything, a commit changes the
+    a persistent change: a command can write anything, a commit changes the
     repository, an app launch reaches outside the workspace entirely, and
     `remember` writes to TMT's own store.
+
+    `bash` is the one that replaced `run_file` and `run_python` here, and it is
+    a wider hole than either of them was: they ran one file by extension, and
+    this runs whatever the model wrote. The two old names are asserted too --
+    they are verbs TMT no longer has, and a whitelist that had kept either of
+    them would let the legacy net land a translated execution verb somewhere
+    permitted. That the net actually lands on `bash` is
+    `test_agent_delegation_wiring`'s to prove, against the real dispatcher.
     """
     constraints = D.DelegationConstraints(read_only=True)
-    for action in ("run_file", "run_python", "git_commit", "open_app",
-                   "remember", "verify", "project_context", "git_push"):
+    for action in ("bash", "git_commit", "open_app",
+                   "remember", "verify", "project_context", "git_push",
+                   "run_file", "run_python"):
         assert action not in D.READ_ONLY_ACTIONS, action
         assert D.refusal(constraints, action), action
 
@@ -101,7 +113,7 @@ def test_a_delegation_that_is_not_read_only_is_refused_nothing():
     for constraints in (D.DEFAULT, None,
                         D.DelegationConstraints(read_only=False),
                         D.DelegationConstraints(timeout_seconds=60)):
-        for action in ("write_file", "delete_file", "run_file", "git_commit"):
+        for action in ("write_file", "delete_file", "bash", "git_commit"):
             assert D.refusal(constraints, action) == "", (constraints, action)
 
 
@@ -124,8 +136,8 @@ def test_a_contract_that_cannot_be_read_fails_closed():
 def test_the_refusal_says_what_may_be_done_instead():
     """A model told only "not permitted" reasonably looks for another route to
     the same effect. This one names the reason, and names the way out."""
-    said = D.refusal(D.DelegationConstraints(read_only=True), "run_file")
-    assert "executes a program" in said, said
+    said = D.refusal(D.DelegationConstraints(read_only=True), "bash")
+    assert "runs a command" in said, said
     assert "internal_response" in said, said
     assert "read_file" in said, said
 
@@ -405,9 +417,9 @@ def test_a_violation_records_the_operation_and_the_path_it_named():
 
 def test_a_violation_with_no_path_carries_no_empty_one():
     """A None under "path" would read as a write to a file called None."""
-    entry = D.violation("run_file")
+    entry = D.violation("bash")
     assert "path" not in entry, entry
-    assert entry["operation"] == "run_file"
+    assert entry["operation"] == "bash"
 
 
 def test_the_violation_line_counts_and_names_without_running_away():

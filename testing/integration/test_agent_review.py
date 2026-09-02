@@ -80,7 +80,7 @@ def state_after_work(paths=("src/thing.py",), ran=True):
     for path in paths:
         review.note_change("write_file", (path,))
     if ran:
-        review.note_run("run_file", "run_tests.py")
+        review.note_run("bash", "python run_tests.py")
     return review
 
 
@@ -657,11 +657,11 @@ def test_what_ran_is_recorded_as_an_observation_and_not_as_a_verdict():
     is the rule that once called a green test run a failure. What is recorded
     is that something ran and what it was."""
     review = agent_review.ReviewState()
-    review.note_run("run_file", "run_tests.py")
-    review.note_run("run_file", "run_tests.py")
-    review.note_run("run_python", "check.py")
-    assert review.verification == ("run_file run_tests.py",
-                                   "run_python check.py")
+    review.note_run("bash", "python run_tests.py")
+    review.note_run("bash", "python run_tests.py")
+    review.note_run("bash", "python check.py")
+    assert review.verification == ("bash python run_tests.py",
+                                   "bash python check.py")
     for word in ("pass", "fail", "ok", "green"):
         assert word not in " ".join(review.verification).lower()
 
@@ -837,7 +837,7 @@ def test_marking_the_plan_or_answering_does_not_make_a_pass_stale():
     that had just approved them."""
     review = state_after_work()
     settled(review, status="PASS")
-    review.note_run("run_file", "run_tests.py")
+    review.note_run("bash", "python run_tests.py")
     assert not review.stale
     assert review.passed
 
@@ -1073,7 +1073,7 @@ def test_the_reviewer_is_given_the_request_the_plan_the_status_and_the_diff():
     assert "PATHS THE IMPLEMENTING AGENT WROTE TO" in brief
     assert "src/auth/token.py" in brief
     assert "WHAT VERIFICATION ACTUALLY RAN" in brief
-    assert "run_file run_tests.py" in brief
+    assert "bash python run_tests.py" in brief
 
 
 def test_the_brief_says_nothing_ran_when_nothing_ran():
@@ -1321,7 +1321,7 @@ def test_the_reviewer_cannot_write_and_the_refusal_names_the_reviewers_reason():
     same effect, which is the mistake WORKER_NEEDS_TERMINAL was given its own
     sentence to avoid."""
     for action in ("write_file", "patch_file", "append_file", "replace_lines",
-                   "delete_file", "rename_file", "run_file", "git_commit",
+                   "delete_file", "rename_file", "bash", "git_commit",
                    "replace_across", "create_folder"):
         assert action not in agent_worker.REVIEW_ACTIONS, action
     refusal = agent_worker._refusal("patch_file", agent_worker.REVIEW_ACTIONS,
@@ -1859,13 +1859,62 @@ def test_review_state_does_not_leak_between_sessions():
 # --- the loop ---------------------------------------------------------------
 
 def test_the_loop_records_a_change_and_a_run_against_the_review():
+    """`bash` is the one verb that is BOTH, and that is why `note_work` asks
+    the two questions with two `if`s rather than an `if/elif`.
+
+    A command changes the tree -- `make`, a formatter, `> file` -- so it makes
+    a passed review stale, which is what putting `bash` in MUTATING_ACTIONS
+    buys. It is also the run the reviewer is shown. An `elif` here let the
+    first branch swallow it and every command silently stopped appearing under
+    "WHAT VERIFICATION ACTUALLY RAN".
+
+    Its changed path is `(unnamed)`, the convention `agent_review` already
+    uses for a mutating action whose paths TMT cannot name. That is the honest
+    entry rather than the tidy one: TMT knows a command ran and does not know
+    what it touched, and saying so beats both inventing a path and claiming
+    nothing changed. `agent_verify_engine` already filters the marker out when
+    it decides what to check."""
     session = agent_session.Session()
     TMT.note_work(session, "write_file", {"path": "src/a.py"})
     TMT.note_work(session, "patch_file", {"path": "src/b.py"})
     TMT.note_work(session, "read_file", {"path": "src/c.py"})
-    TMT.note_work(session, "run_file", {"path": "run_tests.py"})
-    assert session.review.changed_paths == ("src/a.py", "src/b.py")
-    assert session.review.verification == ("run_file run_tests.py",)
+    TMT.note_work(session, "bash", {"command": "python run_tests.py"})
+    assert session.review.changed_paths == ("src/a.py", "src/b.py", "(unnamed)")
+    assert session.review.verification == ("bash python run_tests.py",)
+
+
+def test_a_read_only_command_still_makes_a_passed_review_stale():
+    """The cost of `bash` being in MUTATING_ACTIONS by name: an `ls` re-gates
+    an answer it did not need to. Pinned rather than left to be discovered,
+    because it is the trade that was chosen -- the other way round leaves a
+    review standing over a tree that `make` has since rewritten, and TMT
+    cannot tell the two commands apart from the verb alone."""
+    session = agent_session.Session()
+    settled(session.review, status="PASS")
+    assert session.review.passed
+    TMT.note_work(session, "bash", {"command": "ls"})
+    assert not session.review.passed
+
+
+def test_a_legacy_run_file_is_recorded_by_the_command_it_became():
+    """`bash` is the only verb `note_work` records a run for, and a model
+    written against `run_file` never emits it -- so what has to reach the
+    review state is the object AFTER `adopt_verb`, which is the order the loop
+    dispatches in. Recorded here through the real translation rather than by
+    hand, because a hand-written `{"action": "bash"}` would be testing the
+    recorder against a shape nothing produces.
+
+    The translated object still carries the `path` the model wrote, beside the
+    `command` built from it. The command is what is recorded: it is what would
+    actually have run, and it is what the reviewer's brief is quoting under
+    "WHAT VERIFICATION ACTUALLY RAN".
+    """
+    obj = {"action": "run_file", "path": "run_tests.py"}
+    agent_actions.adopt_verb(obj)
+    assert obj["action"] == "bash", obj
+    session = agent_session.Session()
+    TMT.note_work(session, obj["action"], obj)
+    assert session.review.verification == ("bash python run_tests.py",)
 
 
 def test_note_work_survives_a_session_without_a_review():

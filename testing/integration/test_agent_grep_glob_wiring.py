@@ -198,7 +198,7 @@ def test_validate_action_accepts_the_shapes_the_prompt_teaches():
         {"action": "glob", "pattern": "*.py"},
         {"action": "glob", "pattern": "testing/**/*.py", "kind": "dirs", "limit": 20},
         {"action": "grep", "query": "end_conversation"},
-        {"action": "grep", "query": "def run_file", "glob": "agent_*.py"},
+        {"action": "grep", "query": "def run_command", "glob": "agent_*.py"},
         {"action": "grep", "query": "x", "regex": True, "ignore_case": True,
          "context": 2, "path": "src", "limit": 5},
     ]
@@ -599,24 +599,38 @@ def test_a_model_that_wrote_ignore_case_itself_is_not_overruled():
 
 def test_canonical_action_answers_the_verb_and_adopt_verb_carries_the_meaning():
     """The division the net rests on: `canonical_action` decides WHAT a reply
-    means and `adopt_verb` makes the object say it. Asserted apart because the
-    dispatcher only ever asks the first -- so a test that drove the
-    translation through `execute_action` would be watching the half that does
-    not put the flag back."""
+    means and `adopt_verb` makes the object say it. They are still two
+    functions and still answer two questions, so they are asserted apart.
+
+    What changed when `bash` arrived: the dispatcher used to ask only the
+    first, so an old object handed straight to `execute_action` was renamed
+    and then run WITHOUT the key its old name implied -- case-sensitively for
+    a `search_files`, and for a legacy `run_file` with no `command` at all,
+    which failed outright. It calls `adopt_verb` now, so the spelling and the
+    meaning arrive together however the object reached it. The four real
+    dispatch paths still adopt first; this is the net under them, not a
+    replacement for them."""
     assert agent_actions.canonical_action({"action": "search_files"}) == "grep"
     assert agent_actions.canonical_action({"action": "find_text"}) == "grep"
     assert agent_actions.canonical_action({"action": "grep"}) == "grep"
     assert agent_actions.canonical_action({"action": "glob"}) == "glob"
-    # The dispatcher translates the spelling and nothing more, so an old
-    # object handed straight to it runs case-SENSITIVELY. That is not a
-    # defect, it is why the four real dispatch paths call `adopt_verb` first.
+    # canonical_action still answers the verb ALONE: it reports the name and
+    # touches no key, which is what keeps the two functions separable.
+    named = {"action": "search_files", "query": "TOTAL"}
+    assert agent_actions.canonical_action(named) == "grep"
+    assert "ignore_case" not in named
     box = Project(files=PROJECT)
     try:
+        # Through the dispatcher, the old name now brings its looseness with
+        # it -- the same six matches the adopted object gets.
         spelled = run("search_files", query="TOTAL")
-        assert spelled.startswith("1 match in 1 file"), spelled
+        assert spelled.startswith("6 matches"), spelled
         adopted = agent_actions.adopt_verb({"action": "search_files", "query": "TOTAL"})
         loose = run(adopted.pop("action"), **adopted)
         assert loose.startswith("6 matches"), loose
+        # And a model that wrote the key itself is still obeyed.
+        exact = run("search_files", query="TOTAL", ignore_case=False)
+        assert exact.startswith("1 match in 1 file"), exact
     finally:
         box.close()
 
