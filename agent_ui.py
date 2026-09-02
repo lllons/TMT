@@ -40,6 +40,14 @@ RESET = "\033[0m"
 # exception to.
 BOLD = "\033[1m"
 UNDERLINE = "\033[4m"
+# The two the markdown renderer needs and nothing else did. They are weights
+# rather than colours, which is what keeps a rendered reply inside the rule
+# that the answer carries no gradient: emphasis has to be visible without
+# being an instrument, and it has to vanish cleanly when the escapes are
+# stripped. Both are widely supported and both degrade to no styling at all
+# on a terminal that ignores them, which is the safe direction.
+ITALIC = "\033[3m"
+STRIKE = "\033[9m"
 
 # The activity readout drawn hard against the right edge of the status row,
 # opposite the progress bar: a turning glyph, elapsed time and token count.
@@ -138,6 +146,13 @@ def clip_to_width(text, columns):
 
 
 def wrap_lines(text, columns):
+    """Break text to `columns`, at the column. Prose wants `wrap_words`.
+
+    This one cuts wherever the width runs out, mid-word if that is where it
+    lands. It is right for anything whose columns mean something -- a table
+    somebody laid out by hand, a line of code, a path -- and wrong for a
+    sentence, which is what `wrap_words` is for.
+    """
     lines = []
     for raw in text.split("\n"):
         raw = raw.replace("\t", "    ").replace("\r", "")
@@ -146,6 +161,56 @@ def wrap_lines(text, columns):
             lines.append(head)
         lines.append(raw)
     return lines
+
+
+def wrap_words(text, columns):
+    """Break text to `columns` on spaces, so no word is cut in half.
+
+    What prose wants, and now what every generated sentence TMT shows gets:
+    a word that will not fit in what is left of the row goes down to the next
+    one whole, rather than being sawn through at the edge of the terminal.
+
+    Measured in columns and never counted in characters, which is the rule
+    everywhere in TMT -- a CJK character is two columns wide and a wrap that
+    counted it as one would push the row onto a second screen line.
+
+    A single word too long for a whole row is the one case that cannot be
+    solved by moving it: it falls back to the measured clipper, so a
+    four-hundred-character URL still fits the screen instead of overflowing
+    it. Blank lines are kept, because a blank line is a paragraph break and
+    dropping it would reflow somebody's text into one block.
+    """
+    columns = max(1, int(columns))
+    lines = []
+    for raw in str(text).split("\n"):
+        raw = raw.replace("\t", "    ").replace("\r", "")
+        if not raw.strip():
+            lines.append("")
+            continue
+        # The leading space of a row is structure -- an indented block, a
+        # hanging list item -- so it survives the wrap of its first line.
+        indent = raw[:len(raw) - len(raw.lstrip(" "))]
+        current = ""
+        for word in raw.split():
+            candidate = (current + " " + word) if current else (indent + word)
+            if display_width(candidate) <= columns:
+                current = candidate
+                continue
+            if current:
+                lines.append(current)
+                current = ""
+            if display_width(indent + word) <= columns:
+                current = indent + word
+                continue
+            # One word, wider than the row it would have to itself.
+            rest = word
+            while display_width(rest) > columns:
+                head, rest = clip_to_width(rest, columns)
+                lines.append(head)
+            current = rest
+        if current:
+            lines.append(current)
+    return lines or [""]
 
 
 def activity_glyph(now=None, plain=False):
@@ -561,16 +626,59 @@ def render_response(response: str, stream=None):
     plain = plain_output(stream)
     edge, rule = ("|", "-") if plain else ("│", "─")
     inner = max(10, width - 5)
-    lines = wrap_lines(str(response), inner) or [""]
+    lines = _rendered(str(response), inner, stream)
     fill = rule * (inner + 2)
     if plain:
         border = bottom = "+" + fill + "+"
     else:
         border, bottom = "┌" + fill + "┐", "└" + fill + "┘"
     out = [border]
-    out.extend(f"{edge} {pad_to_width(line, inner)} {edge}" for line in lines)
+    # Padded by what the row SHOWS. A rendered line carries escapes, and
+    # `pad_to_width` measures the string it is given -- so padding the styled
+    # text would count every escape as a column, cut the padding short and
+    # leave the right-hand edge of the box ragged.
+    out.extend("%s %s%s %s" % (edge, line,
+                               " " * max(0, inner - display_width(strip_ansi(line))),
+                               edge)
+               for line in lines)
     out.append(bottom)
     safe_write(stream, "\n".join(out) + "\n")
+
+
+def _message_rows(message, columns, stream):
+    """One generated sentence, styled and wrapped for a row with a marker.
+
+    Inline marks only. These sit inside a bullet with an indent already in
+    front of them, so a heading or a table here would be a block rendered
+    inside a list item; what they do want is `**this**` reading as emphasis
+    rather than as four asterisks, and a word that will not fit moving down
+    whole rather than being cut.
+    """
+    text = str(message or "")
+    try:
+        import agent_markdown
+        return agent_markdown.render_rows(text, columns, stream) or [""]
+    except Exception:
+        # A missing or broken renderer must never cost the user the sentence.
+        # The wrap alone is the half that matters most anyway.
+        return wrap_words(text, columns) or [""]
+
+
+def _rendered(text, columns, stream):
+    """A reply as rows: markdown where it can be, word-wrapped either way.
+
+    The import is lazy because `agent_markdown` is built on this module, so
+    naming it at the top would be a circular import -- and because a missing
+    module must never be the reason a finished answer cannot be shown. The
+    fallback is the wrap alone, which is the half of the job that matters
+    most: a word cut in two at the edge of the terminal is worse than a `**`
+    the reader has to ignore.
+    """
+    try:
+        import agent_markdown
+        return agent_markdown.render(text, columns, stream) or [""]
+    except Exception:
+        return wrap_words(text, columns) or [""]
 
 
 # --- the response history -----------------------------------------------
@@ -913,14 +1021,14 @@ class Transcript:
         if style["level"] == 0:
             # Dim, tight, no blank line. It should read as something said in
             # passing, not as a result.
-            rows = wrap_lines(event.message, max(10, width - 4)) or [""]
+            rows = _message_rows(event.message, max(10, width - 4), stream)
             head = " %s " % mark if mark else "   "
             return [self._dim(head + rows[0], stream)] + [
                 self._dim("   " + row, stream) for row in rows[1:]]
 
         painted_mark = _color(mark, style["position"], stream) if mark else ""
         if style["level"] == 1:
-            rows = wrap_lines(event.message, max(10, width - 4)) or [""]
+            rows = _message_rows(event.message, max(10, width - 4), stream)
             return [" %s %s" % (painted_mark, rows[0])] + [
                 "   " + row for row in rows[1:]]
 
@@ -928,7 +1036,7 @@ class Transcript:
         # puts at the edge of the block. This is the part of a turn worth
         # finding again when scrolling back, so it is the loudest thing below
         # the answer itself.
-        rows = wrap_lines(event.message, max(10, width - 6)) or [""]
+        rows = _message_rows(event.message, max(10, width - 6), stream)
         out = ["   %s %s" % (painted_mark, rows[0])]
         out.extend("     " + row for row in rows[1:])
         facts = self._facts(event)

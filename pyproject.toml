@@ -47,6 +47,7 @@ py-modules = [
     "agent_index",
     "agent_live_renderer",
     "agent_manager",
+    "agent_markdown",
     "agent_memory",
     "agent_menu",
     "agent_model",
