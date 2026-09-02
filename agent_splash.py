@@ -63,7 +63,7 @@ import sys
 import time
 
 from agent_ui import (
-    BOLD, DIM, GRADIENT_TICK, RESET, _supports_color, cycle_text,
+    BOLD, DIM, GRADIENT_TICK, RESET, _supports_color, cycle_bar, cycle_text,
     display_width, encodable, fit_to_width, plain_output,
 )
 
@@ -422,6 +422,13 @@ class SplashState:
         self.state = state if state in STATES else WAITING
         self.detail = str(detail or "")
         self.result = None
+        # When the bar's clock started, or None while nothing is under way.
+        # Set once, by `begin`, from the caller's clock -- never read from
+        # `time.monotonic()` here, for the reason every other moment on this
+        # screen is passed in: a frame has to be a pure function of the moment
+        # it was asked for, or two renders of one instant differ and a test
+        # cannot drive the animation without waiting for real time.
+        self.began = None
         # The settled state the launch actually reached, kept once the screen
         # moves on to DONE. Without it every launch ends indistinguishable
         # from every other -- "done" says the screen is finished and nothing
@@ -453,6 +460,67 @@ class SplashState:
             self.outcome = self.state
         self.state = DONE
         return self
+
+    def begin(self, moment):
+        """Start the bar's clock. Called once, as the stage begins."""
+        self.began = float(moment)
+        return self
+
+    def progress(self, moment=None):
+        """How full the bar is, 0-100 -- or None when there is no bar at all.
+
+        WAITING has none. Nothing is under way, and an empty bar beside
+        "Press Enter to Continue" would say that something was.
+
+        **While a check is actually out the share is capped at 99**, which is
+        the rule the agent bars already keep and it is the same rule for the
+        same reason: nothing can know how long a `git fetch` will take, so a
+        bar that ran to the end and sat there would be inventing the one
+        figure nobody has. It reaches 100 when the work really finished, which
+        is the one moment completion is known.
+
+        SKIPPED looks like an exception and is not one. With the setting off
+        nothing is checked, so there is no unknown work to be wrong about: the
+        stage IS `LAUNCH_BAR_SECONDS`, and elapsed against a duration TMT
+        chose is a measurement rather than a guess.
+
+        A settled state is 100 because the work behind it is over. What
+        follows is the dwell, which is reading time and not work.
+        """
+        if self.state == WAITING:
+            return None
+        if self.state == DONE:
+            return 100
+        if self.began is None or moment is None:
+            share = 0.0
+        else:
+            share = max(0.0, float(moment) - self.began) / LAUNCH_BAR_SECONDS
+        if self.state == SKIPPED:
+            return int(min(100.0, share * 100.0))
+        if self.state in _WORKING:
+            return int(min(99.0, share * 100.0))
+        return 100
+
+    def moving(self, moment=None):
+        """Whether the screen is still going to do something.
+
+        The one rule the whole frame animates on -- wordmark and bar together
+        -- rather than each element deciding for itself and drifting apart.
+
+        SKIPPED counts while its bar is still filling, which is the case that
+        makes this a method rather than a set of states: nothing is being
+        checked, but the screen is plainly still on its way somewhere and a
+        wordmark frozen over a moving bar would say otherwise.
+
+        Once it stops, the frame stops changing, and a frame that stops
+        changing is one `LiveRegion` never repaints -- which is what keeps a
+        settled screen cheap and its cursor still.
+        """
+        if self.state == WAITING or self.state in _WORKING:
+            return True
+        if self.state == SKIPPED:
+            return (self.progress(moment) or 0) < 100
+        return False
 
     @property
     def waiting(self):
@@ -537,7 +605,7 @@ def render_splash_frame(state=None, stream=None, size=None, moment=None,
     # it has. That is `paint_subtitle`'s rule applied to the other element, and
     # it is what keeps a settled frame byte-identical between ticks -- so the
     # repaint is still skipped on exactly the screens that are being read.
-    animated = state.state in (WAITING,) + _WORKING
+    animated = state.moving(moment)
     base = LOGO_PHASE + (_cycle_phase(moment, phase) if animated else 0.0)
     body = []
     for index, row in enumerate(logo):
@@ -559,6 +627,29 @@ def render_splash_frame(state=None, stream=None, size=None, moment=None,
         painted = (paint_subtitle(text, stream, state.state, moment, phase)
                    if index == 0 else _dim(text, stream))
         body.append(_pad_left(text, width) + painted)
+
+    # The bar goes UNDER the sentence, because the sentence says what is
+    # happening and the bar says how far through it is -- and a reader wants
+    # them in that order. It is the one thing on this screen the gradient
+    # genuinely belongs on: a bar is an instrument, which is exactly what the
+    # ramp is for, so nothing here needed a colour of its own.
+    filled = state.progress(moment)
+    if filled is not None:
+        bar_width = max(4, min(LAUNCH_BAR_WIDTH, width - 2))
+        # A bar drawn full says the work is over, so the last cell is held
+        # back until it is. Without this the honest cap is invisible:
+        # `cycle_bar` rounds, and 99% of 28 cells rounds to all 28 -- so a
+        # check of unknown length would look exactly like a finished one.
+        # A display rule, and like every display rule in TMT it can only make
+        # the row say less than the number behind it, never more.
+        if animated:
+            filled = min(filled, (bar_width - 1) * 100 // bar_width)
+        body.append("")
+        body.append(_pad_left(" " * bar_width, width)
+                    + cycle_bar(filled, stream, bar_width,
+                                plain=plain_output(stream),
+                                phase=(_cycle_phase(moment, phase)
+                                       if animated else LOGO_PHASE)))
 
     above = max(0, (height - len(body)) // 2)
     # The optical centre, not the geometric one: a third of the slack above
@@ -609,6 +700,21 @@ def _terminal(size=None):
 # is still being redrawn -- a frozen frame for three quarters of a second
 # reads as a hang, which is the opposite of what this row is for.
 SETTLED_DWELL = 0.75
+
+# How long the bar under the wordmark takes when there is nothing to wait for
+# -- which is the whole of the stage when `Auto Update on Launch` is off --
+# and the budget it measures itself against while a check really is out.
+#
+# With the setting off this is an honest bar rather than a decorative one:
+# nothing is being checked, the stage IS these 1.5 seconds, and elapsed
+# against a duration TMT chose is a measurement. Long enough to read the
+# wordmark and see the bar move; short enough that nobody waits for it.
+LAUNCH_BAR_SECONDS = 1.5
+
+# How wide the bar is drawn before a narrow window cuts it down. Half the
+# scaled wordmark, so it reads as belonging under it rather than as a second
+# element of its own width.
+LAUNCH_BAR_WIDTH = 28
 
 # The same, for a state the user has to actually read: a refusal, or a
 # failure. Longer, because it carries a detail line under it and because it is
@@ -766,14 +872,22 @@ def run_update_stage(state, stream=None, region=None, clock=None,
     """
     stream = sys.stdout if stream is None else stream
     clock = time.monotonic if clock is None else clock
+    # The bar's clock starts here rather than at each `advance`, so it
+    # measures the STAGE rather than restarting at every state inside it. A
+    # bar that went back to zero when "Searching" became "Up to date." would
+    # be reporting the state machine instead of the wait.
+    state.begin(clock())
     enabled = auto_update_enabled() if auto_update is None else bool(auto_update)
     if not enabled:
         # Nothing was checked, and the screen says so by saying nothing about
         # it. Showing "Searching for updates" here would be a claim about work
         # that did not happen, on the one screen whose whole job is to report
         # what is going on.
+        #
+        # The dwell is the bar: with nothing to wait for, the 1.5 seconds it
+        # takes to fill IS the stage, and it ends the moment the bar is full.
         state.advance(SKIPPED)
-        _dwell(state, stream, region, clock, SETTLED_DWELL, key_reader)
+        _dwell(state, stream, region, clock, LAUNCH_BAR_SECONDS, key_reader)
         return state.finish()
 
     module = _updater() if updater is None else updater

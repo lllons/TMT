@@ -531,13 +531,122 @@ def test_a_settled_wordmark_holds_still_so_the_repaint_is_skipped():
     is a frame `LiveRegion` never repaints, which is what keeps a screen being
     read cheap and its cursor still."""
     stream = Tty()
+    # SKIPPED is deliberately absent: with the setting off its bar is still
+    # filling, so that frame is meant to change. It gets its own test below.
     for name in (agent_splash.CURRENT, agent_splash.UPDATED,
-                 agent_splash.BLOCKED, agent_splash.FAILED,
-                 agent_splash.SKIPPED, agent_splash.DONE):
+                 agent_splash.BLOCKED, agent_splash.FAILED, agent_splash.DONE):
         state = agent_splash.SplashState(name)
         early = agent_splash.render_splash_frame(state, stream, (80, 24), 0.0)
         later = agent_splash.render_splash_frame(state, stream, (80, 24), 1.7)
         assert early == later, name
+
+
+def _bar_row(rows):
+    """The bar's row from a rendered frame, or None when there is not one."""
+    for row in rows:
+        body = visible(row).strip()
+        if body and not set(body) - set("#-█░"):
+            return body
+    return None
+
+
+def test_waiting_draws_no_bar_at_all():
+    """Nothing is under way before Enter, and an empty bar under "Press Enter
+    to Continue" would say that something was."""
+    assert agent_splash.SplashState().progress(1.0) is None
+    assert _bar_row(frame(agent_splash.SplashState(), Tty(), (80, 24))) is None
+
+
+def test_with_auto_update_off_the_bar_fills_over_the_stated_time():
+    """The ask, in one test: with nothing to check, the bar takes
+    LAUNCH_BAR_SECONDS to fill and the stage ends when it is full."""
+    state = agent_splash.SplashState(agent_splash.SKIPPED).begin(0.0)
+    span = agent_splash.LAUNCH_BAR_SECONDS
+    assert state.progress(0.0) == 0, state.progress(0.0)
+    assert 40 <= state.progress(span / 2) <= 60, state.progress(span / 2)
+    assert state.progress(span) == 100, state.progress(span)
+    # And it never runs past the end, however long the frame is held.
+    assert state.progress(span * 4) == 100
+
+
+def test_the_skipped_stage_is_exactly_as_long_as_the_bar():
+    """The bar is not decoration laid over a wait of some other length. The
+    1.5 seconds it takes to fill IS the stage."""
+    held = []
+
+    class Clock:
+        def __init__(self):
+            self.now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    clock = Clock()
+
+    class Region:
+        def paint(self, frame):
+            held.append(clock.now)
+            clock.now += 0.08
+
+    state = agent_splash.run_update_stage(
+        agent_splash.SplashState(), Tty(), Region(), clock, auto_update=False)
+    assert state.outcome == agent_splash.SKIPPED, state
+    assert held, "the stage painted nothing"
+    # It ran for the bar's length, not the settled dwell's.
+    assert abs(held[-1] - agent_splash.LAUNCH_BAR_SECONDS) < 0.15, held[-1]
+    assert held[-1] > agent_splash.SETTLED_DWELL, held[-1]
+
+
+def test_a_check_of_unknown_length_never_claims_to_be_finished():
+    """The rule the agent bars already keep, and the reason this is not a
+    fabricated number: nothing can know how long a `git fetch` takes, so the
+    bar approaches the end and stops there. 100 means the work is over."""
+    state = agent_splash.SplashState(agent_splash.CHECKING).begin(0.0)
+    for moment in (0.5, 1.5, 15.0, 600.0):
+        assert state.progress(moment) <= 99, (moment, state.progress(moment))
+    # It reaches 100 only once something has actually settled.
+    assert agent_splash.SplashState(agent_splash.CURRENT).progress(0.0) == 100
+    assert agent_splash.SplashState(agent_splash.DONE).progress(0.0) == 100
+
+
+def test_a_bar_is_never_drawn_full_until_the_work_really_is_done():
+    """The cap has to be VISIBLE or it is not a cap. `cycle_bar` rounds, and
+    99% of 28 cells rounds to all 28 -- so without holding the last cell back
+    a check of unknown length looked exactly like a finished one, which is the
+    single thing this bar must never say."""
+    checking = agent_splash.SplashState(agent_splash.CHECKING).begin(0.0)
+    for moment in (9.0, 600.0):
+        row = _bar_row(frame(checking, Tty(), (72, 20), moment))
+        assert row.endswith("░"), (moment, row)
+    for done in (agent_splash.SplashState(agent_splash.CURRENT),
+                 agent_splash.SplashState(agent_splash.SKIPPED).begin(0.0)):
+        row = _bar_row(frame(done, Tty(), (72, 20), agent_splash.LAUNCH_BAR_SECONDS))
+        assert set(row) == {"█"}, row
+
+
+def test_the_bar_and_the_wordmark_stop_together():
+    """One rule for the whole frame. A wordmark frozen over a moving bar, or
+    a bar still cycling under a settled wordmark, would each say the screen
+    was in two states at once."""
+    filling = agent_splash.SplashState(agent_splash.SKIPPED).begin(0.0)
+    assert filling.moving(0.5) is True
+    assert filling.moving(agent_splash.LAUNCH_BAR_SECONDS) is False
+    assert agent_splash.SplashState(agent_splash.CHECKING).moving(9.9) is True
+    assert agent_splash.SplashState(agent_splash.CURRENT).moving(0.0) is False
+    # Once it has stopped, the frame really is byte-identical between ticks.
+    full = agent_splash.SplashState(agent_splash.SKIPPED).begin(0.0)
+    span = agent_splash.LAUNCH_BAR_SECONDS
+    assert (agent_splash.render_splash_frame(full, Tty(), (80, 24), span)
+            == agent_splash.render_splash_frame(full, Tty(), (80, 24), span + 3))
+
+
+def test_the_bar_reads_on_a_console_that_can_draw_none_of_it():
+    """cp1252 through a pipe carries neither the block characters nor the
+    colour, and the screen still has to say how far along it is."""
+    state = agent_splash.SplashState(agent_splash.SKIPPED).begin(0.0)
+    row = _bar_row(frame(state, Cp1252(), (80, 24), agent_splash.LAUNCH_BAR_SECONDS))
+    assert row is not None and set(row) <= set("#-"), row
+    assert "#" in row, row
 
 
 def test_the_detail_is_drawn_as_its_own_row_under_the_subtitle():
@@ -546,7 +655,10 @@ def test_the_detail_is_drawn_as_its_own_row_under_the_subtitle():
     state = agent_splash.SplashState(agent_splash.BLOCKED,
                                      "Local changes; your work is untouched.")
     drawn = [visible(row) for row in frame(state, Cp1252(), (80, 24))]
-    filled = [row.strip() for row in drawn if row.strip()]
+    # The bar is the last row of the block now, so it is taken off first --
+    # this test is about the two SENTENCES and the order they are in.
+    filled = [row.strip() for row in drawn
+              if row.strip() and set(row.strip()) - set("#-█░")]
     assert filled[-2] == "Continuing without updating.", filled
     assert filled[-1] == "Local changes; your work is untouched.", filled
 
