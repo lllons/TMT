@@ -1922,18 +1922,22 @@ def test_a_token_whose_paste_is_gone_is_left_alone():
 
 
 def test_a_pasted_block_with_newlines_is_taken_whole_only_where_it_is_wanted():
-    """`str.isprintable` is false for anything containing a newline, which is
-    why pasting a block has always done nothing. The task box wants it -- a
-    pasted error message is exactly the thing worth asking about -- and the
-    API key field does not, because a key has no line breaks and half of one
-    would be worse than none."""
+    """The task box wants a block whole -- a pasted error message is exactly
+    the thing worth asking about -- and a single-line field must not take one,
+    because half a key is worse than no key.
+
+    What it must not do either is take it SILENTLY nowhere, which is what
+    ("", "") meant: a field that answers a paste with nothing at all cannot be
+    told from one that is not reading the keyboard. So a block is reported as
+    a block, and the screen says so in words."""
     block = "line one\nline two"
-    assert menu().normalize_text_key(block) == ("", "")
+    assert menu().normalize_text_key(block) == ("block", block)
     assert menu().normalize_text_key(block, allow_multiline=True) == ("char", block)
     # A lone newline is still Enter, whichever way it is read.
     assert menu().normalize_text_key("\n", allow_multiline=True) == ("key", "enter")
     # And a control sequence is still not a paste.
     assert menu().normalize_text_key("\x1b[A", allow_multiline=True) == ("", "")
+    assert menu().normalize_text_key("\x1b[A") == ("", "")
 
 
 def test_the_prompt_box_borders_stay_well_formed_at_every_width():

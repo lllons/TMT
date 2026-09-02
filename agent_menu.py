@@ -2029,21 +2029,30 @@ def normalize_text_key(key, allow_multiline=False):
     """One keystroke for a text field, as (kind, value).
 
     ("end", None) when the input has ended, ("key", name) for the keys that
-    edit rather than type, ("char", text) for characters, and ("", "") for a
-    tick or anything unprintable. A multi-character run is accepted whole, so
-    a paste that arrives in one read is not split or dropped.
+    edit rather than type, ("char", text) for characters, ("block", text) for
+    a paste a single-line field cannot take, and ("", "") for a tick or
+    anything unprintable. A multi-character run is accepted whole, so a paste
+    that arrives in one read is not split or dropped.
 
     `allow_multiline` decides what happens to a run with a line break in it.
-    Off, the whole paste is dropped, because `str.isprintable` is false for
-    any string containing a newline -- which is why pasting a block into the
-    API key field has always done nothing, and is right there: a key has no
-    line breaks and half of one would be worse than none.
 
     On, the run is taken whole, newlines and all. The task box wants it: a
     pasted error message or file is exactly the thing worth asking about, and
     dropping it silently is the least helpful answer available. A single
     newline is still Enter -- that is _TEXT_KEYS, checked first -- so this
     only ever applies to a run the terminal delivered in one read.
+
+    Off, the field is one line, and the breaks at the ENDS of a run are not
+    what makes it more than one. Selecting a key in a browser or copying the
+    line out of a file takes the newline at the end of it with you, and that
+    one invisible character used to drop the entire paste -- `str.isprintable`
+    is false for any string containing a newline, so the API key field sat
+    there showing nothing while the user pasted into it again. The ends are
+    stripped, exactly as `normalize_paste` strips them for the task box, and
+    what is left is taken. A run with a break still INSIDE it is genuinely
+    more than one line, so it is reported as ("block", text) rather than
+    typed: half a key would be worse than none, and silence would be worse
+    than both.
     """
     if key is None:
         return ("end", None)
@@ -2053,17 +2062,26 @@ def normalize_text_key(key, allow_multiline=False):
         return ("", "")
     if key and key.isprintable():
         return ("char", key)
-    if allow_multiline and key and len(key) > 1:
-        # Printable once the breaks and tabs it is allowed to carry are set
-        # aside. Anything else in there is a control sequence, not a paste.
-        #
+    if key and len(key) > 1:
         # A BARE carriage return counts as a break here. The console reports
         # the Enter inside a pasted block as "\r" and nothing else, so a run
         # that only knew about "\r\n" found an unprintable character in every
         # Windows paste and threw the whole block away.
         body = key.replace("\r\n", "\n").replace("\r", "\n")
-        if body.replace("\n", "").replace("\t", "").isprintable():
-            return ("char", body)
+        if allow_multiline:
+            # Printable once the breaks and tabs it is allowed to carry are
+            # set aside. Anything else in there is a control sequence, not a
+            # paste.
+            if body.replace("\n", "").replace("\t", "").isprintable():
+                return ("char", body)
+            return ("", "")
+        single = body.strip("\n")
+        if not single:
+            return ("", "")           # a paste of nothing but line breaks
+        if single.isprintable():
+            return ("char", single)
+        if single.replace("\n", "").isprintable():
+            return ("block", single)
     return ("", "")
 
 
@@ -3804,6 +3822,13 @@ def api_key_screen(provider_id=None, stream=None, key_reader=None, region=None):
     what. Enter with nothing typed is a message rather than a save, Esc leaves
     without writing anything, and the outcome afterwards is whatever the
     provider said -- TMT does not pronounce a key valid on its own.
+
+    A paste arrives here as one read, and the line break a copy takes with it
+    is stripped by `normalize_text_key` rather than dropping the whole paste.
+    A paste that is genuinely more than one line is not a key, and it SAYS so:
+    every other way this field can be given something it cannot use answers in
+    words, and a field that answers a paste with nothing at all is
+    indistinguishable from one that is not reading the keyboard.
     """
     stream = sys.stdout if stream is None else stream
     provider_id = provider_id or current_provider() or PROVIDER_ORDER[0]
@@ -3828,6 +3853,14 @@ def api_key_screen(provider_id=None, stream=None, key_reader=None, region=None):
             # still one mask and one backspace per character the user sees.
             typed.extend(iter_graphemes(value))
             message = ""
+            continue
+        if kind == "block":
+            # Nothing is taken from it -- half a key stored is worse than no
+            # key stored -- but the field says what it saw and what to do
+            # about it, which is the whole difference from doing nothing.
+            message = ("That paste is %d lines. A key is one line: paste just "
+                       "the key, or press Esc to go back."
+                       % (value.count("\n") + 1))
             continue
         if value in ("esc", "interrupt"):
             return None
