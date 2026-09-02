@@ -49,6 +49,23 @@ UNDERLINE = "\033[4m"
 ITALIC = "\033[3m"
 STRIKE = "\033[9m"
 
+# The one colour that lands on a surface being read rather than watched, and
+# it is a POSITION ON THE EXISTING RAMP rather than a hue of its own: the
+# gradient's lime stop at 80 is (132, 204, 22), and this is that muted a fifth
+# of the way toward the neutral so it sits under prose instead of announcing
+# itself the way an instrument does. Bold in a rendered reply is drawn with it.
+#
+# It is STATIC, and that is the mechanical half of the rule rather than a
+# preference: the answer box and the streaming box are skipped by LiveRegion
+# when two frames are byte-identical, and a colour that consulted the clock
+# would put the caret flicker straight back. Same reasoning, and the same
+# fixed-phase answer, as the capability commands painted in the input field.
+#
+# It is always emitted WITH `BOLD`, never instead of it, so a terminal with no
+# colour still shows the emphasis as weight and a reader with the escapes
+# stripped still reads the sentence. Colour is never the message here either.
+LIME = "\033[38;2;123;181;35m"
+
 # The activity readout drawn hard against the right edge of the status row,
 # opposite the progress bar: a turning glyph, elapsed time and token count.
 ACTIVITY_GLYPHS = ("✻", "✽", "✻")

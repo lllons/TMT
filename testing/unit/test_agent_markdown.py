@@ -21,9 +21,12 @@ Windows console actually reports and it can carry none of the marks.
 
 import io
 import re
+import time
 
 import agent_markdown as M
-from agent_ui import display_width, strip_ansi, wrap_words
+from agent_ui import (
+    DIM, LIME, _gradient, display_width, strip_ansi, wrap_words,
+)
 
 
 class Console(io.StringIO):
@@ -298,3 +301,123 @@ def test_two_renders_of_the_same_text_are_identical():
     unchanged reply repaint forever."""
     text = "**a** *b* ~~c~~ `d` and [e](https://f.g)"
     assert M.render(text, 40, Console()) == M.render(text, 40, Console())
+
+
+# --- bold is the one mark that carries a colour -----------------------------
+
+def test_bold_is_lime_and_is_still_bold():
+    """The colour is what the eye lands on and the weight is what survives a
+    terminal that has no colour, so bold has to be both. Dropping either one
+    loses the emphasis for somebody."""
+    painted = M.render("A **strong** word.", 60, Console())[0]
+    assert LIME in painted, repr(painted)
+    assert "\033[1m" in painted, repr(painted)
+    # And the rule none of this may break: it still reads without any of it.
+    assert strip_ansi(painted).strip() == "A strong word.", painted
+
+
+def test_the_lime_is_a_position_on_the_existing_ramp_not_a_new_colour():
+    """DESIGN_PRINCIPLES allows a position on the red -> orange -> green ramp
+    and not a hue of somebody's choosing. This is the ramp's own lime stop,
+    muted toward the one neutral, and this test is what says so out loud."""
+    lime_stop = _gradient(80)                       # (132, 204, 22)
+    neutral = (88, 88, 88)                          # DIM
+    expected = tuple(round(a * 0.8 + b * 0.2) for a, b in zip(lime_stop, neutral))
+    assert LIME == "\033[38;2;%d;%d;%dm" % expected, LIME
+
+
+def test_a_reply_never_animates_however_often_it_is_repainted():
+    """The answer box and the streaming box are skipped by LiveRegion when two
+    frames are byte-identical. A colour that consulted the clock would put the
+    caret flicker straight back, which is the thing not to do."""
+    first = M.render("**now** and later", 40, Console())
+    time.sleep(0.05)
+    assert M.render("**now** and later", 40, Console()) == first
+
+
+def test_a_terminal_with_no_colour_still_shows_the_emphasis():
+    """cp1252 through a pipe is what a Windows console actually reports, and
+    there the colour is refused. The weight has to be what is left."""
+    painted = M.render("A **strong** word.", 60, Console(encoding="cp1252",
+                                                         tty=False))[0]
+    assert "\033[" not in painted, repr(painted)
+    assert painted.strip() == "A strong word.", painted
+
+
+def test_a_quotation_recedes_as_a_whole_even_where_it_is_emphasised():
+    """A lime word inside a block quote would pull the eye to the part of the
+    reply that is being quoted rather than said, so dim wins there."""
+    painted = M.render("> a **stressed** quotation", 60, Console())[0]
+    assert painted.rindex(DIM) > painted.rindex(LIME), repr(painted)
+
+
+def test_one_run_of_escapes_per_phrase_rather_than_one_per_word():
+    """The wrap splits a line into a span per word, so without coalescing a
+    five-word bold phrase opened and closed the escape ten times -- and bold
+    is two escapes a word now rather than one."""
+    painted = M.render("A **long bold phrase here** ends.", 60, Console())[0]
+    assert painted.count(LIME) == 1, repr(painted)
+    assert strip_ansi(painted).strip() == "A long bold phrase here ends.", painted
+
+
+# --- what the renderer used to get wrong ------------------------------------
+
+def test_three_asterisks_are_both_marks_and_not_a_stray_one_each_side():
+    """`**x**` cannot contain a `*`, so on `***x***` the strong arm failed at
+    the third asterisk and what came back was a bold word with a literal
+    asterisk stranded on either side of it."""
+    for source in ("This is ***both*** at once.", "This is ___both___ at once."):
+        rows = M.render(source, 60, Console())
+        assert visible(rows)[0].strip() == "This is both at once.", rows
+        assert "*" not in visible(rows)[0] and "_" not in visible(rows)[0], rows
+        assert "\033[1m" in rows[0] and "\033[3m" in rows[0], repr(rows[0])
+
+
+def test_an_image_does_not_strand_its_bang():
+    """The `!` is part of the mark, not text. A terminal cannot show the
+    image, so the alt text and the address are what there is to show."""
+    text = visible(M.render("See ![the diagram](https://x.dev/d.png) here.", 70,
+                            Console()))[0]
+    assert "!" not in text, text
+    assert "the diagram" in text and "https://x.dev/d.png" in text, text
+
+
+def test_an_autolink_loses_its_angle_brackets():
+    """`<https://x>` is a URL in brackets, and shown whole the brackets read
+    as part of the address."""
+    text = visible(M.render("Read <https://example.com/docs> today.", 70,
+                            Console()))[0]
+    assert "<" not in text and ">" not in text, text
+    assert "https://example.com/docs" in text, text
+
+
+def test_a_heading_underlined_with_equals_is_a_heading():
+    """The other way to write one. Without it a title over a row of `=` came
+    out as two paragraphs, the second of which was five equals signs."""
+    rows = visible(M.render("Release Notes\n=====\n\nBody text.", 50, Console()))
+    body = "\n".join(rows)
+    assert "Release Notes" in body and "=" not in body, body
+    assert "Body text." in body, body
+
+
+def test_a_rule_under_text_is_a_heading_and_a_rule_on_its_own_is_a_rule():
+    """GitHub's precedence, and the reason the existing rule test still
+    passes: `---` is an underline when it follows text and a thematic break
+    when it does not."""
+    ruled = visible(M.render("Section\n---\n\nBody.", 50, Console()))
+    assert "Section" in "\n".join(ruled), ruled
+    assert not any(set(row.strip()) == {"-"} for row in ruled), ruled
+
+    alone = visible(M.render("Body.\n\n---\n", 50, Console()))
+    assert any(set(row.strip()) == {"─"} for row in alone), alone
+
+
+def test_only_a_level_one_heading_is_ruled():
+    """A document has one title. Ruling every `###` in a long reply would
+    draw more lines than text."""
+    top = visible(M.render("# Title\n\nBody.", 40, Console()))
+    assert any(set(row.strip()) == {"─"} for row in top), top
+    deep = visible(M.render("### Title\n\nBody.", 40, Console()))
+    assert not any(set(row.strip()) == {"─"} for row in deep), deep
+    for row in top:
+        assert display_width(row) <= 40, row

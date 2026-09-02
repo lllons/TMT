@@ -6,14 +6,22 @@ as a row of pipes, a code block with its fences. This turns that into
 something meant for a person -- and it is the same subset GitHub renders, so
 what a model writes for a web page reads correctly here.
 
-**Weights, never colour.** DESIGN_PRINCIPLES puts the gradient on the
-instruments -- the bar, the thinking word, the wordmark -- and keeps it off
-the surfaces that are read rather than watched, which is exactly what a reply
-is. So emphasis here is bold, italic, strike and dim: attributes the terminal
-already has, none of which is a colour, and all of which vanish cleanly when
-the escapes are stripped. **Every rendered line still reads with no styling
-at all**, which is the rule this must not become an exception to, and it is
-why inline code keeps its backticks rather than being marked some other way.
+**Weights, and exactly one colour.** DESIGN_PRINCIPLES puts the gradient on
+the instruments -- the bar, the thinking word, the wordmark -- and keeps it
+off the surfaces that are read rather than watched, which is exactly what a
+reply is. Italic, strike and dim are therefore weights and nothing more.
+
+Bold is the one exception, and it is a narrow one: it is drawn in `LIME`, the
+gradient's own lime stop muted toward the neutral, so the word a model chose
+to stress is the word the eye lands on. It takes a POSITION ON THE EXISTING
+RAMP rather than a colour of its own, it never animates -- two frames of the
+same reply are still the same bytes, which is what lets `LiveRegion` skip the
+repaint -- and it is always `BOLD + LIME` rather than the colour alone, so a
+terminal with no colour still shows the emphasis as weight.
+
+**Every rendered line still reads with no styling at all**, which is the rule
+none of this may become an exception to, and it is why inline code keeps its
+backticks rather than being marked some other way.
 
 **Spans first, wrapping second.** Inline markup is parsed into (text, style)
 runs before anything is measured, so a bold phrase that straddles a line
@@ -27,7 +35,7 @@ width and a stream to ask about encoding, and returns rows.
 import re
 
 from agent_ui import (
-    BOLD, DIM, ITALIC, RESET, STRIKE, clip_to_width, display_width,
+    BOLD, DIM, ITALIC, LIME, RESET, STRIKE, clip_to_width, display_width,
     encodable, plain_output, wrap_words,
 )
 
@@ -35,7 +43,17 @@ from agent_ui import (
 # rather than an escape, which is what lets the wrap measure the words.
 STRONG, EM, STRUCK, QUIET = "strong", "em", "struck", "quiet"
 
-_STYLES = {STRONG: BOLD, EM: ITALIC, STRUCK: STRIKE, QUIET: DIM}
+# Bold is the one mark that carries a colour, and it carries the weight too.
+# `BOLD + LIME` rather than `LIME`: the colour is what a reader notices and the
+# weight is what survives a terminal that has none, so dropping either one
+# would lose the emphasis for somebody. The order is fixed here rather than
+# decided per call, because two frames of the same text have to be the same
+# bytes for the repaint to be skipped.
+#
+# QUIET is applied last in `_paint`, so bold inside a block quote is still
+# dim -- a quotation recedes as a whole, and a lime word inside one would
+# pull the eye to the part of the reply that is being quoted rather than said.
+_STYLES = {STRONG: BOLD + LIME, EM: ITALIC, STRUCK: STRIKE, QUIET: DIM}
 
 # What each block draws with, and the ASCII it falls back to on a console
 # that cannot encode the first choice. Checked per stream rather than assumed
@@ -61,17 +79,34 @@ _MARKS = {
 #
 # `*` is deliberately left alone: intraword `*` really is emphasis in GFM, and
 # nothing in this project is named with one.
+#
+# `***both***` is matched BEFORE `**strong**`, and it has to be. The strong
+# arm is `\*\*([^*]+)\*\*`, whose body cannot contain a `*` -- so on
+# `***word***` it fails at the third asterisk, the scan moves on a character,
+# and what came back was a bold word with a literal `*` stranded on each side
+# of it. Three asterisks is the commonest emphasis a model writes after two.
 _INLINE = re.compile(
     r"(?P<code>`+[^`]*`+)"
+    r"|(?P<both>\*\*\*(?P<both_text>[^*]+)\*\*\*"
+    r"|(?<![^\W_])(?<!_)___(?P<both_text2>[^_]+)___(?![^\W_]))"
     r"|(?P<strong>\*\*(?P<strong_text>[^*]+)\*\*"
     r"|(?<![^\W_])(?<!_)__(?P<strong_text2>[^_]+)__(?![^\W_]))"
     r"|(?P<struck>~~(?P<struck_text>[^~]+)~~)"
     r"|(?P<em>\*(?P<em_text>[^*\n]+)\*"
     r"|(?<![^\W_])(?<!_)_(?P<em_text2>[^_\n]+)_(?![^\W_])(?!_))"
-    r"|(?P<link>\[(?P<link_text>[^\]]*)\]\((?P<link_url>[^)\s]+)[^)]*\))"
+    # An autolink is a URL in angle brackets. Without this the brackets are
+    # shown, which reads as part of the address and is not.
+    r"|(?P<auto><(?P<auto_url>[a-zA-Z][a-zA-Z0-9+.-]*://[^>\s]+)>)"
+    # The `!` is part of the mark, not text. Matching a link inside an image
+    # left the bang stranded in front of the alt text.
+    r"|(?P<link>(?P<bang>!?)\[(?P<link_text>[^\]]*)\]\((?P<link_url>[^)\s]+)[^)]*\))"
 )
 
 _HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
+# The other way to write a heading: the text, then a row of `=` (level 1) or
+# `-` (level 2) under it. Without this a `Title` over `=====` came out as two
+# paragraphs, the second of which was five equals signs.
+_SETEXT = re.compile(r"^\s{0,3}(=+|-+)\s*$")
 _BULLET = re.compile(r"^(\s*)([-*+])\s+(.*)$")
 _ORDERED = re.compile(r"^(\s*)(\d{1,3})([.)])\s+(.*)$")
 _TASK = re.compile(r"^\[([ xX])\]\s+(.*)$")
@@ -109,6 +144,9 @@ def _spans(text):
             # already emphasis, and a reader who sees `path/to.py` knows what
             # it is. Removing them would lose that with the escapes stripped.
             out.append((found.group("code"), frozenset({QUIET})))
+        elif found.group("both"):
+            body = found.group("both_text") or found.group("both_text2") or ""
+            out.append((body, frozenset({STRONG, EM})))
         elif found.group("strong"):
             body = found.group("strong_text") or found.group("strong_text2") or ""
             out.append((body, frozenset({STRONG})))
@@ -117,6 +155,8 @@ def _spans(text):
         elif found.group("em"):
             body = found.group("em_text") or found.group("em_text2") or ""
             out.append((body, frozenset({EM})))
+        elif found.group("auto"):
+            out.append((found.group("auto_url"), frozenset({QUIET})))
         elif found.group("link"):
             label = (found.group("link_text") or "").strip()
             url = found.group("link_url")
@@ -137,16 +177,34 @@ def plain(spans):
 
 
 def _paint(spans, stream):
-    """Spans as one string, styled where the stream can carry it."""
+    """Spans as one string, styled where the stream can carry it.
+
+    Adjacent spans with the same styles are painted as ONE run. The wrap
+    splits a line into a span per word and a span per space, so without this
+    a five-word bold phrase opened and closed the escape ten times -- and now
+    that bold carries a colour as well as a weight, that is two escapes a word
+    rather than one. The reader sees no difference; the repaint is smaller,
+    and the row is legible when something dumps it as bytes.
+    """
     if plain_output(stream):
         return plain(spans)
-    out = []
-    for text, styles in spans:
-        # A deterministic order, so two frames of the same text are the same
-        # bytes -- which is what lets a repaint be skipped.
-        opened = "".join(_STYLES[name] for name in (STRONG, EM, STRUCK, QUIET)
-                         if name in styles)
-        out.append((opened + text + RESET) if opened else text)
+    out, run, styles = [], [], None
+
+    def flush():
+        if run:
+            # A deterministic order, so two frames of the same text are the
+            # same bytes -- which is what lets a repaint be skipped.
+            opened = "".join(_STYLES[name] for name in (STRONG, EM, STRUCK, QUIET)
+                             if name in styles)
+            body = "".join(run)
+            out.append((opened + body + RESET) if opened else body)
+
+    for text, these in spans:
+        if these != styles:
+            flush()
+            run, styles = [], these
+        run.append(text)
+    flush()
     return "".join(out)
 
 
@@ -291,12 +349,8 @@ def render(text, columns=80, stream=None):
 
         heading = _HEADING.match(line)
         if heading:
-            spans = [(text_, styles | {STRONG})
-                     for text_, styles in _spans(heading.group(2))]
-            if rows and rows[-1].strip():
-                rows.append("")
-            for wrapped in _wrap_spans(spans, columns, " ", " "):
-                rows.append(_paint(wrapped, stream))
+            _heading(rows, _spans(heading.group(2)), len(heading.group(1)),
+                     columns, stream)
             index += 1
             continue
 
@@ -355,15 +409,44 @@ def render(text, columns=80, stream=None):
         # by the model at 60 columns reflows to the window it is shown in.
         paragraph = [line]
         index += 1
-        while index < len(lines) and lines[index].strip() and not _is_block(lines[index]):
+        while (index < len(lines) and lines[index].strip()
+               and not _is_block(lines[index]) and not _SETEXT.match(lines[index])):
             paragraph.append(lines[index])
             index += 1
         spans = _spans(" ".join(part.strip() for part in paragraph))
+        # A row of `=` or `-` directly under the text makes it a heading
+        # instead. `---` reaches here having already stopped the paragraph as
+        # a thematic rule, which is the right precedence: GitHub reads it as
+        # an underline when it follows text and as a rule when it does not.
+        underline = _SETEXT.match(lines[index]) if index < len(lines) else None
+        if underline:
+            _heading(rows, spans, 1 if underline.group(1)[0] == "=" else 2,
+                     columns, stream)
+            index += 1
+            continue
         for wrapped in _wrap_spans(spans, columns, " ", " "):
             rows.append(_paint(wrapped, stream))
     while rows and rows[-1] == "":
         rows.pop()
     return rows or [""]
+
+
+def _heading(rows, spans, level, columns, stream):
+    """Draw a heading, and rule under a level-1 one.
+
+    Both spellings of a heading end up here, so `# Title` and a `Title` over
+    `=====` draw the same thing. The rule is the only thing that tells the
+    levels apart, and it is kept for level 1 alone: a document has one title,
+    and ruling every `###` in a long reply would draw more lines than text.
+    """
+    spans = [(text, styles | {STRONG}) for text, styles in spans]
+    if rows and rows[-1].strip():
+        rows.append("")
+    for wrapped in _wrap_spans(spans, columns, " ", " "):
+        rows.append(_paint(wrapped, stream))
+    if level == 1:
+        rows.append(_dim_row(" " + _mark("rule", stream) * max(1, columns - 2),
+                             stream))
 
 
 def _is_block(line):
