@@ -590,6 +590,68 @@ def set_project_context(enabled):
     return value
 
 
+# --- the tip cursor ---------------------------------------------------------
+#
+# Which tip the session header shows next. One integer, stored beside the
+# model and the effort level for the reason all of them are there: it belongs
+# to the installation and not to whichever project happens to be open, and a
+# user who has read six tips has read them, whichever directory they were
+# standing in at the time.
+#
+# It is state rather than a setting -- nothing offers it in Settings and there
+# is nothing here to choose -- which is why there is no default to argue about
+# and no vocabulary to read forgivingly. A fresh installation starts at the
+# first tip; so does an installation whose cursor file has been deleted,
+# corrupted or edited into a word, and none of those is worth telling anybody
+# about.
+#
+# What is stored is read and written here and stepped on in `agent_tips`,
+# which owns the rotation. Two modules, one rule each: this one knows where
+# the number lives, that one knows what the number means.
+
+TIP_FILE = INSTALL_DIR / ".tmt_tip"
+
+
+def read_saved_tip_cursor():
+    """The stored cursor, or 0. Never raises.
+
+    Every failure is 0, which is the rule `read_saved_effort` already follows,
+    reached here for a smaller reason: this is a decoration, and a missing,
+    unreadable or hand-mangled file is not evidence of anything except that
+    the next header should open the catalogue at the top.
+    """
+    try:
+        stored = TIP_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return 0
+    try:
+        return int(stored)
+    except ValueError:
+        return 0
+
+
+def set_tip_cursor(position):
+    """Store the cursor. Returns what was stored, or None when it was not.
+
+    **This is the one piece of state here that does NOT raise on a failed
+    write**, and the difference from `set_auto_update` is the difference
+    between a switch and a rotation. A toggle the user just pressed that
+    silently did not persist would show ON in the menu and be OFF next launch,
+    which is worth an error they can see; a cursor that did not persist shows
+    the same tip twice. Nothing about a tip is worth an exception raised in
+    the middle of drawing the session header.
+    """
+    try:
+        value = int(position)
+    except (TypeError, ValueError):
+        return None
+    try:
+        TIP_FILE.write_text(str(value) + "\n", encoding="utf-8")
+    except OSError:
+        return None
+    return value
+
+
 def effort_names():
     """The levels, in the order they escalate rather than alphabetically."""
     return sorted(EFFORT_LEVELS,

@@ -228,6 +228,27 @@ that. It is asked for once for the install, not once per project.
 Type a task at the `Task>` prompt. `quit` or `exit` to leave. Ctrl-C cancels the
 current task without closing TMT.
 
+### The tip under the header
+
+A session opens on the wordmark, the date, the directory it may write to — and one
+line of something TMT can do:
+
+```
+   Wed 02 Sep 2026
+   C:\Coding\myproject
+   Tip · /note answers a question about this project without changing it
+```
+
+There are more than thirty of them and the next one is shown each time that screen is
+reached: a launch, or coming back to a session with `/back`. Which one comes next is
+kept in `.tmt_tip` in the installation directory (git-ignored), so the list moves on
+between launches instead of restarting at the top, and it is the same list in every
+project. A terminal too narrow for the sentence shows the command on its own; one with
+no room for even that shows no tip, and nothing else on the header moves to make space.
+
+Every tip names something TMT actually does. Most of them are the slash commands
+below, which are otherwise invisible until somebody mentions them.
+
 Files under 8 KB are shown to the model automatically, up to a fixed number and total
 size; the listing says so when it stops early. Larger files are read on demand.
 

@@ -686,6 +686,12 @@ BRAND_SPREAD = 0.35
 # ladder already uses for detail belonging to the row above it.
 _HEADER_INDENT = 3
 
+# What the tip row is labelled with. It needs one, because a sentence hanging
+# under the workspace with no label reads as a fact about this session rather
+# than as advice about the program -- and because the label is the part that
+# survives when the sentence will not fit.
+TIP_LABEL = "Tip"
+
 
 def _clock(moment=None):
     """The local wall clock, read now.
@@ -802,8 +808,75 @@ def _header_logo_fits(columns, rows):
             and int(rows) >= HEADER_LOGO_MIN_ROWS)
 
 
+def _tip_parts(tip):
+    """(gesture, detail) from whatever the caller passed, or None.
+
+    Two shapes are accepted because two are natural: `agent_tips` hands over a
+    pair, and a caller with one thing to say has one string. Anything else is
+    no tip rather than an error -- this is a decoration, and a header that
+    refused to draw because a tip was the wrong shape would be taking the
+    session down with it.
+    """
+    if tip is None:
+        return None
+    if isinstance(tip, str):
+        gesture, detail = tip, ""
+    else:
+        try:
+            gesture, detail = tip
+        except (TypeError, ValueError):
+            return None
+    gesture, detail = str(gesture).strip(), str(detail).strip()
+    return (gesture, detail) if gesture else None
+
+
+def _tip_row(tip, stream, room):
+    """The tip, hanging at the header's indent, or "" when it will not fit.
+
+    Two tiers and then silence, which is the launch screen's rule for its own
+    subtitle applied to the other place TMT writes a sentence somebody is
+    meant to act on: what is given up is a whole TIER, never the right-hand
+    end of the words. Advice sawn through at the edge of the screen is worse
+    than no advice -- the reader has to guess the rest of something they did
+    not ask for -- while the gesture on its own is still true and still says
+    the thing exists.
+
+    Dim, like the date it hangs beside and for the same reason: on a screen
+    whose one consequential fact is the directory TMT may write to, this is
+    the bottom of the prominence ladder. It reads with every escape stripped,
+    which is what the label is there for.
+    """
+    parts = _tip_parts(tip)
+    if not parts:
+        return ""
+    gesture, detail = parts
+    label = TIP_LABEL + " %s " % _glyphs(stream)["dot"]
+    tiers = [label + gesture]
+    if detail:
+        tiers.insert(0, label + gesture + " " + detail)
+    for text in tiers:
+        if display_width(text) <= room:
+            return _dim(" " * _HEADER_INDENT + text, stream)
+    return ""
+
+
+def _with_tip(lines, tip_line, rows):
+    """The header with the tip under it, unless the window has no row spare.
+
+    Appended AFTER the frame has been fitted to the window rather than passed
+    through the fit, so the tip is the first thing given up on a short screen.
+    Inside the frame it would compete with the workspace for the row the trim
+    keeps, and the directory TMT may write to is not a thing to lose to a
+    piece of advice.
+    """
+    if tip_line and len(lines) + 1 <= max(1, int(rows) - 1):
+        return lines + [tip_line]
+    return lines
+
+
 def render_status_lines(stream=None, size=None, phase=None, moment=None,
-                        provider_id=None, model_id=None, workspace=None):
+                        provider_id=None, model_id=None, workspace=None,
+                        tip=None):
     """The session header, as a list of ready-to-paint lines.
 
     The block wordmark, and under it the date and the workspace, each at the
@@ -811,6 +884,15 @@ def render_status_lines(stream=None, size=None, phase=None, moment=None,
     above. That indent is the whole of the grouping -- one element, not three
     strings that happen to be adjacent -- and it costs nothing that a reader
     has to look past.
+
+    A `tip` hangs at the same indent, under the workspace and dim, and is the
+    one row here that is different every time the screen is drawn. It is
+    passed IN rather than fetched: the rotation has to step exactly once per
+    drawing of the header, and a renderer that stepped it itself would move
+    the catalogue on every test that composed a frame and would put a write to
+    disk inside a function whose whole job is to return strings. Its absence
+    is the default, so a caller that says nothing gets the header exactly as
+    it was before tips existed.
 
     **The wordmark is the same block the startup menu draws**, at the same
     size, through `render_banner` itself rather than a second copy of it. The
@@ -860,6 +942,7 @@ def render_status_lines(stream=None, size=None, phase=None, moment=None,
     # it is not dimmed.
     room = max(1, width - _HEADER_INDENT)
     place = " " * _HEADER_INDENT + _shorten_middle(workspace, room, marker)
+    tip_line = _tip_row(tip, stream, room)
 
     if _header_logo_fits(columns, rows):
         # The block wordmark, at a FIXED phase. `render_banner` is the one
@@ -869,7 +952,7 @@ def render_status_lines(stream=None, size=None, phase=None, moment=None,
         date = _dim(" " * _HEADER_INDENT
                     + _date_text(moment, max(1, room)), stream)
         lines = [""] + render_banner(stream, phase, columns) + [date, place]
-        return _fit_height(lines, rows, keep_tail=1)
+        return _with_tip(_fit_height(lines, rows, keep_tail=1), tip_line, rows)
 
     # Too narrow or too short for the block. The date rejoins the wordmark on
     # one row, which is what this header was before the block arrived: on a
@@ -878,7 +961,8 @@ def render_status_lines(stream=None, size=None, phase=None, moment=None,
     date = _date_text(moment, max(0, width - spent))
     brand = (" " + _paint("TMT", stream, phase, spread=BRAND_SPREAD)
              + _dim(separator + date, stream))
-    return _fit_height(["", brand, place], rows, keep_tail=1)
+    return _with_tip(_fit_height(["", brand, place], rows, keep_tail=1),
+                     tip_line, rows)
 
 
 def prompt_caption(stream=None, width=None, moment=None, provider_id=None,

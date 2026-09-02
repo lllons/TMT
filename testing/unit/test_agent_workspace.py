@@ -279,7 +279,14 @@ def test_installation_state_does_not_follow_the_workspace():
                      # the workspace too. A per-project on/off would mean TMT
                      # behaved differently in each directory with nothing on
                      # screen to say why.
-                     agent_config.PROJECT_CONTEXT_FILE):
+                     agent_config.PROJECT_CONTEXT_FILE,
+                     # Which tip the header shows next. It records how far
+                     # through the catalogue this INSTALLATION has read, which
+                     # is a fact about the person rather than about the
+                     # directory they happen to be standing in -- so it lives
+                     # here with the model and the effort level, and a user
+                     # who has seen six tips has seen them in every project.
+                     agent_config.TIP_FILE):
             assert Path(path).resolve().parent == INSTALL_DIR, path
             assert box.path not in Path(path).resolve().parents
     finally:

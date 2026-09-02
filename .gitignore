@@ -25,6 +25,10 @@ DESIGN_PRINCIPLES.md
 # their checkout is not a rule anyone else agreed to.
 .tmt_bash_rules.json
 .tmt_autoupdate
+# Which tip the session header shows next. One integer, per installation, and
+# meaningless to anyone else: it says how far through the catalogue THIS
+# machine has read.
+.tmt_tip
 # Whether the persistent project context is on. TMT's own state, so it is
 # ignored here beside the other per-install choices.
 .tmt_context

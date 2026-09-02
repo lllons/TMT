@@ -66,6 +66,7 @@ py-modules = [
     "agent_splash",
     "agent_symbols",
     "agent_testsel",
+    "agent_tips",
     "agent_tree",
     "agent_ui",
     "agent_update",

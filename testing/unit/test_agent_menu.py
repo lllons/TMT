@@ -672,6 +672,128 @@ def test_the_header_is_one_component_and_draws_no_rule_of_its_own():
     # No rule anywhere in it, in either character set.
     joined = "\n".join(lines)
     assert "─" not in joined and "---" not in joined, joined
+    # Two rows because no tip was asked for. A tip is a third row at the same
+    # indent, which is the next test; the grouping asserted here is what makes
+    # adding one a matter of adding a row rather than a component.
+
+
+def tipped(columns=100, rows=40, stream=None, tip=("/note", "asks a question")):
+    """The header with a tip in it, as the terminal shows it."""
+    stream = Console() if stream is None else stream
+    probe = Path(os.sep + "tmt_probe" + os.sep + "chosen_workspace")
+    return [visible(line) for line
+            in menu().render_status_lines(stream=stream, size=(columns, rows),
+                                          workspace=probe, phase=0.25, tip=tip)]
+
+
+def test_the_header_carries_one_tip_hanging_at_the_same_indent():
+    """The one row of this header that is different every time it is drawn.
+
+    It belongs to the header rather than sitting near it: same indent as the
+    date and the workspace, no blank line, no rule, no second component. And
+    it is labelled, because a sentence hanging under the workspace with
+    nothing in front of it reads as another fact about this session rather
+    than as advice about the program."""
+    body = [line for line in tipped() if line.strip()]
+    assert body[-1].startswith("   "), body
+    assert body[-1].strip().startswith("Tip"), body
+    assert "/note asks a question" in body[-1], body
+    # Under the workspace, not above it: the directory TMT may write to is the
+    # one consequential fact on this screen and keeps its place.
+    assert str(Path(os.sep + "tmt_probe" + os.sep + "chosen_workspace")) in body[-2], body
+
+
+def test_a_header_asked_for_no_tip_is_the_header_that_was_there_before():
+    """The default is silence, so every caller that has not heard of tips --
+    and every test that composes a frame -- gets exactly what it got before
+    the feature existed. Asserted as equality rather than described."""
+    without = menu().render_status_lines(stream=Console(), size=(100, 40),
+                                         workspace="C:\\p", phase=0.25)
+    same = menu().render_status_lines(stream=Console(), size=(100, 40),
+                                      workspace="C:\\p", phase=0.25, tip=None)
+    assert without == same, (without, same)
+    assert not any("Tip" in line for line in without), without
+
+
+def test_a_tip_that_will_not_fit_gives_up_its_sentence_and_then_itself():
+    """The launch screen's rule for its own subtitle, applied here: what is
+    given up is a whole tier, never the right-hand end of the words. Advice
+    sawn through at the edge of the screen is worse than no advice, because
+    the reader has to guess the rest of something they did not ask for."""
+    tip = ("/verify", "runs the checks this project already has")
+    wide = tipped(columns=100, tip=tip)[-1]
+    assert wide.strip().endswith("already has"), wide
+
+    narrow = tipped(columns=44, tip=tip)[-1]
+    assert narrow.strip() == "Tip · /verify", narrow
+
+    # Narrower than the gesture itself and the row is not drawn at all -- the
+    # header is complete without it, and half a word would not be. The width
+    # cannot fall below the content floor, so what proves this is a long
+    # gesture rather than an absurd terminal.
+    tiny = tipped(columns=24, rows=10,
+                  tip=("Auto Update on Launch", "keeps TMT current"))
+    assert not any("Tip" in line for line in tiny), tiny
+    assert any("_workspace" in line for line in tiny), tiny
+
+
+def test_a_short_window_gives_up_the_tip_before_it_gives_up_anything_else():
+    """The tip is the bottom of the ladder, so it is the first thing a window
+    with no rows to spare loses. It must never cost the workspace its row,
+    which is what appending it after the frame is fitted buys."""
+    lines = tipped(columns=100, rows=4)
+    assert not any("Tip" in line for line in lines), lines
+    assert lines[-1].strip() == str(Path(os.sep + "tmt_probe" + os.sep
+                                         + "chosen_workspace")), lines
+
+
+def test_the_tip_reads_on_a_console_that_can_neither_colour_nor_decorate():
+    """Colour is confirmation and never the message, and the separator has an
+    ASCII form for the same reason every other glyph in TMT does. cp1252 is
+    what a plain Windows console actually reports."""
+    plain = tipped(stream=Console(encoding="cp1252", tty=False))[-1]
+    assert plain.strip() == "Tip - /note asks a question", plain
+
+
+def test_a_tip_of_the_wrong_shape_is_no_tip_rather_than_an_exception():
+    """It is a decoration. A header that refused to draw because something
+    handed it the wrong object would be taking the session down with it."""
+    for junk in (("",  "detail with no gesture"), (), 7, object(), ("a", "b", "c")):
+        lines = tipped(tip=junk)
+        assert not any("Tip" in line for line in lines), (junk, lines)
+        assert any("chosen_workspace" in line for line in lines), junk
+    # One string is a tip with no detail, which is the shape a caller with
+    # one thing to say naturally writes.
+    assert tipped(tip="Ctrl-C stops a turn")[-1].strip() == "Tip · Ctrl-C stops a turn"
+
+
+def test_no_tip_in_the_catalogue_can_overflow_the_row_it_is_drawn_in():
+    """Every tip there is, at every width the header is drawn at, on a colour
+    terminal and on a console that can encode none of the decoration.
+
+    A row filled to the last column auto-wraps on some terminals and costs a
+    screen line the repaint arithmetic does not know about, so this is asked
+    of the whole catalogue rather than of one example -- a tip is a string
+    somebody types into a tuple, and the next person to add one gets the same
+    guarantee without having to know it exists.
+
+    It also pins the promise the other direction at 80 columns, which is the
+    width TMT assumes when it cannot measure one: the whole sentence is
+    there, through the real renderer, rather than only in the arithmetic
+    `test_agent_tips` does over the catalogue.
+    """
+    import agent_tips
+    for stream in (Console(), Console(encoding="cp1252", tty=False)):
+        for columns in (120, 80, 60, 40, 24):
+            for gesture, detail in agent_tips.TIPS:
+                lines = tipped(columns=columns, stream=stream,
+                               tip=(gesture, detail))
+                limit = max(24, columns - 1)
+                for line in lines:
+                    assert menu().display_width(line) <= limit, (
+                        columns, gesture, line)
+                if columns >= 80:
+                    assert detail in lines[-1], (columns, gesture, lines[-1])
 
 
 def test_the_settled_facts_are_in_the_header_and_the_moving_ones_on_the_box():

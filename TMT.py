@@ -57,6 +57,7 @@ import agent_commands
 import agent_context
 import agent_manager
 import agent_panel
+import agent_tips
 from agent_session import Session
 from agent_live_renderer import LiveRelay
 from agent_setup import ensure_api_key, ensure_git_identity
@@ -1037,7 +1038,12 @@ def _return_to_menu(session, manager, prompt_box, pad, root):
     # and the pad is counted again from the row the cursor is now on, which is
     # the one moment it is answerable.
     clear_screen()
-    drawn = render_status(workspace=root, prompt=False)
+    # A different tip from the one this session opened on. Coming back through
+    # the menu is the second of the two moments the user meets this screen, so
+    # it is the second of the two places the rotation steps: a header that
+    # redrew the same advice every time would stop being read after the first.
+    drawn = render_status(workspace=root, prompt=False,
+                          tip=agent_tips.next_tip())
     pad.reset(opening_pad(drawn or 0))
     return True
 
@@ -1050,7 +1056,15 @@ def _session_loop(root):
     # conversation up the screen. The facts that do change -- the clock, the
     # provider, the model -- are stated by the prompt box instead, which is
     # drawn again for every question anyway.
-    drawn = render_status(workspace=root, prompt=False)
+    #
+    # And one tip, which is the one row of this header that IS different every
+    # time: `next_tip` steps the stored cursor, so a session opens on the tip
+    # after the one the session before it opened on. It is fetched here rather
+    # than inside the renderer because stepping it is a write, and a write
+    # belongs at the moment the screen is actually being shown to somebody --
+    # not in a function that tests, panels and pads all compose frames with.
+    drawn = render_status(workspace=root, prompt=False,
+                          tip=agent_tips.next_tip())
     # Blank rows enough to put the first prompt box at the foot of the window.
     # They live inside the live region and are given up one at a time as
     # permanent output is printed into it, so the session fills the window

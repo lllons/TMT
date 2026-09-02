@@ -434,9 +434,19 @@ def wordmark_rows():
 
 
 def wordmarks(drawn):
-    """How many times the header signed this output, in any of its forms."""
+    """How many times the header signed this output, in any of its forms.
+
+    Counted at the START of a row, not anywhere in the text. The wordmark IS a
+    row -- every form of it is the first thing on a line of its own -- and the
+    header now hangs a tip under it, so the letters TMT turn up inside a
+    sentence a few rows further down. A substring count read those as
+    signatures, and it would have gone wrong on exactly the windows too small
+    for the block: the narrow form of the wordmark and a tip mentioning TMT
+    are the same three letters after a space.
+    """
+    rows = [re.sub(r"\033\[[0-9;]*m", "", line) for line in drawn.splitlines()]
     for form in wordmark_rows():
-        count = drawn.count(form)
+        count = sum(1 for line in rows if line.startswith(form))
         if count:
             return count
     return 0
