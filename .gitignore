@@ -16,6 +16,14 @@ logs/
 build/
 dist/
 
+# The npm side. `npm install -g tmtcode` ships bin/ and scripts/ only, and the
+# package has no dependencies -- so a node_modules here is somebody's local
+# experiment and a .tgz is what `npm pack` leaves behind. The lock file is
+# ignored for the same reason: there is nothing to lock.
+node_modules/
+package-lock.json
+*.tgz
+
 # Working references and per-install choices, not source.
 DESIGN_PRINCIPLES.md
 .tmt_model

@@ -1,0 +1,17 @@
+# The npm launcher and the script that installs TMT for it must keep LF line
+# endings in every checkout, including on Windows.
+#
+# `core.autocrlf` is true here, so a fresh clone on Windows would otherwise get
+# CRLF -- and `npm publish` ships the working tree. A shebang that ends in a
+# carriage return is not a shebang: `#!/usr/bin/env node\r` sends macOS and
+# Linux looking for an interpreter called "node\r", and the published package
+# is broken for everybody who is not on Windows while working perfectly for
+# whoever published it.
+#
+# Deliberately narrow. This repository has never had a .gitattributes and its
+# blobs are a mix of CRLF and LF; a blanket rule here would renormalise the
+# whole tree and produce a diff nobody can read. These three paths are new, are
+# already LF, and are the only ones another operating system has to execute.
+bin/*.js text eol=lf
+scripts/*.js text eol=lf
+package.json text eol=lf

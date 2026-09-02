@@ -14,7 +14,8 @@
 
 ## "Too Many Tools" — a CLI coding agent. It edits files in a workspace it cannot leave, runs shell commands through one guarded tool, and commits and pushes automatically on any repo.
 
->**Needs Python 3.8+.**
+>**Needs Python 3.8+.** Install it with `npm install -g tmtcode` (Node 14+ and git),
+>or from a clone with pip.
 
 ## The command is `tmtcode`
 
@@ -37,6 +38,39 @@ needs TMT files inside it.
 
 ## Install
 
+**Recommended — two commands:**
+
+```bash
+npm install -g tmtcode
+tmtcode
+```
+
+That is the whole of it. There is no separate clone and no pip step: installing puts
+the `tmtcode` command on your PATH and puts TMT itself in `~/.tmtcode`, and the first
+`tmtcode` asks for your API key exactly as it always has.
+
+Needs **Node 14+** to install, and **Python 3.8+** and **git** on PATH to run — TMT is
+a Python program, and the npm package is a launcher rather than a copy of it.
+
+**The live install is a git checkout in your home directory, never inside
+`node_modules`.** That is deliberate and it is what makes the npm path a first-class
+one rather than a convenience: `node_modules` is wiped and rebuilt by npm whenever it
+feels like it, and everything TMT owns — your API key, its logs, the model you chose,
+its git identity — lives in the installation directory. A checkout in `~/.tmtcode`
+survives every reinstall, and it is also what keeps the built-in updater working, since
+that fast-forwards a real repository.
+
+Put it somewhere else with `TMT_HOME`, set when you install and when you run:
+
+```bash
+TMT_HOME=~/tools/TMT npm install -g tmtcode
+```
+
+To remove it: `npm uninstall -g tmtcode` takes the command off your PATH, and
+`~/.tmtcode` is TMT itself — delete that directory and your saved key goes with it.
+
+**From a clone, with pip:**
+
 ```bash
 git clone https://github.com/lllons/TMT.git
 cd TMT
@@ -45,7 +79,8 @@ pip install -e ".[live]"         # optional: adds requests and rich for streamin
 ```
 
 The agent itself needs nothing beyond the standard library; `requests` and `rich` only
-add live streaming and colour, and TMT falls back without them.
+add live streaming and colour, and TMT falls back without them. The npm install offers
+to add the same two, and shrugs and carries on if pip is not there.
 
 After installing, leave the clone where it is and run `tmtcode` from wherever your work
 is. The clone is TMT's home, not your project.
@@ -66,7 +101,7 @@ things and they are meant to stay separate.
 
 | | What lives there | Where it is |
 |---|---|---|
-| **Installation directory** | TMT's own source, your saved API key, TMT's git co-author identity, its logs | wherever you cloned it — `~/tools/TMT`, `C:\Coding\TMT` — set once, and it never moves |
+| **Installation directory** | TMT's own source, your saved API key, TMT's git co-author identity, its logs | `~/.tmtcode` after an npm install, or wherever you cloned it — `~/tools/TMT`, `C:\Coding\TMT` — set once, and it never moves |
 | **Project directory** (the workspace) | the files TMT reads, edits, runs and commits | wherever you ran `tmtcode` |
 
 Only the project directory is ever modified. TMT's own files stay in the installation
@@ -74,7 +109,7 @@ directory whichever project you are standing in, so it is the same agent — sam
 same co-author address — everywhere.
 
 To say it plainly once more: **you do not copy TMT into a project to use it on that
-project.** One clone, one install, then `cd` to any project and type `tmtcode`.
+project.** One install, then `cd` to any project and type `tmtcode`.
 
 ## Choosing the project directory
 
@@ -188,6 +223,11 @@ reads the updater's own source and asserts those commands do not appear in it.
 
 TMT stays usable with no internet. A failed update check is a line on the splash and
 nothing more.
+
+An npm install updates itself like any other: `~/.tmtcode` is an ordinary shallow
+clone with an upstream, so it is a checkout the updater can fast-forward rather than a
+folder somebody copied. Reinstalling with npm is not how you update TMT — launching it
+is.
 
 ### Restarting
 

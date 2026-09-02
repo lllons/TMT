@@ -1,0 +1,44 @@
+{
+  "name": "tmtcode",
+  "version": "0.1.0",
+  "description": "Too Many Tools — a CLI coding agent. Install once, run from any project.",
+  "keywords": [
+    "cli",
+    "coding-agent",
+    "ai",
+    "agent",
+    "tmt",
+    "tmtcode"
+  ],
+  "homepage": "https://github.com/lllons/TMT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lllons/TMT.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lllons/TMT/issues"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "author": "Liam",
+  "engines": {
+    "node": ">=14"
+  },
+  "bin": {
+    "tmtcode": "bin/tmtcode.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "preferGlobal": true,
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ]
+}
