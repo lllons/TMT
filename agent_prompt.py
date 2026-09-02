@@ -145,6 +145,10 @@ The user asks something you must look at first. Read now, answer next turn.
   The file comes back to you as a result. Then, and only then:
   You emit:  {"action":"end_conversation","message":"src/parser.py catches ValueError around the int() conversion and re-raises it as ParseError, but nothing guards the file read at the top, so a missing file raises FileNotFoundError uncaught.","next_step":"Guard the file read"}
 
+You need several files at once. One multi_tool, not one turn per file; every result comes back together.
+  They said: how does each module set up its logging?
+  You emit:  {"action":"multi_tool","calls":[{"action":"grep","query":"logging","for_each":"src/*.py"}],"progress":"Searching every module under src for its logging setup in one go."}
+
 You want to say what you are about to do before you do it. That is a send_message, which cannot end the task.
   They said: tidy up the error handling in the parser
   You emit:  {"action":"send_message","message":"I'll read src/parser.py first to see what error handling is already there."}
@@ -328,6 +332,11 @@ recall - keys: none. Optional: query, limit, kind. Reads back what earlier sessi
   {"action":"recall"}
   {"action":"recall","query":"testing"}
 
+multi_tool - keys: calls (a list of action objects). Optional: limit. Runs several tool calls in ONE action, in order, and returns every result under a numbered header - five reads, a search per file, a command over every module, in one round trip instead of five. Any action goes in the list except send_message, end_conversation and another multi_tool. An entry carrying "for_each" (a path pattern, exactly as glob takes one) is a TEMPLATE: it runs once per matching file, with that file's path put in "path" - or wherever you wrote {path}, {name} or {stem}. At most 200 calls unless "limit" says more. Every call runs whatever the earlier ones returned, so a call that must not run unless an earlier one succeeded belongs in a later turn.
+  {"action":"multi_tool","calls":[{"action":"read_file","path":"src/app.py"},{"action":"read_file","path":"src/net.py"},{"action":"read_file","path":"tests/test_net.py"}]}
+  {"action":"multi_tool","calls":[{"action":"read_lines","for_each":"**/*.py","start":1,"end":6}]}
+  {"action":"multi_tool","calls":[{"action":"grep","query":"TODO","for_each":"src/*.py"},{"action":"write_file","for_each":"src/*.py","path":"docs/{stem}.md","content":"# {name}\n"}]}
+
 send_message - keys: message. Sends text to the user and the task CONTINUES. Use it as often as you need to. It can never end anything, whatever else you put in the object, so it is the safe way to say "I'll look at the parser first", "the retry count is in two places" or "that test was already failing before I started". Say it, then go straight on and emit the real action. Never use it to report finished work - that is end_conversation.
   {"action":"send_message","message":"I found the auth files; starting on the token check now."}
   {"actions":[{"action":"send_message","message":"Checking what the tests expect first."},{"action":"read_file","path":"tests/test_parser.py"}]}
@@ -359,6 +368,9 @@ bash - keys: command. Optional: operation ("run" is the default; also "start", "
   {"action":"bash","command":"npm run build && npm test","cwd":"web","timeout":600,"progress":"Building and testing the web package."}
   {"action":"bash","command":"git log --oneline -20 | head -5","progress":"Reading the last few commits."}
   {"action":"bash","command":"make build 2>&1 | tail -40","progress":"Building, and keeping the end of the log."}
+
+The same command over every file a pattern matches is one multi_tool with a "for_each" template, and {path} is where the file goes:
+  {"action":"multi_tool","calls":[{"action":"bash","command":"python -m py_compile {path}","for_each":"src/*.py"}],"progress":"Compiling every module under src."}
 
 Something long-lived is STARTED rather than run, and collected afterwards. At most 4 at a time, and every one is stopped when the session ends.
   {"action":"bash","operation":"start","command":"npm run dev","progress":"Starting the dev server in the background."}
@@ -689,7 +701,8 @@ PREFERENCE_RULES = r"""=== EDITING PREFERENCES - FOLLOW IN THIS ORDER ===
 7. Several new files in one go: write_files. A single new file: write_file.
 8. Files under 8 KB are already pasted below - do not read them again, just act on them. For anything larger use read_lines with a range instead of read_file.
 9. Use grep to locate the code before editing it, rather than guessing a path or dumping a whole file.
-10. Prefer one batch over many turns: put independent steps in a single "actions" array."""
+10. Prefer one batch over many turns: put independent steps in a single "actions" array.
+11. Several reads or searches in one go: one multi_tool with the calls listed, or with "for_each" naming the files. Never five turns of read_file when one action would do."""
 
 TOOL_CHOICE_RULES = r"""=== CHOOSING A TOOL - ALWAYS TAKE THE NARROWEST ONE ===
 Every one of these answers a different question. Reading a whole file to find one line is the mistake they exist to stop, and so is scanning the workspace again for something you already asked about.
@@ -703,6 +716,7 @@ Every one of these answers a different question. Reading a whole file to find on
   Which tests does my change affect?         -> related_tests
   What did earlier sessions learn here?      -> recall
   This is worth knowing next time            -> remember
+  Several tools at once, or one per file     -> multi_tool
   I know the file and I need the lines       -> read_lines
 
 Rules:
@@ -712,7 +726,8 @@ Rules:
 4. replace_across previews by default. Read the counts it reports, confirm they are what you intended, and only then send the same action again with "apply":true. Never send apply on the first attempt for a change you have not previewed.
 5. After changing code, related_tests tells you what to run. Prefer it to running an entire suite.
 6. What a tool states as fact and what it offers as a guess are marked differently in its output. Carry that distinction into what you tell the user; never repeat a heuristic as though it were measured.
-7. Files under 8 KB are already pasted below. Searching for something that is already in front of you wastes a turn."""
+7. Files under 8 KB are already pasted below. Searching for something that is already in front of you wastes a turn.
+8. multi_tool runs several calls in one action and returns every result at once. Reach for it whenever you would otherwise send the same read, search or command several times, and write "for_each" instead of listing files you found with glob. It is the same actions under the same rules: nothing is allowed inside it that is refused outside it, and it never ends the task."""
 
 WORKFLOW_RULES = r"""=== BEHAVIOUR ===
 - Every task ends with an end_conversation action. A batch whose last entry is end_conversation finishes the task. This is not optional: a task that stops without one has failed, however much work was done, because that "message" is the ONLY thing the user is sure to read.

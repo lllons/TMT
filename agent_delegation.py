@@ -99,6 +99,14 @@ READ_ONLY_ACTIONS = frozenset({
     # https only, no private addresses, a timeout, a size cap, and a refusal
     # to put this machine's own credentials into an outbound query.
     "web_search", "web_fetch",
+    # Several calls in one action. The verb itself writes nothing: what it
+    # does is dispatch its calls, and every one of them comes back through
+    # `agent_actions.execute_action`, which asks `refusal` about EACH under
+    # this same contract -- and the worker loop has asked about each before
+    # dispatch as well. A read-only delegation may therefore read five files
+    # in one action, and a write listed inside one is refused by the same
+    # sentence that refuses it on its own.
+    "multi_tool",
     # Reading git. The three inspecting verbs and no more: `git_commit` and
     # `git_push` change the repository, and `git_push` is refused to every
     # background agent anyway.

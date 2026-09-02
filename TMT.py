@@ -351,6 +351,21 @@ def note_work(session, action, obj):
     """
     if session is None:
         return
+    if action == "multi_tool":
+        # Once per call that RAN, under the call's own verb. A multi_tool is
+        # whatever its calls were: a write inside one makes a passed review
+        # stale exactly as the write would have on its own, a command inside
+        # one is recorded as the run it was, and a list of reads leaves both
+        # states exactly as they were. The ran list is `agent_multi`'s own
+        # record of what happened, not the list that was asked for.
+        try:
+            import agent_multi
+            pairs = agent_multi.ran(obj)
+        except Exception:
+            pairs = ()
+        for call, _ in pairs:
+            note_work(session, str(call.get("action", "")), call)
+        return
     paths = None
     review = getattr(session, "review", None)
     if review is not None:
@@ -400,6 +415,30 @@ def note_work(session, action, obj):
                 verify.note_change(action, paths)
         except Exception:
             pass
+
+
+def mutated(action, obj):
+    """Whether this action changed the workspace: by its name, or by its calls.
+
+    `MUTATING_ACTIONS` is read by verb name and is right for every verb but
+    one. A `multi_tool` is whatever its calls were, and `agent_multi` records
+    which of them ran, so it is asked rather than assumed -- a list of reads
+    keeps the cached prompt and a passed review, and a list with one write in
+    it drops both, exactly as the write would have on its own.
+
+    A module that cannot answer reads as "it did", which is the safe
+    direction here: a rebuilt prompt costs a walk, and a stale one describes
+    files that are no longer there.
+    """
+    if action in MUTATING_ACTIONS:
+        return True
+    if action != "multi_tool":
+        return False
+    try:
+        import agent_multi
+        return bool(agent_multi.mutates(obj))
+    except Exception:
+        return True
 
 
 def _panel_refresh(live_panel):
@@ -1621,7 +1660,7 @@ def _session_loop(root):
                         turn_state["acted"] = True
                         session.count_event(
                             transcript.emit(action_event(sub_action, sub_obj, result)))
-                        if sub_action in MUTATING_ACTIONS:
+                        if mutated(sub_action, sub_obj):
                             invalidate_prompt()
                         note_work(session, sub_action, sub_obj)
                         if sub_action == END_CONVERSATION:
@@ -1760,7 +1799,7 @@ def _session_loop(root):
                 else:
                     relay.reset()
                     live_ui.intermediate_event(ACTION_LABELS.get(action, "Processing..."))
-                if action in MUTATING_ACTIONS:
+                if mutated(action, obj):
                     invalidate_prompt()
                 note_work(session, action, obj)
                 if action == END_CONVERSATION:

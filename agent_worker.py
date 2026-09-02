@@ -81,6 +81,18 @@ WORKER_ROUNDS = 40
 # it had not started.
 MAX_INVALID_RETRIES = 6
 
+# Several calls in one action. Handled by this loop with its own dispatcher
+# rather than left to `execute_action`'s, because the whitelists below are
+# THIS loop's rule and the dispatcher does not know them: a multi_tool handed
+# straight to `execute_action` would run every call inside it through the
+# second layer only, and a write listed inside one would be the one route
+# round the first. `_multi` asks the same two refusals about every entry that
+# the bare-action path asks, and then runs each call through the same guarded
+# `dispatch` -- so the kill flag, the deadline, the read and write records and
+# the prompt invalidation all happen per call, exactly as they would for the
+# call on its own.
+MULTI_ACTION = "multi_tool"
+
 # Everything the note agent may do, and nothing else. Read-only by
 # construction: there is no verb in here that writes a file, runs a program,
 # reaches a network or changes git.
@@ -89,6 +101,12 @@ NOTE_ACTIONS = frozenset({
     "find_symbol", "tree", "code_map", "related_tests", "recall",
     "git_status", "git_diff", "git_identity",
     "send_message", "internal_response",
+    # Several calls in one action. Still read-only by construction, because
+    # the calls INSIDE it are checked against this same list, one by one,
+    # before any of them runs -- see `_multi`. The verb is on the list so a
+    # note agent can read five files in one round trip; the list is what
+    # decides which five.
+    MULTI_ACTION,
 })
 
 # The reviewbot's readout verb. Handled by this loop directly rather than
@@ -709,6 +727,42 @@ def _refusal(action, allowed, forbidden, read_only=_NOT_A_NOTE_VERB):
     return ""
 
 
+def _multi(obj, record, manager, dispatch, allowed, forbidden, read_only,
+           constraints):
+    """Run a multi_tool with this agent's whitelists applied to every call.
+
+    The contract first and then the kind of agent, per ENTRY, before any call
+    is expanded or run -- the same two refusals in the same order the
+    bare-action path asks, so a verb refused outside a multi_tool is refused
+    inside one by the same sentence. One refused entry refuses the whole
+    action with nothing run, which is `agent_multi`'s own rule and is the
+    reviewbot lesson: a refused update leaves no trace of having happened.
+
+    Every call that does run goes through `dispatch`, the loop's own guarded
+    dispatcher, and not through `execute` directly. That is what carries the
+    kill flag, the deadline, the read and write records and the prompt
+    invalidation into each call. A cancellation raised from inside one is
+    re-raised by `agent_multi.run` rather than recorded as that call's
+    failure, so no further call runs once it has arrived.
+
+    Imported at call time for the reason every import in this module is, and
+    an install without the module answers in a sentence the model can read.
+    """
+    try:
+        import agent_multi
+    except Exception as error:
+        return "agent_multi is unavailable: %s" % error
+
+    def refuse(entry):
+        action = entry.get("action")
+        return (_constraint_refusal(manager, record, action, entry, constraints)
+                or _refusal(action, allowed, forbidden, read_only))
+
+    return agent_multi.run(obj, _context(record),
+                           dispatch=lambda call: dispatch(call, call.get("action", "")),
+                           refuse=refuse)
+
+
 def _stop(manager, record, sentence):
     """End an agent that produced no response, and return the reason.
 
@@ -970,7 +1024,12 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
             continue
 
         try:
-            result = dispatch(obj, action)
+            if action == MULTI_ACTION:
+                # The whitelists applied per call inside it; see `_multi`.
+                result = _multi(obj, record, manager, dispatch, allowed,
+                                forbidden, read_only, constraints)
+            else:
+                result = dispatch(obj, action)
         except WorkerCancelled:
             raise
         except Exception as error:
@@ -1035,7 +1094,15 @@ def _run_batch(batch, record, manager, dispatch, allowed, forbidden,
             results.append("%s: %s" % (action, manager.apply_agenda(record.id, entry)))
             continue
         try:
-            result = dispatch(entry, action)
+            if action == MULTI_ACTION:
+                # On the batch path as well as the single one, for the reason
+                # the two refusals above are: a multi_tool inside a batch
+                # that went straight to `dispatch` would run its calls
+                # through the second layer only.
+                result = _multi(entry, record, manager, dispatch, allowed,
+                                forbidden, read_only, constraints)
+            else:
+                result = dispatch(entry, action)
         except WorkerCancelled:
             raise
         except Exception as error:
