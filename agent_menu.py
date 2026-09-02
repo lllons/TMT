@@ -4001,16 +4001,12 @@ def run_startup(stream=None, key_reader=None, model_id=None, workspace=None,
         # The menu is a screen, so it starts at the top of one rather than
         # halfway down whatever the shell last printed.
         clear_screen(stream)
-        # Only when TMT has no way to reach a model at all. Anyone who already
-        # has a provider goes straight to the menu and changes it in Settings.
-        #
-        # Never when resuming: a session that is running got past this at
-        # launch, and a provider form in front of somebody who pressed /back
-        # to reach Help would be asking a question that has already been
-        # answered.
-        if not resuming and not provider_is_configured():
-            provider_setup(stream=stream, key_reader=key_reader, region=region,
-                           text_reader=text_reader)
+        # **Nothing is asked for before the menu.** The credential used to be
+        # taken here, before the first frame, so a first-time user met a form
+        # where they expected a program: wordmark, then "paste your API key".
+        # It is asked for when Start is chosen instead, a few lines down --
+        # which is also the moment it is actually needed, and which leaves
+        # Settings as a way to do it first for anyone who would rather.
         while True:
             choice = main_menu(stream=stream, key_reader=key_reader, region=region,
                                model_id=model_id, workspace=workspace,
@@ -4041,7 +4037,23 @@ def run_startup(stream=None, key_reader=None, model_id=None, workspace=None,
             elif choice == "exit":
                 return "exit"
             else:
-                return "start"
+                # Start. The credential is asked for HERE and nowhere before
+                # it, so the first screen after the wordmark is the menu.
+                #
+                # `resuming` skips it outright: a session reached through
+                # `/back` got past this at launch, and asking again would be a
+                # question that has already been answered.
+                if resuming or provider_is_configured():
+                    return "start"
+                cursor = "start"
+                provider_setup(stream=stream, key_reader=key_reader,
+                               region=region, text_reader=text_reader)
+                if provider_is_configured():
+                    return "start"
+                # Nothing was configured -- Esc, or a key the user did not
+                # have to hand. Back to the menu rather than into a session
+                # that cannot reach a model, and with the cursor still on
+                # Start so a second attempt is one keystroke.
     except KeyboardInterrupt:
         return "exit"
     finally:

@@ -846,12 +846,6 @@ def main(argv=None):
     # the agent exactly as they did before this screen existed.
     if run_splash() == "exit":
         return 0
-    # Only now: the API credential. That order is the routing the launch
-    # sequence asks for -- splash, then the optional update, and only then the
-    # question of whether this installation has been configured at all. A
-    # first-time user meets the wordmark before they meet a form.
-    if not ensure_api_key():
-        return
     # Settings may have moved the model since import, and a request built from
     # a stale value would quietly use the wrong one.
     agent_config.refresh_model()
@@ -875,6 +869,19 @@ def main(argv=None):
     # the agent exactly as it did before this screen existed.
     if run_startup(workspace=root) == "exit":
         return 0
+    # THE CREDENTIAL, AND ONLY NOW. It used to be taken before the menu, so
+    # the first thing a new user saw after the wordmark was a form asking for
+    # an API key -- a question in front of a program they had not been shown
+    # yet. The menu comes first now: Start is what asks, Settings is where
+    # somebody can do it beforehand instead, and Exit never asks at all.
+    #
+    # The menu has usually settled it by the time this runs. `run_startup`
+    # takes a provider and a key when Start is chosen and nothing is
+    # configured, so this is a no-op on that path -- what it still answers for
+    # is the installation with no credential store at all, and the piped run
+    # that never drew a menu to choose Start from.
+    if not ensure_api_key():
+        return
     # Offered once, and never blocking: a missing co-author address stops
     # commits, not the session, and the refusal explains itself when it happens.
     ensure_git_identity()

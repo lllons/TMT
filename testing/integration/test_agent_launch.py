@@ -1014,15 +1014,21 @@ def test_a_first_launch_is_allowed_to_apply_the_update_it_finds():
 
 # --- the routing through main ----------------------------------------------
 
-def test_main_shows_the_launch_screen_before_it_asks_for_an_api_key():
-    """The routing the launch sequence is for: a first-time user meets the
-    wordmark before they meet a form. The order is asserted rather than the
-    existence of the calls, because both happening in the wrong order is a
-    working program with the feature inverted."""
+def test_main_shows_the_launch_screen_and_the_menu_before_it_asks_anything():
+    """The routing the launch sequence is for, and it changed on 2026-09-02:
+    a first-time user meets the wordmark, and then the MENU, before they meet
+    a form. It used to be wordmark then "paste your API key", which is a
+    question in front of a program the user has not been shown yet.
+
+    Exit from the menu therefore asks for nothing at all -- somebody who
+    launched TMT to look at it can leave without being asked for a
+    credential. The order is asserted rather than the existence of the calls,
+    because the same calls in the wrong order is the feature inverted.
+    """
     order, outcome = launch(splash="start", api_key=True, startup="exit")
     assert order[0] == "splash", order
-    assert "api_key" in order, order
-    assert order.index("splash") < order.index("api_key"), order
+    assert "startup" in order, order
+    assert "api_key" not in order, order
     assert outcome == 0, outcome
 
 
@@ -1047,10 +1053,20 @@ def test_startup_re_reads_the_auto_update_setting():
     assert order.index("refresh_auto_update") < order.index("startup"), order
 
 
-def test_a_launch_with_no_api_key_never_reaches_the_startup_menu():
-    """The order asserted from the other end. `ensure_api_key` returning False
-    stops the launch, and a splash that had been moved after it would make the
-    wordmark something a user only ever saw once they were already configured."""
-    order, outcome = launch(splash="start", api_key=False)
-    assert order == ["splash", "api_key"], order
+def test_a_launch_with_no_api_key_still_reaches_the_menu_first():
+    """The other end of the same change, and the inverse of what this test
+    asserted until 2026-09-02.
+
+    The menu comes first whatever the credential situation is. Only once
+    Start has been chosen does the question arise, and a refusal there ends
+    the launch rather than starting a session that cannot reach a model.
+    """
+    order, outcome = launch(splash="start", api_key=False, startup="start")
+    assert order[0] == "splash", order
+    assert order.index("startup") < order.index("api_key"), order
     assert outcome is None, outcome
+
+    # And choosing Exit never asks at all.
+    order, outcome = launch(splash="start", api_key=False, startup="exit")
+    assert "api_key" not in order, order
+    assert outcome == 0, outcome

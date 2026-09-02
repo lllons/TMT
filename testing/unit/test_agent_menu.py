@@ -796,6 +796,111 @@ def test_no_tip_in_the_catalogue_can_overflow_the_row_it_is_drawn_in():
                     assert detail in lines[-1], (columns, gesture, lines[-1])
 
 
+# --- what the first screen is -----------------------------------------------
+#
+# Changed on 2026-09-02: the credential used to be taken before the menu was
+# ever drawn, so the first thing a new user saw after the wordmark was a form
+# asking for an API key. The menu comes first now and Start is what asks.
+
+class Configured:
+    """`provider_is_configured` and `provider_setup`, both replaced.
+
+    Patched together because they are one decision: whether TMT can reach a
+    model, and what happens when it cannot. `answers` is read in order, so a
+    test can say "not configured, then configured" and drive the setup
+    succeeding without a real credential store anywhere near it.
+    """
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.calls = []
+        self.saved = (menu().provider_is_configured, menu().provider_setup)
+        menu().provider_is_configured = self._configured
+        menu().provider_setup = self._setup
+
+    def _configured(self):
+        return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+
+    def _setup(self, **kwargs):
+        self.calls.append(kwargs)
+        return None
+
+    def close(self):
+        menu().provider_is_configured, menu().provider_setup = self.saved
+
+
+def test_the_menu_is_the_first_screen_even_when_nothing_is_configured():
+    """A user who launches TMT to look at it can look at it. Leaving from the
+    menu asks for nothing -- the credential is a question about starting work,
+    and it used to be asked before the program had been shown at all."""
+    box, gate = Sandbox(), Configured(False)
+    try:
+        choice, keys = start(box, "down", "down", "down", "enter")   # Exit
+        assert choice == "exit", choice
+        assert gate.calls == [], "nothing may be asked for before Start"
+        assert has_wordmark(box.stream.getvalue()), "the menu was drawn"
+    finally:
+        gate.close()
+        box.close()
+
+
+def test_start_with_no_key_asks_for_one_and_comes_back_when_it_is_refused():
+    """Start is where the question belongs. A user who escapes it lands back
+    on the menu -- not in a session that cannot reach a model, and not out of
+    TMT altogether."""
+    box, gate = Sandbox(), Configured(False)
+    try:
+        # Start, which asks and is refused; then Exit from the menu it
+        # returns to. The second choice proves the menu came back.
+        choice, keys = start(box, "enter", "down", "down", "down", "enter")
+        assert choice == "exit", choice
+        assert len(gate.calls) == 1, gate.calls
+    finally:
+        gate.close()
+        box.close()
+
+
+def test_start_goes_straight_in_once_a_key_has_been_given():
+    """The same path with the setup succeeding: asked once, and then the
+    session starts rather than the menu being drawn again."""
+    box, gate = Sandbox(), Configured(False, True)
+    try:
+        choice, keys = start(box, "enter")
+        assert choice == "start", choice
+        assert len(gate.calls) == 1, gate.calls
+    finally:
+        gate.close()
+        box.close()
+
+
+def test_start_asks_nothing_when_a_key_is_already_there():
+    """The common case, and the one that must not have grown a form."""
+    box, gate = Sandbox(), Configured(True)
+    try:
+        choice, keys = start(box, "enter")
+        assert choice == "start", choice
+        assert gate.calls == [], "a configured install is never asked again"
+    finally:
+        gate.close()
+        box.close()
+
+
+def test_a_resumed_session_is_never_asked_for_a_credential():
+    """`/back` reaches this menu with a session already running behind it. It
+    got past the question at launch, and asking again would be asking
+    something already answered."""
+    box, gate = Sandbox(), Configured(False)
+    try:
+        keys = Keys("enter")
+        choice = menu().run_startup(stream=box.stream, key_reader=keys,
+                                    workspace=box.workspace, resuming=True)
+        assert choice == "start", choice
+        assert gate.calls == [], gate.calls
+    finally:
+        gate.close()
+        box.close()
+
+
 # --- the Danger Zone --------------------------------------------------------
 #
 # Nothing in this section is allowed to reach the real `agent_uninstall`.

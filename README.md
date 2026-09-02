@@ -330,9 +330,18 @@ also means on rather than an error at startup.
 
 ## First launch
 
-First launch asks for an [OpenRouter key](https://openrouter.ai/keys) and saves it to
-`.tmt_key` in the installation directory (git-ignored). Set `OPENROUTER_API_KEY` to skip
-that. It is asked for once for the install, not once per project.
+The order is: the launch screen, then the menu — **Start, Settings, Help, Exit** — and a
+question about credentials only if you choose Start without one. Nothing is asked for
+before you have seen the program, and choosing Exit asks for nothing at all.
+
+Press Start with no key and TMT asks for an [OpenRouter key](https://openrouter.ai/keys)
+there and then; press Esc at that form and you are back on the menu with nothing
+started. You can equally set it up first in **Settings → AI Provider / API Key**, which
+is the same two screens reached deliberately rather than as a gate.
+
+Either way the key is saved to `.tmt_key` in the installation directory (git-ignored).
+Set `OPENROUTER_API_KEY` to skip the question entirely. It is asked for once for the
+install, not once per project.
 
 Type a task at the `Task>` prompt. `quit` or `exit` to leave. Ctrl-C cancels the
 current task without closing TMT.
