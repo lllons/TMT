@@ -954,17 +954,55 @@ def test_a_read_only_delegation_is_refused_bash_at_the_dispatcher_too():
         box.close()
 
 
+def _teaching_only(prompt):
+    """A prompt with the workspace listing cut off the end of it.
+
+    Every background prompt ends with the SHAPE OF THE WORKSPACE section, which
+    is a listing of the repository TMT happens to be pointed at. Asking whether
+    a verb is TAUGHT has to exclude it, because the answer there is about
+    whatever the files are called rather than about the prompt.
+
+    That is not hypothetical. `test_bash_is_taught_in_the_main_prompt_and_in_no_background_one`
+    asserted the substring "bash" was absent from these prompts, and the day a
+    `docs/bash.md` was added the test failed for everyone -- reporting that the
+    worker prompt taught the verb, when what it contained was a filename. It is
+    the same trap this repository already met with the tips catalogue: "is this
+    string in the prompt" is always yes for anything written in any file here.
+
+    The listing is REMOVED rather than the prompt being truncated at it. The
+    first version of this helper cut everything from the marker onwards, and a
+    mutation that leaked the bash reference AFTER the workspace section
+    survived it -- a blind spot at the end of the very prompt being checked.
+    Taking out exactly the section that is not teaching leaves the rest under
+    test.
+    """
+    return prompt.replace(agent_subprompts._shape_section(), "")
+
+
 def test_bash_is_taught_in_the_main_prompt_and_in_no_background_one():
     """Two-sided isolation, exactly as `plan`, `review` and `project_context`
     have it: a worker is neither taught the verb nor allowed it. The composed
     prompts are asked rather than the modules, because the background prompts
     are built out of the main prompt's own constants and a section leaking
-    through `_common` would not show in a grep of `agent_subprompts`."""
+    through `_common` would not show in a grep of `agent_subprompts`.
+
+    What is asserted is that the TEACHING is absent -- the reference section,
+    the tool-choice row and any worked example -- rather than that the four
+    characters are absent from the whole prompt. A file in the workspace is
+    not a lesson, and the substring form of this test could not tell the two
+    apart."""
     main = agent_prompt.get_system_prompt()
-    assert "bash" in main, "the main prompt does not teach the one command verb"
+    assert agent_prompt.BASH_REFERENCE in main, (
+        "the main prompt does not teach the one command verb")
+    assert agent_prompt.BASH_TOOL_ROW in main, (
+        "the main prompt does not offer bash in the tool-choice table")
     for name in ("worker_prompt", "note_prompt", "review_prompt"):
-        text = getattr(agent_subprompts, name)()
-        assert "bash" not in text, "%s teaches bash" % name
+        text = _teaching_only(getattr(agent_subprompts, name)())
+        assert agent_prompt.BASH_REFERENCE not in text, "%s teaches bash" % name
+        assert agent_prompt.BASH_TOOL_ROW not in text, (
+            "%s offers bash in the tool-choice table" % name)
+        assert '"action":"bash"' not in text, (
+            "%s carries a worked example that emits bash" % name)
         assert "run_file" not in text, "%s still names run_file" % name
         assert "run_python" not in text, "%s still names run_python" % name
 

@@ -40,6 +40,11 @@ DESIGN_PRINCIPLES.md
 # Whether the persistent project context is on. TMT's own state, so it is
 # ignored here beside the other per-install choices.
 .tmt_context
+# The web-search backend and its API key. A credential, so it is ignored for
+# .tmt_providers.json's reason and not for .tmt_context's: staying out of
+# commits is half of what protects it, the file permissions being the other
+# half.
+.tmt_search.json
 
 # The context directory itself. In a project TMT is WORKING ON, these two
 # markdown files are notes about that project, in that project, meant to be

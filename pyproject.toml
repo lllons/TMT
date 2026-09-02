@@ -75,6 +75,7 @@ py-modules = [
     "agent_verify",
     "agent_verify_discovery",
     "agent_verify_engine",
+    "agent_web",
     "agent_worker",
 ]
 

@@ -381,6 +381,53 @@ WHAT ASKS FIRST. Destructive commands - rm, mv, kill, git reset --hard, git clea
 
 The result gives you the command as TMT parsed it, the exit code, the output and the duration. The exit code is the result: never read success or failure out of the output text."""
 
+# The two network verbs, in their own constant for BASH_REFERENCE's reason and
+# with a different answer at the end of it. ACTION_REFERENCE is reused verbatim
+# by the worker, note and review prompts, and these two are permitted to the
+# main agent AND to a delegated worker -- a worker fixing a build is exactly
+# the agent that meets an unfamiliar error -- but refused to the note agent and
+# to the reviewer, which is why they cannot simply live in the shared section.
+#
+# `agent_subprompts.worker_prompt` passes this as its `extra`; `note_prompt`
+# and `review_prompt` do not. The refusal behind that is
+# `agent_worker.NOTE_ACTIONS` and `REVIEW_ACTIONS`, which are whitelists and do
+# not name either verb, so the isolation is code and the prompt merely agrees
+# with it. The note agent answers a question about THIS workspace and the
+# reviewer judges a diff; neither job is research, and a reviewer that could
+# read the web would be checking the code against something nobody had agreed
+# was the standard.
+WEB_REFERENCE = r"""=== SEARCHING THE WEB - RESEARCH, NOT BROWSING ===
+Two actions, for one purpose: working out what an error means and how an unfamiliar API actually behaves. They are not a way to fetch files, not a downloader, and not a general HTTP client.
+
+web_search - keys: query. Optional: max_results (1 to 10, default 5), recency ("day", "week", "month" or "year"). Searches the public web and returns a numbered list of titles, urls and snippets.
+  {"action":"web_search","query":"rust E0308 mismatched types expected Vec found slice","progress":"Looking up what E0308 means here."}
+  {"action":"web_search","query":"npm ERR code ERESOLVE could not resolve peer dependency","max_results":3,"progress":"Finding what ERESOLVE is objecting to."}
+  {"action":"web_search","query":"pytest fixture session scope teardown order","progress":"Confirming when session fixtures tear down."}
+  {"action":"web_search","query":"vite 5 migration breaking changes","recency":"year","progress":"Checking what changed in Vite 5."}
+
+web_fetch - keys: url. Optional: timeout (seconds, up to 30). Reads ONE page and returns its text with the markup taken out, truncated if it is long.
+  {"action":"web_fetch","url":"https://docs.python.org/3/library/subprocess.html","progress":"Reading the subprocess documentation."}
+  {"action":"web_fetch","url":"https://doc.rust-lang.org/error_codes/E0308.html","progress":"Reading the official page for this error code."}
+
+WHEN TO REACH FOR THEM.
+  An error, exit code or warning whose meaning you do not already know - from a compiler, a linker, a runtime, a package manager or a test runner.
+  Confirming how a library or CLI actually behaves in the version this project uses, when the project does not vendor its documentation.
+  Finding whether a symptom is a known issue with a specific version.
+
+WHEN NOT TO. Each of these is a turn spent going the wrong way:
+  The stack trace already names a file and a line in this workspace. Read that file first. The answer is almost always there, and it is about YOUR code, which no search result can be.
+  You want a file's contents, a filename, or where some text appears. That is read_file, glob and grep. Searching the web for something that is on disk in front of you is the worst trade available.
+  You want to build, test, install or run something. Searching is not how anything gets run, and a page describing a command is not the command having been run.
+  Anything not about the task in hand. This is a tool for diagnosing this workspace's problems, not a general reference.
+
+THE LOOP THIS BELONGS TO. Watch the failure, read the local file or log it names, and only search when the message is still opaque after that. Then apply the fix and run it again. Searching is the step between reading and fixing - never the first step and never the last.
+  Read the result rather than collecting more of them: take the answer, act on it, and re-run. Two searches for one error means the first one was already enough or the query was wrong.
+  Prefer official documentation, the project's own issue tracker, and language references over anything else in the list.
+
+WHAT IS ENFORCED. https only, so http, file and data urls are refused. Private, loopback and link-local addresses are refused, including when a redirect leads to one - TMT will not read from inside this machine or its network. There is a timeout, a cap on how much text comes back, and no cookies or credentials of any kind are sent.
+  A query containing one of this machine's own API keys is REFUSED rather than sent. If you have just read a key out of a file, do not put it in a query; search for the error instead.
+  If search is not configured on this machine the result says exactly that, and it is NOT an empty result set. Do not retry it and do not treat it as "nothing found" - work from the files and the command output you already have."""
+
 # Delegation, kept in its own constant rather than appended to
 # ACTION_REFERENCE, and this is load-bearing rather than tidy.
 # agent_subprompts builds the worker and note prompts by reusing
@@ -734,6 +781,33 @@ def _with_bash_row(tool_choice):
                                _BASH_ROW_ANCHOR + BASH_TOOL_ROW, 1)
 
 
+# The web row, held out of the table for BASH_TOOL_ROW's reason and put back
+# for a different set of readers: the main agent AND a delegated worker have
+# these verbs, while the note agent and the reviewer do not.
+#
+# It takes the SAME anchor rather than a second one, and that is safe rather
+# than lucky: both insert immediately after the read_lines row, so whichever
+# is applied last ends up nearer the top and neither can displace the other.
+# `get_system_prompt` applies bash first and web second, which puts web above
+# bash; a worker applies web alone. Both orders were composed and read back
+# rather than reasoned about -- see output/measure_web_prompt.py, which prints
+# the table.
+#
+# The column the arrow sits in is measured from the rows around it, not
+# guessed: every question is padded to 44 columns so the arrows form a line,
+# and a row one space short is visible at a glance in a block this regular.
+WEB_TOOL_ROW = '  What does this error actually mean?        -> web_search\n'
+
+
+def _with_web_row(tool_choice):
+    """The tool-choice table with the web row put back at the end of it."""
+    if _BASH_ROW_ANCHOR not in tool_choice:
+        raise AssertionError("the tool-choice table has moved; WEB_TOOL_ROW "
+                             "has nowhere to go and would be silently dropped")
+    return tool_choice.replace(_BASH_ROW_ANCHOR,
+                               _BASH_ROW_ANCHOR + WEB_TOOL_ROW, 1)
+
+
 PROGRESS_RULES = r"""=== PROGRESS, EVENTS AND NEXT STEP - THREE OPTIONAL KEYS ===
 These three keys may be added to any action you already use. They never replace a required key and never change which action you pick, and adding one costs no extra turn - so never emit an action just to report progress, put the progress on the action you were going to emit anyway.
 
@@ -941,6 +1015,13 @@ def get_system_prompt(capabilities=None, context=None):
         # because that constant is reused by every background prompt and this
         # verb is refused to all three. See the comment on BASH_REFERENCE.
         BASH_REFERENCE,
+        # Beside bash, because they are the other two actions that reach
+        # outside the workspace and the model should read them together: one
+        # runs something here, the others read something out there. Held out
+        # of ACTION_REFERENCE for the same reason bash is, but with a wider
+        # set of readers -- agent_subprompts.worker_prompt includes this one
+        # too. See the comment on WEB_REFERENCE.
+        WEB_REFERENCE,
     ]
     # The three capability sections, each included only when the user's own
     # words authorised that capability for this task. Two isolations are at
@@ -985,7 +1066,7 @@ def get_system_prompt(capabilities=None, context=None):
     # fight over the same anchor. The table is the model's index of which
     # tool answers which question, so leaving bash out of it for the one
     # agent that HAS bash would be the same defect the other way round.
-    tool_choice = _with_bash_row(tool_choice)
+    tool_choice = _with_web_row(_with_bash_row(tool_choice))
     # The project's own memory, and how to keep it. Included only when there
     # IS one with something in it -- teaching a model to correct a file it has
     # not been shown costs ~1.5k tokens on every request and invites a call

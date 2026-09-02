@@ -88,6 +88,17 @@ READ_ONLY_ACTIONS = frozenset({
     # Reading what TMT remembers. `recall` reads; `remember` writes, and is
     # absent for that reason.
     "recall",
+    # Reading the web. Both are read-only in the sense this set means: they
+    # touch nothing in the workspace and nothing on this machine, so a
+    # read-only delegation may use them exactly as it may use `grep`.
+    #
+    # `bash` is absent from this set because a command can write; these two
+    # cannot, and the distinction is worth being explicit about because both
+    # reach the network. Reaching the network is not the property this set is
+    # about -- writing is. What bounds the network side is in `agent_web`:
+    # https only, no private addresses, a timeout, a size cap, and a refusal
+    # to put this machine's own credentials into an outbound query.
+    "web_search", "web_fetch",
     # Reading git. The three inspecting verbs and no more: `git_commit` and
     # `git_push` change the repository, and `git_push` is refused to every
     # background agent anyway.

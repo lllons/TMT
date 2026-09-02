@@ -838,6 +838,26 @@ REQUIRED_KEYS = {
     # agent has no agenda to write to and a silent "Unknown action" would send
     # a model looking for a spelling mistake.
     "review_agenda": ["operation"],
+    # The two network tools. Research, not browsing: `web_search` asks a
+    # search backend about an error message or an API, and `web_fetch` reads
+    # one page of documentation as text. Both are READ-ONLY and neither is in
+    # MUTATING_ACTIONS -- they change nothing in the workspace, so a search
+    # must not make a passed review or a passed verification stale, and must
+    # not throw away the cached system prompt.
+    #
+    # `query` and `url` are required because, unlike `bash` and `plan`, there
+    # is exactly one operation each and it is meaningless without its subject.
+    # Everything else ("max_results", "recency", "timeout") only narrows.
+    #
+    # Registered here and dispatched in agent_actions through `_run_tool`, so
+    # an install whose frozen module list predates agent_web says so in a
+    # sentence rather than raising. Permitted to delegated workers -- both are
+    # in agent_delegation.READ_ONLY_ACTIONS -- and absent from
+    # agent_worker.NOTE_ACTIONS and REVIEW_ACTIONS, so the note agent and the
+    # reviewer cannot reach the network: one answers a question about THIS
+    # workspace and the other judges a diff, and neither job is research.
+    "web_search": ["query"],
+    "web_fetch": ["url"],
     # The evidence half of the completion gate. No required keys, for the
     # reason `review` has none: a verification is of whatever changed, and the
     # optional keys ("scope", "paths", "level", "full", "timeout") only narrow

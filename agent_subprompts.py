@@ -545,7 +545,8 @@ def _shape_section():
             "prompt: read what you need.\n\n" + _tree())
 
 
-def _common(header, overrides, rules, examples, reference=None, extra=None):
+def _common(header, overrides, rules, examples, reference=None, extra=None,
+                    tool_choice=None):
     """Assemble one background prompt from the shared parts and its own.
 
     The order matters and is the main prompt's order: what you are, how you
@@ -554,6 +555,12 @@ def _common(header, overrides, rules, examples, reference=None, extra=None):
     directly after the format rules they override rather than at the end,
     because a rule read on its own is followed on its own.
 
+    `tool_choice` replaces the shared tool-choice table for one kind of agent.
+    The worker passes a copy carrying the web row, for the reason `extra`
+    exists: a table that offered a verb the reader is refused would be the
+    same defect as a section offering it, and the note agent and the reviewer
+    are refused these two.
+
     `reference` is the section describing the ending. It defaults to
     `INTERNAL_RESPONSE_REFERENCE`, which is right for the two agents whose
     ending is a sentence; the reviewer passes its own, because its ending is a
@@ -561,7 +568,8 @@ def _common(header, overrides, rules, examples, reference=None, extra=None):
 
     `extra` is one more section, drawn immediately after `reference`, for a
     verb one kind of agent has and the others do not. The reviewer passes its
-    agenda there. It is a parameter rather than a fourth positional section
+    agenda there. The worker passes the two web verbs, which it may use
+    and the note agent and the reviewer may not. It is a parameter rather than a fourth positional section
     because the other two prompts must not gain a blank line where nothing is
     inserted -- `"
 
@@ -580,7 +588,7 @@ def _common(header, overrides, rules, examples, reference=None, extra=None):
         agent_prompt.ACTION_REFERENCE,
         "Permitted apps for open_app: %s" % apps,
         agent_prompt.PREFERENCE_RULES,
-        agent_prompt.TOOL_CHOICE_RULES,
+        agent_prompt.TOOL_CHOICE_RULES if tool_choice is None else tool_choice,
         # Reused although the contract did not list it, deliberately:
         # git_commit IS dispatchable by a worker, and GIT_RULES is where the
         # co-author trailer, the "never ask for a credential" rule and the
@@ -683,8 +691,10 @@ def worker_prompt():
     global _cached_worker, _worker_dirty
     if not _worker_dirty and _cached_worker is not None:
         return _cached_worker
-    _cached_worker = _common(WORKER_HEADER, WORKER_OVERRIDES, WORKER_RULES,
-                             WORKER_EXAMPLES)
+    _cached_worker = _common(
+        WORKER_HEADER, WORKER_OVERRIDES, WORKER_RULES, WORKER_EXAMPLES,
+        extra=agent_prompt.WEB_REFERENCE,
+        tool_choice=agent_prompt._with_web_row(agent_prompt.TOOL_CHOICE_RULES))
     _worker_dirty = False
     return _cached_worker
 

@@ -1523,6 +1523,23 @@ def execute_action(obj, context=None):
         return _run_tool("agent_symbols", lambda m: m.find_symbol(
             obj["name"], kind=obj.get("kind"), path=obj.get("path"),
             limit=obj.get("limit")))
+    # The two network tools, through `_run_tool` for both of its guarantees.
+    # The first matters more here than anywhere else: `agent_web` is the
+    # newest module in TMT, so it is the one most likely to be missing from a
+    # frozen editable install, and "agent_web is unavailable" is a sentence
+    # the model can work around where a traceback ends the session.
+    #
+    # Neither returns a refusal through ValueError -- `agent_web` catches its
+    # own WebError and answers in words, because a search that failed and a
+    # search that found nothing are different facts and only the module knows
+    # which happened.
+    if action == "web_search":
+        return _run_tool("agent_web", lambda m: m.search(
+            obj["query"], max_results=obj.get("max_results"),
+            recency=obj.get("recency")))
+    if action == "web_fetch":
+        return _run_tool("agent_web", lambda m: m.fetch(
+            obj["url"], timeout=obj.get("timeout")))
     if action == "replace_across":
         # Preview unless the model explicitly asks to apply. A bulk edit it
         # did not look at first is how a repository gets wrecked, so the
@@ -1816,6 +1833,19 @@ def canonical_action(obj):
     return _LEGACY_ACTIONS.get(action, action)
 
 
+# The reads after which "now answer the question" is the right next move.
+#
+# NOT the same set as `agent_delegation.READ_ONLY_ACTIONS`, which shares its
+# name and answers a different question -- that one is a security whitelist
+# saying what a read-only worker may do, and this one is a nudge about what to
+# do next. The two are deliberately not derived from each other.
+#
+# `web_search` and `web_fetch` are absent, and that is a decision rather than
+# an omission. They are read-only in every sense, but the loop they belong to
+# ends in a FIX and not in an answer: a model told to answer the user's
+# question straight after looking up an error would report what the internet
+# says instead of applying it and re-running. `bash` is absent for its own
+# version of the same reason, one comment down.
 READ_ONLY_ACTIONS = ("list_files", "read_file", "grep", "glob", "read_lines", "git_diff")
 
 # What the model is told when it did work without saying what the work was.
@@ -1892,6 +1922,11 @@ ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     "delete_folder", "rename_file", "create_folder", "bash",
     "open_app", "git_status", "git_diff", "git_identity", "git_commit", "git_push",
     "tree", "grep", "glob", "find_symbol", "replace_across", "code_map",
+    # "Web Search" and "Web Fetch". Both title-case from the verb like
+    # everything else here; they are listed because a registered action
+    # with no entry shows the reader a raw verb in a column where every
+    # neighbouring row is a phrase.
+    "web_search", "web_fetch",
     "related_tests", "remember", "recall", "plan", "review", "verify",
     # "Project Context", which is what the transcript should say: the row is
     # about the project's own memory, not about the conversation's context
@@ -1959,6 +1994,11 @@ _EVENT_KIND_FOR_ACTION = {
     # the kind every other reading verb takes. `glob` reads names rather than
     # contents, which is a difference in what is read and not in what happens.
     "list_files": "file_read", "grep": "file_read", "glob": "file_read",
+    # Reading, but not the workspace -- so `tool` rather than `file_read`,
+    # which every other row of that kind names a path in. A web result has
+    # no path, and a row that promised one would be the only `file_read`
+    # in the transcript with nothing local behind it.
+    "web_search": "tool", "web_fetch": "tool",
     # The one verb that runs anything, and the kind `run_file` and `run_python`
     # held before it. A command is not a file operation whatever it does to
     # files: what the user is watching is a process starting, and the row says
@@ -2120,8 +2160,13 @@ def _describe(action, obj, result):
         # order to find out what was actually run, and "Bash" alone answers
         # nothing. It is the command the model asked for; what TMT parsed it
         # into is in the result.
+        # `url` is here for `pattern`'s reason exactly, found the same way --
+        # by somebody reading the composed row rather than the code. A
+        # `web_fetch` row without it is the bare words "Web Fetch", so the
+        # fortieth page read in a session is the same row as the first and a
+        # reader scrolling back cannot tell which one was fetched.
         target = (obj.get("path") or obj.get("query") or obj.get("pattern")
-                  or obj.get("app") or obj.get("command") or "")
+                  or obj.get("url") or obj.get("app") or obj.get("command") or "")
         label = ACTION_LABELS.get(action, action)
         if action == "read_lines":
             # The one read whose extent is a fact rather than a guess, so it

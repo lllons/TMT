@@ -474,8 +474,8 @@ def _activity_label(action, obj):
     except Exception:
         label = str(action).replace("_", " ").title()
     target = ""
-    for key in ("path", "query", "name", "target", "search", "pattern", "app",
-                "message"):
+    for key in ("path", "query", "name", "target", "search", "pattern", "url",
+                "app", "message"):
         value = obj.get(key) if isinstance(obj, dict) else None
         if isinstance(value, str) and value.strip():
             target = value.strip()
