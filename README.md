@@ -110,6 +110,12 @@ will not start, are in [Install](docs/install.md) and
   credited beside you with a `Co-authored-by` trailer. It stages only what it changed,
   never creates a branch and never force-pushes, and pushes only when your own words
   asked for one. → [Git](docs/git.md)
+- **Can be undone** (`/undo`). TMT photographs the workspace before the first action
+  of a turn that could change it, so a turn you did not want is one command away from
+  being put back — files it rewrote, files it deleted and files it created, named
+  before anything moves and only carried out when you confirm. The undo is itself
+  undoable, and what a snapshot cannot cover it refuses rather than half does. →
+  [Undo](docs/undo.md)
 - **Plans the work and is held to it** (`/plan`). The steps are on screen while it
   works, and the runtime will not let it answer while one is outstanding. →
   [The plan](docs/plan.md)

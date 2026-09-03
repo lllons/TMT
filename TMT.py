@@ -53,6 +53,7 @@ from agent_ui import (
     Transcript, fallback_suggestion, render_response, validate_suggestion,
     wrap_lines,
 )
+import agent_checkpoint
 import agent_commands
 import agent_context
 import agent_manager
@@ -1019,6 +1020,12 @@ def _dispatch_command(task, session, manager, slow=None):
                                                         manager))
         if name == "agents" and not argument:
             return agent_commands._agents(argument, session, manager)
+        if name == "undo":
+            # It needs the register for one question, asked before it reads
+            # anything: is something still writing. A worker or a background
+            # command running while the tree is rewritten under it would leave
+            # the restore and the worker both wrong, with neither able to tell.
+            return agent_commands._undo(argument, session, manager)
     return agent_commands.dispatch(task, session)
 
 
@@ -1140,6 +1147,16 @@ def _session_loop(root):
     # Its threads are daemons, so a session that ends with workers still
     # running cannot hold the process open.
     manager = agent_manager.AgentManager()
+    # One before-picture keeper for the run, beside the session and the
+    # register and with the same lifetime. It takes at most one snapshot per
+    # turn, immediately before the first action that could change anything, so
+    # a turn that only reads costs nothing at all -- and a turn that wrote is
+    # one `/undo` away from being put back.
+    #
+    # Built here rather than hung on the Session because nothing in a turn
+    # reads it: the loop takes the snapshot, and `/undo` reads the store off
+    # disk rather than this object. It is the loop's, like the register.
+    checkpoints = agent_checkpoint.Checkpointer()
     # One box for the session. It draws its own frame each time it is asked,
     # so nothing needs redrawing between turns, and the console keeps being
     # the line reader on any run that cannot take raw keys -- a pipe, a
@@ -1391,6 +1408,12 @@ def _session_loop(root):
         # call it is an argument to, so waiting for `begin_turn` would build
         # this turn's prompt from the LAST turn's permissions.
         session.capabilities.adopt(task)
+        # A new turn for the before-pictures too. Nothing is read or written
+        # here -- it only settles which task the next snapshot will be labelled
+        # with and forgets the last turn's commands. The snapshot itself is
+        # taken lazily, by `checkpoints.before` below, and only if something
+        # that could change the workspace is actually about to run.
+        checkpoints.begin(task)
         # The request the turn starts from: the system prompt, the earlier
         # questions and answers this session has already had, and then the new
         # task. `pinned` is how much of that the loop's own trimming must
@@ -1650,6 +1673,16 @@ def _session_loop(root):
                         held, held_line = completion_block(session, sub_obj)
                         if held:
                             break
+                        # The before-picture, on this path as well as on the
+                        # single-action one. Both, deliberately: a batch is
+                        # where a model puts its edits when it has several,
+                        # so a hook only on the other path would miss exactly
+                        # the turns most worth being able to undo. This
+                        # repository has already been bitten twice by a branch
+                        # rehearsed only in the rare case.
+                        notice = checkpoints.before(sub_action, sub_obj)
+                        if notice:
+                            transcript.emit_kind("warning", notice)
                         try:
                             result = execute_action(sub_obj, context)
                         except Exception as error:
@@ -1760,6 +1793,13 @@ def _session_loop(root):
                     messages.extend([{"role": "assistant", "content": raw},
                                      {"role": "user", "content": held}])
                     continue
+                # The before-picture, taken once per turn and only when
+                # something that could change the workspace is about to run.
+                # It is HERE rather than after the action for the one reason
+                # that matters: afterwards there is nothing left to snapshot.
+                notice = checkpoints.before(action, obj)
+                if notice:
+                    transcript.emit_kind("warning", notice)
                 try:
                     result = execute_action(obj, context)
                 except Exception as error:
@@ -1825,6 +1865,12 @@ def _session_loop(root):
             relay.abort()
             live_ui.attach_sink(None)
             live_ui.stop()
+            # The one path out of this loop that does not reach the commit
+            # below, and the one where the undo is worth most: a turn that
+            # crashed half way through its edits is exactly the turn somebody
+            # wants back. `commit` swallows its own failures, so this cannot
+            # replace the exception being raised with one of its own.
+            checkpoints.commit()
             raise
         else:
             relay.abort()
@@ -1846,6 +1892,13 @@ def _session_loop(root):
         typeahead.stop()
         prompt_box.typeahead = None
         queued.extend(typeahead.take())
+        # The turn's before-picture becomes a checkpoint, if one was taken.
+        # At the END of the turn rather than when it was taken, because what
+        # goes on the manifest includes the commands the turn ran, and those
+        # are not known until they have run. However the turn ended: a turn
+        # stopped by Ctrl-C or by a stream failure has still changed files, and
+        # those are the turns somebody most wants back.
+        checkpoints.commit()
         session.record(task, answer, history, turn_state.get("outcome", ""))
         # Carried to the next prompt as shadow text only. It is drawn in the
         # box and never put in the buffer, so pressing Enter on an untouched

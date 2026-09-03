@@ -652,6 +652,19 @@ def set_tip_cursor(position):
     return value
 
 
+# Where the before-pictures live: one snapshot per turn that changed anything,
+# so `/undo` has something to put back. In INSTALL_DIR beside `.tmt_index/` and
+# `.tmt_memory/`, and for their reason exactly -- nothing of TMT's goes in the
+# workspace, a cache keyed by an absolute path is worthless to anybody else,
+# and when TMT is run ON TMT the install and the workspace are the same
+# directory, so a store that followed the workspace would be committed.
+#
+# Named here rather than in `agent_checkpoint` so it sits with the rest of the
+# per-install state and so the test that none of it follows the workspace can
+# name it. What the DIRECTORY is belongs here; what is IN it belongs there.
+CHECKPOINT_DIR = INSTALL_DIR / ".tmt_checkpoints"
+
+
 def effort_names():
     """The levels, in the order they escalate rather than alphabetically."""
     return sorted(EFFORT_LEVELS,

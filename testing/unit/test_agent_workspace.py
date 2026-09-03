@@ -286,7 +286,15 @@ def test_installation_state_does_not_follow_the_workspace():
                      # directory they happen to be standing in -- so it lives
                      # here with the model and the effort level, and a user
                      # who has seen six tips has seen them in every project.
-                     agent_config.TIP_FILE):
+                     agent_config.TIP_FILE,
+                     # The before-pictures /undo puts back. It holds COPIES
+                     # of whatever was in the workspace, so a store that
+                     # followed the workspace would put a second copy of the
+                     # project inside the project -- and, when TMT is run on
+                     # TMT, inside its own git status. It is a cache keyed by
+                     # an absolute path, like `.tmt_index/`, and worthless to
+                     # anybody standing anywhere else.
+                     agent_config.CHECKPOINT_DIR):
             assert Path(path).resolve().parent == INSTALL_DIR, path
             assert box.path not in Path(path).resolve().parents
     finally:

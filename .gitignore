@@ -100,3 +100,18 @@ MULTIAGENT_RECON.md
 
 # The brief for the next session on the multi-agent work. Working material.
 multiagent_promt_*.md
+
+# The build plan. Working material like CLAUDE.local.md and MULTIAGENT_RECON.md
+# -- an argument about what to do next, written for whoever picks this up, and
+# stale the moment a step lands. The README is where the product is described
+# for everybody else, and the git history is where what actually happened is
+# recorded.
+roadmap.md
+
+# The before-pictures /undo puts back: one snapshot of the workspace per turn
+# that changed anything, content-addressed. Under INSTALL_DIR beside
+# .tmt_index/ and .tmt_memory/, so it lands here for their reason -- when TMT
+# is run ON TMT the install and the workspace are the same directory. It holds
+# copies of whatever was in the tree, which on this checkout means copies of
+# this repository, and none of that belongs in the history.
+.tmt_checkpoints/

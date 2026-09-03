@@ -53,6 +53,8 @@ TIPS = (
     ("/plan", "makes TMT list its steps and finish them before it answers"),
     ("/review", "has a second agent audit the work before you see the answer"),
     ("/verify", "runs the checks this project already has, and reports them"),
+    ("/undo", "puts the workspace back to before a turn changed it"),
+    ("/checkpoints", "lists the turns TMT can put the workspace back to"),
     ("/agents", "lists the background agents and what each one is doing"),
     ("/back", "opens the menu without ending the session you are in"),
     ("/clear", "forgets the conversation and keeps everything else"),
