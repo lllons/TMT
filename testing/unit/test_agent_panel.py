@@ -671,6 +671,108 @@ def test_the_running_box_carries_the_counter_on_the_meter_row():
         sandbox.close()
 
 
+def spending():
+    """A session with something on the meter to report."""
+    import agent_session
+    session = agent_session.Session()
+    session.lines_added, session.lines_removed = 27, 5
+    session.tokens_in = 34000
+    session.record_reply("x" * 20000, 5000)
+    return session
+
+
+def delegating(count=1):
+    """A register whose agents have a spend, so the meter carries their group.
+
+    `register` alone leaves them at zero tokens, and a meter with no agent
+    spend on it is several columns shorter -- which is the difference between
+    a row that overflowed the reported terminal and one that did not.
+    """
+    manager, clock = register(count)
+    for record in manager.list():
+        manager.set_tokens(record.id, tokens_out=9000)
+    return manager, clock
+
+
+def test_the_counter_can_never_make_the_meter_row_wider_than_the_window():
+    """The half of the test above that a hundred columns cannot show.
+
+    The counter was joined onto a meter that had ALREADY been fitted to the
+    whole row, so the row came out over-wide by however many columns the
+    counter took. On this surface that is not a cosmetic fault: the row wraps,
+    the wrapped half is a screen line `LiveRegion` does not know it has drawn,
+    and every repaint from then on moves the caret up one row too few and
+    writes into the middle of that wrapped line instead of over the top of it.
+
+    Reported from a real terminal, and the arithmetic is exact: a 64-column
+    window, one background agent, and a row of one lead column, a 60-column
+    meter, the two-column join and an 11-column counter -- 74 where 63 was
+    the most there was room for. It grew another copy of itself several times
+    a second for as long as the turn ran.
+    """
+    import agent_ui
+    manager, _ = delegating()
+    sandbox = Sandbox()
+    try:
+        box = menu().PromptBox(stream=Console(), session=spending(),
+                               manager=manager)
+        for columns in range(30, 121):
+            for row in box.running_lines("Working. Ctrl-C to stop.",
+                                         size=(columns, 24)):
+                width = agent_ui.display_width(visible(row))
+                # `columns - 1`: a row drawn to the last column wraps on the
+                # terminals that auto-wrap, which is the whole of the bug.
+                assert width <= columns - 1, (columns, width, visible(row))
+    finally:
+        sandbox.close()
+
+
+def test_the_counter_keeps_its_room_and_the_meter_is_what_gives_way():
+    """Which of the two gives way is decided rather than incidental.
+
+    The counter is one fixed fact that is either on the row or not; the meter
+    has three forms and drops to a shorter one. So the fixed thing is measured
+    first and the elastic thing takes what is left -- which is exactly what
+    `prompt_caption` does with its own right-hand end, arriving here.
+    """
+    manager, _ = delegating()
+    sandbox = Sandbox()
+    try:
+        box = menu().PromptBox(stream=Console(), session=spending(),
+                               manager=manager)
+        wide = visible(box.running_lines("Working.", size=(100, 24))[0])
+        narrow = visible(box.running_lines("Working.", size=(64, 24))[0])
+        # The counter survives the narrowing whole. Half of it would be worse
+        # than none of it.
+        assert "1/10 agents" in wide and "1/10 agents" in narrow, (wide, narrow)
+        # And the meter is what shortened: the long form on the wide window,
+        # its own shorter form on the narrow one, both still saying the same
+        # four things.
+        assert "+27 lines, -5 lines" in wide, wide
+        assert "+27 -5" in narrow and "lines," not in narrow, narrow
+        assert "ctx" in narrow and "agents ~" in narrow, narrow
+    finally:
+        sandbox.close()
+
+
+def test_the_running_row_with_no_agents_is_the_row_it_always_was():
+    """The counter's room comes out of the width before the meter is asked for
+    one, and with no counter there is no room to take: a session that has
+    delegated nothing draws the meter it drew before any of this existed."""
+    sandbox = Sandbox()
+    try:
+        session = spending()
+        alone = menu().PromptBox(stream=Console(), session=session)
+        empty = menu().PromptBox(stream=Console(), session=session,
+                                 manager=agent_manager.AgentManager())
+        for columns in (100, 80, 64, 40, 30):
+            size = (columns, 24)
+            assert (alone.running_lines("Working.", size=size)
+                    == empty.running_lines("Working.", size=size)), columns
+    finally:
+        sandbox.close()
+
+
 # --- retention ---------------------------------------------------------------
 
 def test_a_finished_card_stays_for_five_seconds_and_then_the_counter_drops_it():

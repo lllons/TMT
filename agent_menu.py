@@ -3656,16 +3656,37 @@ class PromptBox:
         rows = self.lines(editor, size=size, caption=False, pad=False,
                           column=False)
         width = _content_width(_terminal(size)[0])
-        meter = meter_text(self.session, self.stream, columns=width,
-                           manager=self.manager)
         # The agent counter shares the meter's row rather than taking one of
         # its own. Both are running totals of what this session is spending,
         # they are read in the same glance, and a second row here would push
         # the box up the window every time an agent was spawned. With no
         # agents the string is empty and the row is exactly the meter's, as it
         # was before the counter existed.
+        #
+        # ITS ROOM COMES OUT OF THE WIDTH BEFORE THE METER IS ASKED FOR ONE,
+        # which is `prompt_caption`'s rule arriving here: the fixed facts are
+        # measured first and the meter takes what is left over, because the
+        # meter is the one thing on this row with shorter forms to fall back
+        # to. The counter used to be appended to a meter that had already been
+        # fitted to the whole row, so the row was over-wide by however many
+        # columns the counter took -- and an over-wide row is not a cosmetic
+        # fault on this surface. It wraps, the wrapped half is a screen line
+        # `LiveRegion` does not know it has drawn, and from then on every
+        # repaint moves the caret up one row too few and writes into the
+        # middle of that wrapped line rather than over the top of it. One
+        # background agent on a 64-column terminal turned this row into a
+        # single line that grew another copy of itself several times a second
+        # and never stopped.
         agents = self._agents_text()
-        left = "  ".join(part for part in (meter, agents) if part)
+        join = "  "
+        gap = display_width(agents + join) if agents else 0
+        if gap >= width:
+            # Dropped whole rather than cut, which is the rule the meter
+            # itself follows: half a readout is worse than none of it.
+            agents, gap = "", 0
+        meter = meter_text(self.session, self.stream, columns=width - gap,
+                           manager=self.manager)
+        left = join.join(part for part in (meter, agents) if part)
         return ([" " + left] if left else []) + rows
 
     def _frame(self, editor, size=None, phase=None, moment=None, caption=True,
