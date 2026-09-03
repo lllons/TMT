@@ -32,6 +32,7 @@ tmtcode = "TMT:main"
 py-modules = [
     "TMT",
     "agent_actions",
+    "agent_ask",
     "agent_bash",
     "agent_capabilities",
     "agent_checkpoint",

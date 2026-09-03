@@ -110,6 +110,11 @@ will not start, are in [Install](docs/install.md) and
   credited beside you with a `Co-authored-by` trailer. It stages only what it changed,
   never creates a branch and never force-pushes, and pushes only when your own words
   asked for one. → [Git](docs/git.md)
+- **Asks you to decide, without losing its place.** When the answer changes what gets
+  built and is not in the code, TMT puts a question on screen with up to five numbered
+  options; you press one digit and the same task carries straight on with your answer.
+  It never ends the task to ask, and with nobody at a keyboard it decides for itself
+  and says which option it took and why it could not ask. → [Asking you](docs/ask-user.md)
 - **Can be undone** (`/undo`). TMT photographs the workspace before the first action
   of a turn that could change it, so a turn you did not want is one command away from
   being put back — files it rewrote, files it deleted and files it created, named

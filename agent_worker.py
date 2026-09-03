@@ -212,7 +212,15 @@ WORKER_FORBIDDEN = frozenset({"git_push", "end_conversation", "plan",
 # confirmation is a deliberate safety property of both actions, and an agent
 # that cannot obtain it must not proceed without it. Enforced here, in code,
 # because a rule that lives only in a prompt is taught rather than guaranteed.
-WORKER_NEEDS_TERMINAL = frozenset({"delete_file", "delete_folder"})
+WORKER_NEEDS_TERMINAL = frozenset({"delete_file", "delete_folder",
+                                   # Nobody is watching a background agent, so
+                                   # its question would be drawn nowhere and
+                                   # answered by nobody. The main agent is the
+                                   # one with a user in front of it: a worker
+                                   # that needs a decision reports what it
+                                   # needs decided and lets the agent that
+                                   # delegated the work put the question.
+                                   "ask_user"})
 
 # The verb both kinds finish on. Handled by this loop directly rather than
 # through `execute_action`, so a worker still terminates correctly on an

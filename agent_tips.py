@@ -75,6 +75,7 @@ TIPS = (
     ("Answering a to a command", "allows it in this project from now on"),
     ("An unfamiliar command", "is put to you before anything runs"),
     ("Deleting a file", "asks you first, whatever the task said"),
+    ("A numbered question", "is answered with one key, and the turn goes on"),
     ("tmtcode <path>", "opens a session on whichever project you point it at"),
     ("Settings", "holds the provider, the API key and the model TMT runs on"),
     ("Auto Update on Launch", "in Settings keeps TMT's own checkout current"),

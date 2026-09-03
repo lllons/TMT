@@ -786,6 +786,21 @@ REQUIRED_KEYS = {
     # `agent_delegation.READ_ONLY_ACTIONS` -- a read-only worker running a build
     # is not read-only, and a worker cannot be asked to approve anything.
     "bash": [],
+    # A question with numbered options, answered by one keystroke, whose
+    # result goes back to the model like any other action's -- so the turn
+    # carries straight on with the answer instead of ending to ask for it.
+    #
+    # Both keys are required, and that is the difference from `bash` above: a
+    # question with no options is not a question, and options with no question
+    # are a list nobody can read. There is no shape here where one of them is
+    # optional, so REQUIRED_KEYS can answer for both.
+    #
+    # Dispatched in agent_actions and refused to every background agent by
+    # `agent_worker.WORKER_NEEDS_TERMINAL` -- a worker has no terminal to be
+    # asked at, which is the same reason the two delete verbs are in that set
+    # rather than in the flat forbidden one. NOT in MUTATING_ACTIONS: it reads
+    # a keystroke and changes nothing.
+    "ask_user": ["question", "options"],
     # The two verbs that talk to the user, and the whole of the difference
     # between them is in their names. Both take one key and both send its text
     # to the screen; only one of them ends anything.

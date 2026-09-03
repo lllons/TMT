@@ -538,6 +538,98 @@ def _command_approval(prompt_box, live_panel, pad):
     return approve
 
 
+def _question_asker(prompt_box, live_panel, pad):
+    """The callable that puts an `ask_user` question to the user.
+
+    It is in the action context rather than imported by `agent_ask` for the
+    reason `approve` is: reading a terminal is the SESSION's, and only the
+    session knows whether there is one. A context with no `choose` key is the
+    honest state of a run with nobody watching -- which is exactly what a
+    background agent's context looks like -- and `agent_actions` answers a
+    question nobody can be asked with a refusal rather than a block.
+
+    Everything structural here is `_command_approval`'s, deliberately, because
+    the two do the same three things and getting any of them wrong looks
+    identical: `is_interactive` is asked first and any doubt is no; the
+    type-ahead reader is stopped for the length of the question and started
+    again afterwards, because two readers on one stdin take it in turns to
+    swallow the user's characters; and the block is written through the live
+    region's `write_above` rather than printed, because printing past a live
+    region leaves its repaint arithmetic pointing at rows that have moved --
+    which is the defect that put ten stray box tops on a real terminal.
+
+    What differs is the read. An approval is a word and a line; this is ONE
+    KEYSTROKE, so the answer arrives the instant it is pressed and the turn
+    carries straight on. Two keys are handled here rather than left to the
+    caller:
+
+      * Ctrl-C. `msvcrt` hands it back as an ordinary character and no signal
+        is ever raised, so a loop reading raw keys would swallow the one
+        gesture that stops a running turn. It is turned back into the
+        exception the session loop already knows how to end a turn on --
+        the same thing `TypeAhead.interrupt` exists to do.
+      * Esc. It means the user was here and chose not to answer, and it
+        returns "" so the question cannot take the session hostage.
+
+    None and "" are different answers and both are used. None says the
+    question was never put -- no terminal, or the input ended underneath it --
+    and "" says a person was here and dismissed it. `agent_ask.answer` tells
+    the model which, because "nobody was there" and "they said no" are
+    entirely different facts and a model handed the wrong one reasons about a
+    person who was never in the room.
+    """
+    def choose(text, keys):
+        if not agent_menu.is_interactive(sys.stdout):
+            return None
+        accepted = tuple(str(key) for key in keys)
+        typed = getattr(prompt_box, "typeahead", None)
+        stopped = bool(typed is not None and typed.active and typed.stop())
+        try:
+            pad.spend(text)
+            relay = live_panel.get("relay")
+            if relay is not None:
+                relay.write_above(text)
+            else:
+                console.print(text)
+            while True:
+                key = agent_menu.read_key(raw=True)
+                # `read_key` coalesces a run of characters that were already
+                # buffered into ONE string, because it is built for a field
+                # being pasted into -- and a paste is exactly what a run of
+                # fast keystrokes looks like from a console. A question wants
+                # one key, so the first character of the run is the answer and
+                # the rest is dropped. Without this, somebody typing "12"
+                # quickly would answer neither 1 nor 2: the loop would compare
+                # "12" against the offered keys, match nothing, and sit there.
+                if key:
+                    key = key[:1]
+                if key is None:
+                    # The input ended underneath the question. Nobody is
+                    # going to answer it, which is the no-terminal case
+                    # arriving late rather than a person declining.
+                    return None
+                if key == "\x03":
+                    raise KeyboardInterrupt
+                if key == "\x1b":
+                    return ""
+                if key == "\x04":
+                    # End of transmission: the input is gone, not declined.
+                    return None
+                if key in accepted:
+                    return key
+                # Anything else is ignored and the question stays up. A
+                # mistyped letter must not be read as a choice, and must not
+                # count as a dismissal either.
+        except (EOFError, OSError):
+            # The terminal went away between the check and the read, so the
+            # question was never really put.
+            return None
+        finally:
+            if stopped:
+                typed.start()
+    return choose
+
+
 def note_capability_choices(session):
     """Turn this turn's authorisation into the two states' completion rules.
 
@@ -1362,7 +1454,16 @@ def _session_loop(root):
                    # the honest state of a run with nobody to ask -- which is
                    # exactly what a worker's own context looks like -- and
                    # `agent_bash` answers an approval nobody can give with no.
-                   "approve": _command_approval(prompt_box, live_panel, pad)}
+                   "approve": _command_approval(prompt_box, live_panel, pad),
+                   # How `ask_user` puts a question to the person watching.
+                   # Beside `approve` and for its reason exactly: reading a
+                   # terminal is the session's, and a context without this key
+                   # is the honest state of a run with nobody there -- a pipe,
+                   # a script, the suite, a background agent's own context --
+                   # where `agent_actions._ask_user` answers with a refusal
+                   # that tells the model to decide for itself, rather than
+                   # blocking on a keystroke that will never arrive.
+                   "choose": _question_asker(prompt_box, live_panel, pad)}
         # The first-prompt initialisation, and it is HERE rather than at
         # launch on purpose: a directory appearing in somebody's project
         # because they started a program and then changed their mind is

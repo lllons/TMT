@@ -346,6 +346,32 @@ def test_the_store_never_appears_in_the_workspace_a_session_ran_in():
         store.close()
 
 
+def test_the_suite_never_checkpoints_into_the_installation():
+    """The rule the whole suite depends on: a test may not touch the
+    installation's own state.
+
+    Asserted against the two entry points rather than by watching one harness,
+    because there are seven places in this suite that drive `TMT.main` and a
+    fix applied to the one everybody happens to use is a fix the eighth will
+    walk straight past. `run_tests.py` is how the suite is run and
+    `testing/conftest.py` is how pytest collects it; between them every test
+    is covered, whichever way it was started.
+
+    It is worth pinning because the leak is invisible in every other way.
+    `.tmt_checkpoints/` is git-ignored, so nothing shows in `git status`; each
+    driven session builds a NEW temporary workspace, so the store keys by a new
+    hash and the per-workspace retention never sees the last one; and what it
+    holds is copies of whatever the test wrote. Nothing about it is noticeable
+    except the size, and only once somebody looks.
+    """
+    root = Path(agent_config.__file__).resolve().parent
+    for name in ("run_tests.py", "testing/conftest.py"):
+        source = (root / name).read_text(encoding="utf-8")
+        assert "CHECKPOINT_DIR" in source, name
+        assert "mkdtemp" in source, name
+        assert "rmtree" in source, name
+
+
 def test_the_module_is_declared_where_an_editable_install_can_see_it():
     """An editable install writes a frozen py-modules list, so a module that
     is not in it is invisible to `tmtcode` however well it works here."""

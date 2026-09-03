@@ -258,6 +258,26 @@ Also enforced: a constructed environment with your credentials left out, a curat
 Destructive commands - rm, mv, kill, git reset --hard, git clean, git push --force - and commands TMT does not recognise are put to the user before they run. With nobody there to ask the answer is no and the result says which rule asked; say what you needed in your message rather than looking for another route.
 The result gives the command as TMT parsed it, the exit code, the output and the duration. The exit code is the result: never read success or failure out of the output text."""
 
+# The question verb, in its own constant for BASH_REFERENCE's reason: it is
+# refused to every background agent (agent_worker.WORKER_NEEDS_TERMINAL), and
+# ACTION_REFERENCE is reused verbatim by all three background prompts, so a
+# worker that read it there would learn a verb it cannot use. A worker with a
+# decision to make reports what needs deciding; the agent that delegated the
+# work is the one with a user in front of it.
+#
+# The last two lines are the ones that matter. A model that treats this as a
+# way of being agreeable will ask before every edit, which is slower than
+# doing the work and worse than getting it wrong once -- so the rule is
+# stated as what it costs rather than as a preference.
+ASK_REFERENCE = r"""=== ASKING THE USER TO DECIDE ===
+ask_user - keys: question, options. Puts a question on screen with up to 5 numbered options; the user presses one digit and the SAME turn carries on with their answer. It does not end the task.
+  {"action":"ask_user","question":"What should the database layer use?","options":["Node with better-sqlite3","Python's standard-library sqlite3","Something else - I will say what"],"progress":"Asking which stack the database should use."}
+  {"action":"ask_user","question":"main already has a config.py. Replace it or add config_v2.py beside it?","options":["Replace config.py","Add config_v2.py beside it"],"progress":"Asking before overwriting an existing module."}
+The result names the number and the option text. Carry straight on with it and do not ask the same thing twice.
+2 options minimum, 5 maximum. Options are short - they are read at a glance and answered with one key. Make one of them an escape ("Something else - I will say what") whenever the list might not cover it.
+With nobody at a terminal nothing is asked: the result says so and says what to do instead. Read it.
+ASK ONLY WHEN THE ANSWER CHANGES WHAT YOU BUILD and you cannot find it in the workspace. A decision you can make from the code, a preference with an obvious default, and anything you could simply do and report are not questions - they are the work. Asking is a whole round trip and a person's attention; getting an easy call wrong costs one edit."""
+
 # The two network verbs, in their own constant for BASH_REFERENCE's reason and
 # with a different answer at the end of it. ACTION_REFERENCE is reused verbatim
 # by the worker, note and review prompts, and these two are permitted to the
@@ -731,6 +751,11 @@ def get_system_prompt(capabilities=None, context=None):
         # because that constant is reused by every background prompt and this
         # verb is refused to all three. See the comment on BASH_REFERENCE.
         BASH_REFERENCE,
+        # Beside bash because it is the other verb held out of
+        # ACTION_REFERENCE for being refused to every background agent,
+        # and because the two are read together: one is how the model
+        # acts without asking, this is the one time it should ask.
+        ASK_REFERENCE,
         # Beside bash, because they are the other two actions that reach
         # outside the workspace and the model should read them together: one
         # runs something here, the others read something out there. Held out

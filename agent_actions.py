@@ -1374,6 +1374,60 @@ def _bash(context, obj):
 _DELETE_YES = frozenset({"y", "yes"})
 
 
+def _ask_user(context, obj):
+    """Put a question to the user and hand back what they chose.
+
+    An ordinary action: it returns a result and the turn carries on with it,
+    which is the whole point. `end_conversation` is the only verb that ends a
+    turn, and a model that had to end one to ask a question would throw away
+    everything it had read to get there.
+
+    Reached through `context["choose"]`, which the session builds because only
+    the session knows whether there is a terminal. No `choose` -- a piped run,
+    a script, the suite, any background agent -- is answered with
+    `NO_TERMINAL`, never with a block: `agent_ask` says in as many words that
+    nobody was asked and tells the model to decide and state its assumption,
+    because a model left with no answer and no instruction asks again.
+
+    Imported inside the function for `_run_tool`'s reason: an editable install
+    freezes its module list, so a module in the source tree can be invisible to
+    the entry point, and that must come back as a result the model can work
+    around rather than as an exception that ends the session.
+    """
+    try:
+        import agent_ask
+    except Exception as error:
+        return ("ask_user is unavailable here (%s: %s). Decide it yourself and "
+                "say what you assumed." % (type(error).__name__, error))
+    question, refused = agent_ask.parse(obj)
+    if refused:
+        return "REFUSED: " + refused
+    choose = (context or {}).get("choose")
+    if not callable(choose):
+        return agent_ask.NO_TERMINAL
+    # Measured here rather than in `agent_ask`, which is a pure function of a
+    # width and must stay one: a module that read the terminal itself would be
+    # doing it from every test that composes a question. 80 is what TMT
+    # assumes everywhere else when it cannot measure.
+    try:
+        import shutil
+        columns = shutil.get_terminal_size((80, 24)).columns
+    except Exception:
+        columns = 80
+    try:
+        key = choose(agent_ask.render(question, columns), question.keys())
+    except KeyboardInterrupt:
+        # The user stopping the turn. It belongs to the loop, which already
+        # knows how to end one; swallowing it here would leave the question
+        # answered by a keystroke that meant the opposite.
+        raise
+    except Exception:
+        # A terminal that failed mid-question has not chosen anything, and an
+        # exception out of here would end the session over a question.
+        return agent_ask.DISMISSED
+    return agent_ask.answer(question, key)
+
+
 def _confirmation(context):
     """`confirm(question) -> bool` built from the context's approver, or None.
 
@@ -1462,6 +1516,7 @@ def execute_action(obj, context=None):
         return f"Renamed {obj['path']} to {new_name}"
     if action == "create_folder": return create_folder(obj["path"])
     if action == "bash": return _bash(context, obj)
+    if action == "ask_user": return _ask_user(context, obj)
     if action == "open_app": return open_app(obj["app"], file_path=obj.get("path"), url=obj.get("url"))
     if action == "git_status": return _run_git(_git_status)
     if action == "git_diff": return _run_git(lambda agent_git: _git_diff(agent_git, obj))
@@ -1975,7 +2030,7 @@ def build_result_message(action, result, obj=None):
 ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     "write_file", "append_file", "write_files", "patch_file", "delete_file", "read_file",
     "list_files", "read_lines", "replace_lines", "copy_file",
-    "delete_folder", "rename_file", "create_folder", "bash",
+    "delete_folder", "rename_file", "create_folder", "bash", "ask_user",
     "open_app", "git_status", "git_diff", "git_identity", "git_commit", "git_push",
     "tree", "grep", "glob", "find_symbol", "replace_across", "code_map",
     # "Web Search" and "Web Fetch". Both title-case from the verb like
@@ -2067,6 +2122,10 @@ _EVENT_KIND_FOR_ACTION = {
     # files: what the user is watching is a process starting, and the row says
     # so.
     "bash": "command", "open_app": "command",
+    # Neither a file operation nor a command: nothing runs and nothing is
+    # read. What the user is watching is TMT waiting on THEM, so it takes the
+    # neutral tool kind rather than borrowing a kind that promises a path.
+    "ask_user": "tool",
     "git_status": "tool", "git_diff": "tool", "git_identity": "tool",
     "git_commit": "milestone", "git_push": "milestone",
     # A milestone rather than a tool, and it earns it: a plan step changing
@@ -2229,7 +2288,12 @@ def _describe(action, obj, result):
         # fortieth page read in a session is the same row as the first and a
         # reader scrolling back cannot tell which one was fetched.
         target = (obj.get("path") or obj.get("query") or obj.get("pattern")
-                  or obj.get("url") or obj.get("app") or obj.get("command") or "")
+                  or obj.get("url") or obj.get("app") or obj.get("command")
+                  # An `ask_user` row without it is the bare words "Ask User",
+                  # which says a question was put and not what was asked --
+                  # and the answer the user gave is the one thing a reader
+                  # scrolling back needs the question beside.
+                  or obj.get("question") or "")
         label = ACTION_LABELS.get(action, action)
         if action == "read_lines":
             # The one read whose extent is a fact rather than a guess, so it
