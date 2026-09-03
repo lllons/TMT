@@ -110,6 +110,12 @@ will not start, are in [Install](docs/install.md) and
   credited beside you with a `Co-authored-by` trailer. It stages only what it changed,
   never creates a branch and never force-pushes, and pushes only when your own words
   asked for one. → [Git](docs/git.md)
+- **Runs in a pipeline** (`--ci`). One task, no screens and no question that can
+  block, a hard bound on turns and wall clock, one JSON object on stdout with
+  `--json`, and an exit code to branch on. Nothing is relaxed to get there:
+  dangerous commands are still denied, an approval nobody can give is refused
+  rather than waited on, and a push needs both the flag and your own words. →
+  [CI mode](docs/ci.md)
 - **Asks you to decide, without losing its place.** When the answer changes what gets
   built and is not in the code, TMT puts a question on screen with up to five numbered
   options; you press one digit and the same task carries straight on with your answer.

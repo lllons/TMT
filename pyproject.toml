@@ -36,6 +36,7 @@ py-modules = [
     "agent_bash",
     "agent_capabilities",
     "agent_checkpoint",
+    "agent_ci",
     "agent_commands",
     "agent_config",
     "agent_context",

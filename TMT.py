@@ -22,6 +22,7 @@ if _INSTALL_DIR in sys.path:
 sys.path.insert(0, _INSTALL_DIR)
 
 import agent_config
+import agent_images
 import agent_menu
 from agent_menu import (
     BottomPad, PromptBox, TypeAhead, clear_screen, opening_pad, render_command,
@@ -33,6 +34,11 @@ from agent_config import (
 )
 from agent_config import REQUIRED_KEYS
 from agent_actions import authorizes_push, batch_summary, build_result_message, execute_action, trim_messages
+# How a result message carries an image the model asked to look at.
+# It answers with the plain string every caller built before images
+# existed unless something actually attached one, so a turn that
+# looked at nothing sends byte-for-byte the request it always sent.
+from agent_actions import result_content
 from agent_actions import READ_ONLY_ACTIONS, ACTION_LABELS, MAX_TURNS, action_event
 # The two verbs that talk to the user, and the translation of the names
 # they used to have. Imported rather than spelled out again: the loop's
@@ -54,6 +60,7 @@ from agent_ui import (
     wrap_lines,
 )
 import agent_checkpoint
+import agent_ci
 import agent_commands
 import agent_context
 import agent_manager
@@ -920,16 +927,70 @@ def parse_args(argv=None):
                "TMT's own installation is never the workspace unless you are "
                "standing in it.",
     )
+    # ONE variadic positional, read differently in the two modes, because two
+    # positionals cannot be told apart here: argparse would give
+    # `tmtcode --ci run the tests` its first word as the workspace and leave
+    # the rest as a task, silently, and the run would work on the wrong
+    # directory. So the words are collected and `parse_args` decides what they
+    # were, which is also where the error for two directories already lived.
     parser.add_argument(
-        "project", nargs="?", default=None, metavar="PATH",
-        help="the project TMT may modify (default: the current directory). "
-             "It selects a directory; it never creates one.",
+        "words", nargs="*", default=[], metavar="PATH",
+        help="without --ci: the project TMT may modify (default: the current "
+             "directory). It selects a directory; it never creates one. "
+             "With --ci: the task to run, and several words are joined so "
+             "quoting is optional.",
     )
     parser.add_argument(
         "--dir", dest="dir_option", default=None, metavar="PATH",
         help="the same thing as the positional PATH, kept for existing use.",
     )
+    # CI mode. One task, no screens, no questions, a hard bound on both how
+    # long and how many turns, and an exit code to branch on. The flags are
+    # validated in `agent_ci` rather than by argparse `type=`, so a bad value
+    # is refused with a sentence saying what to write instead -- and so the
+    # same check answers for a caller that builds the options itself.
+    parser.add_argument(
+        "--ci", action="store_true",
+        help="run one task non-interactively and exit with a status code. "
+             "No splash, no menu, no prompts: an approval nobody can give is "
+             "refused rather than waited on.",
+    )
+    parser.add_argument(
+        "--max-turns", dest="max_turns", default=None, metavar="N",
+        help="CI only: how many turns the task may take (default %d)."
+             % agent_ci.DEFAULT_MAX_TURNS,
+    )
+    parser.add_argument(
+        "--timeout", dest="timeout", default=None, metavar="SECONDS",
+        help="CI only: the wall clock for the whole run (default %g). It is "
+             "checked between actions, so a command already running finishes "
+             "under its own limit." % agent_ci.DEFAULT_TIMEOUT,
+    )
+    parser.add_argument(
+        "--json", dest="as_json", action="store_true",
+        help="CI only: print one JSON object to stdout with the result. "
+             "Everything a person would read goes to stderr instead, so the "
+             "object is the only thing on stdout and a pipeline can parse it.",
+    )
+    parser.add_argument(
+        "--allow-push", dest="allow_push", action="store_true",
+        help="CI only: permit `git push`. Off by default -- most CI jobs "
+             "should fix and check without pushing, and a push from an "
+             "unattended run is the one action nobody can take back.",
+    )
     args = parser.parse_args(argv)
+    words = list(args.words or [])
+    if args.ci:
+        # Every word is the task; the workspace comes from --dir or from where
+        # the run was started, exactly as it does with no argument at all.
+        args.task_words = words
+        args.project = None
+    else:
+        args.task_words = []
+        if len(words) > 1:
+            parser.error("PATH takes one directory; %d were given. A task on "
+                         "the command line needs --ci." % len(words))
+        args.project = words[0] if words else None
     if args.project and args.dir_option and args.project != args.dir_option:
         parser.error(
             "PATH and --dir name different directories; give only one."
@@ -962,8 +1023,89 @@ def resolve_workspace(directory=None, ask=None):
     return root
 
 
+def run_ci(args):
+    """One task, non-interactively, with a status code. Returns the exit code.
+
+    The whole of CI mode's launch path, and it is deliberately a SHORTER
+    version of `main`'s rather than a different one: the same workspace
+    resolution, the same credential store, the same session loop, the same
+    tools and the same policy. What it leaves out is everything that needs a
+    person -- the splash, the menu, the setup form, the git-identity offer --
+    and what it adds is a bound, an answer for the questions nobody is there to
+    answer, and a summary.
+
+    Nothing here raises at the caller. Every way a run can fail to start is a
+    `CIError` carrying its own exit code, and every way it can fail once
+    started is a status in the result.
+    """
+    real_stdout = sys.stdout
+    try:
+        options_error = None
+        try:
+            turns = agent_ci.check_turns(args.max_turns)
+            timeout = agent_ci.check_timeout(args.timeout)
+            task = agent_ci.read_task(args.task_words, sys.stdin)
+        except agent_ci.CIError as error:
+            options_error = error
+        if options_error is not None:
+            print(str(options_error), file=sys.stderr)
+            return options_error.code
+        # The workspace, on the same terms as an interactive run and with the
+        # one question it can ask answered NO. `workspace_needs_confirmation`
+        # asks out loud before adopting a directory that already holds files
+        # and has no version control, and the thing it is warning about --
+        # "nothing it does will be recoverable" -- is exactly what an
+        # unattended run must not agree to on the user's behalf.
+        root = resolve_workspace(args.directory, ask=lambda _: "n")
+        if root is None:
+            print("CI mode will not adopt that directory unattended. Run TMT "
+                  "in a git repository, or name one with --dir.",
+                  file=sys.stderr)
+            return agent_ci.EXIT_USAGE
+        agent_config.refresh_model()
+        agent_config.refresh_effort()
+        agent_config.refresh_project_context()
+        # Deliberately NOT refresh_auto_update: a CI run never updates itself.
+        # `run_splash` is what performs an update and it is not called here, so
+        # this is a statement of intent rather than a guard -- a pipeline that
+        # rewrote its own agent mid-job would be a pipeline nobody could
+        # reproduce.
+        if not agent_config.OPENROUTER_API_KEY:
+            print(agent_ci.NO_KEY, file=sys.stderr)
+            return agent_ci.EXIT_USAGE
+        run = agent_ci.Run(task=task, workspace=str(root), max_turns=turns,
+                           timeout=timeout, allow_push=bool(args.allow_push))
+        if args.as_json:
+            # Everything a person would read goes to stderr, so the object is
+            # the only thing on stdout. Rebound rather than passed through the
+            # loop because the loop prints through `console` and through
+            # `safe_write(sys.stdout, ...)` in a dozen places, and threading a
+            # stream through all of them would be a much larger change than
+            # the one feature asked for.
+            sys.stdout = sys.stderr
+        try:
+            _session_loop(root, ci=run)
+        except KeyboardInterrupt:
+            run.finish(outcome="you stopped it with Ctrl-C")
+        except Exception as error:      # noqa: BLE001 - a crash is a result
+            run.finish(error="%s: %s" % (type(error).__name__, error))
+        result = run.result()
+    finally:
+        sys.stdout = real_stdout
+    if args.as_json:
+        sys.stdout.write(result.to_json())
+        sys.stdout.flush()
+    else:
+        print(result.human(), file=sys.stderr)
+    return result.exit_code()
+
+
 def main(argv=None):
     args = parse_args(argv)
+    if getattr(args, "ci", False):
+        # Before everything below, because everything below is for somebody
+        # sitting in front of it.
+        return run_ci(args)
     root = resolve_workspace(args.directory)
     if root is None:
         return
@@ -1198,8 +1340,17 @@ def _return_to_menu(session, manager, prompt_box, pad, root):
     return True
 
 
-def _session_loop(root):
-    """Ask, answer, repeat, until the user leaves."""
+def _session_loop(root, ci=None):
+    """Ask, answer, repeat, until the user leaves.
+
+    `ci` is an `agent_ci.Run` when this is a CI run and None otherwise, and
+    None means byte-for-byte the loop that was here before it existed. It
+    changes five things and nothing else: where the task comes from, how many
+    rounds it gets, whether the wall clock has gone, what an approval and a
+    question answer, and that there is exactly one task. The tools, the
+    gates, the policy and the workspace bounds are the same object in both
+    modes -- CI is a mode of this agent, not a second one.
+    """
     # The header is drawn once, as the session opens: the wordmark, the date,
     # and the directory this run may write to. Those cannot change while the
     # loop is running, and repeating them before every prompt only pushed the
@@ -1306,6 +1457,13 @@ def _session_loop(root):
 
     manager.subscribe(_panel_changed)
     placeholder = OPENING_SUGGESTION
+    if ci is not None:
+        # The one task, put where a typed one would have gone. The loop takes
+        # a queued line before it draws a box, and `render_task` echoes it into
+        # the scrollback exactly as it echoes a typed one -- so the record
+        # cannot tell them apart, which is right, because what happened is the
+        # same thing. Nothing reads stdin on this path at all.
+        queued.append(ci.task)
     while True:
         if queued:
             # Something the user typed while the last turn was running. It is
@@ -1315,6 +1473,11 @@ def _session_loop(root):
             # a typed one is -- the record must not be able to tell them
             # apart, because the user cannot either.
             answer = queued.pop(0)
+        elif ci is not None:
+            # One task, and it has been answered. A CI run must never reach
+            # `ask`: there is nothing on the other end of it, and a read that
+            # blocked would be a pipeline that hung with no output.
+            break
         else:
             # Shadow text, and nowhere else. The opening line on the first
             # question and the last turn's hint after that: `ask` returns what
@@ -1386,7 +1549,15 @@ def _session_loop(root):
         # manager in words rather than raising -- which is also what a
         # background agent's own context looks like, so a worker asking to
         # spawn a worker is told it cannot.
-        context = {"push_authorized": authorizes_push(task),
+        context = {# A push needs the user's own words, and in CI it needs the
+                   # flag as well. Both, not either: `--allow-push` on a task
+                   # that never mentioned pushing still does not push, and a
+                   # task that says "push to main" run without the flag does
+                   # not either. An unattended push is the one action nobody
+                   # can take back, so it wants two statements of intent --
+                   # one in the pipeline's configuration, one in the task.
+                   "push_authorized": (authorizes_push(task)
+                                       and (ci is None or ci.allow_push)),
                    "manager": manager,
                    # The plan for THIS task. The session holds one Plan for
                    # its whole life and empties it in `begin_turn`, which runs
@@ -1454,7 +1625,15 @@ def _session_loop(root):
                    # the honest state of a run with nobody to ask -- which is
                    # exactly what a worker's own context looks like -- and
                    # `agent_bash` answers an approval nobody can give with no.
-                   "approve": _command_approval(prompt_box, live_panel, pad),
+                   # In CI both of these are the run's own, which answer
+                   # without reading anything: an approval is refused and a
+                   # question reports that nobody is there. Substituted here
+                   # rather than inside the two builders so the interactive
+                   # callables keep exactly the shape they had, and so there
+                   # is one place to read to find out what a CI run can be
+                   # asked -- which is nothing.
+                   "approve": (ci.approve if ci is not None
+                               else _command_approval(prompt_box, live_panel, pad)),
                    # How `ask_user` puts a question to the person watching.
                    # Beside `approve` and for its reason exactly: reading a
                    # terminal is the session's, and a context without this key
@@ -1463,7 +1642,8 @@ def _session_loop(root):
                    # where `agent_actions._ask_user` answers with a refusal
                    # that tells the model to decide for itself, rather than
                    # blocking on a keystroke that will never arrive.
-                   "choose": _question_asker(prompt_box, live_panel, pad)}
+                   "choose": (ci.choose if ci is not None
+                              else _question_asker(prompt_box, live_panel, pad))}
         # The first-prompt initialisation, and it is HERE rather than at
         # launch on purpose: a directory appearing in somebody's project
         # because they started a program and then changed their mind is
@@ -1605,6 +1785,12 @@ def _session_loop(root):
             # bounded, because a model that cannot be corrected must be
             # stopped rather than asked forever.
             rounds = agent_config.rounds_for_effort()
+            if ci is not None:
+                # The CI budget replaces the effort setting rather than
+                # capping it, in both directions: a pipeline says how long a
+                # task may take, and a machine that happens to have `/effort
+                # low` stored must not silently give a CI job twelve rounds.
+                rounds = ci.max_turns
             steps, retries = 0, 0
 
             def hand_back(said, feedback):
@@ -1627,6 +1813,15 @@ def _session_loop(root):
                 return True
 
             while steps < rounds:
+                if ci is not None and ci.expired():
+                    # Checked at the round boundary, which is the last moment
+                    # before another model request and another action. It
+                    # cannot interrupt a command already running -- `bash` has
+                    # its own timeout for that -- so the wall clock is enforced
+                    # to the nearest action, and `docs/ci.md` says so.
+                    turn_state["outcome"] = ("the run reached its %g second "
+                                             "time limit" % ci.timeout)
+                    break
                 # Rebuilt from THIS turn's authorisation every round, so a
                 # prompt dropped by a mutating action comes back teaching the
                 # same capabilities it taught before rather than all of them.
@@ -1641,6 +1836,19 @@ def _session_loop(root):
                 messages[0]["content"] = get_system_prompt(session.capabilities,
                                                            session.context)
                 messages = trim_messages(messages, pinned)
+                # Images out of everything but the last couple of
+                # messages, and this is the only thing bounding what
+                # one costs. The API is stateless, so every image
+                # still in the array is re-sent on every round after
+                # the one that read it; `trim_messages` would drop
+                # the whole message eventually, but not until there
+                # are twenty of them -- which for an image read in
+                # round two is eighteen rounds carrying several
+                # megabytes of base64. What replaces it SAYS it was
+                # dropped and names the verb that brings it back,
+                # rather than leaving the model reasoning about a
+                # picture it can no longer see.
+                messages = agent_images.prune(messages)
                 state = {"error": None, "next_step": turn_state["next_step"],
                          "progress_seen": turn_state["progress_seen"],
                          "usage": None}
@@ -1802,6 +2010,14 @@ def _session_loop(root):
                         if mutated(sub_action, sub_obj):
                             invalidate_prompt()
                         note_work(session, sub_action, sub_obj)
+                        if ci is not None and mutated(sub_action, sub_obj):
+                            # Both dispatch paths, because a batch is where a
+                            # model puts its edits when it has several -- a
+                            # summary that only counted the single-action path
+                            # would report `changed_files: []` for exactly the
+                            # turns that changed the most.
+                            ci.note_action(sub_action,
+                                           _paths_named(sub_action, sub_obj))
                         if sub_action == END_CONVERSATION:
                             # The project's memory, written before the answer
                             # goes out and after every gate has agreed to let
@@ -1830,7 +2046,11 @@ def _session_loop(root):
                         # this round was work and costs a step.
                         steps += 1
                         retries = 0
-                        messages.extend([{"role": "assistant", "content": raw}, {"role": "user", "content": f"Batch results:\n{chr(10).join(results)}\nOutput your next action."}])
+                        messages.extend([{"role": "assistant", "content": raw},
+                                         {"role": "user",
+                                          "content": result_content(
+                                              f"Batch results:\n{chr(10).join(results)}\nOutput your next action.",
+                                              batch)}])
                         continue
                     if held:
                         # The batch did its work and was stopped at the
@@ -1844,7 +2064,9 @@ def _session_loop(root):
                         messages.extend([
                             {"role": "assistant", "content": raw},
                             {"role": "user",
-                             "content": "Batch results:\n%s\n%s" % (ran, held)}])
+                             "content": result_content(
+                                 "Batch results:\n%s\n%s" % (ran, held),
+                                 batch)}])
                         continue
                     if invalid:
                         console.print(f"[red]Invalid action in batch:[/red] {invalid}")
@@ -1948,9 +2170,19 @@ def _session_loop(root):
                 if mutated(action, obj):
                     invalidate_prompt()
                 note_work(session, action, obj)
+                if ci is not None and mutated(action, obj):
+                    # What the summary's `changed_files` is built from: the
+                    # paths the ACTION named, never the model's account of
+                    # what it changed. Same source `agent_review.note_change`
+                    # reads, for its reason.
+                    ci.note_action(action, _paths_named(action, obj))
                 if action == END_CONVERSATION:
                     break
-                messages.extend([{"role": "assistant", "content": raw}, {"role": "user", "content": build_result_message(action, result, obj)}])
+                messages.extend([{"role": "assistant", "content": raw},
+                                 {"role": "user",
+                                  "content": result_content(
+                                      build_result_message(action, result, obj),
+                                      [obj])}])
             else:
                 # Thirty-five rounds and no final action. The work that did
                 # happen is on screen; what is missing is the answer, and the
@@ -2001,6 +2233,16 @@ def _session_loop(root):
         # those are the turns somebody most wants back.
         checkpoints.commit()
         session.record(task, answer, history, turn_state.get("outcome", ""))
+        if ci is not None:
+            # The turn is over and this is everything measured about it: the
+            # answer or the reason there is none, how many rounds it really
+            # took, and what the verification engine settled at. Settled here,
+            # inside the loop, because `steps` and `turn_state` are the loop's
+            # and nothing outside it can see them.
+            ci.finish(answer=turn_state.get("answer", ""),
+                      outcome=turn_state.get("outcome", ""), turns=steps,
+                      verify=agent_ci.verify_summary(
+                          getattr(session, "verify", None)))
         # Carried to the next prompt as shadow text only. It is drawn in the
         # box and never put in the buffer, so pressing Enter on an untouched
         # prompt still submits nothing.
@@ -2048,4 +2290,10 @@ def finish_response(live_ui, relay, result, transcript=None, state=None, pad=Non
     return suggestion
 
 if __name__ == "__main__":
-    main()
+    # The exit code, which used to be thrown away here. The console script
+    # (`tmtcode = "TMT:main"`) is wrapped by the installer and has always
+    # propagated it, but `bin/tmtcode.js` execs THIS file -- so an npm
+    # install, which is the install the README leads with, could never report
+    # one. `main` returns None on every interactive path and `sys.exit(None)`
+    # is 0, so nothing that worked before changes.
+    sys.exit(main())
