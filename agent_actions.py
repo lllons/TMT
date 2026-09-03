@@ -1367,6 +1367,46 @@ def _bash(context, obj):
         approve=(context or {}).get("approve")))
 
 
+# What a typed answer to a deletion question may be. Narrower than
+# `agent_bash._YES` on purpose: "always" and "allow" are about remembering a
+# command rule for next time, and there is nothing to remember about a file
+# that is about to be gone.
+_DELETE_YES = frozenset({"y", "yes"})
+
+
+def _confirmation(context):
+    """`confirm(question) -> bool` built from the context's approver, or None.
+
+    The session puts one `approve` callable in the action context -- the one
+    `agent_bash` asks about a command -- and a deletion asks through the same
+    one, so the question is written inside the live region with the type-ahead
+    reader stopped, rather than printed past it by a bare `input()`. A context
+    with no approver (a test, a script, a direct call) gets None and
+    `agent_file_ops` falls back to the console prompt it always had.
+
+    Both approver shapes `agent_bash._ask` accepts are accepted here, and
+    every failure is no: a callable that raises has not agreed to anything.
+    """
+    approve = (context or {}).get("approve")
+    if not callable(approve):
+        return None
+
+    def confirm(question):
+        try:
+            answer = approve(question)
+        except TypeError:
+            try:
+                answer = approve(question, "")
+            except Exception:
+                return False
+        except Exception:
+            return False
+        if answer is True:
+            return True
+        return isinstance(answer, str) and answer.strip().lower() in _DELETE_YES
+    return confirm
+
+
 def execute_action(obj, context=None):
     """Run one action object and return its result.
 
@@ -1405,13 +1445,14 @@ def execute_action(obj, context=None):
     if action == "append_file": return append_file(obj["path"], obj.get("content", ""))
     if action == "write_files": return write_files(obj["files"])
     if action == "patch_file": return patch_file(obj["path"], obj.get("search", ""), obj.get("replace", ""))
-    if action == "delete_file": return delete_file(obj["path"])
+    if action == "delete_file": return delete_file(obj["path"], confirm=_confirmation(context))
     if action == "read_file": return read_file(obj["path"])
     if action == "list_files": return list_files()
     if action == "read_lines": return read_lines(obj["path"], obj.get("start", 1), obj.get("end"))
     if action == "replace_lines": return replace_lines(obj["path"], obj["start"], obj["end"], obj.get("content", ""))
     if action == "copy_file": return copy_file(obj["path"], obj.get("to") or obj.get("new_path") or obj.get("dest", ""))
-    if action == "delete_folder": return delete_folder(obj["path"], recursive=obj.get("recursive", False))
+    if action == "delete_folder": return delete_folder(obj["path"], recursive=obj.get("recursive", False),
+                                                       confirm=_confirmation(context))
     if action == "rename_file":
         old, new_name = safe_path(obj["path"]), obj.get("new_name") or obj.get("new_path", "")
         new = safe_path(new_name)

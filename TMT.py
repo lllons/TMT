@@ -472,7 +472,9 @@ def _panel_refresh(live_panel):
 # copy of it.
 _APPROVE_KEYS = ("Type y and Enter to run it once, a to allow `%s` in this "
                  "project from now on, or anything else to refuse:")
-_APPROVE_ONCE = "Type y and Enter to run it, or anything else to refuse:"
+# "allow it" rather than "run it": the same question is put for a command
+# and for a deletion, and only one of those runs anything.
+_APPROVE_ONCE = "Type y and Enter to allow it, or anything else to refuse:"
 
 
 def _command_approval(prompt_box, live_panel, pad):
@@ -495,7 +497,10 @@ def _command_approval(prompt_box, live_panel, pad):
     again afterwards. That is not tidiness -- it is the one thing that would
     actually break: it reads stdin on its own thread for the whole of a turn,
     and two readers on one stdin take it in turns to swallow the user's
-    characters. `delete_file`'s bare `input()` has that defect today.
+    characters. `delete_file` and `delete_folder` ask through this same
+    callable now (`agent_actions._confirmation`), so their bare `input()` --
+    which had exactly that defect, and printed its question past the live
+    region as well -- is reached only by a caller with no session.
 
     The question is written through the live region's `write_above` rather
     than printed, because printing past a live region leaves its repaint
