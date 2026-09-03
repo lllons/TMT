@@ -417,8 +417,13 @@ def gather(objs):
             import agent_multi
         except Exception:
             continue
-        for inner in agent_multi.ran(obj) or ():
-            found.extend(attached(inner))
+        # `ran` answers with (call, result) PAIRS rather than call objects,
+        # which is the shape the transcript and the completion gates want. The
+        # call is the first half, and it is the object the handler attached to
+        # -- `for_each` builds a fresh call per matching file, so an image read
+        # in the fourth of them is hanging on the fourth of these.
+        for pair in agent_multi.ran(obj) or ():
+            found.extend(attached(pair[0]))
     return found
 
 

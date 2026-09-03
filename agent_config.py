@@ -786,6 +786,28 @@ REQUIRED_KEYS = {
     # `agent_delegation.READ_ONLY_ACTIONS` -- a read-only worker running a build
     # is not read-only, and a worker cannot be asked to approve anything.
     "bash": [],
+    # The one action whose result is not only text. It reads an image file
+    # from the workspace and attaches it to the message the model is answered
+    # with, so the model LOOKS at a screenshot, a mockup or a diagram instead
+    # of being told a file exists that it cannot open.
+    #
+    # `path` is required and is the whole of it. There is deliberately no key
+    # that names a format, a size or a scale: the format is read off the
+    # file's own first bytes (an extension is the model's claim, the magic
+    # number is the file's), the size is refused rather than resized because
+    # resizing needs a decoder and TMT takes no dependencies, and there is
+    # nothing to scale.
+    #
+    # NOT in MUTATING_ACTIONS: it reads one file and changes nothing, so a
+    # passed review and a passed verification both survive it, exactly as
+    # `read_file` leaves them standing.
+    #
+    # Dispatched in agent_actions. Available to the main agent and to a
+    # delegated worker -- a worker sent to fix a layout is exactly the agent
+    # that needs to see it -- and refused to the note agent and the reviewer,
+    # which is the split `web_search` already has and for the same reason:
+    # neither of those two jobs is looking at pictures.
+    "view_image": ["path"],
     # A question with numbered options, answered by one keystroke, whose
     # result goes back to the model like any other action's -- so the turn
     # carries straight on with the answer instead of ending to ask for it.

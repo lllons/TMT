@@ -215,6 +215,7 @@ the page that explains it.
 | `delete_file` | Delete a file, after asking you at the terminal |
 | `create_folder` | Create a folder |
 | `delete_folder` | Delete a folder — recursive is opt-in, and it asks |
+| `view_image` | Look at a PNG, JPEG, GIF or WEBP — [Images](docs/images.md) |
 
 **Finding your way around a repository** — [Understanding a repository](docs/repository-tools.md)
 

@@ -99,6 +99,13 @@ READ_ONLY_ACTIONS = frozenset({
     # https only, no private addresses, a timeout, a size cap, and a refusal
     # to put this machine's own credentials into an outbound query.
     "web_search", "web_fetch",
+    # Looking at an image. A read of one file in the workspace and nothing
+    # else -- it opens a path through the same sandbox `read_file` does and
+    # changes nothing -- so a read-only delegation may use it for the reason
+    # it may use `read_file`. What is different about it is where the result
+    # goes rather than what it touched: the picture rides in the message that
+    # answers it, which is a fact about the request and not about the disk.
+    "view_image",
     # Several calls in one action. The verb itself writes nothing: what it
     # does is dispatch its calls, and every one of them comes back through
     # `agent_actions.execute_action`, which asks `refusal` about EACH under

@@ -1374,6 +1374,75 @@ def _bash(context, obj):
 _DELETE_YES = frozenset({"y", "yes"})
 
 
+_IMAGE_ATTACHED = (
+    "Attached %s. It is in this message: look at it and say what you see, "
+    "then carry on with the task."
+)
+
+
+def _view_image(context, obj):
+    """Read an image and attach it to the message this result goes back in.
+
+    The only action whose result is not entirely text, and the seam it uses is
+    the one `agent_multi` already uses for the same problem: a handler returns
+    a string, so what cannot be a string is hung on the action object and the
+    loop assembling the next request asks for it back. `agent_images.attach`
+    is that, `agent_actions.result_content` is the loop's half of it, and
+    every path that builds a result message goes through the second.
+
+    The model's own model is asked FIRST, before the file is opened. Loading a
+    three-megabyte image only to find out it cannot be sent wastes the read
+    and, worse, produces a refusal that reads as though the file were the
+    problem. The three answers are handled apart: False refuses and says what
+    the user could change, True proceeds, and None -- which is most models --
+    proceeds too, because a name table cannot know about a model released
+    after it was written and refusing on that would be refusing on a guess.
+    """
+    path = obj.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return "Refused: view_image needs a 'path' naming an image file."
+    try:
+        import agent_images
+    except Exception as error:
+        # The frozen-module-list failure `_run_tool` guards against, answered
+        # in the same shape: a sentence the model can work around rather than
+        # an exception that ends the turn.
+        return "agent_images is unavailable: %s" % error
+    # A worker may be running on a model the session is not, so its own is
+    # asked for when the context names one. An absent key is the main agent,
+    # whose model `agent_images` reads for itself at call time.
+    model = (context or {}).get("model") or None
+    named = agent_images.unavailable_reason(model_id=model)
+    if named:
+        return agent_images.UNSUPPORTED % (path, named)
+    try:
+        image = agent_images.load(path)
+    except ValueError as error:
+        return "Refused: %s" % error
+    agent_images.attach(obj, [image])
+    return _IMAGE_ATTACHED % image.label()
+
+
+def result_content(text, objs):
+    """The content value for a message reporting what these actions did.
+
+    A STRING when nothing attached an image, and that is the property the rest
+    of the program rests on: every existing call site built a string, every
+    provider adapter has always been handed a string, and a turn that looked
+    at no image produces byte-for-byte the request it produced before this
+    existed. Only a turn that actually read an image gets the list form.
+
+    Takes a LIST of action objects because a batch and a `multi_tool` both run
+    several actions into one result message, and an image read by the third of
+    them has to reach the same request as the text describing it.
+    """
+    try:
+        import agent_images
+    except Exception:
+        return text
+    return agent_images.parts(text, agent_images.gather(objs))
+
+
 def _ask_user(context, obj):
     """Put a question to the user and hand back what they chose.
 
@@ -1636,6 +1705,7 @@ def execute_action(obj, context=None):
     if action == "web_fetch":
         return _run_tool("agent_web", lambda m: m.fetch(
             obj["url"], timeout=obj.get("timeout")))
+    if action == "view_image": return _view_image(context, obj)
     if action == "replace_across":
         # Preview unless the model explicitly asks to apply. A bulk edit it
         # did not look at first is how a repository gets wrecked, so the
@@ -2038,6 +2108,10 @@ ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     # with no entry shows the reader a raw verb in a column where every
     # neighbouring row is a phrase.
     "web_search", "web_fetch",
+    # "View Image". Registered here for the reason the two above it are: an
+    # action with no entry shows the reader a raw verb in a column where every
+    # neighbouring row is a phrase.
+    "view_image",
     # "Multi Tool". The row a multi_tool draws is built by `_multi_event`
     # from the calls that ran, and this label heads it.
     "multi_tool",
@@ -2104,6 +2178,12 @@ _EVENT_KIND_FOR_ACTION = {
     "copy_file": "file_create",
     "delete_file": "file_delete", "delete_folder": "file_delete",
     "read_file": "file_read", "read_lines": "file_read",
+    # Reading a file, and the row names the path like every other file_read.
+    # What is different about it is inside the request rather than on screen:
+    # nothing the transcript can draw distinguishes looking at a screenshot
+    # from reading a source file, and a kind of its own would promise the
+    # reader a distinction the row cannot make.
+    "view_image": "file_read",
     # Both searches read the workspace and change nothing in it, so they take
     # the kind every other reading verb takes. `glob` reads names rather than
     # contents, which is a difference in what is read and not in what happens.
