@@ -7,9 +7,10 @@ second is that the menu never blocks a non-interactive run, and that every
 screen can be driven and left without stranding the terminal.
 
 Everything the menu can reach is redirected first: the model file goes to a
-temp path, stdin is replaced by a stub, and the frames are drawn into a buffer
-that only claims to be a terminal. The developer's own .tmt_model, cwd and
-stdin are restored in a finally in every test.
+temp path, the credential store goes with it, stdin is replaced by a stub, and
+the frames are drawn into a buffer that only claims to be a terminal. The
+developer's own .tmt_model, .tmt_providers.json, .tmt_key, cwd and stdin are
+restored in a finally in every test.
 """
 
 import datetime
@@ -25,6 +26,8 @@ from pathlib import Path
 
 import agent_config
 import agent_models
+
+from test_agent_credentials import FAKE_KEY, Credentials
 
 # Colour and cursor moves, so a frame can be read as the terminal shows it.
 ESCAPE_RE = re.compile("\033\\[[0-9;?]*[ -/]*[@-~]|\033\\][^\007]*\007|\033[=>]")
@@ -138,13 +141,23 @@ class Keys:
 
 
 class Sandbox:
-    """Temp model file, stubbed stdin, and everything restored in close().
+    """Temp model file, temp credential store, stubbed stdin, all restored.
 
     The model file is redirected before anything can write, so a test that
     saves a model never reaches the installation's own .tmt_model.
+
+    The CREDENTIAL is redirected for the mirror-image reason -- not so that a
+    test cannot write one, but so that no test can READ the machine's. Start
+    is where TMT asks for a key, so on a clone with none the key screen opens
+    and eats the scripted keystrokes: three tests here failed on a fresh
+    checkout and passed on the developer's, which is a test measuring the
+    machine rather than the menu. `key=None` is available for a test that is
+    genuinely about having no credential; every other test gets one, and gets
+    the same one everywhere.
     """
 
-    def __init__(self, saved=None, tty=True, broken_stdin=False, colour=True):
+    def __init__(self, saved=None, tty=True, broken_stdin=False, colour=True,
+                 key=FAKE_KEY):
         self.previous_model_file = agent_models.MODEL_FILE
         self.previous_config_model = agent_config.MODEL
         self.previous_env = os.environ.get("OPENROUTER_MODEL")
@@ -170,8 +183,11 @@ class Sandbox:
         self.stream = Terminal()
         self.workspace = self.dir / "probe_workspace"
         self.workspace.mkdir()
+        # Last, so a failure above cannot leave the real store redirected.
+        self.credentials = Credentials(key=key)
 
     def close(self):
+        self.credentials.close()
         agent_models.MODEL_FILE = self.previous_model_file
         agent_config.MODEL = self.previous_config_model
         sys.stdin = self.previous_stdin
