@@ -207,13 +207,31 @@ def patch_file(path, search_text, replace_text):
         p.write_text(new_content, encoding="utf-8")
         return f"Patched file: {path}"
 
-def delete_file(path):
+def _confirmed(question, confirm):
+    """Whether the user agreed to `question`, through `confirm` or the console.
+
+    `confirm(question) -> bool` is the session's own way of asking -- it
+    writes the question inside the live region and reads the answer with the
+    type-ahead reader stopped -- and it is what the dispatcher hands every
+    deletion. The bare `input()` is kept for a caller with no session: a test,
+    a script, a direct call. It used to be the only path, and in a running
+    session it printed the question PAST the live region, where the next
+    repaint drew over it and left one stray box top in the scrollback per
+    question -- nine of them for nine deletions in one multi_tool -- while
+    the type-ahead reader on its own thread competed with it for stdin.
+    """
+    if confirm is not None:
+        return bool(confirm(question))
+    return input(f"{question} (y/N): ").strip().lower() == "y"
+
+
+def delete_file(path, confirm=None):
     p = safe_path(path)
     if not p.exists():
         return f"File not found: {path}"
     if p.is_dir():
         return f"Refusing to delete directory: {path}"
-    if input(f"Delete {path}? (y/N): ").strip().lower() != "y":
+    if not _confirmed(f"Delete {path}?", confirm):
         return "Delete cancelled"
     # The lock is taken for the removal and deliberately not for the
     # confirmation above. A lock held across a read of stdin is a lock held
@@ -598,7 +616,7 @@ def copy_file(path, dest):
         shutil.copy2(src, dst)
         return f"Copied {path} to {dest}"
 
-def delete_folder(path, recursive=False):
+def delete_folder(path, recursive=False, confirm=None):
     p = safe_path(path)
     if p == workspace():
         return "Refusing to delete the workspace root"
@@ -610,7 +628,7 @@ def delete_folder(path, recursive=False):
     if contents and not recursive:
         return f"{path} is not empty ({len(contents)} items). Retry with \"recursive\": true to delete everything inside."
     label = f"{path} and {len(contents)} items inside" if contents else path
-    if input(f"Delete {label}? (y/N): ").strip().lower() != "y":
+    if not _confirmed(f"Delete {label}?", confirm):
         return "Delete cancelled"
     # Same reasoning as delete_file: the removal is locked, the confirmation
     # is not, because a lock held across a prompt is held until it is answered.

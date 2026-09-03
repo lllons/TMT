@@ -710,7 +710,7 @@ def test_the_prompt_still_carries_the_rules_that_came_before():
     """Guard against the new section being pasted over an existing one."""
     rules = prompt_rules()
     for heading in ("=== OUTPUT FORMAT - ABSOLUTE RULES ===",
-                    "=== ACTIONS - REQUIRED KEYS AND TWO EXAMPLES EACH ===",
+                    "=== ACTIONS - REQUIRED KEYS AND AN EXAMPLE OF EACH ===",
                     "=== EDITING PREFERENCES - FOLLOW IN THIS ORDER ===",
                     "=== BEHAVIOUR ===",
                     "=== GIT ==="):

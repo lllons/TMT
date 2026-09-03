@@ -351,6 +351,21 @@ def note_work(session, action, obj):
     """
     if session is None:
         return
+    if action == "multi_tool":
+        # Once per call that RAN, under the call's own verb. A multi_tool is
+        # whatever its calls were: a write inside one makes a passed review
+        # stale exactly as the write would have on its own, a command inside
+        # one is recorded as the run it was, and a list of reads leaves both
+        # states exactly as they were. The ran list is `agent_multi`'s own
+        # record of what happened, not the list that was asked for.
+        try:
+            import agent_multi
+            pairs = agent_multi.ran(obj)
+        except Exception:
+            pairs = ()
+        for call, _ in pairs:
+            note_work(session, str(call.get("action", "")), call)
+        return
     paths = None
     review = getattr(session, "review", None)
     if review is not None:
@@ -402,6 +417,30 @@ def note_work(session, action, obj):
             pass
 
 
+def mutated(action, obj):
+    """Whether this action changed the workspace: by its name, or by its calls.
+
+    `MUTATING_ACTIONS` is read by verb name and is right for every verb but
+    one. A `multi_tool` is whatever its calls were, and `agent_multi` records
+    which of them ran, so it is asked rather than assumed -- a list of reads
+    keeps the cached prompt and a passed review, and a list with one write in
+    it drops both, exactly as the write would have on its own.
+
+    A module that cannot answer reads as "it did", which is the safe
+    direction here: a rebuilt prompt costs a walk, and a stale one describes
+    files that are no longer there.
+    """
+    if action in MUTATING_ACTIONS:
+        return True
+    if action != "multi_tool":
+        return False
+    try:
+        import agent_multi
+        return bool(agent_multi.mutates(obj))
+    except Exception:
+        return True
+
+
 def _panel_refresh(live_panel):
     """A callable that nudges whichever relay is current, or does nothing.
 
@@ -433,7 +472,9 @@ def _panel_refresh(live_panel):
 # copy of it.
 _APPROVE_KEYS = ("Type y and Enter to run it once, a to allow `%s` in this "
                  "project from now on, or anything else to refuse:")
-_APPROVE_ONCE = "Type y and Enter to run it, or anything else to refuse:"
+# "allow it" rather than "run it": the same question is put for a command
+# and for a deletion, and only one of those runs anything.
+_APPROVE_ONCE = "Type y and Enter to allow it, or anything else to refuse:"
 
 
 def _command_approval(prompt_box, live_panel, pad):
@@ -456,7 +497,10 @@ def _command_approval(prompt_box, live_panel, pad):
     again afterwards. That is not tidiness -- it is the one thing that would
     actually break: it reads stdin on its own thread for the whole of a turn,
     and two readers on one stdin take it in turns to swallow the user's
-    characters. `delete_file`'s bare `input()` has that defect today.
+    characters. `delete_file` and `delete_folder` ask through this same
+    callable now (`agent_actions._confirmation`), so their bare `input()` --
+    which had exactly that defect, and printed its question past the live
+    region as well -- is reached only by a caller with no session.
 
     The question is written through the live region's `write_above` rather
     than printed, because printing past a live region leaves its repaint
@@ -1621,7 +1665,7 @@ def _session_loop(root):
                         turn_state["acted"] = True
                         session.count_event(
                             transcript.emit(action_event(sub_action, sub_obj, result)))
-                        if sub_action in MUTATING_ACTIONS:
+                        if mutated(sub_action, sub_obj):
                             invalidate_prompt()
                         note_work(session, sub_action, sub_obj)
                         if sub_action == END_CONVERSATION:
@@ -1760,7 +1804,7 @@ def _session_loop(root):
                 else:
                     relay.reset()
                     live_ui.intermediate_event(ACTION_LABELS.get(action, "Processing..."))
-                if action in MUTATING_ACTIONS:
+                if mutated(action, obj):
                     invalidate_prompt()
                 note_work(session, action, obj)
                 if action == END_CONVERSATION:

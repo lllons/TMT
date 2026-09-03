@@ -858,6 +858,25 @@ REQUIRED_KEYS = {
     # workspace and the other judges a diff, and neither job is research.
     "web_search": ["query"],
     "web_fetch": ["url"],
+    # Several calls in one action: a list of ordinary action objects, run in
+    # order, every result handed back under a numbered header. An entry with
+    # "for_each" is a template run once per file the pattern matches. Only
+    # the list is required; "limit" widens the ceiling on how many calls.
+    #
+    # Deliberately NOT in MUTATING_ACTIONS, and the reason is the opposite of
+    # `bash`'s: that set is read by verb NAME, and `bash` went in because
+    # nothing can tell `make` from `ls` by the name alone. Here the inner
+    # verbs are known -- `agent_multi` records which calls ran -- so
+    # `TMT.mutated` asks it, and a multi_tool of reads leaves a passed review
+    # standing while one carrying a write makes it stale exactly as the write
+    # would have on its own.
+    #
+    # Registered here and dispatched in agent_actions through `_run_tool`.
+    # Available to every kind of agent: it is in every whitelist, and the
+    # calls INSIDE it are checked against that agent's whitelist one by one
+    # before any of them runs, in agent_worker. A worker is refused a write
+    # inside a multi_tool by the same sentence that refuses it outside one.
+    "multi_tool": ["calls"],
     # The evidence half of the completion gate. No required keys, for the
     # reason `review` has none: a verification is of whatever changed, and the
     # optional keys ("scope", "paths", "level", "full", "timeout") only narrow

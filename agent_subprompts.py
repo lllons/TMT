@@ -107,6 +107,10 @@ NOTE_VERBS = (
     # and charges a step for it. The prompt says that in as many words rather
     # than leaving the verb looking like a channel.
     "send_message", "internal_response",
+    # Several calls in one action. On the list because the loop's whitelist
+    # has it; what the calls inside it may be is that same whitelist, asked
+    # per entry, so this offers nothing the loop would refuse.
+    "multi_tool",
 )
 
 # The reviewer's verbs. The same list as the note agent's today and named
@@ -120,6 +124,9 @@ REVIEW_VERBS = (
     "find_symbol", "tree", "code_map", "related_tests", "recall",
     "git_status", "git_diff", "git_identity",
     "send_message", "internal_response",
+    # For NOTE_VERBS' reason: the reviewer may read several files in one
+    # action, and the calls inside are its own whitelist asked per entry.
+    "multi_tool",
     # The one verb the reviewer has and the note agent does not: its own
     # checklist, declared before it reads anything and ticked off as it goes.
     # It is what puts something on screen during a review that is measured

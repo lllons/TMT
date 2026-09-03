@@ -90,6 +90,12 @@ will not start, are in [Install](docs/install.md) and
   `related_tests`, and notes about a project that outlive the session. Structural
   facts and lexical guesses are labelled apart. →
   [Understanding a repository](docs/repository-tools.md)
+- **Strings tools together.** `multi_tool` runs several calls in one round trip and
+  hands every result back together — five files read at once, or the first six lines
+  of every Python file through a `for_each` pattern. Every call inside it meets the
+  same guards it would meet alone, and a background agent's whitelist is asked about
+  each entry before any of them runs. →
+  [Several tools at once](docs/multi-tool.md)
 - **Runs commands through exactly one guarded tool.** `bash` supports pipes, `&&`,
   `||`, `;`, redirection and globbing — parsed by TMT itself, never handed to a shell.
   The environment is built rather than inherited and your credentials are left out,
@@ -156,6 +162,7 @@ Everything TMT does, one file per part of it, in [`docs/`](docs/):
 | [The plan](docs/plan.md) | the steps on screen, the marks and colours, and the gate that will not let a task finish early |
 | [Files and apps](docs/files.md) | the file actions, and the two applications TMT may launch |
 | [Understanding a repository](docs/repository-tools.md) | `tree`, `glob`, `grep`, `find_symbol`, `code_map`, `replace_across`, `related_tests`, `remember`/`recall` |
+| [Several tools at once](docs/multi-tool.md) | `multi_tool`: several calls in one action, `for_each` over every file a pattern matches, the ceiling, and why nothing inside it gets round a guard |
 | [Running commands](docs/bash.md) | the `bash` tool: what is refused, what is enforced, what you are asked about, the two sandbox levels, and background jobs |
 | [Git](docs/git.md) | commits, pushes, the `Co-authored-by` trailer, the co-author identity, and GitHub attribution |
 | [Verification](docs/verification.md) | how the checks are discovered and chosen, the four outcomes, which tests it picks, and the cycle limit |
@@ -170,7 +177,7 @@ Everything TMT does, one file per part of it, in [`docs/`](docs/):
 
 ## Every tool TMT can use
 
-Forty-five actions. You never name one — TMT picks them itself from what you asked for,
+Forty-six actions. You never name one — TMT picks them itself from what you asked for,
 and is told to choose the narrowest tool that answers the question. Each group links to
 the page that explains it.
 
@@ -203,6 +210,7 @@ the page that explains it.
 | `code_map` | What defines this, what imports it, what it imports, where it is referenced |
 | `replace_across` | The same exact edit in many files. Previews unless told to apply |
 | `related_tests` | Reads the git diff and names the tests worth running |
+| `multi_tool` | Several calls in one action, or one call over every file a pattern matches — [Several tools at once](docs/multi-tool.md) |
 | `remember` | Store a durable note about this project, secrets refused |
 | `recall` | Read those notes back |
 

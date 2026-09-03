@@ -1367,6 +1367,46 @@ def _bash(context, obj):
         approve=(context or {}).get("approve")))
 
 
+# What a typed answer to a deletion question may be. Narrower than
+# `agent_bash._YES` on purpose: "always" and "allow" are about remembering a
+# command rule for next time, and there is nothing to remember about a file
+# that is about to be gone.
+_DELETE_YES = frozenset({"y", "yes"})
+
+
+def _confirmation(context):
+    """`confirm(question) -> bool` built from the context's approver, or None.
+
+    The session puts one `approve` callable in the action context -- the one
+    `agent_bash` asks about a command -- and a deletion asks through the same
+    one, so the question is written inside the live region with the type-ahead
+    reader stopped, rather than printed past it by a bare `input()`. A context
+    with no approver (a test, a script, a direct call) gets None and
+    `agent_file_ops` falls back to the console prompt it always had.
+
+    Both approver shapes `agent_bash._ask` accepts are accepted here, and
+    every failure is no: a callable that raises has not agreed to anything.
+    """
+    approve = (context or {}).get("approve")
+    if not callable(approve):
+        return None
+
+    def confirm(question):
+        try:
+            answer = approve(question)
+        except TypeError:
+            try:
+                answer = approve(question, "")
+            except Exception:
+                return False
+        except Exception:
+            return False
+        if answer is True:
+            return True
+        return isinstance(answer, str) and answer.strip().lower() in _DELETE_YES
+    return confirm
+
+
 def execute_action(obj, context=None):
     """Run one action object and return its result.
 
@@ -1405,13 +1445,14 @@ def execute_action(obj, context=None):
     if action == "append_file": return append_file(obj["path"], obj.get("content", ""))
     if action == "write_files": return write_files(obj["files"])
     if action == "patch_file": return patch_file(obj["path"], obj.get("search", ""), obj.get("replace", ""))
-    if action == "delete_file": return delete_file(obj["path"])
+    if action == "delete_file": return delete_file(obj["path"], confirm=_confirmation(context))
     if action == "read_file": return read_file(obj["path"])
     if action == "list_files": return list_files()
     if action == "read_lines": return read_lines(obj["path"], obj.get("start", 1), obj.get("end"))
     if action == "replace_lines": return replace_lines(obj["path"], obj["start"], obj["end"], obj.get("content", ""))
     if action == "copy_file": return copy_file(obj["path"], obj.get("to") or obj.get("new_path") or obj.get("dest", ""))
-    if action == "delete_folder": return delete_folder(obj["path"], recursive=obj.get("recursive", False))
+    if action == "delete_folder": return delete_folder(obj["path"], recursive=obj.get("recursive", False),
+                                                       confirm=_confirmation(context))
     if action == "rename_file":
         old, new_name = safe_path(obj["path"]), obj.get("new_name") or obj.get("new_path", "")
         new = safe_path(new_name)
@@ -1559,6 +1600,21 @@ def execute_action(obj, context=None):
     if action == "recall":
         return _run_tool("agent_memory", lambda m: m.recall(
             query=obj.get("query"), limit=obj.get("limit"), kind=obj.get("kind")))
+    # Several calls in one action. `agent_multi` owns the shape -- which
+    # entries are usable, how a `for_each` template becomes calls, the ceiling
+    # on how many, the budget on how much text comes back -- and runs nothing
+    # itself: every call is dispatched back through THIS function with THIS
+    # context, so a call inside a multi_tool meets exactly the guards the same
+    # call meets on its own. The read-only contract, the capability gate, the
+    # push authority and the command policy are all asked again per call,
+    # because the list is a shape and not a dispatch path.
+    #
+    # Through `_run_tool` for its first guarantee: a frozen install whose
+    # module list predates agent_multi answers in a sentence rather than
+    # ending the session.
+    if action == "multi_tool":
+        return _run_tool("agent_multi", lambda m: m.run(
+            obj, context, dispatch=lambda call: execute_action(call, context)))
     # Delegating to background agents. Every one of these needs the register
     # the session loop holds; without it they say so and change nothing.
     if action in ("spawn_agent", "agent_status", "agent_result",
@@ -1927,6 +1983,9 @@ ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     # with no entry shows the reader a raw verb in a column where every
     # neighbouring row is a phrase.
     "web_search", "web_fetch",
+    # "Multi Tool". The row a multi_tool draws is built by `_multi_event`
+    # from the calls that ran, and this label heads it.
+    "multi_tool",
     "related_tests", "remember", "recall", "plan", "review", "verify",
     # "Project Context", which is what the transcript should say: the row is
     # about the project's own memory, not about the conversation's context
@@ -1999,6 +2058,10 @@ _EVENT_KIND_FOR_ACTION = {
     # no path, and a row that promised one would be the only `file_read`
     # in the transcript with nothing local behind it.
     "web_search": "tool", "web_fetch": "tool",
+    # A multi_tool is whatever its calls are, and `_multi_event` decides the
+    # row from them; this is the kind it takes when nothing inside it says
+    # otherwise, and the kind a refused one falls back to before the warning.
+    "multi_tool": "tool",
     # The one verb that runs anything, and the kind `run_file` and `run_python`
     # held before it. A command is not a file operation whatever it does to
     # files: what the user is watching is a process starting, and the row says
@@ -2196,6 +2259,8 @@ def action_event(action, obj, result):
     # about -- an event here would print the same sentence a second time.
     if action in (END_CONVERSATION, SEND_MESSAGE):
         return None
+    if action == "multi_tool":
+        return _multi_event(obj, result)
     kind = _EVENT_KIND_FOR_ACTION.get(action, "tool")
     text = str(result)
     detail = {}
@@ -2290,6 +2355,83 @@ def action_event(action, obj, result):
     return agent_ui.AgentEvent.make(kind, _describe(action, obj, result), **detail)
 
 
+def _multi_calls(obj):
+    """The calls a multi_tool ran, or the ones it was asked for if it has not.
+
+    The ran list is the fact and the asked list is the intent; the second is
+    only consulted before there is a first -- a refusal recording which paths
+    a contract was violated for is about what was asked.
+    """
+    try:
+        import agent_multi
+        pairs = agent_multi.ran(obj)
+    except Exception:
+        pairs = ()
+    if pairs:
+        return [call for call, _ in pairs]
+    calls = obj.get("calls") if isinstance(obj, dict) else None
+    return [call for call in (calls or ()) if isinstance(call, dict)]
+
+
+def _multi_event(obj, result):
+    """The one transcript row a multi_tool draws, measured off its calls.
+
+    One row rather than one per call, on purpose: a fan-out over a hundred
+    files is a hundred rows the user did not ask to scroll past, and the
+    per-call detail is in the result the model reads. What the row carries is
+    everything the inner rows would have added up to -- the verbs and how
+    many of each, the line counts summed where they were counted, every path
+    named for the session record, and a warning whenever any call's own row
+    would have been one. Nothing here is estimated: each inner event is the
+    same `action_event` the call would have produced on its own.
+
+    A multi_tool refused before anything ran draws the refusal, which is this
+    program's own sentence about the request and can be shown as-is.
+    """
+    label = ACTION_LABELS.get("multi_tool", "Multi Tool")
+    try:
+        import agent_multi
+        started = agent_multi.started(obj)
+        pairs = agent_multi.ran(obj)
+    except Exception:
+        started, pairs = False, ()
+    if not started:
+        first = str(result).strip().split("\n", 1)[0]
+        return agent_ui.AgentEvent.make("warning", first[:200] if first else label)
+    counts = Counter(str(call.get("action", "?")) for call, _ in pairs)
+    added = removed = None
+    warnings = 0
+    seen, paths = set(), []
+    for call, sub_result in pairs:
+        event = action_event(str(call.get("action", "")), call, sub_result)
+        if event is None:
+            continue
+        if event.kind == "warning":
+            warnings += 1
+        found = event.detail or {}
+        if isinstance(found.get("added"), int):
+            added = (added or 0) + found["added"]
+        if isinstance(found.get("removed"), int):
+            removed = (removed or 0) + found["removed"]
+        for path in found.get("paths") or ():
+            if path not in seen:
+                seen.add(path)
+                paths.append(path)
+    summary = ", ".join(
+        "%s x%d" % (ACTION_LABELS.get(verb, verb), count) if count > 1
+        else ACTION_LABELS.get(verb, verb)
+        for verb, count in counts.items())
+    message = "%s: %s" % (label, summary) if summary else label
+    if warnings:
+        message += " (%d %s)" % (warnings, "warning" if warnings == 1 else "warnings")
+    detail = {"calls": len(pairs)}
+    if added is not None or removed is not None:
+        detail["added"], detail["removed"] = added or 0, removed or 0
+    if paths:
+        detail["paths"] = tuple(paths)
+    return agent_ui.AgentEvent.make("warning" if warnings else "tool", message, **detail)
+
+
 def _paths_named(action, obj):
     """The workspace paths an action was given, in order, each once.
 
@@ -2304,6 +2446,11 @@ def _paths_named(action, obj):
         for entry in obj.get("files") or ():
             if isinstance(entry, dict):
                 candidates.append(entry.get("path"))
+    elif action == "multi_tool":
+        # Every path every call named, under that call's own verb, so a
+        # `write_files` inside a multi_tool still names each of its files.
+        for call in _multi_calls(obj):
+            candidates.extend(_paths_named(str(call.get("action", "")), call))
     else:
         candidates.extend((obj.get("path"), obj.get("destination"), obj.get("new_path")))
     seen, out = set(), []

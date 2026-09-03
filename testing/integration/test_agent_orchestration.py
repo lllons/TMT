@@ -166,7 +166,7 @@ def test_a_worker_gets_the_worker_prompt_and_not_the_main_one():
 
         # The reused halves are really reused, not paraphrased.
         for heading in ("=== OUTPUT FORMAT - ABSOLUTE RULES ===",
-                        "=== ACTIONS - REQUIRED KEYS AND TWO EXAMPLES EACH ===",
+                        "=== ACTIONS - REQUIRED KEYS AND AN EXAMPLE OF EACH ===",
                         "=== EDITING PREFERENCES - FOLLOW IN THIS ORDER ===",
                         "=== CHOOSING A TOOL - ALWAYS TAKE THE NARROWEST ONE ==="):
             assert heading in worker, heading

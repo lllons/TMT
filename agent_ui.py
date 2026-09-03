@@ -1025,7 +1025,8 @@ class Transcript:
         parts = []
         if detail.get("added") is not None or detail.get("removed") is not None:
             parts.append("+%s -%s" % (detail.get("added", 0), detail.get("removed", 0)))
-        for key, label in (("lines", "lines"), ("files", "files"), ("bytes", "bytes")):
+        for key, label in (("lines", "lines"), ("files", "files"), ("bytes", "bytes"),
+                           ("calls", "calls")):
             if isinstance(detail.get(key), int):
                 parts.append("%d %s" % (detail[key], label))
         if detail.get("status") is not None:
