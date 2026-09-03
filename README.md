@@ -110,6 +110,23 @@ will not start, are in [Install](docs/install.md) and
   credited beside you with a `Co-authored-by` trailer. It stages only what it changed,
   never creates a branch and never force-pushes, and pushes only when your own words
   asked for one. → [Git](docs/git.md)
+- **Runs in a pipeline** (`--ci`). One task, no screens and no question that can
+  block, a hard bound on turns and wall clock, one JSON object on stdout with
+  `--json`, and an exit code to branch on. Nothing is relaxed to get there:
+  dangerous commands are still denied, an approval nobody can give is refused
+  rather than waited on, and a push needs both the flag and your own words. →
+  [CI mode](docs/ci.md)
+- **Asks you to decide, without losing its place.** When the answer changes what gets
+  built and is not in the code, TMT puts a question on screen with up to five numbered
+  options; you press one digit and the same task carries straight on with your answer.
+  It never ends the task to ask, and with nobody at a keyboard it decides for itself
+  and says which option it took and why it could not ask. → [Asking you](docs/ask-user.md)
+- **Can be undone** (`/undo`). TMT photographs the workspace before the first action
+  of a turn that could change it, so a turn you did not want is one command away from
+  being put back — files it rewrote, files it deleted and files it created, named
+  before anything moves and only carried out when you confirm. The undo is itself
+  undoable, and what a snapshot cannot cover it refuses rather than half does. →
+  [Undo](docs/undo.md)
 - **Plans the work and is held to it** (`/plan`). The steps are on screen while it
   works, and the runtime will not let it answer while one is outstanding. →
   [The plan](docs/plan.md)
@@ -198,6 +215,7 @@ the page that explains it.
 | `delete_file` | Delete a file, after asking you at the terminal |
 | `create_folder` | Create a folder |
 | `delete_folder` | Delete a folder — recursive is opt-in, and it asks |
+| `view_image` | Look at a PNG, JPEG, GIF or WEBP — [Images](docs/images.md) |
 
 **Finding your way around a repository** — [Understanding a repository](docs/repository-tools.md)
 

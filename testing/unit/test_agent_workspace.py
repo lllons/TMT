@@ -289,6 +289,24 @@ def test_installation_state_does_not_follow_the_workspace():
                      agent_config.TIP_FILE):
             assert Path(path).resolve().parent == INSTALL_DIR, path
             assert box.path not in Path(path).resolve().parents
+        # The before-pictures `/undo` puts back. It holds COPIES of whatever
+        # was in the workspace, so a store that followed the workspace would
+        # put a second copy of the project inside the project -- and, when TMT
+        # is run on TMT, inside its own git status.
+        #
+        # Asserted by where it does NOT go rather than by where it does, which
+        # is the property this test is named for and the only one available:
+        # the suite redirects CHECKPOINT_DIR to a temporary directory for the
+        # length of a run (see `run_tests.isolate_checkpoints` and
+        # `testing/conftest.py`), because a driven session takes a real
+        # checkpoint and every one of them keys by a new temporary workspace,
+        # so the store would grow in INSTALL_DIR for as long as anybody ran
+        # the tests.
+        import agent_checkpoint
+        store = agent_checkpoint.store_dir().resolve()
+        assert store != box.path
+        assert box.path not in store.parents
+        assert box.path not in agent_checkpoint.workspace_dir().resolve().parents
     finally:
         box.close()
 

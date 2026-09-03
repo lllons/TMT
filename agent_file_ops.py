@@ -242,8 +242,43 @@ def delete_file(path, confirm=None):
         return f"Deleted file: {path}"
 
 def read_file(path):
+    """The whole of a text file, or a sentence saying why it is not text.
+
+    A binary file used to be a UnicodeDecodeError raised out of here, which
+    the session loop caught and handed back as "the action failed to run" --
+    true, unhelpful, and wrong about whose mistake it was. It is now answered
+    in words, and for an image the words name the verb that CAN open it:
+    `view_image` attaches the picture to the model's next message, which is
+    the thing a model reaching for `read_file` on a screenshot actually wants.
+    """
     p = safe_path(path)
-    return p.read_text(encoding="utf-8") if p.exists() else f"File not found: {path}"
+    if not p.exists():
+        return f"File not found: {path}"
+    try:
+        with p.open("rb") as handle:
+            head = handle.read(BINARY_SNIFF_BYTES)
+    except OSError as error:
+        return f"{path} could not be read: {error}"
+    # The image question is asked FIRST and independently of the NUL sniff.
+    # `_looks_binary` is a heuristic -- a NUL near the front -- and a small
+    # image need not have one in its first bytes, which would send a PNG down
+    # the text path and raise the decode error this exists to answer.
+    # `agent_images.kind` reads a signature, which is a fact rather than a
+    # guess, so it is the better question and it goes first.
+    try:
+        import agent_images
+        media = agent_images.kind(head)
+    except Exception:
+        media = ""
+    if media:
+        return (f"{path} is a {media.split('/')[-1].upper()} image, not text. "
+                f"Use view_image to look at it: "
+                f'{{"action":"view_image","path":"{path}"}}')
+    if _looks_binary(head):
+        return (f"{path} is a binary file, not text. read_file only reads "
+                f"text. If it is an image use view_image; otherwise there is "
+                f"nothing here to read.")
+    return p.read_text(encoding="utf-8")
 
 def list_files():
     """Every file in the workspace, up to a fixed ceiling.

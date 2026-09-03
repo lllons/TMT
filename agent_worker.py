@@ -212,7 +212,15 @@ WORKER_FORBIDDEN = frozenset({"git_push", "end_conversation", "plan",
 # confirmation is a deliberate safety property of both actions, and an agent
 # that cannot obtain it must not proceed without it. Enforced here, in code,
 # because a rule that lives only in a prompt is taught rather than guaranteed.
-WORKER_NEEDS_TERMINAL = frozenset({"delete_file", "delete_folder"})
+WORKER_NEEDS_TERMINAL = frozenset({"delete_file", "delete_folder",
+                                   # Nobody is watching a background agent, so
+                                   # its question would be drawn nowhere and
+                                   # answered by nobody. The main agent is the
+                                   # one with a user in front of it: a worker
+                                   # that needs a decision reports what it
+                                   # needs decided and lets the agent that
+                                   # delegated the work put the question.
+                                   "ask_user"})
 
 # The verb both kinds finish on. Handled by this loop directly rather than
 # through `execute_action`, so a worker still terminates correctly on an
@@ -403,7 +411,56 @@ def _tokens_for_chars(chars):
 
 
 def _message_chars(messages):
-    return sum(len(str(message.get("content", ""))) for message in messages)
+    """The characters this conversation will cost, images included.
+
+    A message carrying an image has a LIST for its content, and
+    `str()` on that is the repr of a base64 blob -- which would
+    report a worker that looked at one screenshot as having sent a
+    million characters. `agent_images.text_of` gives the words, and
+    the image is charged at the rough rate the corner meter uses
+    rather than at its encoded length. A module that will not import
+    falls back to the old measurement rather than stopping the run.
+    """
+    try:
+        import agent_images
+    except Exception:
+        return sum(len(str(message.get("content", "")))
+                   for message in messages)
+    total = 0
+    for message in messages:
+        content = message.get("content", "")
+        if agent_images.is_parts(content):
+            total += agent_images.measure(content, len)
+        else:
+            total += len(str(content))
+    return total
+
+
+def _with_images(text, objs):
+    """A result message's content, carrying whatever it attached.
+
+    `agent_actions.result_content` under a local name, imported at
+    call time for this module's reason: `agent_actions` is imported
+    inside functions here so a frozen module list cannot stop a
+    worker loading. A module that will not import gives back the
+    plain text, which is what every result was before images
+    existed -- so the worst case is a picture that does not arrive,
+    never a step that cannot run.
+    """
+    try:
+        import agent_actions
+    except Exception:
+        return text
+    return agent_actions.result_content(text, objs)
+
+
+def _prune_images(messages):
+    """This conversation with the older images taken out of it."""
+    try:
+        import agent_images
+    except Exception:
+        return list(messages)
+    return agent_images.prune(messages)
 
 
 def _default_ask():
@@ -533,8 +590,13 @@ def _result_message(action, result):
 # optional path that narrows the search rather than naming the thing read, so
 # they are deliberately absent: a search over the whole workspace would
 # otherwise record the workspace root as a file that was inspected.
+#
+# `view_image` is here because it names one file and looks at it, which is the
+# question this set answers. That the looking happens in the model rather than
+# in a result string does not change what a delegation's report should say it
+# inspected.
 _READING_ACTIONS = frozenset({"read_file", "read_lines", "code_map",
-                              "related_tests"})
+                              "related_tests", "view_image"})
 
 
 def _record_reads(manager, record, action, obj):
@@ -861,6 +923,13 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
 
     while steps < rounds:
         _guard(record)
+        # Images out of everything but the last couple of messages.
+        # This loop has no `trim_messages` of its own, so nothing
+        # else here bounds what one costs: the API is stateless and
+        # every image still in the array goes again on every step
+        # this worker has left. Written in place because the record
+        # holds this same list for the panel to read.
+        messages[:] = _prune_images(messages)
         # Reported at the top of the step rather than at the end of it, so the
         # bar on this agent's row moves when the work starts rather than once
         # it is already over.
@@ -961,10 +1030,10 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
             steps += 1
             retries = 0
             messages.append({"role": "assistant", "content": raw})
-            messages.append({"role": "user", "content":
-                             "Batch results:\n%s\nOutput your next action, or "
-                             "internal_response when the task is done."
-                             % "\n".join(response) + agenda_nudge()})
+            messages.append({"role": "user", "content": _with_images(
+                "Batch results:\n%s\nOutput your next action, or "
+                "internal_response when the task is done."
+                % "\n".join(response) + agenda_nudge(), obj["actions"])})
             continue
 
         # Read before validation, deliberately. `internal_response` is
@@ -1043,7 +1112,9 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
         retries = 0
         messages.append({"role": "assistant", "content": raw})
         messages.append({"role": "user",
-                         "content": _result_message(action, result) + agenda_nudge()})
+                         "content": _with_images(
+                             _result_message(action, result) + agenda_nudge(),
+                             [obj])})
 
     return _stop(manager, record,
                  "stopped: ran out of steps after %d actions without finishing"
@@ -1140,7 +1211,15 @@ def _context(record):
     dispatcher's guard is not even consulted.
     """
     context = {"push_authorized": False, "agent_id": record.id,
-               "agent_kind": record.kind}
+               "agent_kind": record.kind,
+               # THIS agent's model, which need not be the session's:
+               # `spawn_agent` takes a model of its own. `view_image`
+               # asks whether the model it is about to be sent to can
+               # read images, and asking the session's would be asking
+               # about a different model. Empty for a worker that took
+               # the default, which reads as "no answer here" and
+               # sends the question back to the session's own.
+               "model": getattr(record, "model", "") or ""}
     try:
         if record.constraints is not None and record.constraints.read_only:
             context["read_only"] = True

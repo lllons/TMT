@@ -652,6 +652,19 @@ def set_tip_cursor(position):
     return value
 
 
+# Where the before-pictures live: one snapshot per turn that changed anything,
+# so `/undo` has something to put back. In INSTALL_DIR beside `.tmt_index/` and
+# `.tmt_memory/`, and for their reason exactly -- nothing of TMT's goes in the
+# workspace, a cache keyed by an absolute path is worthless to anybody else,
+# and when TMT is run ON TMT the install and the workspace are the same
+# directory, so a store that followed the workspace would be committed.
+#
+# Named here rather than in `agent_checkpoint` so it sits with the rest of the
+# per-install state and so the test that none of it follows the workspace can
+# name it. What the DIRECTORY is belongs here; what is IN it belongs there.
+CHECKPOINT_DIR = INSTALL_DIR / ".tmt_checkpoints"
+
+
 def effort_names():
     """The levels, in the order they escalate rather than alphabetically."""
     return sorted(EFFORT_LEVELS,
@@ -773,6 +786,43 @@ REQUIRED_KEYS = {
     # `agent_delegation.READ_ONLY_ACTIONS` -- a read-only worker running a build
     # is not read-only, and a worker cannot be asked to approve anything.
     "bash": [],
+    # The one action whose result is not only text. It reads an image file
+    # from the workspace and attaches it to the message the model is answered
+    # with, so the model LOOKS at a screenshot, a mockup or a diagram instead
+    # of being told a file exists that it cannot open.
+    #
+    # `path` is required and is the whole of it. There is deliberately no key
+    # that names a format, a size or a scale: the format is read off the
+    # file's own first bytes (an extension is the model's claim, the magic
+    # number is the file's), the size is refused rather than resized because
+    # resizing needs a decoder and TMT takes no dependencies, and there is
+    # nothing to scale.
+    #
+    # NOT in MUTATING_ACTIONS: it reads one file and changes nothing, so a
+    # passed review and a passed verification both survive it, exactly as
+    # `read_file` leaves them standing.
+    #
+    # Dispatched in agent_actions. Available to the main agent and to a
+    # delegated worker -- a worker sent to fix a layout is exactly the agent
+    # that needs to see it -- and refused to the note agent and the reviewer,
+    # which is the split `web_search` already has and for the same reason:
+    # neither of those two jobs is looking at pictures.
+    "view_image": ["path"],
+    # A question with numbered options, answered by one keystroke, whose
+    # result goes back to the model like any other action's -- so the turn
+    # carries straight on with the answer instead of ending to ask for it.
+    #
+    # Both keys are required, and that is the difference from `bash` above: a
+    # question with no options is not a question, and options with no question
+    # are a list nobody can read. There is no shape here where one of them is
+    # optional, so REQUIRED_KEYS can answer for both.
+    #
+    # Dispatched in agent_actions and refused to every background agent by
+    # `agent_worker.WORKER_NEEDS_TERMINAL` -- a worker has no terminal to be
+    # asked at, which is the same reason the two delete verbs are in that set
+    # rather than in the flat forbidden one. NOT in MUTATING_ACTIONS: it reads
+    # a keystroke and changes nothing.
+    "ask_user": ["question", "options"],
     # The two verbs that talk to the user, and the whole of the difference
     # between them is in their names. Both take one key and both send its text
     # to the screen; only one of them ends anything.

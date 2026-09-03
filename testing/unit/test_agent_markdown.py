@@ -141,7 +141,7 @@ def test_an_underscore_inside_a_word_is_not_emphasis():
     """
     for untouched in ("agent_live_renderer.py calls _rendered_body",
                       "snake_case_names_stay_plain", "file__name__thing",
-                      "read agent_markdown.render_rows next"):
+                      "read agent_markdown.render_message next"):
         rows = M.render(untouched, 78, Console())
         assert visible(rows)[0].strip() == untouched, rows
         assert "\033[3m" not in rows[0], repr(rows[0])
@@ -285,10 +285,10 @@ def test_a_sentence_with_no_markup_comes_back_as_itself():
     assert visible(M.render(plain_text, 60, Console()))[0].strip() == plain_text
 
 
-def test_render_rows_is_the_shape_a_progress_line_needs():
+def test_render_message_is_the_shape_a_progress_line_needs():
     """One sentence, styled and wrapped, with no block grammar: these are
     drawn inside a row that already has a marker and an indent."""
-    rows = M.render_rows("Reading **agent_ui.py** for the wrap", 20, Console())
+    rows = M.render_message("Reading **agent_ui.py** for the wrap", 20, Console())
     assert len(rows) > 1, rows
     assert "**" not in " ".join(visible(rows))
     for row in rows:
@@ -468,3 +468,73 @@ def test_only_a_level_one_heading_is_ruled():
     assert not any(set(row.strip()) == {"─"} for row in deep), deep
     for row in top:
         assert display_width(row) <= 40, row
+
+# --- the event stream takes the weights and none of the colour --------------
+#
+# `render` draws a reply, which is a surface with nothing else on it, so the
+# two lit marks are the only colour in the row and they mean what they say.
+# `render_message` draws one line of the event stream, and that row already
+# has a marker on it carrying a gradient position -- orange for a milestone,
+# lime for an edit, red for an error. A lit word inside the sentence is a
+# second colour system in the same row, and on a progress line, which is the
+# quietest thing TMT draws, it is a lit word inside something whose whole job
+# is to recede.
+
+
+def test_a_message_row_carries_no_colour_at_all():
+    """The two lit marks are the reply's, not the event stream's."""
+    painted = M.render_message("Edit `agent_ui.py` and set **LIME** now.", 70,
+                               Console())[0]
+    assert LIME not in painted and CYAN not in painted, repr(painted)
+    # And the same sentence in a reply still has both, so this is a decision
+    # about the surface rather than a colour that was removed.
+    reply = M.render("Edit `agent_ui.py` and set **LIME** now.", 70, Console())[0]
+    assert LIME in reply and CYAN in reply, repr(reply)
+
+
+def test_the_emphasis_survives_losing_the_colour():
+    """Neither lit mark loses anything it needed: bold keeps the weight it was
+    always emitted with, and code keeps the backticks it was always drawn
+    with. That is what makes an unlit palette a palette rather than a second
+    parser."""
+    painted = M.render_message("Edit `agent_ui.py` and set **LIME** now.", 70,
+                               Console())[0]
+    assert "\033[1m" in painted, repr(painted)
+    assert strip_ansi(painted).strip() == "Edit `agent_ui.py` and set LIME now."
+
+
+def test_a_span_gives_back_the_styling_it_interrupted():
+    """The bug this was written for. `RESET` ends the caller's colour as well
+    as the span's own weight, so a dim progress line carrying one `path` was
+    dim as far as the first backtick and full brightness for the rest of the
+    sentence -- half quiet, half loud, and the loud half whatever the model
+    wrote after its first inline mark."""
+    painted = M.render_message("plain **bold** plain again", 60, Console(),
+                               DIM)[0]
+    tail = painted[painted.rindex("\033[0m") + len("\033[0m"):]
+    assert tail.startswith(DIM), repr(painted)
+    assert strip_ansi(painted).strip() == "plain bold plain again"
+
+
+def test_a_row_with_nothing_to_style_opens_nothing_to_close():
+    """A base is re-opened after a span and never emitted on its own: a
+    sentence with no marks in it must be the bytes the caller already
+    surrounded, or every unstyled row would carry an escape it did not need
+    and two frames of it would be bigger than they were."""
+    assert M.render_message("nothing to mark here", 60, Console(), DIM) == [
+        "nothing to mark here"]
+
+
+def test_a_message_row_still_reads_with_every_escape_stripped():
+    """The rule the whole interface keeps, asserted on the surface where the
+    styling has just been taken away."""
+    sentence = "Read `a.py`, wrote **b.py**, *skipped* ~~c.py~~ and [d](https://e.f)."
+    for stream in (Console(), Console(encoding="cp1252", tty=False)):
+        rows = M.render_message(sentence, 40, stream, DIM)
+        text = " ".join(visible(rows))
+        for fragment in ("`a.py`", "b.py", "skipped", "c.py", "https://e.f"):
+            assert fragment in text, (fragment, text)
+        for mark in ("**", "~~", "](" ):
+            assert mark not in text, (mark, text)
+        for row in rows:
+            assert display_width(strip_ansi(row)) <= 40, row

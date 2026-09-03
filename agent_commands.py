@@ -32,7 +32,7 @@ _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
 # What a command may be given after its name. Held here rather than parsed by
 # each handler so the error for a stray argument reads the same everywhere.
-_TAKES_ARGUMENT = ("effort", "model", "note")
+_TAKES_ARGUMENT = ("effort", "model", "note", "undo")
 
 # The three commands that are also capability authorisations. Alone on a line
 # each is the read-only report it has always been; followed by anything else
@@ -767,6 +767,235 @@ def _one_line(text, limit):
     return flat if len(flat) <= limit else flat[:limit - 1].rstrip() + "…"
 
 
+# How many paths an /undo preview names before it stops naming them. A preview
+# exists to be read before it is agreed to, and four hundred rows scrolling
+# past is not read -- but the COUNT is always exact, so what is hidden is which
+# files rather than how many.
+_PREVIEW_PATHS = 40
+
+# The word. Spelled out rather than taken from a `y`, for `replace_across`'s
+# reason: this rewrites and deletes files across the whole workspace, and the
+# deliberateness belongs in the typing.
+_CONFIRM = "confirm"
+
+_UNDO_BUSY = ("Work is still running (%s). An undo would race whatever it is "
+              "writing, so it is refused until that finishes.")
+
+
+def _checkpoint_module():
+    """agent_checkpoint, or a Result saying why not.
+
+    The guard `_plan` and `_agents` both use, for the reason `_run_tool`
+    gives: an editable install freezes its module list at install time, so a
+    module sitting in the source tree can be invisible to the entry point, and
+    that must not take a slash command down with it.
+    """
+    try:
+        import agent_checkpoint
+        return agent_checkpoint, None
+    except Exception as error:
+        return None, Result("Undo is unavailable",
+                            ["The checkpoint module could not be loaded.",
+                             str(error)], ok=False)
+
+
+def _checkpoints(argument, session):
+    """Every before-picture TMT holds for this workspace, newest first.
+
+    Read-only, and the way to find the id `/undo` takes. It reads the store
+    rather than the session, so it answers about turns from earlier runs as
+    well as this one -- which is the point: the turn somebody wants back is
+    usually not the one they just watched.
+    """
+    module, refused = _checkpoint_module()
+    if refused is not None:
+        return refused
+    try:
+        known = module.history()
+    except Exception as error:
+        return Result("Checkpoints", ["The store could not be read.",
+                                      str(error)], ok=False)
+    if not known:
+        return Result("Checkpoints",
+                      ["Nothing yet. TMT takes one before the first action of "
+                       "a turn that could change the workspace, so a session "
+                       "that has only read files has none.",
+                       "Usage: %s" % USAGE["undo"]])
+    rows = ["%d kept, newest first. TMT keeps the last %d."
+            % (len(known), module.MAX_TURNS), ""]
+    for snapshot in known:
+        marks = []
+        if not snapshot.complete:
+            marks.append("cannot be restored")
+        if snapshot.restored:
+            marks.append("already restored")
+        if snapshot.commands:
+            marks.append("ran %d command%s" % (len(snapshot.commands),
+                                               "" if len(snapshot.commands) == 1 else "s"))
+        rows.append("%s  %s  %s" % (snapshot.id, snapshot.when(),
+                                    _one_line(snapshot.label or "(no task)", 60)))
+        if marks:
+            rows.append("      " + ", ".join(marks))
+    rows.append("")
+    rows.append("Usage: %s" % USAGE["undo"])
+    return Result("Checkpoints", rows)
+
+
+def _undo(argument, session, manager=None):
+    """Put the workspace back to before a turn changed it. Previews first.
+
+    **Saying nothing changes nothing**, which is `replace_across`'s rule
+    reached for the same reason: this is the most destructive thing TMT does
+    to a tree -- it overwrites files and deletes others across the whole
+    workspace -- and a bulk change nobody looked at first is how a repository
+    gets wrecked. `/undo` shows exactly what would move; `/undo confirm` moves
+    it.
+
+    Confirming through a typed word rather than through `context["approve"]`
+    is what keeps this reachable from a pipe and from the suite: a command
+    that could only be answered by a terminal would be a command a scripted
+    run could never use, and `dispatch` returns a Result and never reads
+    input.
+    """
+    module, refused = _checkpoint_module()
+    if refused is not None:
+        return refused
+    words = str(argument or "").split()
+    apply = bool(words) and words[-1].lower() == _CONFIRM
+    if apply:
+        words = words[:-1]
+    if len(words) > 1:
+        return Result("/undo takes one checkpoint",
+                      ["It was given %r." % argument,
+                       "Usage: %s" % USAGE["undo"]], ok=False)
+    identifier = words[0] if words else ""
+    # Asked before anything is read, because the answer is about right now
+    # rather than about the checkpoint: a worker writing while the tree is
+    # rewritten under it would leave both the restore and the worker wrong,
+    # and neither would know.
+    busy = _still_running_phrase(manager)
+    if busy:
+        return Result("Undo refused", [_UNDO_BUSY % busy], ok=False)
+    snapshot = module.find(identifier)
+    if snapshot is None:
+        return Result("Undo refused",
+                      [module._UNKNOWN % identifier if identifier else module._NOTHING],
+                      ok=False)
+    try:
+        plan = module.plan(snapshot)
+    except Exception as error:
+        return Result("Undo refused",
+                      ["That checkpoint could not be read (%s: %s), so TMT "
+                       "will not restore it."
+                       % (type(error).__name__, error)], ok=False)
+    if plan.refusal:
+        return Result("Undo refused", [plan.refusal], ok=False)
+    if plan.empty():
+        return Result("Nothing to undo",
+                      ["The workspace already matches checkpoint %s (%s)."
+                       % (snapshot.id, snapshot.label or "no task"),
+                       "%d file%s checked." % (plan.unchanged,
+                                               "" if plan.unchanged == 1 else "s")])
+    if not apply:
+        return Result("Undo would change %d file%s"
+                      % (len(plan.touches()), "" if len(plan.touches()) == 1 else "s"),
+                      _preview_rows(module, snapshot, plan))
+    try:
+        outcome = module.restore(plan)
+    except module.CheckpointError as error:
+        return Result("Undo refused", [str(error)], ok=False)
+    except Exception as error:
+        return Result("Undo failed",
+                      ["The restore stopped part way (%s: %s)."
+                       % (type(error).__name__, error),
+                       "Run /undo again to see what the workspace looks like now."],
+                      ok=False)
+    return Result("Undone" if outcome.ok() else "Undone, with failures",
+                  _result_rows(snapshot, outcome), ok=outcome.ok())
+
+
+def _preview_rows(module, snapshot, plan):
+    """What restoring would do, as rows. Names the paths; changes nothing."""
+    rows = ["Checkpoint %s, taken %s: %s"
+            % (snapshot.id, snapshot.when(), snapshot.label or "(no task)"), ""]
+    for title, paths in (("Put back", plan.overwrite),
+                         ("Restore (deleted since)", plan.recreate),
+                         ("DELETE (created since)", plan.delete)):
+        if not paths:
+            continue
+        rows.append("%s  %d" % (title, len(paths)))
+        for path in paths[:_PREVIEW_PATHS]:
+            rows.append("   " + path)
+        if len(paths) > _PREVIEW_PATHS:
+            rows.append("   ... and %d more" % (len(paths) - _PREVIEW_PATHS))
+        rows.append("")
+    rows.append("%d file%s already match%s." % (plan.unchanged,
+                                                "" if plan.unchanged == 1 else "s",
+                                                "es" if plan.unchanged == 1 else ""))
+    if snapshot.commands:
+        rows.append(module.COMMAND_CAVEAT % ", ".join(
+            "`%s`" % one for one in snapshot.commands[:3]))
+    if plan.delete:
+        rows.append(module.DIRECTORY_CAVEAT)
+    rows.append("")
+    rows.append("Nothing has changed. Run `/undo %s%s` to do it."
+                % ((snapshot.id + " ") if snapshot.id else "", _CONFIRM))
+    return rows
+
+
+def _result_rows(snapshot, outcome):
+    """What the restore actually did. Every path, because it already happened."""
+    rows = ["Checkpoint %s: %s" % (snapshot.id, snapshot.label or "(no task)"), ""]
+    for title, paths in (("Put back", outcome.restored), ("Deleted", outcome.deleted)):
+        if not paths:
+            continue
+        rows.append("%s  %d" % (title, len(paths)))
+        for path in paths:
+            rows.append("   " + path)
+        rows.append("")
+    if outcome.failed:
+        rows.append("Could not be changed  %d" % len(outcome.failed))
+        for path, why in outcome.failed:
+            rows.append("   %s  (%s)" % (path, why))
+        rows.append("")
+    for note in outcome.notes:
+        rows.append(note)
+    if outcome.checkpoint is not None:
+        rows.append("The workspace as it was a moment ago is checkpoint %s, so "
+                    "this undo can itself be undone."
+                    % outcome.checkpoint.id)
+    return rows
+
+
+def _still_running_phrase(manager):
+    """What is still working, as a phrase, or "".
+
+    The same question `TMT._still_running` asks before it offers Settings, and
+    it is asked again here rather than shared because the two are reached from
+    different places -- this module must answer with no session loop at all,
+    which is how the tests drive it.
+
+    Guarded to "" for the reason that one gives: a register that cannot answer
+    must not be able to refuse the user their undo forever. The restore's own
+    preview is the second look, so a wrong "" here is a wasted question rather
+    than a wrecked tree.
+    """
+    if manager is None:
+        return ""
+    try:
+        parts = []
+        agents = int(manager.active_count())
+        if agents:
+            parts.append("%d agent%s" % (agents, "" if agents == 1 else "s"))
+        for record, name in ((manager.note(), "a note"),
+                             (manager.review(), "a review")):
+            if record is not None and not record.is_terminal():
+                parts.append(name)
+        return ", ".join(parts)
+    except Exception:
+        return ""
+
+
 # The order commands are offered in, and it is deliberate rather than
 # alphabetical: the five that read the session come first, then the two that
 # reach the background agents, which are the newest and the least often
@@ -792,6 +1021,12 @@ _HANDLERS = {
     # agent made of having done it.
     "verify": _verify,
     "review": _review,
+    # Last, and the two of them together, because they are the only commands
+    # here that can CHANGE anything -- everything above reads. `/checkpoints`
+    # is how the id `/undo` takes is found, so it sits beside it for the reason
+    # `/notes` sits beside `/note`.
+    "undo": _undo,
+    "checkpoints": _checkpoints,
 }
 
 SUMMARY = {
@@ -807,6 +1042,8 @@ SUMMARY = {
     "plan": "the steps TMT is working through for this task",
     "verify": "what was actually run to check this task's work",
     "review": "what the independent review found",
+    "undo": "put the workspace back to before a turn changed it",
+    "checkpoints": "the turns TMT can put the workspace back to",
 }
 
 USAGE = {
@@ -822,4 +1059,6 @@ USAGE = {
     "plan": "/plan",
     "verify": "/verify",
     "review": "/review",
+    "undo": "/undo [<checkpoint>] [confirm]",
+    "checkpoints": "/checkpoints",
 }

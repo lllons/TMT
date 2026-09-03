@@ -19,11 +19,40 @@ Kept dependency-free so the suite runs anywhere the agent runs; the test files
 are plain functions with asserts, so pytest can also collect them as-is.
 """
 
+import shutil
 import sys
+import tempfile
 import traceback
 from pathlib import Path
 
 TESTS_DIRNAME = "testing"
+
+
+def isolate_checkpoints():
+    """Point the checkpoint store at a temporary directory for this run.
+
+    A driven session that writes a file takes a real before-picture, and the
+    store lives in INSTALL_DIR beside the credentials and the index. Every
+    driven session builds a NEW temporary workspace, so the store keys by a new
+    hash each time and the per-workspace retention never sees the last one --
+    it only ever grows, it is git-ignored so nothing shows in `git status`, and
+    what it holds is copies of whatever the test wrote.
+
+    Done HERE rather than in a harness because seven different places in this
+    suite drive `TMT.main`, and a fix applied to the one everybody happens to
+    use is a fix the eighth walks straight past. `testing/conftest.py` does the
+    same for a pytest run, which is the other supported way in.
+
+    Returns the directory to remove afterwards, or None when it could not be
+    redirected -- which must not stop the suite running.
+    """
+    try:
+        import agent_config
+        temporary = Path(tempfile.mkdtemp(prefix="tmt_cp_suite_")).resolve()
+        agent_config.CHECKPOINT_DIR = temporary
+        return temporary
+    except Exception:
+        return None
 
 
 def add_to_path(directory):
@@ -47,6 +76,18 @@ def run():
     # one another by bare name across unit/ and integration/ both ways.
     for path in paths:
         add_to_path(path.parent)
+    # After the path is set up, because it imports agent_config, and before a
+    # single test runs, because the first driven session that writes a file
+    # takes a checkpoint.
+    checkpoints = isolate_checkpoints()
+    try:
+        return _collect(paths)
+    finally:
+        if checkpoints is not None:
+            shutil.rmtree(str(checkpoints), ignore_errors=True)
+
+
+def _collect(paths):
     passed, failures = 0, []
     for path in paths:
         module = __import__(path.stem)

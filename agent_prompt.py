@@ -258,6 +258,26 @@ Also enforced: a constructed environment with your credentials left out, a curat
 Destructive commands - rm, mv, kill, git reset --hard, git clean, git push --force - and commands TMT does not recognise are put to the user before they run. With nobody there to ask the answer is no and the result says which rule asked; say what you needed in your message rather than looking for another route.
 The result gives the command as TMT parsed it, the exit code, the output and the duration. The exit code is the result: never read success or failure out of the output text."""
 
+# The question verb, in its own constant for BASH_REFERENCE's reason: it is
+# refused to every background agent (agent_worker.WORKER_NEEDS_TERMINAL), and
+# ACTION_REFERENCE is reused verbatim by all three background prompts, so a
+# worker that read it there would learn a verb it cannot use. A worker with a
+# decision to make reports what needs deciding; the agent that delegated the
+# work is the one with a user in front of it.
+#
+# The last two lines are the ones that matter. A model that treats this as a
+# way of being agreeable will ask before every edit, which is slower than
+# doing the work and worse than getting it wrong once -- so the rule is
+# stated as what it costs rather than as a preference.
+ASK_REFERENCE = r"""=== ASKING THE USER TO DECIDE ===
+ask_user - keys: question, options. Puts a question on screen with up to 5 numbered options; the user presses one digit and the SAME turn carries on with their answer. It does not end the task.
+  {"action":"ask_user","question":"What should the database layer use?","options":["Node with better-sqlite3","Python's standard-library sqlite3","Something else - I will say what"],"progress":"Asking which stack the database should use."}
+  {"action":"ask_user","question":"main already has a config.py. Replace it or add config_v2.py beside it?","options":["Replace config.py","Add config_v2.py beside it"],"progress":"Asking before overwriting an existing module."}
+The result names the number and the option text. Carry straight on with it and do not ask the same thing twice.
+2 options minimum, 5 maximum. Options are short - they are read at a glance and answered with one key. Make one of them an escape ("Something else - I will say what") whenever the list might not cover it.
+With nobody at a terminal nothing is asked: the result says so and says what to do instead. Read it.
+ASK ONLY WHEN THE ANSWER CHANGES WHAT YOU BUILD and you cannot find it in the workspace. A decision you can make from the code, a preference with an obvious default, and anything you could simply do and report are not questions - they are the work. Asking is a whole round trip and a person's attention; getting an easy call wrong costs one edit."""
+
 # The two network verbs, in their own constant for BASH_REFERENCE's reason and
 # with a different answer at the end of it. ACTION_REFERENCE is reused verbatim
 # by the worker, note and review prompts, and these two are permitted to the
@@ -284,6 +304,19 @@ web_fetch - keys: url. Optional: timeout (seconds, up to 30). Reads ONE page and
 
 Reach for them when an error, exit code or warning is still opaque after you have read the local file or log it names, or to confirm how a library or CLI behaves in the version this project uses. Not for anything on disk in front of you (that is read_file, glob and grep), not for running anything, and not for anything off the task. Read the result, apply it, re-run: two searches for one error means the first was enough or the query was wrong. Prefer official documentation, the project's own issue tracker and language references.
 Enforced: https only; private, loopback and link-local addresses are refused, including through a redirect; a timeout, a cap on the text, and no cookies or credentials of any kind. A query containing one of this machine's own API keys is REFUSED rather than sent - search for the error, never the key. If search is not configured on this machine the result says exactly that, and it is NOT an empty result set: do not retry it and do not treat it as "nothing found"."""
+
+IMAGE_REFERENCE = r"""=== LOOKING AT AN IMAGE ===
+One action, for the one input that cannot be described around: something the user can SEE and you cannot.
+
+view_image - keys: path. Reads an image out of the workspace and attaches it to the message you are answered with, so you look at it rather than being told it exists. PNG, JPEG, GIF and WEBP.
+  {"action":"view_image","path":"screenshot.png","progress":"Looking at the screenshot of the broken layout."}
+  {"action":"view_image","path":"design/mockup.jpg","progress":"Reading the mockup before building the page."}
+
+Reach for it when the task is about something visual and there is a file for it: a screenshot of a bug, a mockup to build from, a diagram of an architecture, a photograph of a terminal. read_file cannot open one - it reads text, and it will tell you to come here.
+THE PICTURE IS IN THE NEXT MESSAGE, not in this action's result. The result says what was attached; the image itself arrives with it. Look, say what you can see, then act on it.
+It is taken back out of the conversation after a couple of steps to keep the request small, and the line that replaces it says so by name. Ask for it again if you still need it rather than assuming it is still in front of you.
+If the model you are running on cannot read images the result says exactly that, in those words. That is not an empty picture and not a missing file: tell the user their model is text only, that Settings can change it, and carry on with what you can do without it."""
+
 
 # Delegation, kept in its own constant rather than appended to
 # ACTION_REFERENCE, and this is load-bearing rather than tidy.
@@ -563,6 +596,23 @@ def _with_bash_row(tool_choice):
 WEB_TOOL_ROW = '  What does this error actually mean?        -> web_search\n'
 
 
+# The image row, held out of the table for BASH_TOOL_ROW's reason and
+# put back for WEB_TOOL_ROW's set of readers: the main agent and a
+# delegated worker have this verb, and the note agent and the reviewer
+# do not. Same anchor as the other two, which is safe for the reason
+# written above WEB_TOOL_ROW.
+IMAGE_TOOL_ROW = '  There is a screenshot or image to look at  -> view_image\n'
+
+
+def _with_image_row(tool_choice):
+    """The tool-choice table with the image row put back at the end."""
+    if _BASH_ROW_ANCHOR not in tool_choice:
+        raise AssertionError("the tool-choice table has moved; IMAGE_TOOL_ROW "
+                             "has nowhere to go and would be silently dropped")
+    return tool_choice.replace(_BASH_ROW_ANCHOR,
+                               _BASH_ROW_ANCHOR + IMAGE_TOOL_ROW, 1)
+
+
 def _with_web_row(tool_choice):
     """The tool-choice table with the web row put back at the end of it."""
     if _BASH_ROW_ANCHOR not in tool_choice:
@@ -731,6 +781,11 @@ def get_system_prompt(capabilities=None, context=None):
         # because that constant is reused by every background prompt and this
         # verb is refused to all three. See the comment on BASH_REFERENCE.
         BASH_REFERENCE,
+        # Beside bash because it is the other verb held out of
+        # ACTION_REFERENCE for being refused to every background agent,
+        # and because the two are read together: one is how the model
+        # acts without asking, this is the one time it should ask.
+        ASK_REFERENCE,
         # Beside bash, because they are the other two actions that reach
         # outside the workspace and the model should read them together: one
         # runs something here, the others read something out there. Held out
@@ -738,6 +793,13 @@ def get_system_prompt(capabilities=None, context=None):
         # set of readers -- agent_subprompts.worker_prompt includes this one
         # too. See the comment on WEB_REFERENCE.
         WEB_REFERENCE,
+        # Beside the web verbs, and included by the same two prompts.
+        # A verb that reads one file in the workspace would ordinarily
+        # belong in ACTION_REFERENCE with the other reads; it is out
+        # here because that constant is reused by the note agent and
+        # the reviewer, and both are refused this one. Neither of
+        # those jobs is looking at pictures.
+        IMAGE_REFERENCE,
     ]
     # The three capability sections, each included only when the user's own
     # words authorised that capability for this task. Two isolations are at
@@ -782,7 +844,7 @@ def get_system_prompt(capabilities=None, context=None):
     # fight over the same anchor. The table is the model's index of which
     # tool answers which question, so leaving bash out of it for the one
     # agent that HAS bash would be the same defect the other way round.
-    tool_choice = _with_web_row(_with_bash_row(tool_choice))
+    tool_choice = _with_image_row(_with_web_row(_with_bash_row(tool_choice)))
     # The project's own memory, and how to keep it. Included only when there
     # IS one with something in it -- teaching a model to correct a file it has
     # not been shown costs ~1.5k tokens on every request and invites a call

@@ -680,7 +680,7 @@ def render_response(response: str, stream=None):
     safe_write(stream, "\n".join(out) + "\n")
 
 
-def _message_rows(message, columns, stream):
+def _message_rows(message, columns, stream, base=""):
     """One generated sentence, styled and wrapped for a row with a marker.
 
     Inline marks only. These sit inside a bullet with an indent already in
@@ -688,11 +688,17 @@ def _message_rows(message, columns, stream):
     inside a list item; what they do want is `**this**` reading as emphasis
     rather than as four asterisks, and a word that will not fit moving down
     whole rather than being cut.
+
+    Weights, never colour -- the marker at the head of the row already says
+    what kind of event this is, in the gradient, and a lit word inside the
+    sentence would be a second colour system in the same row. `base` is the
+    styling the row is drawn inside, so a dim line stays dim past its first
+    inline mark.
     """
     text = str(message or "")
     try:
         import agent_markdown
-        return agent_markdown.render_rows(text, columns, stream) or [""]
+        return agent_markdown.render_message(text, columns, stream, base) or [""]
     except Exception:
         # A missing or broken renderer must never cost the user the sentence.
         # The wrap alone is the half that matters most anyway.
@@ -1056,8 +1062,12 @@ class Transcript:
 
         if style["level"] == 0:
             # Dim, tight, no blank line. It should read as something said in
-            # passing, not as a result.
-            rows = _message_rows(event.message, max(10, width - 4), stream)
+            # passing, not as a result -- and it has to stay that way for the
+            # whole sentence, which is what the base is doing here: every
+            # inline mark inside it closes with a RESET, and a RESET ends this
+            # row's dim as well as the span's own weight.
+            rows = _message_rows(event.message, max(10, width - 4), stream,
+                                 self._dim_base(stream))
             head = " %s " % mark if mark else "   "
             return [self._dim(head + rows[0], stream)] + [
                 self._dim("   " + row, stream) for row in rows[1:]]
@@ -1081,5 +1091,13 @@ class Transcript:
         return out
 
     @staticmethod
-    def _dim(text, stream):
-        return DIM + text + RESET if _supports_color(stream) else text
+    def _dim_base(stream):
+        """The escape a dim row opens with, or nothing where there is no
+        colour. Handed to `_message_rows` so a span inside the row can put
+        back what its own RESET took away."""
+        return DIM if _supports_color(stream) else ""
+
+    @classmethod
+    def _dim(cls, text, stream):
+        base = cls._dim_base(stream)
+        return base + text + RESET if base else text

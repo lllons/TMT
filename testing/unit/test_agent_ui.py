@@ -427,6 +427,89 @@ def test_progress_is_visibly_quieter_than_a_file_edit():
     assert any("+18 -4" in visible(line) for line in edit), edit
 
 
+class Terminal(io.StringIO):
+    """A stream with colour, which `Recorder` deliberately has not.
+
+    The rows below are about what is painted, and `Recorder` reports it is
+    not a tty -- so on that stream the dim is withheld and the bug these
+    cover cannot appear at all.
+    """
+
+    encoding = "utf-8"
+
+    def isatty(self):
+        return True
+
+
+MARKED_UP = "Read `index.html`, and **GameController** has no such method."
+
+
+def test_a_progress_line_stays_dim_past_its_first_inline_mark():
+    """The reported bug, at the surface it was reported on.
+
+    A progress line is drawn dim because it is something said in passing, and
+    every inline mark inside it closes with a RESET -- which ends the row's
+    dim as well as the span's own weight. So the sentence was dim as far as
+    its first backtick and full brightness for the rest of it: half quiet and
+    half loud, with the loud half being whatever the model happened to write
+    after its first mark.
+    """
+    transcript = agent_ui.Transcript(stream=Terminal())
+    rows = transcript.lines_for(agent_ui.AgentEvent.make("progress", MARKED_UP))
+    assert rows, rows
+    for row in rows:
+        assert row.startswith(agent_ui.DIM), repr(row)
+        # Every RESET either ends the row or hands the dim straight back.
+        position = row.find(agent_ui.RESET)
+        while position != -1:
+            after = position + len(agent_ui.RESET)
+            assert after == len(row) or row.startswith(agent_ui.DIM, after), repr(row)
+            position = row.find(agent_ui.RESET, after)
+    assert "GameController has no such method." in visible(" ".join(rows))
+
+
+def test_the_event_stream_carries_no_colour_of_its_own():
+    """The marker at the head of the row is already saying what kind of event
+    this is, in the gradient. A lime word and a cyan path inside the sentence
+    are a second colour system in the same row -- and on a progress line they
+    are a lit word inside the quietest thing TMT draws."""
+    transcript = agent_ui.Transcript(stream=Terminal())
+    for kind in agent_ui.EVENT_KINDS:
+        for row in transcript.lines_for(agent_ui.AgentEvent.make(kind, MARKED_UP)):
+            assert agent_ui.LIME not in row, (kind, repr(row))
+            assert agent_ui.CYAN not in row, (kind, repr(row))
+    # And the reply box, which is the surface those two belong to, still has
+    # them -- so this is a decision about where they go, not a removal.
+    box = io.StringIO()
+    box.isatty = lambda: True
+    render_response(MARKED_UP, box)
+    assert agent_ui.LIME in box.getvalue(), box.getvalue()
+    assert agent_ui.CYAN in box.getvalue(), box.getvalue()
+
+
+def test_a_stream_with_no_colour_is_not_handed_one_to_give_back():
+    """`Recorder` is not a tty, so the dim is withheld -- and the base handed
+    to the renderer has to be withheld with it. A row that opened nothing has
+    nothing to put back, and emitting the escape anyway would paint a colour
+    onto the one stream that said it has none."""
+    transcript = agent_ui.Transcript(stream=Recorder())
+    for kind in agent_ui.EVENT_KINDS:
+        for row in transcript.lines_for(agent_ui.AgentEvent.make(kind, MARKED_UP)):
+            assert agent_ui.DIM not in row, (kind, repr(row))
+
+
+def test_the_emphasis_still_arrives_without_the_colour():
+    """Weights, not nothing. Bold keeps the weight it was always emitted with
+    and code keeps its backticks, so both still say what they say on a row
+    with no colour left in it."""
+    transcript = agent_ui.Transcript(stream=Terminal())
+    rows = transcript.lines_for(agent_ui.AgentEvent.make("milestone", MARKED_UP))
+    joined = "".join(rows)
+    assert "\033[1m" in joined, repr(joined)
+    assert "`index.html`" in visible(joined), visible(joined)
+    assert "**" not in visible(joined), visible(joined)
+
+
 def test_the_facts_on_an_event_are_only_the_ones_it_was_given():
     """Nothing on screen may be invented. An event with no counts gets no
     counts rather than a plausible-looking zero."""

@@ -1374,6 +1374,129 @@ def _bash(context, obj):
 _DELETE_YES = frozenset({"y", "yes"})
 
 
+_IMAGE_ATTACHED = (
+    "Attached %s. It is in this message: look at it and say what you see, "
+    "then carry on with the task."
+)
+
+
+def _view_image(context, obj):
+    """Read an image and attach it to the message this result goes back in.
+
+    The only action whose result is not entirely text, and the seam it uses is
+    the one `agent_multi` already uses for the same problem: a handler returns
+    a string, so what cannot be a string is hung on the action object and the
+    loop assembling the next request asks for it back. `agent_images.attach`
+    is that, `agent_actions.result_content` is the loop's half of it, and
+    every path that builds a result message goes through the second.
+
+    The model's own model is asked FIRST, before the file is opened. Loading a
+    three-megabyte image only to find out it cannot be sent wastes the read
+    and, worse, produces a refusal that reads as though the file were the
+    problem. The three answers are handled apart: False refuses and says what
+    the user could change, True proceeds, and None -- which is most models --
+    proceeds too, because a name table cannot know about a model released
+    after it was written and refusing on that would be refusing on a guess.
+    """
+    path = obj.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return "Refused: view_image needs a 'path' naming an image file."
+    try:
+        import agent_images
+    except Exception as error:
+        # The frozen-module-list failure `_run_tool` guards against, answered
+        # in the same shape: a sentence the model can work around rather than
+        # an exception that ends the turn.
+        return "agent_images is unavailable: %s" % error
+    # A worker may be running on a model the session is not, so its own is
+    # asked for when the context names one. An absent key is the main agent,
+    # whose model `agent_images` reads for itself at call time.
+    model = (context or {}).get("model") or None
+    named = agent_images.unavailable_reason(model_id=model)
+    if named:
+        return agent_images.UNSUPPORTED % (path, named)
+    try:
+        image = agent_images.load(path)
+    except ValueError as error:
+        return "Refused: %s" % error
+    agent_images.attach(obj, [image])
+    return _IMAGE_ATTACHED % image.label()
+
+
+def result_content(text, objs):
+    """The content value for a message reporting what these actions did.
+
+    A STRING when nothing attached an image, and that is the property the rest
+    of the program rests on: every existing call site built a string, every
+    provider adapter has always been handed a string, and a turn that looked
+    at no image produces byte-for-byte the request it produced before this
+    existed. Only a turn that actually read an image gets the list form.
+
+    Takes a LIST of action objects because a batch and a `multi_tool` both run
+    several actions into one result message, and an image read by the third of
+    them has to reach the same request as the text describing it.
+    """
+    try:
+        import agent_images
+    except Exception:
+        return text
+    return agent_images.parts(text, agent_images.gather(objs))
+
+
+def _ask_user(context, obj):
+    """Put a question to the user and hand back what they chose.
+
+    An ordinary action: it returns a result and the turn carries on with it,
+    which is the whole point. `end_conversation` is the only verb that ends a
+    turn, and a model that had to end one to ask a question would throw away
+    everything it had read to get there.
+
+    Reached through `context["choose"]`, which the session builds because only
+    the session knows whether there is a terminal. No `choose` -- a piped run,
+    a script, the suite, any background agent -- is answered with
+    `NO_TERMINAL`, never with a block: `agent_ask` says in as many words that
+    nobody was asked and tells the model to decide and state its assumption,
+    because a model left with no answer and no instruction asks again.
+
+    Imported inside the function for `_run_tool`'s reason: an editable install
+    freezes its module list, so a module in the source tree can be invisible to
+    the entry point, and that must come back as a result the model can work
+    around rather than as an exception that ends the session.
+    """
+    try:
+        import agent_ask
+    except Exception as error:
+        return ("ask_user is unavailable here (%s: %s). Decide it yourself and "
+                "say what you assumed." % (type(error).__name__, error))
+    question, refused = agent_ask.parse(obj)
+    if refused:
+        return "REFUSED: " + refused
+    choose = (context or {}).get("choose")
+    if not callable(choose):
+        return agent_ask.NO_TERMINAL
+    # Measured here rather than in `agent_ask`, which is a pure function of a
+    # width and must stay one: a module that read the terminal itself would be
+    # doing it from every test that composes a question. 80 is what TMT
+    # assumes everywhere else when it cannot measure.
+    try:
+        import shutil
+        columns = shutil.get_terminal_size((80, 24)).columns
+    except Exception:
+        columns = 80
+    try:
+        key = choose(agent_ask.render(question, columns), question.keys())
+    except KeyboardInterrupt:
+        # The user stopping the turn. It belongs to the loop, which already
+        # knows how to end one; swallowing it here would leave the question
+        # answered by a keystroke that meant the opposite.
+        raise
+    except Exception:
+        # A terminal that failed mid-question has not chosen anything, and an
+        # exception out of here would end the session over a question.
+        return agent_ask.DISMISSED
+    return agent_ask.answer(question, key)
+
+
 def _confirmation(context):
     """`confirm(question) -> bool` built from the context's approver, or None.
 
@@ -1462,6 +1585,7 @@ def execute_action(obj, context=None):
         return f"Renamed {obj['path']} to {new_name}"
     if action == "create_folder": return create_folder(obj["path"])
     if action == "bash": return _bash(context, obj)
+    if action == "ask_user": return _ask_user(context, obj)
     if action == "open_app": return open_app(obj["app"], file_path=obj.get("path"), url=obj.get("url"))
     if action == "git_status": return _run_git(_git_status)
     if action == "git_diff": return _run_git(lambda agent_git: _git_diff(agent_git, obj))
@@ -1581,6 +1705,7 @@ def execute_action(obj, context=None):
     if action == "web_fetch":
         return _run_tool("agent_web", lambda m: m.fetch(
             obj["url"], timeout=obj.get("timeout")))
+    if action == "view_image": return _view_image(context, obj)
     if action == "replace_across":
         # Preview unless the model explicitly asks to apply. A bulk edit it
         # did not look at first is how a repository gets wrecked, so the
@@ -1975,7 +2100,7 @@ def build_result_message(action, result, obj=None):
 ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     "write_file", "append_file", "write_files", "patch_file", "delete_file", "read_file",
     "list_files", "read_lines", "replace_lines", "copy_file",
-    "delete_folder", "rename_file", "create_folder", "bash",
+    "delete_folder", "rename_file", "create_folder", "bash", "ask_user",
     "open_app", "git_status", "git_diff", "git_identity", "git_commit", "git_push",
     "tree", "grep", "glob", "find_symbol", "replace_across", "code_map",
     # "Web Search" and "Web Fetch". Both title-case from the verb like
@@ -1983,6 +2108,10 @@ ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     # with no entry shows the reader a raw verb in a column where every
     # neighbouring row is a phrase.
     "web_search", "web_fetch",
+    # "View Image". Registered here for the reason the two above it are: an
+    # action with no entry shows the reader a raw verb in a column where every
+    # neighbouring row is a phrase.
+    "view_image",
     # "Multi Tool". The row a multi_tool draws is built by `_multi_event`
     # from the calls that ran, and this label heads it.
     "multi_tool",
@@ -2049,6 +2178,12 @@ _EVENT_KIND_FOR_ACTION = {
     "copy_file": "file_create",
     "delete_file": "file_delete", "delete_folder": "file_delete",
     "read_file": "file_read", "read_lines": "file_read",
+    # Reading a file, and the row names the path like every other file_read.
+    # What is different about it is inside the request rather than on screen:
+    # nothing the transcript can draw distinguishes looking at a screenshot
+    # from reading a source file, and a kind of its own would promise the
+    # reader a distinction the row cannot make.
+    "view_image": "file_read",
     # Both searches read the workspace and change nothing in it, so they take
     # the kind every other reading verb takes. `glob` reads names rather than
     # contents, which is a difference in what is read and not in what happens.
@@ -2067,6 +2202,10 @@ _EVENT_KIND_FOR_ACTION = {
     # files: what the user is watching is a process starting, and the row says
     # so.
     "bash": "command", "open_app": "command",
+    # Neither a file operation nor a command: nothing runs and nothing is
+    # read. What the user is watching is TMT waiting on THEM, so it takes the
+    # neutral tool kind rather than borrowing a kind that promises a path.
+    "ask_user": "tool",
     "git_status": "tool", "git_diff": "tool", "git_identity": "tool",
     "git_commit": "milestone", "git_push": "milestone",
     # A milestone rather than a tool, and it earns it: a plan step changing
@@ -2229,7 +2368,12 @@ def _describe(action, obj, result):
         # fortieth page read in a session is the same row as the first and a
         # reader scrolling back cannot tell which one was fetched.
         target = (obj.get("path") or obj.get("query") or obj.get("pattern")
-                  or obj.get("url") or obj.get("app") or obj.get("command") or "")
+                  or obj.get("url") or obj.get("app") or obj.get("command")
+                  # An `ask_user` row without it is the bare words "Ask User",
+                  # which says a question was put and not what was asked --
+                  # and the answer the user gave is the one thing a reader
+                  # scrolling back needs the question beside.
+                  or obj.get("question") or "")
         label = ACTION_LABELS.get(action, action)
         if action == "read_lines":
             # The one read whose extent is a fact rather than a guess, so it

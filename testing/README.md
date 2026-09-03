@@ -99,6 +99,47 @@ whole-repository UTF-8 and NUL-byte guard in `integration/test_agent_git.py` wou
 gone vacuous exactly that way, so it now also asserts that it checked a non-zero number
 of modules.
 
+## What a test may not read
+
+**The suite passes on a clone with no credentials, and that is a property to keep.**
+`INSTALL_DIR` holds `.tmt_key`, `.tmt_providers.json`, `.tmt_search.json`, `.tmt_model`
+and `.tmt_effort` — the machine's own state, none of it in git. A test that reads any of
+them is asking a question about the developer running it, and the answer is different in
+CI, in a fresh clone, and on the next person's laptop.
+
+That is not hypothetical. Four tests did exactly this and it went unnoticed for months,
+because the failure only appears where nobody was looking:
+
+- three in `test_agent_menu` pressed Enter on Start, which is where TMT asks for a
+  credential when there is none — so on a clone with no key the key screen opened and
+  ate the scripted keystrokes;
+- `test_agent_stream.test_a_multibyte_character_survives_the_stream_intact` replaced the
+  transport but never reached it, because `stream_chat` resolves a credential and
+  refuses before it posts.
+
+None of the four was about credentials. They were reading the machine by accident, and
+they passed here and failed everywhere else.
+
+Redirect installation state before the test can reach it, the way the suite already
+does for the model file:
+
+| What | Use |
+|---|---|
+| the provider credential, the store, `TMT_PROVIDER`, the legacy `.tmt_key` | `test_agent_credentials.Credentials` |
+| the model file, stdin, `COLUMNS`, `NO_COLOR`, and the credential | `test_agent_menu.Sandbox`, which holds one |
+| the web-search key | `test_agent_search_settings.Store` |
+
+`Credentials()` states the answer rather than hiding the question — OpenRouter, with a
+key — so a screen naming the provider reads the same on a machine set to Anthropic.
+`Credentials(key=None)` is the empty store, for a test that is genuinely about TMT
+having no way to reach a model.
+
+**Check it the way it is checked:** clone the repository somewhere else, run the suite
+there, and give the child no `*_API_KEY` in its environment. A copy of the files is not
+enough — two tests ask git what it is looking at and what `pyproject.toml` declares, and
+a directory that is not a repository fails both for reasons that have nothing to do with
+credentials.
+
 ## Writing one
 
 Plain `def test_*()` functions with asserts, at column zero, in a `test_*.py` file. No

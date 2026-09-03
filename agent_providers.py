@@ -370,6 +370,66 @@ def is_json_mode_rejection(message):
     return any(token in lowered for token in JSON_MODE_REJECTIONS)
 
 
+# --- which models read images -----------------------------------------------
+#
+# A NAME TABLE, and it is deliberately short. The temptation is to make it
+# exhaustive; the failure that produces is a confident wrong answer about a
+# model nobody here has tested, in a table nobody re-reads. So it holds only
+# what is not in doubt, everything else is None, and None is ATTEMPTED --
+# `agent_images.supports_images` explains a refusal rather than pre-empting
+# one. Being wrong towards None costs one request with a clear reason; being
+# wrong towards False silently removes the feature.
+#
+# Matched against the whole lowered id, so OpenRouter's "vendor/model:free"
+# form is covered by the same entries as the vendors' own bare ids.
+#
+# Known gap: OpenRouter's live model listing reports input modalities per
+# model, and TMT does not read it. Reading it would answer this exactly for
+# the one provider where the table can least be trusted, and it needs the
+# listing at the moment an action runs rather than at the moment the model
+# picker is drawn -- which is a caching question this feature did not need to
+# answer to be useful.
+VISION_NAMES = (
+    # Anthropic, and OpenRouter's copies of them. The adapter answers for
+    # itself as well; these are here so `anthropic/claude-...` on OpenRouter
+    # gets the same answer as `claude-...` on Anthropic.
+    "claude-3", "claude-4", "claude-5", "claude-opus", "claude-sonnet",
+    "claude-haiku", "claude-fable",
+    # OpenAI.
+    "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-4-vision", "gpt-5",
+    # Google.
+    "gemini-", "gemma-3",
+    # Open-weight multimodal families that are common on OpenRouter.
+    "pixtral", "llava", "internvl", "molmo", "llama-3.2-vision", "llama-4",
+    "grok-2-vision", "grok-4", "mistral-medium-3",
+)
+
+# Any id saying so about itself. "-vl" is the near-universal suffix for a
+# vision-language variant and is matched with its separator so it cannot fire
+# inside an ordinary word.
+VISION_MARKERS = ("-vl-", "-vl:", "vision", "multimodal", "-vl")
+
+# The other direction, and shorter still: only where a model would otherwise
+# be matched by something above, or where getting it wrong wastes a request on
+# a model that has never read an image.
+TEXT_ONLY_NAMES = ("claude-2", "claude-instant", "gpt-3.5", "text-embedding",
+                   "whisper", "gpt-4-0314", "gpt-4-0613")
+
+
+def vision_by_name(model_id):
+    """True, False or None for a model id, from the tables above."""
+    name = str(model_id or "").strip().lower()
+    if not name:
+        return None
+    if any(entry in name for entry in TEXT_ONLY_NAMES):
+        return False
+    if any(entry in name for entry in VISION_NAMES):
+        return True
+    if any(entry in name for entry in VISION_MARKERS):
+        return True
+    return None
+
+
 class Provider:
     """One provider's wire format. Stateless; holds no key and no session.
 
@@ -418,6 +478,36 @@ class Provider:
                 continue
             role = str(message.get("role") or "user").strip().lower()
             content = message.get("content")
+            # A message carrying an image is a LIST of parts rather than a
+            # string, and it is the one shape that must not be flattened with
+            # str(): that would send the repr of a base64 blob as prose. The
+            # parts are mapped to this provider's own blocks instead, which is
+            # the only place in TMT that knows what an image looks like on a
+            # wire. A system message is never in that shape -- the system
+            # prompt is text -- so the lift below is untouched.
+            if isinstance(content, list) and role != "system":
+                blocks = self.blocks(content)
+                if not blocks:
+                    continue
+                converted.append(self.message(self.ROLE_MAP.get(role, "user"),
+                                              blocks))
+                continue
+            if isinstance(content, list):
+                # A system message is text and TMT never builds one any other
+                # way. The guard is here because the failure if one ever
+                # arrived is the silent kind this module's own docstring is
+                # about: the lift below is what keeps a system role out of
+                # "messages", where Anthropic rejects it and Gemini ignores
+                # it, and a list falling through the branch above would have
+                # walked straight past the lift. Flattened to its words rather
+                # than refused -- a prompt that reached the model without its
+                # picture is survivable; one that did not reach it at all is
+                # an agent answering with none of TMT's rules.
+                try:
+                    import agent_images
+                    content = agent_images.text_of(content)
+                except Exception:
+                    content = ""
             content = "" if content is None else str(content)
             if role == "system":
                 if content.strip():
@@ -429,8 +519,69 @@ class Provider:
         return "\n\n".join(system_parts), converted
 
     def message(self, role, content):
-        """One message in the provider's own shape."""
+        """One message in the provider's own shape.
+
+        `content` is a string for an ordinary turn and a list of this
+        provider's own blocks for one carrying an image. Both are what this
+        family puts under "content", so nothing branches here; Gemini, which
+        puts neither there, overrides it.
+        """
         return {"role": role, "content": content}
+
+    # --- images -------------------------------------------------------------
+    #
+    # TMT's neutral part shape is {"type": "text", "text": ...} and
+    # {"type": "image", "media_type": ..., "data": <base64>}; see
+    # agent_images. Each adapter maps it, and nothing upstream of here has an
+    # opinion about how a given provider spells an image.
+
+    def text_block(self, text):
+        """One run of text in this provider's own block shape."""
+        return {"type": "text", "text": text}
+
+    def image_block(self, part):
+        """One image in this provider's own block shape, or None.
+
+        None means this provider cannot carry an image at all, and `blocks`
+        turns that into a line of text saying so. Every adapter TMT ships
+        overrides it; the base answers None so that a fifth adapter which
+        forgets to is visibly missing the feature rather than silently
+        dropping the picture.
+        """
+        return None
+
+    def blocks(self, parts):
+        """TMT's neutral content list as this provider's own block list."""
+        try:
+            import agent_images
+            not_carried = agent_images.NOT_CARRIED
+        except Exception:
+            not_carried = "[an image could not be sent]"
+        out = []
+        for part in parts or ():
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "image":
+                block = self.image_block(part)
+                out.append(block if block is not None
+                           else self.text_block(not_carried))
+                continue
+            text = str(part.get("text") or "")
+            if text:
+                out.append(self.text_block(text))
+        return out
+
+    def supports_images(self, model_id):
+        """True, False or None for "does this model read images".
+
+        None means unknown and is the honest answer for most ids: this is a
+        name table, and a name table cannot know about a model released after
+        it was written. `agent_images.supports_images` attempts an unknown
+        model rather than refusing it, so being wrong here in the None
+        direction costs a request and being wrong in the False direction would
+        cost the feature.
+        """
+        return vision_by_name(model_id)
 
     def chat_payload(self, messages, model=None, stream=False,
                      max_tokens=DEFAULT_MAX_TOKENS, json_mode=None):
@@ -593,6 +744,20 @@ class _OpenAICompatible(Provider):
     """
 
     supports_json_mode = True
+
+    def image_block(self, part):
+        """This family takes an image as a data: URL under "image_url".
+
+        A URL rather than a payload, which is why the media type is spelled
+        into the string rather than sent as a field of its own: this shape has
+        nowhere else to put it, and a data URL whose declared type disagrees
+        with its bytes is rejected. `agent_images.kind` reads the type off the
+        bytes for exactly this reason.
+        """
+        return {"type": "image_url",
+                "image_url": {"url": "data:%s;base64,%s"
+                                     % (part.get("media_type") or "image/png",
+                                        part.get("data") or "")}}
 
     def headers(self, key, stream=False):
         headers = {
@@ -829,6 +994,29 @@ class AnthropicProvider(Provider):
          "note": "writing focused"},
     )
 
+    def image_block(self, part):
+        """Anthropic takes the payload itself, with the type as a field."""
+        return {"type": "image",
+                "source": {"type": "base64",
+                           "media_type": part.get("media_type") or "image/png",
+                           "data": part.get("data") or ""}}
+
+    def supports_images(self, model_id):
+        """Every Claude model this adapter can reach except the oldest two.
+
+        Answered here rather than left to the name table because this adapter
+        only ever sees Anthropic's own ids, so the family answer is exact:
+        claude-3 and everything after it reads images, and claude-2 and
+        claude-instant did not. An id from neither group is unknown, which is
+        the table's answer and is right for a model released after this line.
+        """
+        name = str(model_id or "").strip().lower()
+        if name.startswith(("claude-2", "claude-instant")):
+            return False
+        if name.startswith("claude-"):
+            return True
+        return vision_by_name(model_id)
+
     def headers(self, key, stream=False):
         headers = {
             "x-api-key": key,
@@ -967,7 +1155,35 @@ class GeminiProvider(Provider):
         return headers
 
     def message(self, role, content):
+        """Text lives in "parts" here, so a block list IS the parts list.
+
+        The one adapter where the neutral shape and the provider's shape are
+        the same kind of thing: `blocks` has already built Gemini's own parts,
+        so they go straight in rather than being wrapped again.
+        """
+        if isinstance(content, list):
+            return {"role": role, "parts": content}
         return {"role": role, "parts": [{"text": content}]}
+
+    def text_block(self, text):
+        """A Gemini part has no "type"; the key it carries is the type."""
+        return {"text": text}
+
+    def image_block(self, part):
+        """Gemini takes the payload under "inline_data"."""
+        return {"inline_data": {"mime_type": part.get("media_type") or "image/png",
+                                "data": part.get("data") or ""}}
+
+    def supports_images(self, model_id):
+        """Every Gemini model this adapter can reach.
+
+        The whole current line is multimodal, and this adapter only ever sees
+        Google's own ids. An id that is not one falls through to the table.
+        """
+        name = str(model_id or "").strip().lower()
+        if name.startswith(("gemini-", "models/gemini-", "gemma-")):
+            return True
+        return vision_by_name(model_id)
 
     @staticmethod
     def _model_path(model):

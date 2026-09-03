@@ -11,6 +11,7 @@ from TMT import stream_handler
 from agent_live_renderer import LiveRelay
 from agent_model import StreamingActionParser, StreamError, ask_model
 from agent_ui import LiveUI
+from test_agent_credentials import Credentials
 
 RESPOND = '{"action": "respond", "message": "Hello world"}'
 
@@ -380,10 +381,17 @@ def test_a_multibyte_character_survives_the_stream_intact():
         for piece in (reply[:30], reply[30:])
     ) + b"data: [DONE]\n"
 
+    # A credential of the test's own. `stream_chat` resolves one and refuses
+    # before it posts, so with the transport replaced and nothing else done
+    # this test measured whether the machine running it happened to have a key
+    # -- green on a developer's checkout, StreamError on a fresh clone. The
+    # key here is never sent: the only thing that could send it has just been
+    # replaced two lines down.
     original = agent_model._session.post
     agent_model._session.post = lambda *a, **k: EncodingSensitiveResponse(body)
     try:
-        received = "".join(agent_model.stream_chat({"model": "x"}))
+        with Credentials():
+            received = "".join(agent_model.stream_chat({"model": "x"}))
     finally:
         agent_model._session.post = original
 

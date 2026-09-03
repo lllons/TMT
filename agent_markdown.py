@@ -6,11 +6,11 @@ as a row of pipes, a code block with its fences. This turns that into
 something meant for a person -- and it is the same subset GitHub renders, so
 what a model writes for a web page reads correctly here.
 
-**Weights, and two colours.** DESIGN_PRINCIPLES puts the gradient on the
-instruments -- the bar, the thinking word, the wordmark -- and keeps it off
-the surfaces that are read rather than watched, which is exactly what a reply
-is. Italic, strike and dim are therefore weights and nothing more. Two marks
-are lit, and each is lit for a different reason:
+**Weights, and two colours -- in the reply, and only there.** DESIGN_PRINCIPLES
+puts the gradient on the instruments -- the bar, the thinking word, the
+wordmark -- and keeps it off the surfaces that are read rather than watched,
+which is exactly what a reply is. Italic, strike and dim are therefore weights
+and nothing more. Two marks are lit, and each is lit for a different reason:
 
 - **Bold is `BOLD + LIME`**, the gradient's own lime stop muted toward the
   neutral, so the word a model chose to stress is the word the eye lands on.
@@ -26,6 +26,24 @@ are lit, and each is lit for a different reason:
 
 Neither animates: two frames of the same reply are still the same bytes, which
 is what lets `LiveRegion` skip the repaint.
+
+**The event stream gets the weights and none of the colour**, and that is
+`render_message` rather than `render`. A progress line, a milestone, a file
+edit: each is drawn in a row whose MARKER already carries a gradient position
+saying what kind of thing happened -- orange for a milestone, lime for an
+edit, red for an error. A lime word and a cyan path inside that row are a
+second colour system in the same row, saying something about the sentence
+while the marker says something about the event, and on a progress line the
+whole point is that it recedes. So bold is `BOLD` alone there, inline code is
+its backticks alone, and the row keeps one voice.
+
+**A styled span inside a coloured row has to give the row back**, which is
+what `base` is for. `RESET` ends everything, so a dim progress line carrying
+one `` `path` `` used to be dim as far as the first backtick and full
+brightness for the rest of the sentence -- the row half quiet and half loud,
+with the loud half being whatever the model happened to write after its first
+inline mark. Every span now closes with `RESET` and then re-opens the base it
+interrupted.
 
 **Every rendered line still reads with no styling at all**, which is the rule
 none of this may become an exception to. It is why bold keeps its weight and
@@ -69,6 +87,17 @@ CODE = "code"
 _ORDER = (STRONG, EM, STRUCK, CODE, QUIET)
 _STYLES = {STRONG: BOLD + LIME, EM: ITALIC, STRUCK: STRIKE, CODE: CYAN,
            QUIET: DIM}
+
+# The same marks for a row in the event stream, with the two lit ones unlit.
+# `render_message` uses this and `render` does not.
+#
+# Neither mark loses anything by it, which is the whole reason this is a
+# palette rather than a second parser: bold keeps the weight it was always
+# emitted with, and inline code keeps the backticks it was always drawn with,
+# so both still say what they say on a row that has no colour left in it.
+# DIM stays, because it is the one neutral rather than a colour -- a link's
+# URL receding behind its label is the same statement on any surface.
+_WEIGHTS = {STRONG: BOLD, EM: ITALIC, STRUCK: STRIKE, CODE: "", QUIET: DIM}
 
 # What each block draws with, and the ASCII it falls back to on a console
 # that cannot encode the first choice. Checked per stream rather than assumed
@@ -193,7 +222,7 @@ def plain(spans):
     return "".join(text for text, _styles in spans)
 
 
-def _paint(spans, stream):
+def _paint(spans, stream, palette=None, base=""):
     """Spans as one string, styled where the stream can carry it.
 
     Adjacent spans with the same styles are painted as ONE run. The wrap
@@ -202,18 +231,25 @@ def _paint(spans, stream):
     that bold carries a colour as well as a weight, that is two escapes a word
     rather than one. The reader sees no difference; the repaint is smaller,
     and the row is legible when something dumps it as bytes.
+
+    `palette` is which escape each mark is drawn with, `_STYLES` by default
+    and `_WEIGHTS` for a row in the event stream. `base` is the styling this
+    run is being painted INSIDE -- re-opened after every span, because `RESET`
+    ends the caller's colour as well as the span's own and the rest of the row
+    would otherwise be drawn at the terminal's default.
     """
     if plain_output(stream):
         return plain(spans)
+    palette = _STYLES if palette is None else palette
     out, run, styles = [], [], None
 
     def flush():
         if run:
             # A deterministic order, so two frames of the same text are the
             # same bytes -- which is what lets a repaint be skipped.
-            opened = "".join(_STYLES[name] for name in _ORDER if name in styles)
+            opened = "".join(palette[name] for name in _ORDER if name in styles)
             body = "".join(run)
-            out.append((opened + body + RESET) if opened else body)
+            out.append((opened + body + RESET + base) if opened else body)
 
     for text, these in spans:
         if these != styles:
@@ -476,28 +512,26 @@ def _dim_row(text, stream):
     return text if plain_output(stream) else DIM + text + RESET
 
 
-def render_rows(text, columns=80, stream=None):
-    """One sentence as styled rows, wrapped on words with the marks removed.
+def render_message(text, columns=80, stream=None, base=""):
+    """One generated line of the event stream, as styled rows.
 
     Spans, then the wrap, then the paint -- the module's whole shape in one
     function, and the reason it is here rather than in the caller: wrapping
     text that still has `**` in it measures the markup as though it were
     words, and styling each row afterwards leaves an emphasis that straddles
     a break rendered as asterisks on both sides of it.
+
+    Inline marks only, and no block grammar: these are single sentences drawn
+    in a row that already has a marker and an indent in front of them, and a
+    heading or a table there would be a block rendered inside a bullet.
+
+    Weights, and no colour, because the marker on that row is already carrying
+    a gradient position -- see the module docstring. `base` is what the caller
+    has opened around the row, re-opened after every span so a dim line stays
+    dim to the end of the sentence rather than to its first backtick.
     """
-    return [_paint(line, stream)
+    return [_paint(line, stream, _WEIGHTS, base)
             for line in _wrap_spans(_spans(str(text)), columns)] or [""]
-
-
-def render_message(text, columns=80, stream=None):
-    """One short generated line -- a progress sentence, a status message.
-
-    Inline marks only, and no block grammar: these are single sentences
-    drawn in a row that already has a marker and an indent in front of them,
-    and a heading or a table there would be a paragraph rendered inside a
-    bullet. Returns the styled text; the caller wraps it into its own shape.
-    """
-    return _paint(_spans(str(text)), stream)
 
 
 def wrap(text, columns):

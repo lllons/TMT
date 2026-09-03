@@ -700,8 +700,14 @@ def worker_prompt():
         return _cached_worker
     _cached_worker = _common(
         WORKER_HEADER, WORKER_OVERRIDES, WORKER_RULES, WORKER_EXAMPLES,
-        extra=agent_prompt.WEB_REFERENCE,
-        tool_choice=agent_prompt._with_web_row(agent_prompt.TOOL_CHOICE_RULES))
+        # Both sections a worker has and the other two background
+        # agents do not, joined rather than given a second parameter:
+        # `extra` is one slot and the note and review prompts must not
+        # gain a blank line where nothing is inserted, which is the
+        # whole reason it is a parameter at all.
+        extra=agent_prompt.WEB_REFERENCE + "\n\n" + agent_prompt.IMAGE_REFERENCE,
+        tool_choice=agent_prompt._with_image_row(
+            agent_prompt._with_web_row(agent_prompt.TOOL_CHOICE_RULES)))
     _worker_dirty = False
     return _cached_worker
 

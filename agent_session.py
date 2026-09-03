@@ -93,6 +93,28 @@ def estimate_tokens(text):
     return (len(text or "") + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
 
 
+def _content_tokens(content):
+    """A token estimate for one message's content, whatever shape it is.
+
+    A string is the case that has always existed and is measured exactly as it
+    always was. A LIST is a message carrying an image, and it is handed to
+    `agent_images`, which is the module that knows what the parts mean --
+    measuring it here would mean this module knowing about base64, and
+    `str()`ing it would report a screenshot as a million tokens.
+
+    Imported at call time and never allowed to matter: a module that will not
+    import falls back to the old measurement rather than stopping a request
+    from being counted, which is what every guard in this file does.
+    """
+    if not isinstance(content, list):
+        return estimate_tokens(str(content or ""))
+    try:
+        import agent_images
+    except Exception:
+        return estimate_tokens(str(content))
+    return agent_images.measure(content, estimate_tokens)
+
+
 class Turn:
     """One question and what came of it.
 
@@ -487,7 +509,14 @@ class Session:
         over and called the total a context. What the request carries is what
         this now reports; what the session has spent is `tokens_sent`.
         """
-        size = sum(estimate_tokens(str(message.get("content", "")))
+        # A message carrying an image has a LIST for its content, and `str()`
+        # on that is the repr of a base64 blob -- so a single screenshot would
+        # be reported as a request of roughly a million tokens, in the one
+        # readout the user is watching to know how full the window is.
+        # `agent_images.measure` charges its text as text and the image at the
+        # rate providers roughly agree on, which is an estimate like every
+        # other figure here and is marked `~` on screen for that reason.
+        size = sum(_content_tokens(message.get("content", ""))
                    for message in (messages or ()) if isinstance(message, dict))
         self.tokens_in = size
         self.tokens_sent += size
