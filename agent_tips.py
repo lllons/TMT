@@ -84,6 +84,8 @@ TIPS = (
     ("TMT_Context/notes.md", "is what TMT remembers about this project"),
     ("The meter above the box", "counts lines changed and tokens as you go"),
     ("The workspace", "is the directory you launched in; edits stay there"),
+    ("Up at the prompt", "brings back what you typed before, ready to edit"),
+    ("Up while TMT works", "reaches a queued task, and Enter replaces it"),
 )
 
 

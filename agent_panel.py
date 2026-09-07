@@ -187,20 +187,33 @@ def _short_count(value):
     return _menu()._short_count(value)
 
 
-def _elide(text, columns):
+def _elide(text, columns, stream=None):
     """`text`, cut to fit, with the marker the rest of TMT already cuts with.
 
     Middle-elided rather than tail-cut: the two ends of a card row are the
     agent's number and its state, and those are the two facts a reader is
     scanning the column for. Cutting the tail would take the state off every
     card at once.
+
+    The marker degrades with everything else on the panel. `…` is in
+    `DECORATION`, so a console that cannot carry it is exactly the console
+    `plain_output` already answers True for -- and before this asked, a
+    cp437 or cp850 window drew the panel's rule as `-` on one row and then a
+    `?` in the middle of the card on the next. One glyph degraded and the one
+    beside it replaced reads as a fault in TMT rather than as the deliberate
+    ASCII interface it is. `agent_menu` picks the same pair the same way for
+    the workspace path in the session header.
     """
     text = str(text)
     if columns <= 0:
         return ""
     if display_width(text) <= columns:
         return text
-    return _menu()._shorten_middle(text, columns)
+    # `_shorten_middle` takes the marker's width out of the budget itself, so
+    # the three-column form cannot push the row wider than the one-column
+    # form -- it takes two more columns of the text instead.
+    marker = "..." if plain_output(stream) else "…"
+    return _menu()._shorten_middle(text, columns, marker)
 
 
 def _row(text, columns, stream, position=None, dim=False):
@@ -210,7 +223,7 @@ def _row(text, columns, stream, position=None, dim=False):
     through an escape sequence and leaves half of one on the row, which the
     terminal then swallows along with whatever followed it.
     """
-    text = _elide(text, columns)
+    text = _elide(text, columns, stream)
     if not _supports_color(stream):
         return text
     if dim:
@@ -1655,6 +1668,27 @@ def compose(left_rows, right_rows, width, gutter=GUTTER):
     right_rows = list(right_rows or [])
     panel = max([visible_width(row) for row in right_rows] or [0])
     left_width = max(0, width - gutter - panel)
+    if not left_width:
+        # No left column, so no gutter. The gutter is the blank space BETWEEN
+        # two columns, and with nothing on the left of it there is nothing to
+        # separate -- it is an indent, and one that pushes the panel two
+        # columns past the end of the row.
+        #
+        # That is panel-only mode on every terminal from 30 to 44 columns:
+        # `layout` gives the panel the whole content width, so the row came
+        # out at `columns + 1` and wrapped. The wrapped half is a screen line
+        # LiveRegion never counted, and from the next repaint on the caret
+        # arithmetic is a row out and writes into the middle of a line instead
+        # of over the top of it -- the failure this module's own header
+        # already names, reached by the documented Right Arrow gesture.
+        #
+        # Clamping the gutter to the room left over was the other candidate
+        # and it is a different statement: it would quietly draw a one-column
+        # indent when a panel came within a column of filling the row, which
+        # is a gutter separating nothing. The question compose is answering is
+        # whether there are two columns, not how much room the gutter can be
+        # squeezed into.
+        gutter = 0
     height = max(len(left_rows), len(right_rows))
     left_rows = [""] * (height - len(left_rows)) + left_rows
     right_rows = right_rows + [""] * (height - len(right_rows))
@@ -1678,13 +1712,23 @@ def panel_key(raw):
     return _PANEL_KEYS.get(raw, "")
 
 
-def agents_report(manager, now=None):
+def agents_report(manager, now=None, stream=None):
     """What `/agents` prints: the visible agents, as permanent text.
 
     The unambiguous alternate to the arrow gesture, and the only way in on a
     terminal too narrow for the panel to open into. It goes to the permanent
     surface like any other command result, so it is a record rather than a
     frame, and it says the same things the cards do in the same words.
+
+    `stream` is the console the report will be printed on, and it is here for
+    one reason: the elision marker. Without it this function cut a long task
+    with the unicode ellipsis whatever the console could encode, so a cp437 or
+    cp850 window drew a `?` in the middle of the report while the panel's own
+    rows -- which ARE told the stream -- degraded correctly. One readout right
+    and the one beside it wrong reads as a fault in TMT.
+
+    It defaults to None, which is the marker the report has always used, so
+    every existing caller and test means what it meant.
     """
     if manager is None:
         return "Background agents are unavailable in this session."
@@ -1719,7 +1763,7 @@ def agents_report(manager, now=None):
             lines.append("   " + label)
         task = str(getattr(record, "task", "") or "").strip()
         if task:
-            lines.append("   " + _elide(task, 68))
+            lines.append("   " + _elide(task, 68, stream))
     return "\n".join(lines)
 
 

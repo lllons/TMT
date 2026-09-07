@@ -1146,13 +1146,14 @@ def test_the_danger_screens_fit_a_narrow_terminal_and_degrade_to_ascii():
                           report=FakeReport("C:\\probe"))]
             limit = max(24, columns - 1)
             for frame in frames:
-                # Every row except the last. `_footer` is the one thing no
-                # menu screen fits to width -- its three hints are 41 columns
-                # and always have been -- so these two screens overflow at 30
-                # and 40 exactly as Settings and the launch screen already do.
-                # Asserting otherwise here would be asking two new frames to
-                # fix a component they share with every old one.
-                for line in frame[:-1]:
+                # EVERY row, the last one included. It used to be every row
+                # except the last, because `_footer` was the one thing no menu
+                # screen fitted to width and its three hints are 41 columns
+                # decorated and 45 in the ASCII form -- so these two screens
+                # overflowed at 30 and 40 exactly as Settings and the launch
+                # screen did. `_footer` takes a width now and gives up hints
+                # from the right, so the exemption is gone.
+                for line in frame:
                     # Measured with the escapes stripped: a painted row is
                     # full of them and they occupy no columns.
                     assert menu().display_width(visible(line)) <= limit, (
@@ -2186,3 +2187,458 @@ def test_the_prompt_box_repaints_in_place_rather_than_reprinting_itself():
     raw = stream.getvalue()
     assert "\033[4A" in raw, "the box was reprinted rather than repainted"
     assert stream.text().count("> hi") >= 1, stream.text()
+
+
+# --- the frames fit the window they are drawn into --------------------------
+#
+# Every one of these is about a row or a frame that was built without asking
+# how much room there was. The consequence is always the same and it is never
+# cosmetic: a row past `columns - 1` soft-wraps and a frame past `rows - 1`
+# scrolls, and either costs `LiveRegion` a screen line it has not counted --
+# so every later repaint lands a row high and the screen fills with stray
+# fragments of earlier frames.
+
+# The option-carrying screens, each as (name, build, how many rows it offers).
+# `build(selected, size, stream)` draws one. Kept together so a sweep asks the
+# same question of all of them: the next screen with a cursor on it joins this
+# tuple rather than getting a test of its own that forgets half the cases.
+def option_screens():
+    return (
+        ("startup", lambda sel, size, stream: menu().render_startup_frame(
+            sel, stream, size=size, phase=0.0, workspace=LONG_WORKSPACE),
+         len(menu().MENU_ITEMS)),
+        ("settings", lambda sel, size, stream: menu().render_settings_menu_frame(
+            sel, stream, size=size, phase=0.0), len(menu().SETTINGS_ITEMS)),
+        ("danger", lambda sel, size, stream: menu().render_danger_frame(
+            sel, stream, size=size, phase=0.0), len(menu().DANGER_ITEMS)),
+        ("model", lambda sel, size, stream: menu().render_settings_frame(
+            sel, "z-ai/glm-5.2:free", stream, size=size, phase=0.0),
+         len(agent_models.catalogue())),
+        ("provider", lambda sel, size, stream: menu().render_provider_frame(
+            sel, "openrouter", stream, size=size, phase=0.0),
+         len(menu().provider_ids())),
+    )
+
+
+LONG_WORKSPACE = "C:\\Users\\somebody\\code\\repos\\acme-platform\\services\\api"
+
+
+def option_labels(name):
+    """Every label the named screen can put on a selectable row."""
+    if name == "startup":
+        return [item[1] for item in menu().MENU_ITEMS + (menu().RESUME_ITEM,)]
+    if name == "settings":
+        return [item[1] for item in menu().SETTINGS_ITEMS]
+    if name == "danger":
+        return [item[1] for item in menu().DANGER_ITEMS]
+    if name == "model":
+        return [model["label"] for model in agent_models.catalogue()]
+    return [menu().provider_label(one) for one in menu().provider_ids()]
+
+
+def draws_an_option(frame, name):
+    """Whether any row of `frame` is a selectable row rather than a heading.
+
+    Matched on the row's OWN prefix and label rather than on the word
+    appearing anywhere: "Esc Back" in the footer contains "Back", which is
+    also the label of a row, so a plain substring search reads a footer as a
+    list.
+    """
+    labels = option_labels(name)
+    for line in frame:
+        for prefix in (" > ", "   "):
+            if line.startswith(prefix) and any(
+                    line[len(prefix):].startswith(label) for label in labels):
+                return True
+    return False
+
+
+def test_the_footer_fits_the_window_and_its_ascii_form_is_the_wider_one():
+    """The one row of every menu frame that never went through fit_to_width.
+
+    `_glyphs` answers the plain question with "Up" and "Down" where the
+    decorated one is a single arrow each, so the three-hint footer is 41
+    columns decorated and 45 in the ASCII form -- and it is the ASCII form a
+    plain Windows console gets. Every menu screen's last row therefore wrapped
+    on a plain console at widths where the decorated one fitted, which costs
+    `LiveRegion` a screen line it has not counted and drifts every later
+    repaint by a row.
+
+    Hints are given up whole from the right, and the last resort is the way
+    out rather than the first hint: half a hint tells nobody anything, and an
+    arrow is guessable where "Esc Back" is not.
+    """
+    hints = ("{up}/{down} Navigate", "Enter Select", "Esc Back")
+    for stream in (Console(), Console(encoding="cp437", tty=False)):
+        # The premise: the ASCII form really is the wider of the two.
+        plain = visible(menu()._footer(stream, hints))
+        assert menu().display_width(plain) >= 41, plain
+        whole = [visible(menu()._footer(stream, (hint,), 99)).strip()
+                 for hint in hints]
+        for width in range(6, 60):
+            row = visible(menu()._footer(stream, hints, width))
+            assert menu().display_width(row) <= width, (width, row)
+            if min(menu().display_width(one) for one in whole) > width - 1:
+                # Narrower than the shortest hint there is. Moving something
+                # cannot help here, so the row is cut, for the reason the word
+                # wrapper cuts a word wider than the whole row.
+                continue
+            # Everywhere else it is whole hints or nothing: no fragment of one
+            # is ever drawn, because half a hint tells nobody anything.
+            for piece in row.split("    "):
+                if piece.strip():
+                    assert piece.strip() in whole, (width, piece, row)
+        # The last thing standing is the way out, not the first hint.
+        assert "Esc Back" in visible(menu()._footer(stream, hints, 12)), stream.encoding
+
+    # A caller that cannot measure a width gets exactly the row it always got.
+    stream = Console()
+    assert menu()._footer(stream, hints) == menu()._footer(stream, hints, None)
+
+
+def test_every_menu_screen_keeps_its_cursor_on_screen_at_every_height():
+    """A cursor that is not drawn is a selection nobody can see.
+
+    `_fit_height` truncates from the end, so on a 16-row terminal the Settings
+    screen drew six of its eight rows plus the footer -- and pressing Down
+    onto Danger Zone moved a marker the frame contained nowhere at all, with
+    Enter then opening it blind. The list is windowed on the selection now,
+    the way the reviewbot agenda is windowed on the item in hand.
+
+    Swept over heights rather than checked at one, because the bands differ
+    per screen: Settings hid Back below 18 rows, Danger Zone below 17, the
+    startup menu below 13 and the model picker below 12.
+    """
+    for stream_encoding, tty in (("utf-8", True), ("cp437", False)):
+        for name, build, count in option_screens():
+            for columns in (30, 60, 100):
+                for rows in range(4, 41):
+                    for selected in range(count):
+                        frame = [visible(line) for line in build(
+                            selected, (columns, rows),
+                            Console(encoding=stream_encoding, tty=tty))]
+                        if not draws_an_option(frame, name):
+                            # Too short for a list at all -- the heading and
+                            # the footer. Nothing is claimed about a cursor
+                            # that has no row to sit on.
+                            continue
+                        marked = [line for line in frame if line.startswith(" > ")]
+                        assert len(marked) == 1, (name, columns, rows, selected,
+                                                  frame)
+                        assert marked[0][3:].startswith(
+                            tuple(option_labels(name))), (name, rows, marked)
+
+
+def test_a_windowed_menu_says_how_many_rows_are_off_it_and_which_way():
+    """The only thing a reader can do about a hidden row is press a key, and
+    there are two of them -- so the row that says something is missing has to
+    say which direction. It is dropped whole rather than cut when it will not
+    fit: "2 abo" has said nothing and has taken an option row's place to say
+    it, and at that width the option row is worth more."""
+    stream = Console()
+    total = len(menu().SETTINGS_ITEMS)
+    # Short enough to window, wide enough for the note.
+    frame = [visible(line) for line in menu().render_settings_menu_frame(
+        total - 1, stream, size=(60, 10), phase=0.0)]
+    note = [line for line in frame if line.strip().endswith("above")]
+    assert note, frame
+    hidden = int(note[0].strip().split()[0])
+    drawn = len([line for line in frame
+                 if line.startswith((" > ", "   "))
+                 and any(line[3:].startswith(label)
+                         for label in option_labels("settings"))])
+    assert hidden + drawn == total, (hidden, drawn, frame)
+    assert " > " in "".join(frame), frame
+
+    # Cursor at the top: what is hidden is below it, and it says so.
+    top = [visible(line) for line in menu().render_settings_menu_frame(
+        0, stream, size=(60, 10), phase=0.0)]
+    assert [line for line in top if line.strip().endswith("below")], top
+
+    # Too narrow for the sentence: the row is given back to the list rather
+    # than drawn as a fragment.
+    narrow = [visible(line) for line in menu().render_settings_menu_frame(
+        total - 1, Console(), size=(30, 10), phase=0.0)]
+    for line in narrow:
+        assert "abov" not in line or line.strip().endswith("above"), narrow
+
+
+def test_the_model_picker_draws_the_catalogue_of_the_provider_in_force():
+    """It iterated agent_models.FREE_MODELS whatever the provider was, while
+    model_screen acted on agent_models.catalogue(). So a user on OpenAI,
+    Anthropic or Gemini -- reached by Settings, or by the documented
+    TMT_PROVIDER override -- was shown five OpenRouter models their provider
+    does not offer, with the '>' on one of them, and Enter saved a model the
+    screen had never drawn for a provider that cannot run it."""
+    box = Sandbox()
+    try:
+        for provider in ("openai", "anthropic", "gemini"):
+            models = agent_models.catalogue(provider)
+            assert models, provider
+            frame = "\n".join(visible(line) for line in menu().render_settings_frame(
+                0, models[0]["id"], Console(), size=(100, 40), phase=0.0,
+                models=models))
+            for model in models:
+                assert model["label"] in frame, (provider, model, frame)
+            # And not one row of somebody else's catalogue.
+            for other in agent_models.FREE_MODELS:
+                if other["id"] not in [one["id"] for one in models]:
+                    assert other["label"] not in frame, (provider, other, frame)
+            # The row the cursor is on is a row of the list being drawn.
+            assert menu()._model_at(0, models)["id"] == models[0]["id"]
+
+        # A provider whose adapter offers no list at all says so, rather than
+        # falling back to another provider's catalogue or drawing a cursor
+        # with nothing under it.
+        empty = "\n".join(visible(line) for line in menu().render_settings_frame(
+            0, "whatever", Console(), size=(80, 24), phase=0.0, models=[]))
+        assert "no model list" in empty, empty
+        assert " > " not in empty, empty
+        assert menu()._model_at(0, []) is None
+    finally:
+        box.close()
+
+
+def test_the_picker_descriptions_and_override_notices_fit_a_narrow_window():
+    """Two rows of prose per picker, neither of them ever fitted: the
+    description wrapped below 40 columns on the model picker and below 42 on
+    the provider one, and the notices shown when OPENROUTER_MODEL or
+    TMT_PROVIDER is set -- both advertised on TMT's own Help screen -- wrapped
+    below 62. Same consequence as any other overflowing row."""
+    box = Sandbox()
+    previous = os.environ.get("TMT_PROVIDER")
+    try:
+        os.environ["OPENROUTER_MODEL"] = "some/forced-model:free"
+        os.environ["TMT_PROVIDER"] = "openai"
+        assert agent_models.is_overridden() and menu()._provider_overridden()
+        for stream in (Console(), Console(encoding="cp437", tty=False)):
+            for columns in range(30, 101):
+                frames = [
+                    menu().render_settings_frame(0, "x", stream,
+                                                 size=(columns, 40), phase=0.0),
+                    menu().render_provider_frame(0, "openrouter", stream,
+                                                 size=(columns, 40), phase=0.0),
+                ]
+                for frame in frames:
+                    for line in frame:
+                        assert menu().display_width(visible(line)) <= columns - 1, (
+                            columns, visible(line))
+        # And the notice is still said, whole, on a window with room for it.
+        # Wrapped on words, so it is read back with the breaks normalised
+        # rather than as the two hand-split halves it used to be.
+        drawn = " ".join(" ".join(visible(line).split())
+                         for line in menu().render_settings_frame(
+                             0, "x", Console(), size=(100, 40), phase=0.0))
+        assert "OPENROUTER_MODEL is set and forces the model" in drawn, drawn
+        assert "only once that variable is unset" in drawn, drawn
+    finally:
+        os.environ.pop("OPENROUTER_MODEL", None)
+        os.environ.pop("TMT_PROVIDER", None)
+        if previous is not None:
+            os.environ["TMT_PROVIDER"] = previous
+        box.close()
+
+
+def test_settings_states_the_model_that_will_run_after_a_provider_change():
+    """state["model"] was captured once, when Settings opened, so switching to
+    a provider that already had a key left the block reading "Provider
+    Anthropic / Model minimax/minimax-m3:free" -- a raw OpenRouter id in a
+    summary where every other value is a friendly label, naming a model TMT
+    was not going to run on. The same stale id was handed to the model picker
+    as its active row."""
+    import agent_credentials
+    box = Sandbox()
+    seen = []
+    real_setup = menu().provider_setup
+    real_frame = menu().render_settings_menu_frame
+
+    def switch(**kwargs):
+        """Stands in for the provider screens: the outcome, without the keys."""
+        agent_credentials.set_credential("anthropic", FAKE_KEY)
+        agent_credentials.set_provider("anthropic")
+        return "anthropic"
+
+    def record(selected=0, stream=None, model_id=None, **kwargs):
+        seen.append(model_id)
+        return real_frame(selected, stream, model_id, **kwargs)
+
+    try:
+        menu().provider_setup = switch
+        menu().render_settings_menu_frame = record
+        rows = [item[0] for item in menu().SETTINGS_ITEMS]
+        steps = ["down"] * rows.index("provider") + ["enter", "esc"]
+        menu().settings_screen(stream=box.stream, key_reader=Keys(*steps),
+                               region=menu().LiveRegion(box.stream),
+                               active_id="minimax/minimax-m3:free")
+    finally:
+        menu().provider_setup = real_setup
+        menu().render_settings_menu_frame = real_frame
+        box.close()
+
+    assert seen, "Settings drew no frame at all"
+    assert seen[0] == "minimax/minimax-m3:free", seen
+    # The frame drawn AFTER the provider changed states the model that will
+    # actually answer, and it is Anthropic's rather than OpenRouter's.
+    assert seen[-1] != "minimax/minimax-m3:free", seen
+    assert seen[-1] == agent_models.provider_default("anthropic"), seen
+    assert agent_models.describe(seen[-1], "anthropic") != seen[-1], seen
+
+
+def test_the_startup_screen_keeps_both_ends_of_the_workspace_path():
+    """The row cut from the right, so a 60-column terminal showed the machine
+    and a parent folder and not the project directory -- which is the one fact
+    the user is being asked to confirm before pressing Start. The session
+    header at the same width already keeps both ends by shortening the middle;
+    this is that treatment on the screen the decision is made on."""
+    # Every width at which the row genuinely does not fit. The label and the
+    # path are 67 columns together, so 68 is the last window that draws it
+    # whole and everything below has to give something up.
+    for columns in (66, 60, 50, 44):
+        frame = [visible(line) for line in menu().render_startup_frame(
+            0, Console(), size=(columns, 40), phase=0.0,
+            workspace=LONG_WORKSPACE)]
+        row = [line for line in frame if "Workspace" in line]
+        assert row, (columns, frame)
+        shown = row[0].split("Workspace", 1)[1].strip()
+        assert shown != LONG_WORKSPACE, (columns, shown)
+        assert shown.startswith("C:\\Users"), (columns, shown)
+        assert shown.endswith("api"), (columns, shown)
+        assert "\u2026" in shown or "..." in shown, (columns, shown)
+        assert menu().display_width(row[0]) <= columns - 1, (columns, row[0])
+
+    # ASCII where the console cannot carry the ellipsis, and never a
+    # replacement mark: a row of '?' reads as a bug where '...' reads as a
+    # choice.
+    plain = Console(encoding="cp437", tty=False)
+    drawn = "\n".join(visible(line) for line in menu().render_startup_frame(
+        0, plain, size=(60, 40), phase=0.0, workspace=LONG_WORKSPACE))
+    drawn.encode("cp437")
+    assert "..." in drawn and "\u2026" not in drawn, drawn
+
+    # A path that fits is left exactly as it is: nothing is shortened that did
+    # not have to be.
+    whole = "\n".join(visible(line) for line in menu().render_startup_frame(
+        0, Console(), size=(120, 40), phase=0.0, workspace=LONG_WORKSPACE))
+    assert LONG_WORKSPACE in whole, whole
+
+
+class Completions:
+    """A completer with the real command set's shape behind it.
+
+    Fourteen names, the longest of them twelve columns, which is what makes it
+    both tall enough to overflow a short window and uneven enough to show the
+    column the summaries line up on.
+    """
+
+    NAMES = ("/context", "/config", "/clear", "/effort", "/model", "/note",
+             "/notes", "/agents", "/back", "/plan", "/verify", "/review",
+             "/undo", "/checkpoints")
+
+    def __call__(self, value):
+        if not value.startswith("/"):
+            return []
+        return [(name, "what %s does" % name) for name in self.NAMES
+                if name.startswith(value)]
+
+
+def test_the_prompt_box_never_builds_a_frame_taller_than_the_window():
+    """The completion rows were appended with no reference to the window, so
+    typing "/" on an 80x12 terminal built a region taller than the screen: the
+    rows scrolled away from the cursor moves that repaint them and the whole
+    terminal went blank but for one stray rule -- no box, no prompt, no caret.
+    Any window of eighteen rows or fewer, which is a split pane or a session
+    somebody resized.
+
+    The caret arithmetic is the trap in the fix rather than the fix: `_frame`
+    returns how far the input row sits above the foot of the frame, so a
+    dropped row that is not reflected there trades a blanked screen for a
+    caret in the wrong place. Both are asserted at every height.
+    """
+    box = menu().PromptBox(stream=Console(), completer=Completions())
+    for typed in ("/", "/c", "/checkpoints", "an ordinary task"):
+        state = editor(typed=typed)
+        for rows in range(4, 31):
+            frame, caret, up = box._frame(state, size=(80, rows), phase=0.0,
+                                          pad=False)
+            assert len(frame) <= max(1, rows - 1), (typed, rows, len(frame))
+            # The field and both rules survive whatever else does not.
+            assert set(visible(frame[-1]).strip()) <= {"-", "\u2500"}, (rows, frame)
+            assert set(visible(frame[len(frame) - up - 1]).strip()) <= {"-", "\u2500"}, (
+                rows, frame)
+            # `up` counts back from one row BELOW the frame, which is where
+            # LiveRegion leaves the cursor, so the input row is at -up.
+            row = visible(frame[len(frame) - up])
+            assert row.startswith(" %s " % menu().PROMPT_MARKER), (typed, rows, row)
+            assert typed[:1] in row or not typed, (typed, rows, row)
+            for line in frame:
+                assert menu().display_width(visible(line)) <= 79, (rows, line)
+
+    # A window with room for everything is untouched: the rows dropped are
+    # dropped because they did not fit, never because the bound is on.
+    tall, _, _ = box._frame(editor(typed="/"), size=(80, 40), phase=0.0, pad=False)
+    # A caption, two rules, one row of field, and every command offered.
+    assert len(tall) == 4 + len(Completions.NAMES), len(tall)
+
+
+def test_the_offered_commands_line_up_on_a_column_measured_from_the_names():
+    """The format string hard-coded a name column of nine, which was the
+    longest command name when it was written. `/checkpoints` is twelve, so
+    that one row pushed its summary three columns right of every other and
+    broke the column the rest line up on. A number in a format string is a
+    measurement that stops being true the next time a command is added."""
+    box = menu().PromptBox(stream=Console(), completer=Completions())
+    rows = [visible(line) for line in box._offered(editor(typed="/c"), 79)]
+    assert len(rows) == 4, rows
+    starts = {row.index("what ") for row in rows}
+    assert len(starts) == 1, rows
+    # And the longest name is drawn whole rather than being what breaks it.
+    assert any("/checkpoints" in row for row in rows), rows
+
+    # The column follows the matches rather than a constant: a set with only
+    # short names lines up tighter, and one long name moves every row.
+    short = menu().PromptBox(stream=Console(),
+                             completer=lambda value: [("/ab", "one"), ("/c", "two")])
+    tight = [visible(line) for line in short._offered(editor(typed="/"), 79)]
+    columns = {row.index("one") if "one" in row else row.index("two")
+               for row in tight}
+    assert len(columns) == 1, tight
+    assert columns.pop() < starts.pop(), tight
+
+
+def test_the_cursor_reads_the_same_catalogue_the_screen_draws_by_default():
+    """The other half of the model-picker fix, and the half a mutation walked
+    straight through.
+
+    `render_settings_frame` and `_model_at` were BOTH iterating
+    agent_models.FREE_MODELS, and both were given a `models` list to fix it --
+    but every test passed that list in explicitly, so `_model_at`'s default
+    was never exercised and reverting it to FREE_MODELS kept the suite green.
+    The default is what a caller that does not pass a list gets, and a default
+    that answers from another provider's catalogue is the original defect with
+    one call site left in it.
+    """
+    box = Sandbox()
+    previous = os.environ.get("TMT_PROVIDER")
+    try:
+        for provider in ("openai", "anthropic", "gemini"):
+            os.environ["TMT_PROVIDER"] = provider
+            models = agent_models.catalogue()
+            assert models, provider
+            ids = [model["id"] for model in models]
+            # Asked with no list at all: the row the cursor is on has to be a
+            # row of the catalogue in force.
+            for index in range(len(models)):
+                chosen = menu()._model_at(index)
+                assert chosen is not None, (provider, index)
+                assert chosen["id"] == ids[index], (provider, index, chosen)
+            # And it wraps within that list rather than reaching past it.
+            assert menu()._model_at(len(models))["id"] == ids[0], provider
+            for other in agent_models.FREE_MODELS:
+                if other["id"] not in ids:
+                    assert menu()._model_at(0)["id"] != other["id"], provider
+    finally:
+        if previous is None:
+            os.environ.pop("TMT_PROVIDER", None)
+        else:
+            os.environ["TMT_PROVIDER"] = previous
+        box.close()

@@ -264,6 +264,45 @@ def test_every_panel_row_is_measured_rather_than_counted():
             assert menu().visible_width(row) <= width, (width, repr(row))
 
 
+def test_the_mark_on_a_cut_row_degrades_with_everything_else_on_the_panel():
+    """`…` is in DECORATION, so a console that cannot carry it is exactly the
+    console the ASCII fallbacks exist for -- and it drew the panel's rule as
+    `-` on one row and then put a `?` in the middle of the card on the next.
+    One glyph degraded and the one beside it replaced reads as a fault in TMT
+    rather than as the deliberate ASCII interface it is.
+
+    The three-column form must not buy its honesty with a column: the marker's
+    width comes out of the budget, so it takes two more characters of the text
+    instead of pushing the row over."""
+    manager, _ = register(1)
+    record = manager.list()[0]
+    # Four words, because `clip_activity` keeps five of them -- and four real
+    # module names are already far wider than the column, which is how a card
+    # comes to be cut in the first place.
+    manager.set_activity(record.id,
+                         "Reading agent_verify_discovery.py and "
+                         "agent_verify_engine.py")
+    for encoding in ("cp437", "cp850", "ascii", "latin-1", "koi8-r"):
+        for width in (18, 22, 28):
+            rows = [visible(row) for row
+                    in agent_panel.panel_rows(manager.visible_agents(), width,
+                                              stream=Console(encoding))]
+            cut = [row for row in rows if "..." in row]
+            assert cut, (encoding, width, rows)
+            for row in rows:
+                assert "…" not in row, (encoding, width, row)
+                assert menu().display_width(row) <= width, (encoding, width, row)
+                # The whole point: what is drawn is what the console can put
+                # on screen, rather than a row of replacement marks.
+                row.encode(encoding)
+    # And a console that can carry it still gets the one-column marker, so
+    # nothing was given up on the terminal most people are looking at.
+    unicode_rows = [visible(row) for row
+                    in agent_panel.panel_rows(manager.visible_agents(), 22,
+                                              stream=Console())]
+    assert any("…" in row for row in unicode_rows), unicode_rows
+
+
 # --- tokens ------------------------------------------------------------------
 
 def test_an_estimated_token_figure_says_it_is_estimated():
@@ -402,6 +441,51 @@ def test_an_overlong_left_row_is_cut_rather_than_wrapping_the_region():
     rows = agent_panel.compose(["x" * 200], ["AGENTS 0"], 40)
     for row in rows:
         assert menu().visible_width(row) <= 40, (menu().visible_width(row), row)
+
+
+def test_a_panel_only_row_is_never_wider_than_the_window_it_is_drawn_in():
+    """The gutter is the space BETWEEN two columns, so with no left column
+    there is nothing for it to separate. Emitting it anyway put every row of
+    panel-only mode at `columns + 1` -- the row soft-wraps, the wrapped half is
+    a screen line LiveRegion never counted, and from the next repaint on the
+    caret arithmetic is a row out and writes into the middle of a line instead
+    of over the top of it. Reached by the documented Right Arrow gesture on any
+    terminal between the two thresholds.
+
+    Measured on the composed row rather than on `layout`'s numbers, because
+    the numbers were right all along and the row was not."""
+    for columns in range(agent_panel.PANEL_ONLY_MIN, agent_panel.TWO_COLUMN_MIN):
+        state = agent_panel.PanelState(register(2)[0], stream=Console())
+        assert state.open_panel(columns) is True, columns
+        left, join = state.frame(columns, rows=24)
+        assert left == 0, (columns, left)
+        # Both the real call -- panel-only draws no box, so the left column is
+        # empty -- and one with a left row in it, which must not sneak columns
+        # back onto a row that has no room for them.
+        for left_rows in ([], ["a task being typed"]):
+            rows = join(list(left_rows))
+            assert rows, columns
+            widest = max(menu().display_width(visible(row)) for row in rows)
+            assert widest <= columns - 1, (columns, widest, rows)
+
+
+def test_two_columns_keep_the_gutter_and_the_width_they_always_had():
+    """The other half of the fix, and the half that had to not move. Dropping
+    the gutter where there is no left column must leave the two-column
+    composition exactly as it was: the left cell padded to its own width, two
+    blank columns, then the panel, and the whole row inside `columns - 1`."""
+    for columns in (agent_panel.TWO_COLUMN_MIN, 46, 60, 80, 100, 121):
+        state = agent_panel.PanelState(register(2)[0], stream=Console())
+        assert state.open_panel(columns) is True, columns
+        left, join = state.frame(columns, rows=24)
+        assert left > 0, (columns, left)
+        rows = [visible(row) for row in join(["box"])]
+        widest = max(menu().display_width(row) for row in rows)
+        assert widest <= columns - 1, (columns, widest, rows)
+        for row in rows:
+            assert row[left:left + agent_panel.GUTTER] == " " * agent_panel.GUTTER, \
+                (columns, repr(row))
+        assert rows[-1].startswith("box"), rows
 
 
 # --- the keys ----------------------------------------------------------------
@@ -1110,3 +1194,40 @@ def test_agents_report_says_the_same_things_the_cards_do():
         "Background agents are unavailable in this session.")
     empty = agent_manager.AgentManager(clock=Clock())
     assert agent_panel.agents_report(empty) == "No background agents are running."
+
+
+def test_the_agents_report_cuts_with_a_marker_the_console_can_print():
+    """The other half of the same defect, and the half that survived the fix.
+
+    `/agents` is the way in on a terminal too narrow for the panel to open
+    into, so it is exactly what a small plain console reaches for -- and it
+    was the one readout still cutting a long task with the unicode ellipsis,
+    because it had never been told which stream would print it. The panel's
+    rows degraded and the report beside them did not, which reads as a fault
+    rather than as the ASCII interface it is.
+    """
+    manager, _ = register(1)
+    record = manager.list()[0]
+    record.task = "refactor " + "the very long module name " * 6
+    for encoding in ("cp437", "cp850", "ascii", "latin-1", "koi8-r"):
+        report = agent_panel.agents_report(manager, stream=Console(encoding))
+        assert "…" not in report, (encoding, report)
+        assert "..." in report, (encoding, report)
+        # What is drawn is what the console can actually put on screen.
+        report.encode(encoding)
+    # And a console that can carry it keeps the one-column marker, so the
+    # terminal most people are looking at gave nothing up.
+    assert "…" in agent_panel.agents_report(manager, stream=Console("utf-8"))
+    # No stream is still the marker it always was, so every caller that
+    # predates this means what it meant.
+    assert "…" in agent_panel.agents_report(manager)
+
+
+def test_the_agents_command_hands_the_report_the_console_it_prints_on():
+    """The wire, not the function. `agents_report` degrading correctly is
+    worth nothing if the one caller never tells it which stream to degrade
+    for -- and that caller lives in a module the panel does not import."""
+    import inspect
+    import agent_commands
+    source = inspect.getsource(agent_commands._agents)
+    assert "stream=sys.stdout" in source, source

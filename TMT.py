@@ -22,6 +22,7 @@ if _INSTALL_DIR in sys.path:
 sys.path.insert(0, _INSTALL_DIR)
 
 import agent_config
+import agent_history
 import agent_images
 import agent_menu
 from agent_menu import (
@@ -510,9 +511,15 @@ def _command_approval(prompt_box, live_panel, pad):
     which had exactly that defect, and printed its question past the live
     region as well -- is reached only by a caller with no session.
 
-    The question is written through the live region's `write_above` rather
-    than printed, because printing past a live region leaves its repaint
-    arithmetic pointing at rows that have moved.
+    The question goes through the live region's `ask_below`, which prints it
+    permanently, takes the region DOWN with the caret restored, reads the
+    answer, and paints the region again afterwards. Printing past a live
+    region leaves its repaint arithmetic pointing at rows that have moved --
+    and so does READING past one, which is the half that was still wrong:
+    the terminal echoes the answer and the Enter that ends it, so the caret
+    finished a row below where the region believed it was and one copy of its
+    top row was orphaned in the scrollback per question. There was no caret
+    on screen while the user typed, either.
 
     A Ctrl-C at the prompt is deliberately NOT caught: it means the user wants
     the turn to stop, and the loop already knows how to end one.
@@ -525,16 +532,24 @@ def _command_approval(prompt_box, live_panel, pad):
         try:
             text = "%s\n%s" % (question, _APPROVE_KEYS % pattern
                                if pattern else _APPROVE_ONCE)
+            # The question's rows, and one more for the row the answer is
+            # typed on: the terminal echoes it and the Enter that ends it, so
+            # that row is spent out of the scrollback exactly as a printed one
+            # is. A pad that did not count it would put the region back one
+            # row too low and scroll it off the foot of the window.
             pad.spend(text)
+            pad.take(1)
+            def read():
+                # The raw answer, for `agent_bash` to read: it owns what "yes"
+                # and "always" mean, and this returns what was typed rather
+                # than an interpretation of it.
+                return input().strip().lower()
+
             relay = live_panel.get("relay")
             if relay is not None:
-                relay.write_above(text)
-            else:
-                console.print(text)
-            # The raw answer, for `agent_bash` to read: it owns what "yes" and
-            # "always" mean, and this returns what was typed rather than an
-            # interpretation of it.
-            return input().strip().lower()
+                return relay.ask_below(text, read)
+            console.print(text)
+            return read()
         except (EOFError, OSError):
             # The terminal went away between the check and the read. Nothing
             # was approved.
@@ -560,15 +575,19 @@ def _question_asker(prompt_box, live_panel, pad):
     identical: `is_interactive` is asked first and any doubt is no; the
     type-ahead reader is stopped for the length of the question and started
     again afterwards, because two readers on one stdin take it in turns to
-    swallow the user's characters; and the block is written through the live
-    region's `write_above` rather than printed, because printing past a live
-    region leaves its repaint arithmetic pointing at rows that have moved --
-    which is the defect that put ten stray box tops on a real terminal.
+    swallow the user's characters; and the block goes through the live
+    region's `ask_below`, which prints it permanently and then takes the
+    region DOWN for the read. Printing past a live region leaves its repaint
+    arithmetic pointing at rows that have moved -- the defect that put ten
+    stray box tops on a real terminal -- and so does reading past one.
 
     What differs is the read. An approval is a word and a line; this is ONE
     KEYSTROKE, so the answer arrives the instant it is pressed and the turn
-    carries straight on. Two keys are handled here rather than left to the
-    caller:
+    carries straight on. It also costs the pad nothing beyond the question
+    itself: a raw key is not echoed, so no row of the scrollback is spent on
+    the answer, where a typed line and its Enter spend one.
+
+    Two keys are handled here rather than left to the caller:
 
       * Ctrl-C. `msvcrt` hands it back as an ordinary character and no signal
         is ever raised, so a loop reading raw keys would swallow the one
@@ -591,13 +610,8 @@ def _question_asker(prompt_box, live_panel, pad):
         accepted = tuple(str(key) for key in keys)
         typed = getattr(prompt_box, "typeahead", None)
         stopped = bool(typed is not None and typed.active and typed.stop())
-        try:
-            pad.spend(text)
-            relay = live_panel.get("relay")
-            if relay is not None:
-                relay.write_above(text)
-            else:
-                console.print(text)
+
+        def read():
             while True:
                 key = agent_menu.read_key(raw=True)
                 # `read_key` coalesces a run of characters that were already
@@ -627,6 +641,14 @@ def _question_asker(prompt_box, live_panel, pad):
                 # Anything else is ignored and the question stays up. A
                 # mistyped letter must not be read as a choice, and must not
                 # count as a dismissal either.
+
+        try:
+            pad.spend(text)
+            relay = live_panel.get("relay")
+            if relay is not None:
+                return relay.ask_below(text, read)
+            console.print(text)
+            return read()
         except (EOFError, OSError):
             # The terminal went away between the check and the read, so the
             # question was never really put.
@@ -1404,10 +1426,25 @@ def _session_loop(root, ci=None):
     # so nothing needs redrawing between turns, and the console keeps being
     # the line reader on any run that cannot take raw keys -- a pipe, a
     # redirect, the test suite -- so a scripted run behaves as it always did.
+    # What the user has already typed, in the two tiers Up walks back through.
+    #
+    # Both belong to the SESSION rather than to a box or to a turn's reader.
+    # `pending` outlives every reader built for it: somebody who queued three
+    # lines during one turn and wants to fix the third while the next turn
+    # runs is asking about a line the current reader never saw. `typed` is the
+    # lines that have already been answered, recorded as they are dispatched
+    # so that a line is in exactly one of the two at any moment.
+    #
+    # Memory only. A task line carries whatever was pasted into it, and
+    # writing that into INSTALL_DIR beside `.tmt_effort` is a decision the
+    # user has not made.
+    pending = agent_history.PendingQueue()
+    typed_history = agent_history.History()
     prompt_box = PromptBox(line_reader=_console_line, session=session, pad=pad,
                            completer=agent_commands.completions,
                            completed=agent_commands.completed,
-                           manager=manager)
+                           manager=manager, history=typed_history,
+                           queue=pending)
     # Which live region the panel currently belongs to. A worker changing its
     # activity label happens on its own thread, and the relay repaints only
     # when the reply or the status row moves -- so without a nudge the panel
@@ -1444,10 +1481,12 @@ def _session_loop(root, ci=None):
                                       stream=sys.stdout)
         + agent_panel.reviewbot_rows(manager.review(), session.review, columns,
                                      stream=sys.stdout))
-    # Lines the user typed while a turn was running. They are taken from
-    # the reader when the turn ends and answered before the next question
-    # is asked, in the order they were entered.
-    queued = []
+    # Lines the user typed while a turn was running are on `pending`, built
+    # above. They are answered before the next question is asked, in the order
+    # they were entered, and taken ONE AT A TIME rather than drained into a
+    # list here -- a line still on the queue is a line the user can still
+    # reach with Up and correct, and one lifted into a local list would be
+    # waiting to run with no way back to it.
     live_panel = {"relay": None}
 
     def _panel_changed(name, record):
@@ -1463,16 +1502,16 @@ def _session_loop(root, ci=None):
         # the scrollback exactly as it echoes a typed one -- so the record
         # cannot tell them apart, which is right, because what happened is the
         # same thing. Nothing reads stdin on this path at all.
-        queued.append(ci.task)
+        pending.add(ci.task)
     while True:
-        if queued:
+        if pending.count():
             # Something the user typed while the last turn was running. It is
             # taken before the box is drawn, so a queued line is answered
             # rather than sitting behind a prompt nobody is looking at, and it
             # is echoed into the scrollback by `render_task` below exactly as
             # a typed one is -- the record must not be able to tell them
             # apart, because the user cannot either.
-            answer = queued.pop(0)
+            answer = pending.pop()
         elif ci is not None:
             # One task, and it has been answered. A CI run must never reach
             # `ask`: there is nothing on the other end of it, and a read that
@@ -1494,6 +1533,16 @@ def _session_loop(root, ci=None):
             break
         if not task:
             continue
+        # It has left the queue and is about to run, so this is the moment it
+        # stops being editable and becomes history. Recorded HERE rather than
+        # at the box for that reason: a line recorded when it was typed would
+        # be in both tiers at once, and an edit of it would leave the version
+        # before the edit sitting underneath the corrected one.
+        #
+        # Slash commands are recorded too. `/model` and `/effort` take an
+        # argument, and re-reaching one to change the argument is exactly what
+        # a history is for.
+        typed_history.record(task)
         # A slash command is answered here and never becomes a request. The
         # test is the parser's, not a prefix check: a task that happens to
         # start with a path is not a command and goes to the model exactly as
@@ -1763,7 +1812,8 @@ def _session_loop(root, ci=None):
         # instead of interrupting the work. It reads nothing at all on a
         # run that has no raw keys to read, so a piped or scripted run is
         # exactly as it was.
-        typeahead = TypeAhead(on_change=relay.refresh)
+        typeahead = TypeAhead(on_change=relay.refresh, queue=pending,
+                              history=typed_history)
         prompt_box.typeahead = typeahead
         typeahead.start()
         live_ui.attach_sink(relay.set_status)
@@ -2224,7 +2274,10 @@ def _session_loop(root, ci=None):
         # take it in turns to swallow the user's characters.
         typeahead.stop()
         prompt_box.typeahead = None
-        queued.extend(typeahead.take())
+        # Nothing is drained here. The reader wrote straight onto the shared
+        # queue as each line was entered, and the loop takes from that one
+        # line at a time -- so a line queued three turns ago is still on it,
+        # still in its own position, and still reachable with Up.
         # The turn's before-picture becomes a checkpoint, if one was taken.
         # At the END of the turn rather than when it was taken, because what
         # goes on the manifest includes the commands the turn ran, and those

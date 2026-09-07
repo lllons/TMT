@@ -20,7 +20,10 @@ Windows console actually reports and it can carry none of the marks.
 """
 
 import io
+import os
 import re
+import subprocess
+import sys
 import time
 
 import agent_markdown as M
@@ -538,3 +541,205 @@ def test_a_message_row_still_reads_with_every_escape_stripped():
             assert mark not in text, (mark, text)
         for row in rows:
             assert display_width(strip_ansi(row)) <= 40, row
+
+
+# --- rows wider than the box, and a wrap that never returned ----------------
+#
+# Four defects reported off a real terminal, and every one of them was in a
+# case the tests above never made: a table with no blank line above it, a
+# table with more columns than the box has room for, and a list nested deeply
+# enough that its own indent was wider than the window. Each is swept across
+# widths rather than checked at one, because this project has already shipped
+# a layout bug whose test only ever asserted at a hundred columns.
+
+def _table_source(span):
+    """A pipe table of `span` columns, with a sentence hard against it."""
+    return ("A sentence.\n"
+            + "| " + " | ".join("column%d" % i for i in range(span)) + " |\n"
+            + "|" + "---|" * span + "\n"
+            + "| " + " | ".join("a value %d" % i for i in range(span)) + " |\n")
+
+
+def test_a_table_never_eats_the_sentence_written_above_it():
+    """The table branch used to fire on the SEPARATOR row and then pop what it
+    assumed was the header off the rows already drawn. With no blank line
+    between them the sentence and the header are one paragraph, so the pop
+    took the model's own words -- at every width and on every stream."""
+    source = ("Here is what changed.\n"
+              "| col | col2 |\n| --- | --- |\n| a | b |\n")
+    for stream in (Console(), Console(encoding="cp1252", tty=False)):
+        for columns in (120, 100, 80, 60, 40, 30, 20, 12):
+            rows = visible(M.render(source, columns, stream))
+            said = " ".join(row.strip() for row in rows)
+            assert "Here is what changed." in said, (columns, rows)
+            assert "col2" in said, (columns, rows)
+            # And it is a sentence, not a row of the table it sits above.
+            for row in rows:
+                if "Here is" in row:
+                    assert "|" not in row, (columns, row)
+
+
+def test_a_table_header_too_wide_for_the_box_leaves_no_raw_markdown_above_it():
+    """The pop was a guessed COUNT as well as a guessed row. A header that
+    wrapped into more rows than it accounted for left the remainder on screen
+    as unrendered pipes above the table it belonged to -- reachable on an
+    ordinary eighty-column terminal with a five-column table."""
+    for span in range(3, 11):
+        source = _table_source(span)
+        for stream in (Console(), Console(encoding="cp1252", tty=False)):
+            for columns in (120, 100, 80, 60, 40, 30, 20, 12, 10):
+                rows = visible(M.render(source, columns, stream))
+                for row in rows:
+                    # The raw separator row, drawn rather than rendered.
+                    assert not (set(row.strip()) <= set("|-: ") and "-" in row), (
+                        span, columns, rows)
+                    # A prose row is prose. Before the fix the sentence and
+                    # the header were one paragraph and this row carried both.
+                    if "A sentence" in row:
+                        assert "|" not in row, (span, columns, row)
+
+
+def test_a_table_of_any_shape_fits_the_width_it_was_handed():
+    """The shrink loop stopped while `max(widths) > 4`, so an eight-column
+    table stayed the same width however narrow the window was and overflowed
+    every one of them. Inside the streaming box that soft-wraps, which costs
+    LiveRegion a screen line it never counted and corrupts every repaint after
+    it -- see DESIGN_PRINCIPLES on leaving a spare column. Three to ten
+    columns against ten to a hundred and twenty, on both consoles."""
+    for span in range(3, 11):
+        source = _table_source(span)
+        for stream in (Console(), Console(encoding="cp1252", tty=False)):
+            for columns in range(10, 121):
+                for row in M.render(source, columns, stream):
+                    assert display_width(strip_ansi(row)) <= columns, (
+                        span, columns, strip_ansi(row))
+
+
+def _returns_within(program, seconds=90):
+    """Run `program` in a fresh interpreter and hand back what it printed.
+
+    A subprocess because the failure below is a HANG and this suite has no
+    per-test timeout: a test that reproduced it in process would take the
+    whole run down with it rather than report it.
+    """
+    root = os.path.dirname(os.path.abspath(M.__file__))
+    try:
+        done = subprocess.run([sys.executable, "-c", program, root],
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=seconds)
+    except subprocess.TimeoutExpired:
+        raise AssertionError("still running after %d seconds" % seconds)
+    output = done.stdout.decode("utf-8", "replace")
+    assert done.returncode == 0, output
+    return output
+
+
+_NESTED_LIST = "\n".join([
+    "import sys",
+    "sys.path.insert(0, sys.argv[1])",
+    "import agent_markdown",
+    "from agent_ui import display_width, strip_ansi",
+    "source = '\\n'.join(['Steps:', '', '1. One', '    1. Nested',",
+    "                    '        1. Deeper', '            100. Deepest'])",
+    "for columns in range(10, 60):",
+    "    for row in agent_markdown.render(source, columns, None):",
+    "        assert display_width(strip_ansi(row)) <= columns, (columns, row)",
+    "print('returned')",
+])
+
+
+def test_a_deeply_nested_list_in_a_narrow_box_returns_instead_of_hanging():
+    """A four-deep ordered list indents eighteen columns, and the long-word
+    branch looped against `columns - prefix_width` -- negative on any window
+    narrower than that prefix, so an empty remainder was still "too wide",
+    the row list grew without bound and the process died. It renders on the
+    relay's DAEMON thread while a reply streams, where Ctrl-C does not land,
+    so it was a hang with no way out of it. Widths ten to fifty-nine, every
+    one of which has to come back and to fit."""
+    assert "returned" in _returns_within(_NESTED_LIST)
+
+
+_WIDE_PREFIX = "\n".join([
+    "import sys",
+    "sys.path.insert(0, sys.argv[1])",
+    "import agent_markdown",
+    "from agent_ui import display_width",
+    "spans = agent_markdown._spans('Deepest')",
+    "for columns in range(1, 40):",
+    "    indent = ' ' * 18 + '100. '",
+    "    for line in agent_markdown._wrap_spans(spans, columns, indent, indent):",
+    "        row = ''.join(text for text, styles in line)",
+    "        assert display_width(row) <= columns, (columns, row)",
+    "print('returned')",
+])
+
+
+def test_a_prefix_wider_than_the_column_is_clamped_rather_than_looped_on():
+    """The same defect at the seam rather than through `render`, because the
+    guarantee belongs to `_wrap_spans` and not to the one caller that happened
+    to reach it. A prefix at least as wide as the row leaves nothing to wrap
+    into; it is cut back so a column of room is always left."""
+    assert "returned" in _returns_within(_WIDE_PREFIX)
+
+
+# --- the guards the fixes rest on, pinned separately ------------------------
+#
+# Each of the four below was found by an independent reviewer mutating the
+# shipped code and watching the suite stay green. A fix nothing fails without
+# is a fix the next "simplification" removes.
+
+def test_nothing_but_the_prose_is_drawn_above_a_table():
+    """The count, not just the content.
+
+    The test above asserts that the sentence survives and that the row
+    carrying it has no pipe in it. Both stay true if the old backward-looking
+    branch comes back and leaves a WRAPPED HEADER row above the table -- that
+    row contains neither "A sentence" nor a full separator, so it slips past
+    both. What cannot slip past is the number of rows: one sentence, one
+    header, one rule, one body row, at every width where the sentence fits on
+    a line of its own.
+    """
+    for span in range(3, 11):
+        source = _table_source(span)
+        for stream in (Console(), Console(encoding="cp1252", tty=False)):
+            for columns in (120, 100, 80, 60, 40, 30, 20, 14):
+                rows = visible(M.render(source, columns, stream))
+                assert len(rows) == 4, (span, columns, rows)
+                assert "A sentence." in rows[0], (span, columns, rows)
+                # And the rule is where a rule belongs, under the header,
+                # rather than two rows down with raw markdown in between.
+                # The elision marker is part of a rule that had to be cut,
+                # and it is "..." on a console that cannot carry the ellipsis.
+                rule = rows[2].strip()
+                assert rule and set(rule) <= set("-+.\u2500\u253c\u2026"), (
+                    span, columns, rows)
+
+
+def test_a_table_gives_up_the_middle_of_its_cells_before_its_columns():
+    """`_table` promises a table "loses the middle of its widest cells rather
+    than its right-hand columns", and the shrink floor is what keeps that
+    promise: it stopped at four columns per cell, so a narrow window dropped
+    HALF the columns of an eight-column table instead of narrowing all of
+    them. The row fits either way -- the assembled row is clipped as a last
+    resort -- so nothing about the width catches this, and it survived a
+    mutation run until it was asked for by name.
+    """
+    source = _table_source(8)
+    header = visible(M.render(source, 30))[1]
+    # Eight columns is seven separators. A floor of four columns per cell
+    # reaches four of them; the row is the same width either way.
+    assert header.count("|") >= 6, header
+    assert display_width(header) <= 30, header
+
+
+def test_no_drawn_row_ends_in_the_space_that_broke_it():
+    """The wrap strips trailing whitespace where it breaks a row and did not
+    strip it at the end of the last one, so a sentence ending in a space drew
+    a row a column wider than the text in it. One column, on the surface the
+    interface has the least room to spare on."""
+    assert visible(M.render_message("a ", 40)) == ["a"]
+    for columns in range(12, 60):
+        for text in ("a ", "one two three ", "word " * 9, "  padded  "):
+            for row in visible(M.render_message(text, columns)):
+                assert row == row.rstrip(), (columns, repr(text), repr(row))
+                assert display_width(row) <= columns, (columns, repr(row))
