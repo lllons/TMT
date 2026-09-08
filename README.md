@@ -85,6 +85,12 @@ will not start, are in [Install](docs/install.md) and
   than rewrites, Python is syntax-checked before it is written, and a path that
   resolves outside the project directory is refused. →
   [Files and apps](docs/files.md)
+- **Reads documents that are not text.** `read_document` converts a PDF, Word,
+  PowerPoint, Excel, OpenDocument, EPUB, HTML, CSV, JSON, XML, RTF or ZIP into
+  Markdown — with the standard library alone, and through
+  [markitdown](https://github.com/microsoft/markitdown) when it is installed. A scanned
+  PDF says it is scanned rather than coming back empty. →
+  [Documents](docs/documents.md)
 - **Finds its way around a repository without reading all of it.** `tree`, `glob`,
   `grep`, `find_symbol`, `code_map`, `replace_across` (which previews by default),
   `related_tests`, and notes about a project that outlive the session. Structural
@@ -216,6 +222,7 @@ the page that explains it.
 | `create_folder` | Create a folder |
 | `delete_folder` | Delete a folder — recursive is opt-in, and it asks |
 | `view_image` | Look at a PNG, JPEG, GIF or WEBP — [Images](docs/images.md) |
+| `read_document` | Read a PDF, Office, OpenDocument, EPUB, HTML, CSV, JSON, XML, RTF or ZIP file — [Documents](docs/documents.md) |
 
 **Finding your way around a repository** — [Understanding a repository](docs/repository-tools.md)
 

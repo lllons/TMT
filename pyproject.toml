@@ -17,6 +17,12 @@ dependencies = []
 
 [project.optional-dependencies]
 live = ["requests", "rich"]
+# read_document converts PDF, Office, OpenDocument, EPUB, HTML and the rest
+# with the standard library alone. markitdown is better at it, so it is used
+# when it is present and TMT works exactly as well without it -- the same
+# bargain requests and rich already have. The result line names which of the
+# two actually did the conversion.
+documents = ["markitdown"]
 
 [project.urls]
 Homepage = "https://github.com/lllons/TMT"
@@ -42,6 +48,7 @@ py-modules = [
     "agent_context",
     "agent_credentials",
     "agent_delegation",
+    "agent_documents",
     "agent_execution",
     "agent_file_ops",
     "agent_git",

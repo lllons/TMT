@@ -99,6 +99,9 @@ WORKER_TREE_LIMIT = 800
 NOTE_VERBS = (
     "list_files", "read_file", "read_lines", "grep", "glob",
     "find_symbol", "tree", "code_map", "related_tests", "recall",
+    # Reading a PDF, a spreadsheet or a deck. On the list for `read_file`'s
+    # reason: one path through the same sandbox, answered with text.
+    "read_document",
     "git_status", "git_diff", "git_identity",
     # `send_message` is on the list because the dispatcher's whitelist has it,
     # and the two must agree or the prompt offers something the loop refuses.
@@ -122,6 +125,9 @@ NOTE_VERBS = (
 REVIEW_VERBS = (
     "list_files", "read_file", "read_lines", "grep", "glob",
     "find_symbol", "tree", "code_map", "related_tests", "recall",
+    # Reading a PDF, a spreadsheet or a deck. On the list for `read_file`'s
+    # reason: one path through the same sandbox, answered with text.
+    "read_document",
     "git_status", "git_diff", "git_identity",
     "send_message", "internal_response",
     # For NOTE_VERBS' reason: the reviewer may read several files in one

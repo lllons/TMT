@@ -99,6 +99,12 @@ MULTI_ACTION = "multi_tool"
 NOTE_ACTIONS = frozenset({
     "list_files", "read_file", "read_lines", "grep", "glob",
     "find_symbol", "tree", "code_map", "related_tests", "recall",
+    # Reading a document that is not text. On the list for `read_file`'s
+    # reason and with `read_file`'s guarantees: it opens one path through the
+    # same sandbox, writes nothing, runs nothing and answers with text. A
+    # question about a workspace whose specification is a PDF is a question
+    # the note agent could not answer without it.
+    "read_document",
     "git_status", "git_diff", "git_identity",
     "send_message", "internal_response",
     # Several calls in one action. Still read-only by construction, because
@@ -596,7 +602,7 @@ def _result_message(action, result):
 # in a result string does not change what a delegation's report should say it
 # inspected.
 _READING_ACTIONS = frozenset({"read_file", "read_lines", "code_map",
-                              "related_tests", "view_image"})
+                              "related_tests", "view_image", "read_document"})
 
 
 def _record_reads(manager, record, action, obj):

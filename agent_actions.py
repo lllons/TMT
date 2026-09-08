@@ -1706,6 +1706,15 @@ def execute_action(obj, context=None):
         return _run_tool("agent_web", lambda m: m.fetch(
             obj["url"], timeout=obj.get("timeout")))
     if action == "view_image": return _view_image(context, obj)
+    if action == "read_document":
+        # Through `_run_tool` like every other reading verb, which is what
+        # turns `agent_documents.DocumentError` -- a ValueError -- into
+        # "Refused: ..." with the reason in it. Every refusal that module
+        # raises is written to be read by the model, so a scanned PDF, an
+        # encrypted one and a format TMT has no converter for each say what
+        # would work instead.
+        return _run_tool("agent_documents", lambda m: m.read_document(
+            obj["path"], pages=obj.get("pages")))
     if action == "replace_across":
         # Preview unless the model explicitly asks to apply. A bulk edit it
         # did not look at first is how a repository gets wrecked, so the
@@ -2108,10 +2117,10 @@ ACTION_LABELS = {action: action.replace("_", " ").title() for action in (
     # with no entry shows the reader a raw verb in a column where every
     # neighbouring row is a phrase.
     "web_search", "web_fetch",
-    # "View Image". Registered here for the reason the two above it are: an
-    # action with no entry shows the reader a raw verb in a column where every
-    # neighbouring row is a phrase.
-    "view_image",
+    # "View Image" and "Read Document". Registered here for the reason the two
+    # above them are: an action with no entry shows the reader a raw verb in a
+    # column where every neighbouring row is a phrase.
+    "view_image", "read_document",
     # "Multi Tool". The row a multi_tool draws is built by `_multi_event`
     # from the calls that ran, and this label heads it.
     "multi_tool",
@@ -2184,6 +2193,11 @@ _EVENT_KIND_FOR_ACTION = {
     # from reading a source file, and a kind of its own would promise the
     # reader a distinction the row cannot make.
     "view_image": "file_read",
+    # Reading a file, and the row names the path exactly as the other reads
+    # do. That what came back was converted rather than read verbatim is a
+    # fact about the RESULT, which the result's own first line states; the
+    # transcript row is about which file was opened.
+    "read_document": "file_read",
     # Both searches read the workspace and change nothing in it, so they take
     # the kind every other reading verb takes. `glob` reads names rather than
     # contents, which is a difference in what is read and not in what happens.
