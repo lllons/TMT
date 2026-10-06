@@ -414,6 +414,159 @@ def test_a_footer_that_fails_is_not_drawn_and_does_not_end_the_turn():
     assert painted[-1] == "### 42%", painted
 
 
+class Window:
+    """A terminal of a fixed size, put back on close().
+
+    `_compose` measures the window on every call, so a test asserting what a
+    24-row terminal does would otherwise be asserting what the window the
+    suite happens to run in does.
+    """
+
+    def __init__(self, columns=80, rows=24):
+        import shutil as _shutil
+        import agent_live_renderer as renderer
+        self.renderer = renderer
+        self.previous = renderer.shutil.get_terminal_size
+        renderer.shutil.get_terminal_size = (
+            lambda default=None: _shutil.os.terminal_size((columns, rows)))
+
+    def close(self):
+        self.renderer.shutil.get_terminal_size = self.previous
+
+
+def panel_like(asked=None, column=30):
+    """A panel hook shaped exactly like `agent_panel.PanelState.frame`.
+
+    The contract being pinned is the two rows that function keeps back from
+    the height it is handed -- the status row under the region and the spare
+    row a region never draws on -- and the fact that it fills everything
+    else. This module has to take its own tail off that height before asking,
+    because whatever it draws below the panel is drawn below a column that
+    has already been told it may have the rest of the window.
+
+    Written here rather than imported so this stays a unit test of the seam.
+    `agent_panel`'s own tests drive the real column.
+    """
+    def frame(columns, rows=None):
+        height = max(1, int(rows if rows else 24) - 2)
+        if asked is not None:
+            asked.append(height)
+        body = ["|panel %d" % index for index in range(height)]
+        left = max(0, int(columns) - 1 - column)
+
+        def join(left_rows):
+            rows_out = []
+            for index in range(max(len(left_rows), len(body))):
+                cell = left_rows[index] if index < len(left_rows) else ""
+                side = body[index] if index < len(body) else ""
+                # Padded by what the row SHOWS: the reply box's edges are two
+                # columns wide each, so len() would leave the column ragged.
+                rows_out.append(cell + " " * max(0, left - display_width(cell))
+                                + side)
+            return rows_out
+
+        return (left, join)
+    return frame
+
+
+def test_the_region_never_grows_past_the_window_however_many_agents_report():
+    """The panel was budgeted against the WHOLE window while the per-agent
+    bars were appended underneath it, so the composed region was taller than
+    the terminal the moment anything was delegated: measured on 80x24 with the
+    panel open, six agents composed 24 rows, seven 27 and eight 30.
+
+    Past the foot the terminal scrolls, the next cursor-up clamps at the top
+    of the viewport, and every repaint from then on writes over the
+    scrollback the session is recorded in -- twelve times a second while the
+    workers emit activity. `room` bounded only the reply inside the left
+    column and never the panel, so the invariant this module states for
+    itself -- a short window gives rows up out of the REPLY rather than
+    growing past the foot -- was not enforced at all."""
+    for agents in range(1, 11):
+        bars = ["███░░░░░ #%d  4k out  47s  running" % number
+                for number in range(1, agents + 1)]
+        for rows in range(10, 41):
+            window = Window(80, rows)
+            try:
+                relay = LiveRelay(stream=io.StringIO(), ansi=True,
+                                  footer=lambda size=None: ["  > the box"],
+                                  panel=panel_like(),
+                                  agent_rows=lambda columns, b=bars: list(b))
+                relay.streamed = True
+                painted = relay._compose("### 42% Patching",
+                                         "a reply that wraps. " * 40)
+                assert len(painted) <= rows - 1, (agents, rows, len(painted))
+                for row in painted:
+                    assert visible_width(row) <= 79, (rows, visible_width(row))
+            finally:
+                window.close()
+
+
+def test_the_panel_is_asked_for_a_column_that_leaves_room_for_the_bars():
+    """The fix at its cause. The panel keeps two rows back from the height it
+    is given, so it is told about exactly one row underneath it -- and every
+    row beyond that one has to come off the height before it is asked, or the
+    column fills the window and the bars are drawn past the bottom of it.
+
+    A region with nothing under the panel but the status row must ask for
+    what it always asked for: two frames of an untouched region being
+    identical is what lets the repaint be skipped, which is half the cursor
+    fix."""
+    window = Window(80, 24)
+    try:
+        for agents in (0, 1, 5):
+            asked = []
+            bars = ["bar #%d" % number for number in range(agents)]
+            relay = LiveRelay(stream=io.StringIO(), ansi=True,
+                              footer=lambda size=None: ["  > the box"],
+                              panel=panel_like(asked),
+                              agent_rows=lambda columns, b=bars: list(b))
+            relay.streamed = True
+            relay._compose("### 42%", "a reply")
+            # 24 rows, less the spare row, less the status row and each bar.
+            assert asked == [24 - 2 - agents], (agents, asked)
+        # And with no status row and no bars there is nothing under it at all,
+        # so the panel keeps the row it always reserved for the status line
+        # rather than being handed one more.
+        asked = []
+        relay = LiveRelay(stream=io.StringIO(), ansi=True,
+                          panel=panel_like(asked))
+        relay.streamed = True
+        relay._compose("", "a reply")
+        assert asked == [22], asked
+    finally:
+        window.close()
+
+
+def test_a_fleet_larger_than_the_window_gives_up_bars_not_rows_off_the_screen():
+    """Reachable with no panel at all: ten workers need seventeen rows of
+    tail on a fourteen-row terminal, and the reply cannot shrink below one
+    line to pay for them. Something has to be given up, and it is the bars --
+    they are the last rows drawn and subordinate to the status row above
+    them, while the box and the status row are what the user is actually
+    using."""
+    window = Window(80, 14)
+    try:
+        footer = [" ---", " > Working. Ctrl-C to stop.", " ---"]
+        bars = ["bar #%d" % number for number in range(1, 11)]
+        relay = LiveRelay(stream=io.StringIO(), ansi=True,
+                          footer=lambda: list(footer),
+                          agent_rows=lambda columns: list(bars))
+        relay.streamed = True
+        painted = relay._compose("### 42%", "a reply that wraps. " * 40)
+        assert len(painted) <= 13, (len(painted), painted)
+        # The box and the instrument measuring the turn survive; the bars are
+        # what was given up, and the ones that are left are the first of them
+        # rather than an arbitrary slice.
+        assert footer[1] in painted, painted
+        assert "### 42%" in painted, painted
+        drawn = [row for row in painted if row.startswith("bar #")]
+        assert drawn == bars[:len(drawn)], drawn
+        assert drawn, "every bar was given up before the reply had shrunk"
+    finally:
+        window.close()
+
+
 def test_the_reply_gives_up_rows_so_the_whole_region_stays_on_screen():
     """A region taller than the terminal scrolls away from the cursor moves
     that repaint it, which walks the frame down the screen. The reply is what

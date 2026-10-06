@@ -808,6 +808,28 @@ REQUIRED_KEYS = {
     # which is the split `web_search` already has and for the same reason:
     # neither of those two jobs is looking at pictures.
     "view_image": ["path"],
+    # Reading a document that is not text: PDF, Word, PowerPoint, Excel,
+    # OpenDocument, EPUB, HTML, CSV, JSON, XML, RTF and ZIP, converted to
+    # Markdown. `read_file` is a UTF-8 read, so every one of those was a file
+    # TMT could not open -- which is wrong about a specification, a datasheet
+    # or an exported report, and those are frequently what the task is about.
+    #
+    # `path` is the only required key. `pages` is optional and means something
+    # for a PDF and for slides alone; on anything else it is REFUSED rather
+    # than ignored, because a key that is quietly dropped is a request the
+    # model believes was honoured.
+    #
+    # NOT in MUTATING_ACTIONS: it reads one file and changes nothing, exactly
+    # as `read_file` and `view_image` leave a passed review standing.
+    #
+    # Dispatched in agent_actions, and unlike `view_image` it is available to
+    # EVERY agent -- the main one, a worker, the note agent and the reviewer.
+    # It is a read of one workspace file that answers with text, which is what
+    # all four already do with `read_file`; what holds the other two out of
+    # `view_image` is that an image is not text and changes the shape of the
+    # request, and out of `web_search` that it reaches the network. Neither
+    # applies here, so it is taught in ACTION_REFERENCE with the other reads.
+    "read_document": ["path"],
     # A question with numbered options, answered by one keystroke, whose
     # result goes back to the model like any other action's -- so the turn
     # carries straight on with the answer instead of ending to ask for it.

@@ -241,6 +241,21 @@ def delete_file(path, confirm=None):
         p.unlink()
         return f"Deleted file: {path}"
 
+def _unreadable_document(head, path):
+    """The words for a document this cannot read, or "" for anything else.
+
+    Guarded and lazy for `_run_tool`'s reason: an editable install freezes its
+    module list, so `agent_documents` can be absent from a `tmtcode` that has
+    the source for it -- and a missing module must cost a better error
+    message, never the read itself.
+    """
+    try:
+        import agent_documents
+        return agent_documents.unreadable_as_text(head, str(path))
+    except Exception:
+        return ""
+
+
 def read_file(path):
     """The whole of a text file, or a sentence saying why it is not text.
 
@@ -274,10 +289,21 @@ def read_file(path):
         return (f"{path} is a {media.split('/')[-1].upper()} image, not text. "
                 f"Use view_image to look at it: "
                 f'{{"action":"view_image","path":"{path}"}}')
+    # And the same question again for a document. Asked before the NUL sniff
+    # for the reason the image question is: `sniff` reads a signature, which
+    # is a fact, and `_looks_binary` is a heuristic. It is asked SECOND
+    # because an image is the commoner case and because `agent_documents`
+    # answers "" for an image rather than claiming it.
+    document = _unreadable_document(head, path)
+    if document:
+        return (f"{path} is {document}, not text. Use read_document to read "
+                f"it -- it converts the file to Markdown: "
+                f'{{"action":"read_document","path":"{path}"}}')
     if _looks_binary(head):
         return (f"{path} is a binary file, not text. read_file only reads "
-                f"text. If it is an image use view_image; otherwise there is "
-                f"nothing here to read.")
+                f"text. If it is an image use view_image, and if it is a "
+                f"document use read_document; otherwise there is nothing "
+                f"here to read.")
     return p.read_text(encoding="utf-8")
 
 def list_files():

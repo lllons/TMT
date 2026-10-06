@@ -162,6 +162,8 @@ read_file - keys: path. The whole file. Only for files not already pasted below.
   {"action":"read_file","path":"notes.txt"}
 read_lines - keys: path. Optional: start (default 1), end. A numbered line range; use it for large files.
   {"action":"read_lines","path":"src/app.py","start":1,"end":60}
+read_document - keys: path. Optional: pages ("3", "2-6" or "1,4,7-9", for a PDF or slides only). Converts a document that is NOT text into Markdown and returns it: PDF, Word, PowerPoint, Excel, OpenDocument, EPUB, HTML, CSV, JSON, XML, RTF and ZIP. read_file cannot open any of them and will tell you to come here.
+  {"action":"read_document","path":"docs/spec.pdf","pages":"1-4","progress":"Reading the first four pages of the specification."}
 list_files - keys: none. Every path in the workspace.
   {"action":"list_files"}
 copy_file - keys: path, to.
@@ -504,6 +506,7 @@ Every one of these answers a different question. Reading a whole file to find on
   This is worth knowing next time            -> remember
   Several tools at once, or one per file     -> multi_tool
   I know the file and I need the lines       -> read_lines
+  A PDF, spreadsheet or other document       -> read_document
 
 Rules:
 1. glob finds FILES BY NAME; grep finds TEXT INSIDE FILES. Do not grep to discover a filename and do not glob to search code. The order that works: glob for the candidate files, grep for the lines, read_lines for the region, then edit, then test.

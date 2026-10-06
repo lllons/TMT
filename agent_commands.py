@@ -19,6 +19,7 @@ set, and never the value or any part of it.
 """
 
 import re
+import sys
 
 import agent_config
 import agent_models
@@ -541,7 +542,11 @@ def _agents(argument, session, manager=None):
         return Result("Agents are unavailable",
                       ["The panel module could not be loaded.", str(error)],
                       ok=False)
-    report = agent_panel.agents_report(manager)
+    # The console the report will be printed on, so a long task is cut with a
+    # marker that console can actually encode. The panel's own rows are told
+    # the same thing; without it this one readout drew a `?` where every other
+    # one degraded, which reads as a fault rather than as a narrow window.
+    report = agent_panel.agents_report(manager, stream=sys.stdout)
     return Result("Agents", [line for line in report.splitlines()])
 
 

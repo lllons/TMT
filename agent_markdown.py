@@ -269,10 +269,33 @@ def _wrap_spans(spans, columns, indent="", hanging=None):
     """
     columns = max(1, int(columns))
     hanging = indent if hanging is None else hanging
+    # A prefix at least as wide as the row leaves nothing to wrap INTO, and
+    # the long-word branch below then never finishes: `columns - prefix_width`
+    # is negative there, so an empty `rest` is still "too wide", `lines` grows
+    # without bound and the process dies. Not hypothetical -- a four-deep
+    # ordered list indents eighteen columns, and this hung on any window
+    # narrower than that. It runs on the relay's DAEMON thread while a reply
+    # streams, where Ctrl-C does not land, so the hang had no way out.
+    # One column of room is the floor, here and in the loop below.
+    limit = max(0, columns - 1)
+    # `clip_to_width` always makes progress, so it gives a grapheme back even
+    # when asked for none. A one-column row therefore has to drop the prefix
+    # outright rather than clip it.
+    if display_width(indent) > limit:
+        indent = clip_to_width(indent, limit)[0] if limit else ""
+    if display_width(hanging) > limit:
+        hanging = clip_to_width(hanging, limit)[0] if limit else ""
     lines, current, used = [], [], 0
     prefix, prefix_width = indent, display_width(indent)
 
     def flush():
+        # Trailing spaces go rather than being drawn. They are the author's
+        # spacing at a break nobody chose, and a row ending in one is a column
+        # past the box spent on no text at all -- which the mid-loop break
+        # already knew and the final flush did not, so a sentence ending in a
+        # space overflowed by one.
+        while current and current[-1][0].isspace():
+            current.pop()
         if current:
             lines.append([(prefix, frozenset())] + list(current))
 
@@ -287,9 +310,6 @@ def _wrap_spans(spans, columns, indent="", hanging=None):
                 continue
             width = display_width(word)
             if used and prefix_width + used + width > columns:
-                while current and current[-1][0].isspace():
-                    current.pop()
-                    used -= 1
                 flush()
                 current, used = [], 0
                 prefix, prefix_width = hanging, display_width(hanging)
@@ -297,10 +317,12 @@ def _wrap_spans(spans, columns, indent="", hanging=None):
                 # One word wider than a whole row. Cut it, because moving it
                 # cannot help -- the same answer `wrap_words` gives.
                 rest = word
-                while display_width(rest) > columns - prefix_width:
-                    head, rest = clip_to_width(rest, max(1, columns - prefix_width))
+                room = max(1, columns - prefix_width)
+                while display_width(rest) > room:
+                    head, rest = clip_to_width(rest, room)
                     lines.append([(prefix, frozenset()), (head, styles)])
                     prefix, prefix_width = hanging, display_width(hanging)
+                    room = max(1, columns - prefix_width)
                 if rest:
                     current.append((rest, styles))
                     used = display_width(rest)
@@ -309,6 +331,52 @@ def _wrap_spans(spans, columns, indent="", hanging=None):
             used += width
     flush()
     return lines or [[(indent, frozenset())]]
+
+
+def _rstrip_spans(spans):
+    """A row of spans with its trailing spaces dropped."""
+    out = list(spans)
+    while out:
+        text = out[-1][0].rstrip()
+        if text:
+            out[-1] = (text, out[-1][1])
+            break
+        out.pop()
+    return out
+
+
+def _fit_spans(spans, columns, marker):
+    """A row of spans cut to `columns`, with the cut marked.
+
+    The last line of defence for a table. The shrink in `_table` can reach one
+    column a cell and go no further, so a table with enough columns in it is
+    still wider than the box whatever the cells give up -- and a row past the
+    last column soft-wraps, which costs `LiveRegion` a screen line it never
+    counted and corrupts every repaint after it. Cutting a row is a visible
+    loss; overflowing one silently breaks the box it was drawn in.
+
+    Measured in the span domain rather than on the painted string, which is
+    the module's own rule: clipping a styled row counts escapes as columns.
+    """
+    if sum(display_width(text) for text, _styles in spans) <= columns:
+        return spans
+    room = max(0, columns - display_width(marker))
+    out, used = [], 0
+    for text, styles in spans:
+        width = display_width(text)
+        if used + width <= room:
+            out.append((text, styles))
+            used += width
+            continue
+        if room - used > 0:
+            head, _rest = clip_to_width(text, room - used)
+            # `clip_to_width` always makes progress, so a wide character comes
+            # back one column past what was asked for rather than not at all.
+            # Taking it is the overflow this function exists to stop.
+            if head and display_width(head) <= room - used:
+                out.append((head, styles))
+        break
+    return out + [(marker, frozenset())]
 
 
 def _table(rows, columns, stream):
@@ -329,31 +397,54 @@ def _table(rows, columns, stream):
     widths = [max(display_width(plain(_spans(row[index]))) for row in [header] + body)
               for index in range(span)]
     gap = 3                                    # " | " between columns
-    while sum(widths) + gap * (span - 1) > columns and max(widths) > 4:
+    # Down to ONE column a cell, not four. The floor used to be four, and an
+    # eight-column table was therefore fifty-four columns wide at every width
+    # it was ever drawn at -- it overflowed a forty-column window by fourteen
+    # columns and said nothing about it. A one-column cell says almost
+    # nothing; a row wider than the box breaks the box.
+    while sum(widths) + gap * (span - 1) > columns and max(widths) > 1:
         widest = widths.index(max(widths))
         widths[widest] -= 1
     marker = _mark("ellipsis", stream)
     rule = _mark("rule", stream)
 
     def draw(row, strong):
-        pieces = []
+        # Built as spans and painted last, so the row can be measured and cut
+        # by `_fit_spans` without counting escapes as columns.
+        out = [(" ", frozenset())]
         for index, cell in enumerate(row):
+            if index:
+                # Its own span, and deliberately unstyled: rolled into a bold
+                # header run the separators would be lit as well.
+                out.append((" | ", frozenset()))
             spans = _spans(cell)
             if strong:
                 spans = [(text, styles | {STRONG}) for text, styles in spans]
             text = plain(spans)
             if display_width(text) > widths[index]:
-                head, _rest = clip_to_width(text, max(1, widths[index]
-                                                      - display_width(marker)))
-                spans = [(head + marker, spans[0][1] if spans else frozenset())]
+                room = widths[index] - display_width(marker)
+                if room >= 1:
+                    head, _rest = clip_to_width(text, room)
+                    spans = [(head + marker, spans[0][1] if spans else frozenset())]
+                else:
+                    # No room for a character AND the mark. The character
+                    # wins: an ellipsis that pushed the cell past its own
+                    # width would put the whole row past the box, which is
+                    # the failure the width was computed to avoid.
+                    head, _rest = clip_to_width(text, max(1, widths[index]))
+                    spans = [(head, spans[0][1] if spans else frozenset())]
                 text = plain(spans)
-            pad = " " * max(0, widths[index] - display_width(text))
-            pieces.append(_paint(spans, stream) + pad)
-        return " " + " | ".join(pieces).rstrip()
+            out.extend(spans)
+            out.append((" " * max(0, widths[index] - display_width(text)),
+                        frozenset()))
+        return _paint(_fit_spans(_rstrip_spans(out), columns, marker), stream)
 
+    ruled = " " + (rule + "+" + rule).join(rule * width for width in widths)
     out = [draw(header, True),
-           " " + "-+-".join(rule * width for width in widths).replace("-+-",
-                                                                     rule + "+" + rule)]
+           # Fitted like every other row: with one-column cells the rule is
+           # exactly as wide as the widest row, so if that one had to be cut
+           # this one does too, or the table draws a line past its own text.
+           _paint(_fit_spans([(ruled, frozenset())], columns, marker), stream)]
     out.extend(draw(row, False) for row in body)
     return out
 
@@ -406,14 +497,13 @@ def render(text, columns=80, stream=None):
             index += 1
             continue
 
-        if _TABLE_SEP.match(line) and index and "|" in lines[index - 1]:
-            block, start = [lines[index - 1], line], index + 1
+        if _table_starts_at(lines, index):
+            block, start = [line, lines[index + 1]], index + 2
             while start < len(lines) and "|" in lines[start]:
                 block.append(lines[start])
                 start += 1
             drawn = _table(block, columns - 1, stream)
             if drawn is not None:
-                rows.pop()                   # the header, drawn as a paragraph
                 rows.extend(drawn)
                 index = start
                 continue
@@ -444,6 +534,14 @@ def render(text, columns=80, stream=None):
                 body = ordered.group(4)
             depth = " " * min(MAX_INDENT, len(pad))
             indent = depth + " " + marker
+            # On a narrow window the INDENTATION gives way, never the marker.
+            # A row that keeps "100. " still says what it is; one that kept
+            # eight columns of indent and lost the number says nothing at all.
+            # `_wrap_spans` clamps again for callers that do not do this --
+            # a prefix as wide as the row is what used to hang it.
+            while depth and display_width(indent) >= columns:
+                depth = depth[:-1]
+                indent = depth + " " + marker
             hanging = " " * display_width(indent)
             for wrapped in _wrap_spans(_spans(body), columns, indent, hanging):
                 rows.append(_paint(wrapped, stream))
@@ -462,7 +560,8 @@ def render(text, columns=80, stream=None):
         paragraph = [line]
         index += 1
         while (index < len(lines) and lines[index].strip()
-               and not _is_block(lines[index]) and not _SETEXT.match(lines[index])):
+               and not _is_block(lines[index]) and not _SETEXT.match(lines[index])
+               and not _table_starts_at(lines, index)):
             paragraph.append(lines[index])
             index += 1
         spans = _spans(" ".join(part.strip() for part in paragraph))
@@ -499,6 +598,23 @@ def _heading(rows, spans, level, columns, stream):
     if level == 1:
         rows.append(_dim_row(" " + _mark("rule", stream) * max(1, columns - 2),
                              stream))
+
+
+def _table_starts_at(lines, index):
+    """Whether `lines[index]` is the header row of a pipe table.
+
+    Looking FORWARD is what stops a table eating the sentence above it. The
+    branch used to fire on the SEPARATOR row and then `rows.pop()` the header
+    it assumed had been drawn as a paragraph one row back -- a guessed number
+    of rows, and wrong two ways. A header with no blank line above it is one
+    paragraph with the sentence before it, so the pop ate the model's own
+    words; and a header too wide for the box wrapped to more rows than the pop
+    accounted for, leaving raw pipes on screen above the drawn table.
+    Recognising the header before it is ever drawn removes the guess rather
+    than correcting it.
+    """
+    return (index + 1 < len(lines) and "|" in lines[index]
+            and bool(_TABLE_SEP.match(lines[index + 1])))
 
 
 def _is_block(line):

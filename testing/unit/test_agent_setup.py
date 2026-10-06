@@ -20,6 +20,23 @@ class FakeTTY(io.StringIO):
         return True
 
 
+class StrictTTY(FakeTTY):
+    """A stream that refuses what it cannot encode, the way a real console does.
+
+    io.StringIO accepts any character whatever its `encoding` attribute claims,
+    so a test written against a plain FakeTTY cannot see an encoding failure at
+    all: the crash happens where the bytes are actually produced. That is why
+    `test_terminals_without_unicode_get_a_plain_screen` was green while setup
+    was dying on an ascii console.
+    """
+
+    encoding = "ascii"
+
+    def write(self, text):
+        text.encode(self.encoding)
+        return super().write(text)
+
+
 def temp_key_file():
     """Point the saved-key path at a throwaway file for the duration of a test."""
     directory = tempfile.mkdtemp(prefix="tmt-key-")
@@ -179,6 +196,59 @@ def test_terminals_without_unicode_get_a_plain_screen():
     text.encode("cp1252")                  # would raise if a symbol slipped through
     assert "|_    _|" in text
     assert "100% Key saved!" in text
+
+
+def test_a_console_that_cannot_encode_the_screen_still_gets_the_key_prompt():
+    """Setup must not raise on an ascii console.
+
+    Three of its sentences carried a hard-coded em dash that no plain branch
+    replaced, written through a raw stream.write rather than safe_write, so
+    run_setup died with UnicodeEncodeError inside the welcome box -- before the
+    key prompt was ever drawn. Nothing catches it: ensure_api_key has no try,
+    TMT.main calls it bare and the entry point is sys.exit(main()), so the user
+    got a traceback with no way to enter a key and no way past it.
+    """
+    output = StrictTTY()
+    key = run_setup(stream=output, ask=lambda prompt: "sk-or-v1-abcdefghijkl", animate=False)
+    assert key == "sk-or-v1-abcdefghijkl"
+    text = output.getvalue()
+    text.encode("ascii")                   # everything drawn is encodable by the stream
+    plain = strip_ansi(text)
+    assert "which is git-ignored - it never travels with a push." in plain
+    assert "?" not in plain                # the words degraded, not a replacement mark
+    assert "100% Key saved!" in plain
+
+
+def test_both_ways_setup_gives_up_are_readable_on_an_ascii_console():
+    """The other two em dashes are on paths the happy case never touches.
+
+    Cancelling and running out of tries each write their own sentence, so a fix
+    proved only against a successful run would leave both crashing -- and both
+    are the moment the user most needs to be told what happened.
+    """
+    def stop(prompt):
+        raise KeyboardInterrupt
+
+    cancelled = StrictTTY()
+    assert run_setup(stream=cancelled, ask=stop, animate=False) == ""
+    cancelled.getvalue().encode("ascii")
+    assert "Setup cancelled - no key saved." in strip_ansi(cancelled.getvalue())
+
+    exhausted = StrictTTY()
+    assert run_setup(stream=exhausted, ask=lambda prompt: "", animate=False) == ""
+    exhausted.getvalue().encode("ascii")
+    assert "tries - stopping here." in strip_ansi(exhausted.getvalue())
+
+
+def test_a_terminal_that_can_carry_the_em_dash_still_gets_it():
+    """The ASCII form is a degradation, not the new wording everywhere.
+
+    Pins the decorated branch so a later edit cannot quietly flatten the
+    typography of the one screen a new user meets first.
+    """
+    output = FakeTTY()
+    run_setup(stream=output, ask=lambda prompt: "sk-or-v1-abcdefghijkl", animate=False)
+    assert "which is git-ignored — it never travels with a push." in strip_ansi(output.getvalue())
 
 
 def test_the_title_keeps_cycling_while_the_prompt_waits():

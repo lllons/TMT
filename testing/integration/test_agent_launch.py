@@ -666,26 +666,50 @@ def test_the_toggle_keeps_its_state_on_a_terminal_too_narrow_for_its_words():
         box.close()
 
 
+def _cp437():
+    """A console that can encode none of the decoration.
+
+    The ASCII fallback is the wider of the two forms for the footer's arrows,
+    so a width sweep that only ever asks a UTF-8 stream is asking the easier
+    question.
+    """
+    class Console(io.StringIO):
+        encoding = "cp437"
+
+        def isatty(self):
+            return True
+
+    return Console()
+
+
 def test_every_settings_row_fits_the_terminal_it_was_drawn_for():
     """Measured, never counted -- a row filled past the last column wraps and
     costs a screen line the repaint arithmetic does not know about.
 
-    The footer is excluded and that is not the toggle's doing: the hint row is
-    a fixed string of three hints and overflows a terminal under about 42
-    columns on every settings frame TMT has ever drawn, before and after this
-    setting existed. Asserting it here would be asserting a pre-existing bug
-    is correct; asserting the rest is what this feature can actually break.
+    THE FOOTER IS NOW INCLUDED, and that reverses what this docstring used to
+    say. It read "the hint row is a fixed string of three hints and overflows
+    a terminal under about 42 columns on every settings frame TMT has ever
+    drawn... asserting it here would be asserting a pre-existing bug is
+    correct". That was true, and it understated the defect twice over: the
+    ASCII fallback is WIDER than the unicode form -- `Up`/`Down` against
+    `↑`/`↓`, so 45 columns against 41 -- so a plain console wrapped this row at
+    widths where a UTF-8 one did not, and the main menu's two hints did not
+    escape it either. `_footer` takes a width now and drops whole hints from
+    the right rather than being cut, so the exclusion has nothing left to
+    protect and asserting the whole frame is what keeps it fixed.
     """
     box = Setting()
     try:
         for value in (True, False):
             agent_config.set_auto_update(value)
-            for columns in (30, 40, 50, 60, 80, 120, 200):
-                frame = agent_menu.render_settings_menu_frame(
-                    3, io.StringIO(), size=(columns, 30))
-                for row in frame[:-1]:
-                    width = agent_ui.display_width(visible(row))
-                    assert width <= columns - 1, (columns, width, visible(row))
+            for stream in (io.StringIO(), _cp437()):
+                for columns in (30, 40, 50, 60, 80, 120, 200):
+                    frame = agent_menu.render_settings_menu_frame(
+                        3, stream, size=(columns, 30))
+                    for row in frame:
+                        width = agent_ui.display_width(visible(row))
+                        assert width <= columns - 1, (
+                            columns, width, visible(row))
     finally:
         box.close()
 

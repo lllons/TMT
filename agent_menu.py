@@ -25,6 +25,7 @@ import threading
 import time
 
 import agent_config
+import agent_history
 import agent_models
 from agent_live_renderer import LiveRegion
 from agent_ui import (
@@ -335,6 +336,104 @@ def _fit_height(lines, rows, keep_tail=0):
         return lines
     tail = lines[len(lines) - keep_tail:] if keep_tail else []
     return lines[:max(0, limit - len(tail))] + tail
+
+
+# The least a menu frame's heading block is cut down to: a blank and the
+# heading itself. A screen with no title still says what it is doing on the
+# row the cursor is on; a screen with no cursor on it says nothing at all, so
+# the head gives its rows up first.
+_MENU_MIN_HEAD = 2
+
+
+def _menu_window(options, room, selected):
+    """The slice of `options` that fits in `room` rows and holds `selected`.
+
+    Returns (rows, how many are hidden above, how many below). Built around
+    the SELECTION rather than the top of the list, which is the whole point of
+    it: `_fit_height` drops from the end, so on a 16-row terminal the Settings
+    screen drew six of its eight rows and pressing Down onto Danger Zone moved
+    a marker that appeared nowhere in the frame -- and Enter then opened it
+    blind. The reviewbot agenda is windowed on the item in hand for the same
+    reason and this is the same rule for a list somebody is steering.
+    """
+    total = len(options)
+    if room >= total:
+        return list(options), 0, 0
+    if room <= 0:
+        return [], total, 0
+    start = max(0, min(max(0, selected - room // 2), total - room))
+    return list(options[start:start + room]), start, total - start - room
+
+
+def _hidden_row(above, below, stream, width):
+    """One dim row naming what the window is not showing, or no row at all.
+
+    It says which DIRECTION, because the only thing a reader can do about it
+    is press a key and there are two of them. Dropped whole rather than cut
+    when it will not fit: a row reading "2 abo" has said nothing and has taken
+    an option row's place to say it, and at that width the option is worth
+    more. It reads with every escape stripped -- the dim is confirmation, and
+    the words are the message.
+    """
+    parts = [text for text, count in (("%d above" % above, above),
+                                      ("%d below" % below, below)) if count]
+    if not parts:
+        return []
+    text = ", ".join(parts)
+    if display_width(text) + 3 > width:
+        return []
+    return [_dim("   " + text, stream)]
+
+
+def _fit_menu(head, options, tail, rows, selected, stream, width):
+    """A menu frame fitted to the window with the cursor kept on screen.
+
+    `_fit_height` truncates from the end, which is right for a frame that is
+    prose and wrong for one that has a selection in it -- the rows it drops
+    are the last options, so the `>` marker goes with them and the screen
+    stops saying what Enter would do.
+
+    What is given up, in order. The footer never is: it carries the way out.
+    Then the head, down to a blank and the heading, keeping its own last row
+    -- the rule -- as the boundary for as long as it has more than that, so
+    the options never run straight into the summary above them. Then the
+    options are windowed on the cursor, with one row spent saying what is off
+    the window.
+
+    A frame that already fits is returned untouched, so nothing about a
+    terminal of an ordinary height changes.
+    """
+    head, options, tail = list(head), list(options), list(tail)
+    limit = max(1, rows - 1)
+    if len(head) + len(options) + len(tail) <= limit:
+        return head + options + tail
+    # The footer is the last row of `tail`. Anything above it there -- the
+    # note belonging to the selected row, and the blank line -- gives way to
+    # the options, because those are what the cursor is actually on.
+    keep_tail = min(len(tail), max(1, limit - len(head) - len(options)))
+    kept_tail = tail[len(tail) - keep_tail:]
+    room = limit - len(kept_tail)
+    if room <= 0:
+        return kept_tail[-limit:]
+    keep_head = min(len(head), max(min(len(head), _MENU_MIN_HEAD),
+                                   room - len(options)))
+    kept_head = head[:keep_head]
+    if _MENU_MIN_HEAD < keep_head < len(head):
+        kept_head = kept_head[:-1] + head[-1:]
+    room -= len(kept_head)
+    if room <= 0:
+        return kept_head + kept_tail
+    shown, above, below = _menu_window(options, room, selected)
+    if not (above or below):
+        return kept_head + shown + kept_tail
+    # One row goes to saying what is off the window -- if it fits at this
+    # width. Where it does not, the row is given back to the list.
+    if room > 1:
+        narrowed, above, below = _menu_window(options, room - 1, selected)
+        note = _hidden_row(above, below, stream, width)
+        if note:
+            return kept_head + narrowed + note + kept_tail
+    return kept_head + shown + kept_tail
 
 
 def _credentials():
@@ -721,7 +820,22 @@ def render_banner(stream=None, phase=None, columns=None):
             for index, row in enumerate(rows)]
 
 
-def _field(name, value, stream, width, name_width=10):
+def _field(name, value, stream, width, name_width=10, middle=False):
+    """One `name  value` row of a summary block.
+
+    `middle` shortens the VALUE through its middle instead of cutting its
+    tail, and it is for the workspace. Trimming from the right threw away the
+    project directory -- the one fact the user is being asked to confirm
+    before pressing Start -- and left them looking at
+    `C:\\Users\\...\\repos\\acme-platform\\servi`, which names a machine and a
+    parent folder and nothing they were asked about. The session header at the
+    same width already keeps both ends this way; this is that treatment
+    arriving on the screen the decision is actually made on.
+    """
+    if middle:
+        room = max(1, width - 1 - display_width(pad_to_width(name, name_width)))
+        value = _shorten_middle(value, room,
+                                "..." if plain_output(stream) else "\u2026")
     line = " " + pad_to_width(name, name_width) + value
     line = fit_to_width(line, width)
     if not _supports_color(stream):
@@ -768,10 +882,46 @@ def _option_row(is_selected, label, detail, stream, phase, width, label_width,
     return line[:head_width] + _dim(line[head_width:], stream)
 
 
-def _footer(stream, hints):
+def _footer(stream, hints, width=None):
+    """The hints along the bottom of a menu frame, fitted to the window.
+
+    THIS WAS THE ONE ROW OF EVERY MENU FRAME THAT NEVER WENT THROUGH
+    `fit_to_width`, and the reason that mattered is the ASCII fallback rather
+    than the width: `_glyphs` answers the plain question with "Up" and "Down"
+    where the decorated one is a single arrow each, so the three-hint footer
+    is 41 columns decorated and 45 in the cp437 form. A plain console
+    therefore wrapped the last row of every menu screen at widths where the
+    decorated one fitted -- and a wrapped row is a screen line `LiveRegion`
+    has not counted, so every later repaint lands a row high and three arrow
+    presses leave three stray copies of the wordmark's top row up the screen.
+
+    Hints are given up from the RIGHT as room runs out, and the last resort is
+    the LAST hint on its own rather than the first: an arrow and Enter are
+    guessable, and the way out of a screen is the one thing a reader cannot
+    work out from the screen. Dropped whole rather than cut, because half a
+    hint tells nobody anything -- the ladder `render_uninstall_frame` and the
+    launch screen's subtitle already use.
+
+    `width=None` returns the row exactly as it always was, for a caller that
+    cannot measure one.
+    """
     glyph = _glyphs(stream)
-    text = "    ".join(hints).replace("{up}", glyph["up"]).replace("{down}", glyph["down"])
-    return _dim(" " + text, stream)
+
+    def row(chosen):
+        return ("    ".join(chosen).replace("{up}", glyph["up"])
+                .replace("{down}", glyph["down"]))
+
+    hints = tuple(hints)
+    if width is None:
+        return _dim(" " + row(hints), stream)
+    room = max(1, width - 1)
+    tiers = [row(hints[:count]) for count in range(len(hints), 0, -1)]
+    if len(hints) > 1:
+        tiers.append(row(hints[-1:]))
+    # Fitted after the ladder as well. A single hint wider than the window is
+    # the one case where moving something cannot help, and it is cut for the
+    # reason the word wrapper cuts an over-long word.
+    return _dim(" " + fit_to_width(_widest(tiers, room), room), stream)
 
 
 def _rule(stream, phase, width):
@@ -815,13 +965,16 @@ def render_startup_frame(selected=0, stream=None, model_id=None, workspace=None,
     if provider_id and not provider_has_key(provider_id):
         provider_text += "  (no key yet)"
 
-    body = [
+    head = [
         "",
         " " + _paint("TMT", stream, phase) + _dim("  %s  v%s" % (glyph["dot"], _version()), stream),
         "",
         _field("Provider", provider_text, stream, width),
         _field("Model", label, stream, width),
-        _field("Workspace", str(workspace), stream, width),
+        # Shortened through the middle rather than cut at the right. This is
+        # the directory the user is confirming before they press Start, and
+        # the project name is at the end of it.
+        _field("Workspace", str(workspace), stream, width, middle=True),
         _rule(stream, phase, width),
     ]
     if busy:
@@ -830,21 +983,19 @@ def render_startup_frame(selected=0, stream=None, model_id=None, workspace=None,
         # why, because a button that vanished without a word would read as a
         # fault rather than as a rule.
         for text in _wrap_words(BUSY_NOTE % busy, max(1, width - 1)):
-            body.append(_dim(fit_to_width(" " + text, width), stream))
-        body.append("")
-    body.extend(
+            head.append(_dim(fit_to_width(" " + text, width), stream))
+        head.append("")
+    options = [
         _option_row(index == selected, item[1], item[2], stream, phase, width,
                     label_width, live=(resuming and item[0] == "start"))
         for index, item in enumerate(items)
-    )
-    body.append("")
-    body.append(_footer(stream, ("{up}/{down} Navigate", "Enter Select")))
+    ]
+    tail = ["", _footer(stream, ("{up}/{down} Navigate", "Enter Select"), width)]
 
     banner = render_banner(stream, phase, columns)
-    lines = banner + body
-    if len(lines) > max(1, rows - 1):
-        lines = body          # the logo is the first thing given up for room
-    return _fit_height(lines, rows, keep_tail=1)
+    if len(banner) + len(head) + len(options) + len(tail) <= max(1, rows - 1):
+        head = banner + head  # the logo is the first thing given up for room
+    return _fit_menu(head, options, tail, rows, selected, stream, width)
 
 
 # ---------------------------------------------------------------------------
@@ -1617,45 +1768,90 @@ def _context_label(context):
     return "%dK ctx" % (context // 1000)
 
 
-def _model_at(index):
-    return agent_models.FREE_MODELS[index % len(agent_models.FREE_MODELS)]
+def _model_at(index, models=None):
+    """The model row the cursor is on, out of the list actually being drawn.
+
+    `models` defaults to the catalogue of the provider in force, which is what
+    `model_screen` acts on. It used to be `FREE_MODELS` unconditionally, on
+    both sides -- see `render_settings_frame`.
+    """
+    models = list(agent_models.catalogue()) if models is None else list(models)
+    if not models:
+        return None
+    return models[index % len(models)]
 
 
-def render_settings_frame(selected=0, active_id=None, stream=None, size=None, phase=None):
-    """The model chooser."""
+def render_settings_frame(selected=0, active_id=None, stream=None, size=None,
+                          phase=None, models=None):
+    """The model chooser.
+
+    `models` is the list to draw and defaults to the catalogue of the provider
+    in force. IT USED TO ITERATE `agent_models.FREE_MODELS` REGARDLESS, while
+    `model_screen` acted on `agent_models.catalogue()` -- so a user on OpenAI,
+    Anthropic or Gemini, reached by Settings -> AI Provider or by the
+    documented TMT_PROVIDER override, was shown five OpenRouter models their
+    provider does not offer, with the `>` on one of them, and Enter saved a
+    model the screen never drew for a provider that cannot run it. The screen
+    and the list it acts on are one list now, and `model_screen` passes it in
+    so the two cannot drift again.
+    """
     stream = sys.stdout if stream is None else stream
     columns, rows = _terminal(size)
     phase = gradient_phase() if phase is None else phase
     width = _content_width(columns)
     active_id = active_id or agent_models.current_model()
-    label_width = max(display_width(model["label"]) for model in agent_models.FREE_MODELS)
+    models = list(agent_models.catalogue()) if models is None else list(models)
 
-    lines = [
+    head = [
         "",
         " " + _paint("Settings", stream, phase),
         "",
-        _dim(" The model TMT sends every request to.", stream),
+        _dim(fit_to_width(" The model TMT sends every request to.", width), stream),
     ]
     if agent_models.is_overridden():
         # Saying nothing here would let a choice look as though it had taken
-        # effect while the environment quietly kept overriding it.
-        lines.append(_dim(" OPENROUTER_MODEL is set and forces the model. A choice made", stream))
-        lines.append(_dim(" here is saved, but applies only once that variable is unset.", stream))
-    lines.append(_rule(stream, phase, width))
-    for index, model in enumerate(agent_models.FREE_MODELS):
-        lines.append(_option_row(
+        # effect while the environment quietly kept overriding it. Wrapped on
+        # words rather than split by hand: the two hand-written halves were 61
+        # columns each and wrapped on any terminal narrower than that.
+        for text in _wrap_words(
+                "OPENROUTER_MODEL is set and forces the model. A choice made "
+                "here is saved, but applies only once that variable is unset.",
+                max(10, width - 1)):
+            head.append(_dim(fit_to_width(" " + text, width), stream))
+    head.append(_rule(stream, phase, width))
+
+    if not models:
+        # A provider whose adapter offers no list at all. Saying so beats an
+        # empty frame with a cursor in it, and beats falling back to another
+        # provider's catalogue, which is the defect this screen just lost.
+        for text in _wrap_words(
+                "This provider offers no model list TMT can read. The model it"
+                " uses is its own default until one is set another way.",
+                max(10, width - 1)):
+            head.append(fit_to_width(" " + text, width))
+        head.append("")
+        return _fit_height(head + [_footer(stream, ("Esc Back",), width)],
+                           rows, keep_tail=1)
+
+    label_width = max(display_width(model["label"]) for model in models)
+    options = [
+        _option_row(
             index == selected, model["label"],
             pad_to_width(_context_label(model["context"]), 8),
             stream, phase, width, label_width,
-            suffix="  (active)" if model["id"] == active_id else ""))
+            suffix="  (active)" if model["id"] == active_id else "")
+        for index, model in enumerate(models)
+    ]
     # The note and the full id belong to whichever row the cursor is on: they
     # are what the choice actually means, and they do not fit on every row.
-    chosen = _model_at(selected)
-    lines.append("")
-    lines.append(_dim(fit_to_width(" %s  %s" % (chosen["id"], chosen["note"]), width), stream))
-    lines.append("")
-    lines.append(_footer(stream, ("{up}/{down} Navigate", "Enter Save", "Esc Back")))
-    return _fit_height(lines, rows, keep_tail=1)
+    chosen = _model_at(selected, models)
+    tail = ["",
+            _dim(fit_to_width(" %s  %s" % (chosen["id"], chosen["note"]), width),
+                 stream),
+            "",
+            _footer(stream, ("{up}/{down} Navigate", "Enter Save", "Esc Back"),
+                    width)]
+    return _fit_menu(head, options, tail, rows, selected, stream, width)
 
 
 def render_provider_frame(selected=0, active_id=None, stream=None, size=None, phase=None):
@@ -1668,21 +1864,26 @@ def render_provider_frame(selected=0, active_id=None, stream=None, size=None, ph
     active_id = active_id or current_provider()
     label_width = max(display_width(provider_label(name)) for name in ids)
 
-    lines = [
+    head = [
         "",
         " " + _paint("AI Provider", stream, phase),
         "",
-        _dim(" The service TMT sends every request to.", stream),
+        _dim(fit_to_width(" The service TMT sends every request to.", width), stream),
     ]
     if _provider_overridden():
         # The same courtesy the model picker pays OPENROUTER_MODEL: a choice
-        # that cannot take effect must not look as though it has.
-        lines.append(_dim(" TMT_PROVIDER is set and forces the provider. A choice made", stream))
-        lines.append(_dim(" here is saved, but applies only once that variable is unset.", stream))
-    lines.append(_rule(stream, phase, width))
+        # that cannot take effect must not look as though it has. Wrapped on
+        # words, for the reason the model picker's is.
+        for text in _wrap_words(
+                "TMT_PROVIDER is set and forces the provider. A choice made "
+                "here is saved, but applies only once that variable is unset.",
+                max(10, width - 1)):
+            head.append(_dim(fit_to_width(" " + text, width), stream))
+    head.append(_rule(stream, phase, width))
+    options = []
     for index, name in enumerate(ids):
         state = "key set" if provider_has_key(name) else "no key"
-        lines.append(_option_row(
+        options.append(_option_row(
             index == selected, provider_label(name),
             pad_to_width(state, 8) + " " + provider_note(name),
             stream, phase, width, label_width,
@@ -1690,12 +1891,14 @@ def render_provider_frame(selected=0, active_id=None, stream=None, size=None, ph
     # The id and the state of the key belong to the row the cursor is on, the
     # way the model picker's note and full id do.
     chosen = ids[selected % len(ids)]
-    lines.append("")
-    lines.append(_dim(fit_to_width(" %s  %s  %s" % (chosen, _glyphs(stream)["dot"],
-                                                    provider_key_hint(chosen)), width), stream))
-    lines.append("")
-    lines.append(_footer(stream, ("{up}/{down} Navigate", "Enter Select", "Esc Back")))
-    return _fit_height(lines, rows, keep_tail=1)
+    tail = ["",
+            _dim(fit_to_width(" %s  %s  %s" % (chosen, _glyphs(stream)["dot"],
+                                               provider_key_hint(chosen)), width),
+                 stream),
+            "",
+            _footer(stream, ("{up}/{down} Navigate", "Enter Select", "Esc Back"),
+                    width)]
+    return _fit_menu(head, options, tail, rows, selected, stream, width)
 
 
 def render_key_frame(provider_id, typed=0, message="", stream=None, size=None,
@@ -1736,7 +1939,7 @@ def render_key_frame(provider_id, typed=0, message="", stream=None, size=None,
     lines.append("")
     hints = ("Enter Continue", "Esc Back") if done else (
         "Enter Save", "Backspace Delete", "Esc Back")
-    lines.append(_footer(stream, hints))
+    lines.append(_footer(stream, hints, width))
     return _fit_height(lines, rows, keep_tail=1)
 
 
@@ -1755,7 +1958,7 @@ def render_search_frame(selected=0, active_id=None, stream=None, size=None, phas
     module = _web()
     active_id = active_id or (module.active_backend() if module else "")
 
-    lines = [
+    head = [
         "",
         " " + _paint("Web Search", stream, phase),
         "",
@@ -1763,20 +1966,21 @@ def render_search_frame(selected=0, active_id=None, stream=None, size=None, phas
         _dim(fit_to_width(" is enough; search is off until one has one.", width), stream),
     ]
     if not ids:
-        lines.append(_rule(stream, phase, width))
+        head.append(_rule(stream, phase, width))
         for text in _wrap_words(
                 "Web search is unavailable on this installation: agent_web "
                 "could not be loaded.", max(10, width - 1)):
-            lines.append(fit_to_width(" " + text, width))
-        lines.append("")
-        lines.append(_footer(stream, ("Esc Back",)))
-        return _fit_height(lines, rows, keep_tail=1)
+            head.append(fit_to_width(" " + text, width))
+        head.append("")
+        head.append(_footer(stream, ("Esc Back",), width))
+        return _fit_height(head, rows, keep_tail=1)
 
     label_width = max(display_width(search_backend_label(name)) for name in ids)
-    lines.append(_rule(stream, phase, width))
+    head.append(_rule(stream, phase, width))
+    options = []
     for index, name in enumerate(ids):
         state = "key set" if search_backend_has_key(name) else "no key"
-        lines.append(_option_row(
+        options.append(_option_row(
             index == selected, search_backend_label(name),
             pad_to_width(state, 8) + " " + search_backend_note(name),
             stream, phase, width, label_width,
@@ -1785,14 +1989,16 @@ def render_search_frame(selected=0, active_id=None, stream=None, size=None, phas
     # rather than the screen because each backend has its own signup page, and
     # a screen that says "paste a key" without saying where one comes from has
     # asked for something the user has no way to obtain.
+    tail = []
     if 0 <= selected < len(ids):
         url = search_key_url(ids[selected])
         if url:
-            lines.append("")
-            lines.append(_dim(fit_to_width(" Get a key at %s" % url, width), stream))
-    lines.append("")
-    lines.append(_footer(stream, ("{up}/{down} Navigate", "Enter Select", "Esc Back")))
-    return _fit_height(lines, rows, keep_tail=1)
+            tail.append("")
+            tail.append(_dim(fit_to_width(" Get a key at %s" % url, width), stream))
+    tail.append("")
+    tail.append(_footer(stream, ("{up}/{down} Navigate", "Enter Select", "Esc Back"),
+                        width))
+    return _fit_menu(head, options, tail, rows, selected, stream, width)
 
 
 def render_search_key_frame(backend, typed=0, message="", stream=None, size=None,
@@ -1833,7 +2039,7 @@ def render_search_key_frame(backend, typed=0, message="", stream=None, size=None
     lines.append("")
     hints = ("Enter Continue", "Esc Back") if done else (
         "Enter Save", "Backspace Delete", "Esc Back")
-    lines.append(_footer(stream, hints))
+    lines.append(_footer(stream, hints, width))
     return _fit_height(lines, rows, keep_tail=1)
 
 
@@ -1958,7 +2164,7 @@ def render_settings_menu_frame(selected=0, stream=None, model_id=None, size=None
                name_width=_SETTINGS_FIELD_WIDTH),
         _rule(stream, phase, width),
     ]
-    lines.extend(
+    options = [
         # The toggle carries its state on its OWN row, in the slot the model
         # picker uses to mark the active model, and deliberately not in the
         # field block above. The three fields up there each summarise a screen
@@ -1969,10 +2175,10 @@ def render_settings_menu_frame(selected=0, stream=None, model_id=None, size=None
                     label_width,
                     suffix=_settings_suffix(item[0]))
         for index, item in enumerate(SETTINGS_ITEMS)
-    )
-    lines.append("")
-    lines.append(_footer(stream, ("{up}/{down} Navigate", "Enter Select", "Esc Back")))
-    return _fit_height(lines, rows, keep_tail=1)
+    ]
+    tail = ["", _footer(stream, ("{up}/{down} Navigate", "Enter Select", "Esc Back"),
+                        width)]
+    return _fit_menu(lines, options, tail, rows, selected, stream, width)
 
 
 def render_danger_frame(selected=0, stream=None, size=None, phase=None):
@@ -1990,21 +2196,21 @@ def render_danger_frame(selected=0, stream=None, size=None, phase=None):
     width = _content_width(columns)
     label_width = max(display_width(item[1]) for item in DANGER_ITEMS)
 
-    lines = ["", " " + _paint("Danger Zone", stream, phase), ""]
+    head = ["", " " + _paint("Danger Zone", stream, phase), ""]
     for text in _wrap_words(
             "Nothing in here can be undone. TMT's own files go, and so does "
             "the tmtcode command; anything git ignores stays, which is your "
             "notes and TMT's saved key.", max(10, width - 1)):
-        lines.append(_dim(" " + text, stream))
-    lines.append(_rule(stream, phase, width))
-    lines.extend(
+        head.append(_dim(fit_to_width(" " + text, width), stream))
+    head.append(_rule(stream, phase, width))
+    options = [
         _option_row(index == selected, item[1], item[2], stream, phase, width,
                     label_width)
         for index, item in enumerate(DANGER_ITEMS)
-    )
-    lines.append("")
-    lines.append(_footer(stream, ("{up}/{down} Navigate", "Enter Select", "Esc Back")))
-    return _fit_height(lines, rows, keep_tail=1)
+    ]
+    tail = ["", _footer(stream, ("{up}/{down} Navigate", "Enter Select", "Esc Back"),
+                        width)]
+    return _fit_menu(head, options, tail, rows, selected, stream, width)
 
 
 def render_uninstall_frame(plan, typed=0, message="", stream=None, size=None,
@@ -2029,7 +2235,7 @@ def render_uninstall_frame(plan, typed=0, message="", stream=None, size=None,
             for text in _wrap_words(row, max(10, width - 1)):
                 lines.append(fit_to_width(" " + text, width))
         lines.append("")
-        lines.append(_footer(stream, ("Enter Close TMT",)))
+        lines.append(_footer(stream, ("Enter Close TMT",), width))
         return _fit_height(lines, rows, keep_tail=1)
 
     lines.append(_field("Removing", str(plan.root), stream, width, name_width=11))
@@ -2038,7 +2244,7 @@ def render_uninstall_frame(plan, typed=0, message="", stream=None, size=None,
         for text in _wrap_words(plan.refusal, max(10, width - 1)):
             lines.append(fit_to_width(" " + text, width))
         lines.append("")
-        lines.append(_footer(stream, ("Esc Back",)))
+        lines.append(_footer(stream, ("Esc Back",), width))
         return _fit_height(lines, rows, keep_tail=1)
 
     lines.append(_field("Removes", "%d file(s) TMT installed" % len(plan.tracked),
@@ -2071,7 +2277,7 @@ def render_uninstall_frame(plan, typed=0, message="", stream=None, size=None,
     if message:
         lines.append(_dim(" " + fit_to_width(message, max(1, width - 1)), stream))
     lines.append("")
-    lines.append(_footer(stream, ("Esc Back",)))
+    lines.append(_footer(stream, ("Esc Back",), width))
     return _fit_height(lines, rows, keep_tail=1)
 
 
@@ -2207,7 +2413,7 @@ def render_help_frame(stream=None, size=None, phase=None):
         else:
             lines.append(_dim(fit_to_width("   " + text, width), stream))
     lines.append("")
-    lines.append(_footer(stream, ("Esc Back",)))
+    lines.append(_footer(stream, ("Esc Back",), width))
     return _fit_height(lines, rows, keep_tail=1)
 
 
@@ -2298,8 +2504,27 @@ _TEXT_KEYS = {
 # have nothing to do here. They are ignored rather than typed.
 _TEXT_IGNORED = ("up", "down")
 
+# The two keys that walk back through what has already been entered. Both the
+# raw sequence and the name, as everywhere else, so a scripted reader can send
+# either and a terminal that reports an arrow one way is not a different key
+# from one that reports it the other.
+#
+# OFF BY DEFAULT AND ASKED FOR BY NAME, which is the whole reason this is a
+# separate table rather than four more rows in `_TEXT_KEYS`. Every other text
+# field in TMT is one line with nothing behind it -- an API key, the uninstall
+# word, a search key -- and in those an arrow is a tick, which is what
+# `_TEXT_IGNORED` says and what their tests assert. Only the task box asks for
+# these, so nothing else changes meaning.
+#
+# "j" and "k" are deliberately absent. They move a menu cursor and they are
+# letters of a task.
+_HISTORY_KEYS = {
+    "\x1b[A": "up", "\x1bOA": "up", "up": "up",
+    "\x1b[B": "down", "\x1bOB": "down", "down": "down",
+}
 
-def normalize_text_key(key, allow_multiline=False):
+
+def normalize_text_key(key, allow_multiline=False, allow_history=False):
     """One keystroke for a text field, as (kind, value).
 
     ("end", None) when the input has ended, ("key", name) for the keys that
@@ -2327,11 +2552,19 @@ def normalize_text_key(key, allow_multiline=False):
     more than one line, so it is reported as ("block", text) rather than
     typed: half a key would be worse than none, and silence would be worse
     than both.
+
+    `allow_history` decides whether Up and Down are keys or ticks. Off, they
+    are ignored, which is what every single-line field in TMT wants and what
+    those fields' tests assert. On, they come back as ("key", "up") and
+    ("key", "down") for the caller to walk its own recall with -- the key
+    table knows which stroke it was and nothing about what going back means.
     """
     if key is None:
         return ("end", None)
     if key in _TEXT_KEYS:
         return ("key", _TEXT_KEYS[key])
+    if allow_history and key in _HISTORY_KEYS:
+        return ("key", _HISTORY_KEYS[key])
     if key in _TEXT_IGNORED:
         return ("", "")
     if key and key.isprintable():
@@ -2644,10 +2877,11 @@ def _next_key(key_reader):
         return "interrupt"
 
 
-def _next_text_key(key_reader, allow_multiline=False):
+def _next_text_key(key_reader, allow_multiline=False, allow_history=False):
     """One keystroke from the reader, read as text rather than as a menu key."""
     try:
-        return normalize_text_key(key_reader(), allow_multiline=allow_multiline)
+        return normalize_text_key(key_reader(), allow_multiline=allow_multiline,
+                                  allow_history=allow_history)
     except (StopIteration, IndexError):
         return ("end", None)
     except KeyboardInterrupt:
@@ -3113,18 +3347,80 @@ def _interrupt_main():
         pass
 
 
-def _queued_hint(count):
+def _widest(tiers, width=None):
+    """The longest of `tiers` that fits, or the shortest when none does.
+
+    The launch screen's subtitle rule, factored out because a third surface
+    now wants it: a row that is fitted rather than wrapped gets cut mid-word,
+    and half an instruction is worse than a shorter whole one. With no width
+    the longest form is returned, which is what a caller that cannot measure
+    should get -- it is the one that says the most.
+    """
+    tiers = tuple(tiers)
+    if not tiers:
+        return ""
+    if width is None:
+        return tiers[0]
+    for text in tiers:
+        if display_width(text) <= width:
+            return text
+    return tiers[-1]
+
+
+# What Enter is about to do to a line that came back from the recall. Up puts
+# a COPY of something already entered into the field, and from the outside the
+# two kinds look identical -- one will replace a task that is still waiting,
+# the other will be entered again as a new one. The same keystroke does two
+# different things, so the screen has to say which.
+_RECALL_EDITING = (
+    "Editing a queued task - Enter replaces it, empty Enter drops it",
+    "Editing a queued task - Enter replaces it",
+    "Editing a queued task",
+)
+_RECALL_REPLAY = (
+    "From history - Enter sends it as a new task",
+    "From history - Enter re-sends it",
+    "From history",
+)
+
+
+def recall_note(recall, width=None):
+    """One line saying what the recalled text on screen is, or "" for none."""
+    entry = recall.current() if recall is not None else None
+    if entry is None:
+        return ""
+    return _widest(_RECALL_EDITING if entry.editable else _RECALL_REPLAY, width)
+
+
+def _queued_hint(count, width=None):
     """Shadow text for a box with lines waiting behind it.
 
     It states the number, for the reason the folded-paste token states its
     size: a placeholder that hid the amount would be worse than no placeholder
     at all, and "queued" alone leaves the user guessing whether the thing they
     typed twenty seconds ago actually landed.
+
+    It also names the key, because a queued line you cannot find your way back
+    to is a line you have to re-type -- and this row is the only place on
+    screen that knows there is anything to go back to.
+
+    Three tiers and then the shortest, which is the launch screen's subtitle
+    rule: the placeholder is fitted rather than wrapped, so a sentence too
+    long for the field is cut mid-word, and half an instruction is worse than
+    a shorter whole one. `width` is the field's inner width; with none given
+    the longest form is returned, which is what every caller that predates
+    this got.
     """
     count = max(0, int(count))
     if not count:
         return ""
-    return "%d queued, and will run when this task finishes" % count
+    noun = "task" if count == 1 else "tasks"
+    return _widest((
+        "%d queued %s - Up to edit, and they run when this one finishes"
+        % (count, noun),
+        "%d queued %s - Up to edit" % (count, noun),
+        "%d queued %s" % (count, noun),
+    ), width)
 
 
 class TypeAhead:
@@ -3157,10 +3453,25 @@ class TypeAhead:
     """
 
     def __init__(self, stream=None, instream=None, reader=None, on_change=None,
-                 interrupt=None):
+                 interrupt=None, queue=None, history=None):
         self.stream = sys.stdout if stream is None else stream
         self.instream = sys.stdin if instream is None else instream
         self.reader = reader
+        # Where a finished line goes, and what Up can walk back through.
+        #
+        # The queue is SHARED with the session loop rather than owned here.
+        # One of these is built per turn and the queue outlives all of them:
+        # somebody who queued three lines during one turn and wants to fix the
+        # third while the next turn runs is asking about a line this object
+        # never saw. Left alone it makes its own, so a TypeAhead built the way
+        # they were built before this existed behaves exactly as it did.
+        self.queue = agent_history.PendingQueue() if queue is None else queue
+        self.history = agent_history.History() if history is None else history
+        # Newest first, pending before recorded: what somebody reaches for is
+        # what they said last, and during a turn what they said last is the
+        # thing still waiting. Re-asked at every step rather than snapshotted,
+        # because both tiers move while the box is open.
+        self.recall = agent_history.Recall(self._entries)
         # How a Ctrl-C read here is put back into the main thread. Injectable
         # only so it can be tested: firing a real asynchronous
         # KeyboardInterrupt into a suite with no isolation between tests lands
@@ -3172,8 +3483,11 @@ class TypeAhead:
         # and typing would appear in bursts.
         self.on_change = on_change
         self.editor = LineEditor()
-        self._queued = []
-        self._lock = threading.Lock()
+        # Re-entrant: `_apply` holds this while it asks the recall what is on
+        # the queue, and the queue has a lock of its own. A plain Lock here
+        # would be a reader thread deadlocking on itself the first time
+        # anybody pressed Up.
+        self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread = None
         self._cancelled = False
@@ -3217,7 +3531,8 @@ class TypeAhead:
         reader = self.reader if self.reader is not None else _default_text_reader()
         while not self._stop.is_set():
             try:
-                kind, value = _next_text_key(reader, allow_multiline=True)
+                kind, value = _next_text_key(reader, allow_multiline=True,
+                                             allow_history=True)
             except Exception:
                 return
             if kind == "end":
@@ -3265,24 +3580,60 @@ class TypeAhead:
                 return True
             if kind == "key" and value == "tab":
                 return False      # completion is the asking box's, not this one's
+            if kind == "key" and value in ("up", "down"):
+                # Walking back through what has already been entered. Taken
+                # before the editor sees it: the editor is one line and knows
+                # nothing about there being anything behind it.
+                if value == "up":
+                    return self.recall.back(self.editor)
+                return self.recall.forward(self.editor)
             outcome = self.editor.handle(kind, value)
             if outcome == "submit":
                 line = self.editor.expanded().strip()
-                if line:
-                    self._queued.append(line)
+                target = self.recall.current()
+                if target is not None and target.editable:
+                    # An edit of a line that has not run yet. It REPLACES the
+                    # line where it stands rather than joining the back of the
+                    # queue: the queue is an order, and a correction that
+                    # queued itself behind the mistake would run the mistake
+                    # first. An empty edit drops it, which is the only way to
+                    # unsay something already queued.
+                    self.queue.replace(target.handle, line)
+                elif line:
+                    # Anything else is a new line, including an edited copy of
+                    # something that has already been answered -- that one has
+                    # run, so there is nothing left to correct and re-entering
+                    # it is what a shell history does.
+                    self.queue.add(line)
                 self.editor = LineEditor()
+                self.recall.reset()
                 return True
             if outcome == "cancel":
                 # Esc clears what has been typed; Ctrl-C is the turn's to
                 # handle and reaches the main thread as a KeyboardInterrupt of
                 # its own, so nothing here tries to stop the work.
+                #
+                # Nothing queued is touched. A recalled line is a COPY on the
+                # screen until Enter, so abandoning the edit leaves the task
+                # waiting exactly as it was -- clearing the box has never been
+                # a way to delete anything and this does not make it one.
                 self._cancelled = True
                 self.editor = LineEditor()
+                self.recall.reset()
                 return True
             if outcome == "end":
                 self._stop.set()
                 return False
             return True
+
+    def _entries(self):
+        """What Up walks back through, newest first.
+
+        Pending lines, then answered ones. A line is in exactly one tier at a
+        time -- the session loop records it as answered as it dispatches it,
+        by which time it has left the queue -- so nothing appears twice.
+        """
+        return agent_history.entries_for(self.queue, self.history)
 
     def text(self):
         """What is currently typed, for the box to draw."""
@@ -3290,15 +3641,18 @@ class TypeAhead:
             return self.editor.value, self.editor.cursor
 
     def take(self):
-        """Every finished line, in order, and clear the queue."""
-        with self._lock:
-            queued, self._queued = list(self._queued), []
-            return queued
+        """Every finished line, in order, and clear the queue.
+
+        Kept, and still what it always was, for a caller that owns no queue of
+        its own. The session loop no longer uses it: it holds the queue and
+        takes from it one line at a time, so a line queued during turn three
+        is still there to be edited during turn four.
+        """
+        return self.queue.take()
 
     def pending(self):
         """How many lines are waiting, without taking them."""
-        with self._lock:
-            return len(self._queued)
+        return self.queue.count()
 
 
 class PromptBox:
@@ -3316,7 +3670,7 @@ class PromptBox:
 
     def __init__(self, stream=None, instream=None, reader=None, line_reader=None,
                  session=None, pad=None, completer=None, completed=None,
-                 manager=None, panel=None):
+                 manager=None, panel=None, history=None, queue=None):
         self.stream = sys.stdout if stream is None else stream
         self.instream = sys.stdin if instream is None else instream
         # The blank rows that hold the box against the foot of the window, or
@@ -3361,6 +3715,21 @@ class PromptBox:
         # attaches one; nothing else needs to, and with none attached this
         # class behaves exactly as it did before type-ahead existed.
         self.typeahead = None
+        # What Up walks back through here. The same two objects the type-ahead
+        # reader is given, so the question "what did I say last" has one answer
+        # whether it is asked between turns or during one. Both default to an
+        # empty one of their own, so a box built the way they were built before
+        # this existed still answers Up -- with nothing, because nothing has
+        # been recorded into it.
+        self.history = agent_history.History() if history is None else history
+        self.queue = queue
+        # The cursor whose position the box is currently drawing, or None when
+        # the field holds a line the user wrote themselves. Set by whoever is
+        # driving it -- `ask` for the box between turns, `running_lines` for
+        # the one the relay draws during a turn -- and the OBJECT rather than
+        # the sentence, because the sentence has shorter forms and only
+        # `_frame` knows how much room there is for one.
+        self.recall = None
         self.cancelled = False
         # When the box last asked something. The caller writes the question
         # into scrollback afterwards and stamps it with this, so the record
@@ -3509,8 +3878,17 @@ class PromptBox:
                 # No raw keys to be had: a pipe, a redirect, or the test
                 # suite. Waiting on a keystroke that cannot arrive would hang
                 # the run, so the box is drawn and the line is read as a line.
+                # No cursor is built at all on the way through: there is no
+                # key that could move one, and one left standing here would
+                # outlive this call with nothing to take it down -- the `finally`
+                # below is not on this path.
                 return self._read_line(editor, moment=moment)
             reader = _default_text_reader()
+        # A cursor over what has already been entered, built per question and
+        # thrown away with the box. The two tiers it reads live on the session,
+        # so it is the CURSOR that is new each time and never the record.
+        recall = self.recall = agent_history.Recall(
+            lambda: agent_history.entries_for(self.queue, self.history))
         region = LiveRegion(self.stream)
         placed, shown = 0, None
         try:
@@ -3542,12 +3920,14 @@ class PromptBox:
                 # The panel gets first refusal on a keystroke, and only while
                 # it is open. It takes Up, Down, Enter and Left and hands back
                 # everything else, so a character typed while it is on screen
-                # is still typed into the line behind it. Up and Down reach
-                # the field as a tick today and Left is a caret move, so
-                # nothing that works with the panel shut is touched.
+                # is still typed into the line behind it. Left is a caret move
+                # and Up and Down walk the recall, so with the panel shut all
+                # three still do what they do -- the panel simply borrows them
+                # for as long as it has focus, which is what having focus is.
                 if self._panel_key(raw):
                     continue
-                kind, value = normalize_text_key(raw, allow_multiline=True)
+                kind, value = normalize_text_key(raw, allow_multiline=True,
+                                                 allow_history=True)
                 # Right Arrow at the end of the line, where it moves nothing.
                 # Taken before the editor sees it, and only when this box was
                 # given a panel at all.
@@ -3571,6 +3951,16 @@ class PromptBox:
                     # line of prose should do.
                     self._accept_completion(editor)
                     continue
+                if kind == "key" and value in ("up", "down"):
+                    # Walking back through what has already been entered.
+                    # Taken before the editor sees it, because the editor is
+                    # one line and knows nothing about there being anything
+                    # behind it -- the same seam Tab and the panel use.
+                    if value == "up":
+                        recall.back(editor)
+                    else:
+                        recall.forward(editor)
+                    continue
                 outcome = editor.handle(kind, value)
                 if outcome == "continue":
                     continue
@@ -3588,12 +3978,29 @@ class PromptBox:
                     # Expanded, not as displayed: the token was a way of
                     # showing a long paste in a small box, never a way of
                     # shortening what the user actually said.
-                    return editor.expanded()
+                    line = editor.expanded()
+                    target = recall.current()
+                    if target is not None and target.editable:
+                        # An edit of a line that is still waiting to run. It
+                        # is written back where it stands and NOT returned as
+                        # this question's answer: the queue is asked before
+                        # the box is drawn, so the corrected line is picked up
+                        # from there, in its own position, on the next pass.
+                        # Returning it here as well would run it twice.
+                        if self.queue is not None:
+                            self.queue.replace(target.handle, line.strip())
+                        return ""
+                    return line
                 if outcome == "cancel":
                     self.cancelled = True
                     return ""
                 return None
         finally:
+            # The cursor goes with the box. Left set, the next thing to draw
+            # this box -- the relay's footer during the turn that is about to
+            # start -- would inherit a position in a list nobody is walking
+            # and put a sentence about it under an empty field.
+            self.recall = None
             self._unplace(placed)
             _restore_terminal(self.stream)
 
@@ -3629,7 +4036,24 @@ class PromptBox:
         # draws exactly the hint it always drew.
         editor = LineEditor(hint)
         typed = self.typeahead
-        if typed is not None and typed.active:
+        # The field's own inner width, worked out the way `_frame` works it
+        # out, because the shadow text below has shorter forms and this is the
+        # only place that can choose between them. `_frame` fits the
+        # placeholder rather than wrapping it, so a hint too long for the
+        # field is cut mid-word -- and this hint's whole job is to name a key.
+        columns = _terminal(size)[0]
+        inner = max(1, min(_content_width(columns), max(6, columns - 1))
+                    - _PROMPT_PREFIX)
+        # Which recalled line the box is drawing, if it is drawing one. Taken
+        # off the reader rather than held here: the reader owns the cursor for
+        # the length of the turn, and this box is redrawn from a different
+        # thread several times a second.
+        # Only while it is actually reading: a stopped reader's cursor may
+        # still be standing on an entry, and a sentence about a line the box
+        # is no longer drawing is worse than no sentence.
+        active = bool(typed is not None and typed.active)
+        self.recall = getattr(typed, "recall", None) if active else None
+        if active:
             value, cursor = typed.text()
             if not value and not typed.pending():
                 # The box can be typed into now, and nothing else on screen
@@ -3647,7 +4071,7 @@ class PromptBox:
                 # Nothing on the line, but lines are waiting. Say so, because
                 # the alternative is a box that looks untouched while the user
                 # has already queued three questions into it.
-                editor = LineEditor(_queued_hint(typed.pending()))
+                editor = LineEditor(_queued_hint(typed.pending(), inner))
         # `column=False`: this box is the RELAY's footer, and the relay draws
         # the right-hand column around the whole region -- it has already
         # narrowed the `size` handed in here to the left column's width. A
@@ -3716,7 +4140,7 @@ class PromptBox:
         move the caret further from the foot of the frame.
         """
         stream = self.stream
-        columns = _terminal(size)[0]
+        columns, window_rows = _terminal(size)
         # The panel, if one is open, takes its column out of the width before
         # anything else is measured. Everything below then draws the box at
         # the width that is left, which is the whole of what a second column
@@ -3760,7 +4184,34 @@ class PromptBox:
             body = _dim(body, stream) if editor.placeholder_visible else body
             lead = " " + PROMPT_MARKER + " " if index == 0 else " " * _PROMPT_PREFIX
             typed.append(lead + body)
-        offered = self._offered(editor, width) + self._refusal(width)
+        # BOUNDED BY THE WINDOW, which nothing here used to measure. The
+        # completions were appended with no reference to the terminal's
+        # height, so typing "/" on an 80x12 window built a region taller than
+        # the screen: the rows scrolled away from the cursor moves that
+        # repaint them and the whole terminal went blank but for one stray
+        # rule -- no box, no prompt, no caret. Any window of eighteen rows or
+        # fewer, which is a split pane or a resized session.
+        #
+        # What is kept is the field and both rules; what is given up is the
+        # rows under the line, from the bottom. The two NOTES go before the
+        # completions do, because each is one row about the text in the field
+        # right now -- what a recalled line will do, or why the panel would
+        # not open -- and the completions are a list that is already however
+        # long it happens to be.
+        suggestions = self._offered(editor, width)
+        notes = self._recall_row(width) + self._refusal(width)
+        limit = max(1, window_rows - 1)
+        if head and len(head) + len(typed) + 2 > limit:
+            # A window too short even for a caption above the box. It is the
+            # last thing given up because it is the only row here that is not
+            # part of the box, and losing it costs the clock and the model
+            # rather than the ability to type.
+            head = []
+        room = max(0, limit - len(head) - len(typed) - 2)
+        if len(suggestions) + len(notes) > room:
+            notes = notes[:room]
+            suggestions = suggestions[:max(0, room - len(notes))]
+        offered = suggestions + notes
         rows = head + [rule] + typed + offered + [rule]
         # How far the caret sits above the foot of the frame: the bottom rule,
         # then anything offered under the field, then however many field rows
@@ -3780,6 +4231,24 @@ class PromptBox:
         holding = self.pad if (pad and self.pad is not None) else None
         lead = [""] * (holding.above(len(rows), size) if holding else 0)
         return lead + rows, _PROMPT_PREFIX + caret, up
+
+    def _recall_row(self, width):
+        """What the recalled line on screen is, as one dim row under it.
+
+        Drawn where the offered commands are drawn, and counted by the same
+        arithmetic: `_frame` already measures the caret's distance from the
+        foot of the box as one plus however many rows sit under the field, so
+        a third kind of row there costs nothing and moves nothing.
+
+        Temporary, like the refusal beside it. It says something about the
+        text currently in the field and stops being true the moment that text
+        is submitted or abandoned, so it belongs on the surface that repaints
+        rather than in the scrollback.
+        """
+        note = recall_note(getattr(self, "recall", None), max(1, width - 3))
+        if not note:
+            return []
+        return [_dim(fit_to_width("   " + note, width), self.stream)]
 
     def _refusal(self, width):
         """The reason the panel would not open, as one row inside the box.
@@ -3846,9 +4315,18 @@ class PromptBox:
             matches = self.completer(editor.value)
         except Exception:
             return []            # decoration is never allowed to end a run
+        # The name column is MEASURED off the matches rather than written
+        # out. It was a hard-coded 9, which was the longest command name when
+        # the format string was written; `/checkpoints` is twelve, so that one
+        # row pushed its summary three columns right of every other and broke
+        # the column the rest line up on. A number in a format string is a
+        # measurement that stops being true the next time a command is added.
+        matches = list(matches)
+        column = max([display_width(name) for name, _ in matches] or [0])
         rows = []
         for name, summary in matches:
-            rows.append(_dim(fit_to_width("   %-9s %s" % (name, summary), width),
+            rows.append(_dim(fit_to_width("   " + pad_to_width(name, column + 1)
+                                          + " " + summary, width),
                              self.stream))
         return rows
 
@@ -4051,11 +4529,27 @@ def model_screen(stream=None, key_reader=None, region=None, active_id=None):
         key_reader = _default_reader()
     region = LiveRegion(stream) if region is None else region
     active_id = active_id or agent_models.current_model()
-    ids = agent_models.known_ids()
+    # The catalogue is read ONCE and handed to the frame as well as acted on
+    # here, so the row the cursor is on and the id Enter saves are the same
+    # row of the same list. They were two lists -- the frame drew OpenRouter's
+    # five whatever the provider was -- and the cost of that was a save the
+    # screen had never shown.
+    models = list(agent_models.catalogue())
+    ids = [model["id"] for model in models]
+    if not ids:
+        # Nothing to choose between. The frame says so; there is no cursor to
+        # move and no id to save, and looping on a modulo of zero would be a
+        # ZeroDivisionError out of a menu.
+        _drive(lambda: render_settings_frame(0, active_id, stream, models=models),
+               key_reader, region,
+               lambda key: "" if key in (None, "esc", "quit", "interrupt",
+                                         "enter") else None)
+        return None
     state = {"selected": ids.index(active_id) if active_id in ids else 0}
 
     def render():
-        return render_settings_frame(state["selected"], active_id, stream)
+        return render_settings_frame(state["selected"], active_id, stream,
+                                     models=models)
 
     def on_key(key):
         if key in (None, "esc", "quit", "interrupt"):
@@ -4433,6 +4927,19 @@ def settings_screen(stream=None, key_reader=None, region=None, active_id=None,
             elif entry == "provider":
                 provider_setup(stream=stream, key_reader=key_reader, region=region,
                                text_reader=text_reader)
+                # Re-read, because the model is a fact ABOUT THE PROVIDER and
+                # the provider has just changed. `state["model"]` was captured
+                # once when Settings opened, so after switching to a provider
+                # that already had a key the block read "Provider Anthropic /
+                # Model minimax/minimax-m3:free" -- a raw OpenRouter id in a
+                # block where every other value is a friendly label, naming a
+                # model TMT was not going to run on. The stale id was handed
+                # to the model picker as its active row as well.
+                #
+                # `state["changed"]` is deliberately NOT touched: it is what
+                # this screen RETURNS, and it means "the user chose a model
+                # here". A provider's default is not a choice made here.
+                state["model"] = agent_models.current_model()
             elif entry == "key":
                 api_key_screen(current_provider(), stream=stream,
                                key_reader=text_reader, region=region)

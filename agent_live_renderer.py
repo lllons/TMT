@@ -305,6 +305,61 @@ class LiveRegion:
                 self._paint(held)
             return True
 
+    def ask_below(self, text, read, lines=None):
+        """Print `text` permanently, read the answer with the region DOWN.
+
+        The half `write_above` cannot do. That method erases, prints and
+        paints again, which is right for text nobody answers -- but an
+        approval is READ, and the read used to happen with the region still
+        on screen. The terminal echoes what the user types and echoes the
+        Enter that ends it, so the caret finishes a row below where this class
+        believes it is; the next repaint then lands one row high, and one copy
+        of the region's top row is left stranded in the scrollback with
+        nothing under it. Nine deletions in one multi_tool left nine stray box
+        rules -- the residue of the ten this class's `write_above` was
+        introduced to fix, arriving through the read instead of the print.
+
+        Either the terminal is yours or it is the region's, and `write_above`
+        is how you borrow it for a line. This is how you borrow it for a
+        question -- and a question is borrowed for longer, so the region comes
+        DOWN for the length of it rather than being painted straight back.
+
+        The caret is RESTORED with the rows. `_paint` hides it and only the
+        prompt box or `clear` ever gave it back, so the user was answering at
+        a caret that was switched off, with nothing on screen saying where the
+        letters they typed would appear. That is not an exception to the rule
+        that the caret stays in the input row: for as long as this question is
+        up, the row under it IS the input row.
+
+        The paint lock is held across the read, deliberately. The relay's
+        worker repaints on its own clock and a background agent changing its
+        activity label is enough to ask it to -- so without the lock a repaint
+        could land on top of the question while the user is reading it, which
+        is the bug this is fixing arriving from the other thread. `lines` is
+        composed by the caller BEFORE the lock is taken, exactly as
+        `write_above` does it, so the two locks are never held in opposite
+        orders.
+
+        Nothing here interprets the answer. Whatever `read` returns is handed
+        straight back, and an exception from it -- EOFError when the input
+        ends, KeyboardInterrupt when the user wants the turn to stop --
+        travels on to the caller with the region already painted again.
+        """
+        with self._paint_lock:
+            held = self._last if lines is None else list(lines)
+            # Erased WITH the caret given back: unlike `write_above`, which is
+            # making room for a line nobody answers, this is handing the rows
+            # to the user for as long as they are typing on them.
+            self._erase(restore=True)
+            if text and not safe_write(
+                    self.stream, text if text.endswith("\n") else text + "\n"):
+                self.ansi = False
+            try:
+                return read()
+            finally:
+                if held:
+                    self._paint(held)
+
     def clear(self):
         with self._paint_lock:
             self._erase(restore=True)
@@ -471,6 +526,21 @@ class LiveRelay:
         """
         return self.region.write_above(text, self._frame_now())
 
+    def ask_below(self, text, read):
+        """Put a question into the scrollback and read its answer below it.
+
+        The seam an approval takes: `write_above` is for text nobody answers,
+        and this is for text somebody has to. See `LiveRegion.ask_below` for
+        why the read cannot happen while the region is up.
+
+        The frame is composed here, before the region's lock is taken, for the
+        reason `write_above` composes it here -- the two locks are never held
+        in opposite orders -- and it is composed AFTER the caller has spent
+        the pad for what it is about to print, so the region that goes back is
+        the shorter one that belongs under the question.
+        """
+        return self.region.ask_below(text, read, self._frame_now())
+
     def _frame_now(self):
         """The region as it should stand right now, or None if it has none."""
         if self._closed:
@@ -615,26 +685,86 @@ class LiveRelay:
         except Exception:
             return []
 
+    def _panel_height(self, rows, tail):
+        """The window height as the PANEL should see it.
+
+        `agent_panel.PanelState.frame` keeps two rows back from the height it
+        is handed: the status row under the region, and the spare row a region
+        never draws on. So it is already told about ONE row below it, and only
+        the rows beyond that one have to come off the height here. A region
+        with nothing under the panel but the status row therefore asks for
+        exactly what it always asked for, and two frames of an untouched
+        region stay identical -- which is what lets the repaint be skipped.
+        """
+        return max(3, int(rows) - max(0, len(tail) - 1))
+
+    def _fit(self, size, rows, tail, droppable=0):
+        """`lead + rows + tail`, and never taller than the window.
+
+        The last guard rather than the budget. `room` shrinks the reply so the
+        tail fits, but the reply has a floor of one visible line and cannot
+        shrink past it -- so a short enough window, or a large enough fleet,
+        still composed a region taller than the terminal. That is the failure
+        this whole module is arranged around: a region taller than the window
+        scrolls away from the cursor moves that repaint it, the next cursor-up
+        clamps at the top of the viewport, and every repaint from then on
+        overwrites the scrollback the session is recorded in -- twelve times a
+        second, which is what makes it destructive rather than untidy.
+
+        The ladder is the one already stated here: the reply gives up rows
+        first, then the per-agent bars, which are the last rows drawn and
+        subordinate to the status row above them. If even that is not enough
+        the TOP of the region goes, because what is at the bottom is the box
+        being typed into and the instrument measuring the turn, and a region
+        that gave those up would look like a program that had stopped.
+
+        The pad is asked last and only about the rows that survived. It clamps
+        its own answer to the window, so the blank rows holding the region
+        against the foot can never put back what this has just taken away.
+        """
+        limit = max(1, int(size.lines) - 1)
+        drawn = list(rows) + list(tail)
+        if len(drawn) > limit and droppable > 0:
+            drawn = drawn[:len(drawn) - min(droppable, len(drawn) - limit)]
+        if len(drawn) > limit:
+            drawn = drawn[len(drawn) - limit:]
+        return self._lead(len(drawn)) + drawn
+
     def _compose(self, status, body):
         size = shutil.get_terminal_size((80, 24))
         width = max(24, size.columns)
-        panel = self._panel_frame(width, size.lines)
+        # Asked for BEFORE the panel is, because the panel is budgeted against
+        # the window and these rows go BELOW it. They were appended to a panel
+        # that had already taken the whole height: six background agents on an
+        # 80x24 terminal composed a 24-row region, eight composed 30, and the
+        # module's own stated invariant -- a short window gives rows up out of
+        # the REPLY rather than growing past the foot -- was violated whenever
+        # anything was delegated.
+        #
+        # Held rather than asked for twice, as well. `agent_rows` is a
+        # callable reporting a fleet that changes on its own thread, so a
+        # second call could answer differently and budget the panel against a
+        # tail that is no longer the tail being drawn.
+        agents = self._agent_rows(width)
+        instruments = ([status] if status else []) + agents
+        panel = self._panel_frame(width, self._panel_height(size.lines, instruments))
         if panel is not None:
-            return self._compose_with_panel(status, body, size, width, panel)
+            return self._compose_with_panel(status, body, size, width, panel, agents)
         footer = self._footer_rows()
-        tail = footer + ([status] if status else []) + self._agent_rows(width)
-        if not body:
-            return self._lead(len(tail)) + tail
-        # Keep the whole region on screen: a region taller than the terminal
-        # would scroll away from the cursor moves that repaint it. The reply is
-        # what gives up rows for the footer, because the footer is the box the
-        # user is looking at and the status row is one line.
-        room = size.lines - 3 - len(tail)
-        visible = max(1, min(self.body_lines, room))
-        lines = self._body_rows(body, width - 1, visible)
-        return self._lead(len(lines) + len(tail)) + lines + tail
+        tail = footer + instruments
+        rows = []
+        if body:
+            # Keep the whole region on screen: a region taller than the
+            # terminal would scroll away from the cursor moves that repaint
+            # it. The reply is what gives up rows for the footer, because the
+            # footer is the box the user is looking at and the status row is
+            # one line.
+            room = size.lines - 3 - len(tail)
+            visible = max(1, min(self.body_lines, room))
+            rows = self._body_rows(body, width - 1, visible)
+        return self._fit(size, rows, tail, len(agents))
 
-    def _compose_with_panel(self, status, body, size, width, panel):
+    def _compose_with_panel(self, status, body, size, width, panel, agents):
         """The region with a right-hand column beside it.
 
         The status row and the per-agent rows are the two things left full
@@ -662,11 +792,16 @@ class LiveRelay:
         left_columns, join = panel
         # Both instruments, in the order the no-panel branch puts them: the
         # main agent's own bar, then the agents it delegated to, which are
-        # subordinate to it. `room` below already subtracts the whole tail, so
-        # a terminal short of rows gives them up out of the REPLY rather than
-        # growing the region past the window -- exactly as it does without a
-        # panel.
-        tail = ([status] if status else []) + self._agent_rows(width)
+        # subordinate to it. Handed in rather than asked for again, because
+        # the PANEL was budgeted against these exact rows a moment ago and a
+        # second call to a hook that reports a live fleet could answer with a
+        # different number of them.
+        #
+        # `room` subtracts the whole tail so the reply gives its rows up
+        # first, and `_fit` is the guarantee behind that: the reply cannot
+        # shrink below one line, and past that point the region has to give up
+        # bars rather than grow past the foot of the window.
+        tail = ([status] if status else []) + agents
         left = []
         if left_columns:
             footer = self._footer_rows((left_columns + 1, size.lines))
@@ -675,8 +810,7 @@ class LiveRelay:
                 left = self._body_rows(body, left_columns,
                                        max(1, min(self.body_lines, room)))
             left = left + footer
-        rows = list(join(left))
-        return self._lead(len(rows) + len(tail)) + rows + tail
+        return self._fit(size, list(join(left)), tail, len(agents))
 
     def wait_for_reveal(self, timeout=FINALIZE_TIMEOUT):
         """Block until every queued symbol has resolved to its character."""

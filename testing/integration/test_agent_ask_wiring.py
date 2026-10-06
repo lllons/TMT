@@ -25,9 +25,13 @@ What is pinned, and why each is worth a test of its own:
 - Ctrl-C at the question stops the turn. msvcrt hands it back as an ordinary
   character and raises no signal, so a raw read that did not turn it back into
   the exception would swallow the one gesture that stops a running turn;
-- the question is written through `write_above` and never printed, because
+- the question is put through the live region and never printed, because
   printing past a live region leaves its repaint arithmetic pointing at rows
   that have moved -- the defect that put ten stray box tops on a real terminal.
+  It goes through `ask_below` rather than `write_above`, so the region is DOWN
+  for the length of the read: writing alone printed and painted again, and the
+  keypress the terminal echoed then left the caret a row below where the next
+  repaint expected it -- one stray rule per question answered.
 """
 
 import io
@@ -84,13 +88,29 @@ class Keyboard:
 
 
 class Relay:
-    """A live region that records what was written above it."""
+    """A live region that records what was written above it.
+
+    Both ways permanent text reaches the scrollback record into `above`,
+    because what a test of the asker cares about is that the text went
+    through the region rather than past it. `asked` records the questions
+    that were also READ through it, which is the half `write_above` cannot
+    do: it prints and paints again, leaving the region UP while the answer is
+    typed onto rows the region believes are its own -- and the echoed keypress
+    then leaves the caret a row below where the repaint arithmetic thinks it
+    is. That is the orphaned-row defect, and `ask_below` is what closed it.
+    """
 
     def __init__(self):
         self.above = []
+        self.asked = []
 
     def write_above(self, text):
         self.above.append(text)
+
+    def ask_below(self, text, read):
+        self.above.append(text)
+        self.asked.append(text)
+        return read()
 
 
 class Pad:
@@ -249,10 +269,17 @@ def test_ctrl_c_at_the_question_becomes_the_exception_the_loop_ends_turns_on():
         restore(saved)
 
 
-def test_the_question_goes_through_write_above_and_is_never_printed():
+def test_the_question_goes_through_the_region_and_is_never_printed():
     """Printing past a live region leaves its repaint arithmetic pointing at
     rows that have moved, which is what put ten stray box tops on a real
-    terminal when the deletions asked with a bare input()."""
+    terminal when the deletions asked with a bare input().
+
+    It is now READ through the region as well as written through it. Writing
+    alone printed and painted again, so the region was still up while the
+    answer was typed, and the keypress the terminal echoed left the caret a
+    row below where the next repaint expected it -- one stray rule stranded in
+    the scrollback per question answered.
+    """
     relay = Relay()
     screen = io.StringIO()
     choose, saved = asker(["1"], relay=relay)
@@ -264,6 +291,7 @@ def test_the_question_goes_through_write_above_and_is_never_printed():
         sys.stdout = stdout
         restore(saved)
     assert relay.above == ["Which one?"], relay.above
+    assert relay.asked == ["Which one?"], relay.asked
     assert screen.getvalue() == "", screen.getvalue()
 
 

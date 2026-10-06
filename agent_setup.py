@@ -123,6 +123,13 @@ class TitleLoop:
         DEC save/restore (ESC 7 / ESC 8) is used rather than plain cursor
         moves: the user may be part-way through typing their key, so the
         column has to come back exactly as it was, not just the row.
+
+        The raw write here is deliberate, and is the one in this module that
+        stays raw: a frame is a cursor move, six repainted rows and a restore,
+        so `safe_write`'s replacement marks would land in the middle of the
+        title with the cursor arithmetic already committed. Giving up the
+        animation is the better degradation, which is what the except does --
+        the words the user has to read all go through `say`.
         """
         phase = gradient_phase()
         parts = [SAVE_CURSOR, "\033[%dA" % (self.lines_below + len(self.art))]
@@ -155,18 +162,32 @@ def run_setup(stream=None, ask=None, animate=True):
     icons = ASCII_PANEL_ICONS if plain else PANEL_ICONS
     arrow, caret = (">", ">") if plain else ("➤", "▸")
     tick, cross = ("OK", "x") if plain else ("✓", "✗")
+    # The em dash in the three sentences below is the only punctuation here a
+    # cp437 or ascii console cannot encode, so it takes a plain form like every
+    # other decorated character on this screen. A deliberate hyphen reads as a
+    # choice; a replacement mark reads as a bug.
+    dash = "-" if plain else "—"
     below = [0]
 
     def say(text=""):
-        """Write a line and remember how far the cursor has moved on."""
-        stream.write(text + "\n")
-        stream.flush()
+        """Write a line and remember how far the cursor has moved on.
+
+        Through safe_write, never a raw stream.write. This screen is the only
+        thing between a fresh install and a usable TMT and nothing above it
+        catches anything -- ensure_api_key has no try, TMT.main calls it bare,
+        and the entry point is sys.exit(main()). A character the console could
+        not encode used to raise UnicodeEncodeError on the sixth row of the
+        welcome box, so the user got a traceback instead of the key prompt with
+        no way to enter a key and no way past it. Decoration must never end the
+        run; the ASCII vocabulary above is what keeps the words readable when
+        it degrades.
+        """
+        safe_write(stream, text + "\n")
         below[0] += 1
 
     say()
     for line in art:
-        stream.write(cycle_text(TITLE_MARGIN + line, stream) + "\n")
-    stream.flush()
+        safe_write(stream, cycle_text(TITLE_MARGIN + line, stream) + "\n")
     below[0] = 0                       # count lines below the title from here
 
     say(TITLE_MARGIN + sparkles(12, stream, plain))
@@ -177,7 +198,7 @@ def run_setup(stream=None, ask=None, animate=True):
         (icons[1], "No OpenRouter API key found on this machine."),
         (icons[2], f"Get one free at  {KEY_URL}"),
         (icons[3], f"It is saved to {agent_config.KEY_FILE.name} beside the code,"),
-        (" ", "which is git-ignored — it never travels with a push."),
+        (" ", f"which is git-ignored {dash} it never travels with a push."),
         (icons[4], "Or set OPENROUTER_API_KEY in your environment instead."),
     ):
         body = f"{icon}  {text}".ljust(width - 4)
@@ -190,8 +211,7 @@ def run_setup(stream=None, ask=None, animate=True):
         for attempt in range(MAX_ATTEMPTS):
             progress = 40 + attempt * 15
             say(f"  {cycle_bar(progress, stream, plain=plain)} {progress:>3}% Waiting for your key...")
-            stream.write(f"  {cycle_text(f'{arrow} paste key {caret}', stream)} ")
-            stream.flush()
+            safe_write(stream, f"  {cycle_text(f'{arrow} paste key {caret}', stream)} ")
             if animate:
                 title.start(below[0])
             try:
@@ -199,7 +219,7 @@ def run_setup(stream=None, ask=None, animate=True):
             except (EOFError, KeyboardInterrupt):
                 title.stop()
                 say()
-                say(f"  {cross} Setup cancelled — no key saved.")
+                say(f"  {cross} Setup cancelled {dash} no key saved.")
                 return ""
             title.stop()
             below[0] += 1              # the line the user just submitted
@@ -214,7 +234,7 @@ def run_setup(stream=None, ask=None, animate=True):
                 f"stored in {agent_config.KEY_FILE.name}  {sparkles(3, stream, plain, gradient_phase() + 0.5)}")
             say()
             return key
-        say(f"  {cross} No key entered after {MAX_ATTEMPTS} tries — stopping here.")
+        say(f"  {cross} No key entered after {MAX_ATTEMPTS} tries {dash} stopping here.")
         return ""
     finally:
         title.stop()

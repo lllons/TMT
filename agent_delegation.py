@@ -85,6 +85,12 @@ READ_ONLY_ACTIONS = frozenset({
     # able to search at all.
     "list_files", "read_file", "read_lines", "grep", "glob",
     "find_symbol", "tree", "code_map", "related_tests",
+    # Reading a document that is not text -- a PDF, a spreadsheet, a deck.
+    # Named here for `read_file`'s reason: it opens one path through the same
+    # sandbox and answers with text. It reaches no network: the optional
+    # markitdown reader it can delegate to is handed local document formats
+    # only, never the audio or image ones that would.
+    "read_document",
     # Reading what TMT remembers. `recall` reads; `remember` writes, and is
     # absent for that reason.
     "recall",
