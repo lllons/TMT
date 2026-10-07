@@ -332,26 +332,18 @@ _REVIEW_AGENDA_ELSEWHERE_SAID = (
 _REVIEW_AGENDA_ELSEWHERE = _REVIEW_AGENDA_ELSEWHERE_SAID % '{"action":"review"}'
 
 
-def _example(obj):
-    """An action written in the reply format in force, for use in a sentence.
-
-    Under JSON it is the compact JSON every hint here has always embedded,
-    byte for byte; under tags it is the tag block, so a refusal never shows a
-    model that was asked for tags the other shape. Read at call time --
-    Settings can change the format between two questions -- and anything
-    that goes wrong answers in JSON, which is what these sentences were.
-    """
-    try:
-        import agent_config
-        import agent_protocol
-        return agent_protocol.example(obj, agent_protocol.normal(agent_config.PROTOCOL))
-    except Exception:
+try:
+    from agent_protocol import hint as _hint
+except Exception:           # a frozen module list lacking agent_protocol
+    def _hint(obj, as_json=None):
         import json
+        if as_json is not None:
+            return as_json
         return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
 def _review_agenda_elsewhere():
-    return _REVIEW_AGENDA_ELSEWHERE_SAID % _example({"action": "review"})
+    return _REVIEW_AGENDA_ELSEWHERE_SAID % _hint({"action": "review"})
 
 # The values "scope" understands. One, for now, and a wrong one is named
 # rather than ignored: a model that asked for "changed_files" and silently got
@@ -1905,7 +1897,7 @@ _LEGACY_RUN_REFUSED = (
 
 def _legacy_run_refused(reason):
     """The refusal, its example written in the reply format in force now."""
-    return _LEGACY_RUN_REFUSED % (reason, _example({"action": "bash", "command": "..."}))
+    return _LEGACY_RUN_REFUSED % (reason, _hint({"action": "bash", "command": "..."}))
 
 
 # Whether a path can go into a command line as it stands. A WHITELIST of the

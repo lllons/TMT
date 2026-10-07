@@ -73,7 +73,7 @@ OPERATIONS = ("create", "update", "add", "remove", "clear", "show")
 # format is a setting the user can change between two turns, and a refusal
 # that taught the other shape would be teaching the model to leave the one it
 # was asked to use. Reading `agent_config.PROTOCOL` is reading a module global
-# and `agent_protocol` is imported lazily, so this module still imports
+# and `agent_protocol.hint` reads it lazily, so this module still imports
 # nothing and still does no I/O.
 
 def _protocol():
@@ -85,20 +85,13 @@ def _protocol():
         return "json"
 
 
-def _example(obj, as_json=None):
-    """An action object written in the reply format in force.
-
-    `as_json` is the exact text a sentence has always carried under JSON, for
-    the one hint that is not what `json.dumps` would make of its object.
-    """
-    protocol = _protocol()
-    if protocol == "json" and as_json is not None:
-        return as_json
-    try:
-        import agent_protocol
-        return agent_protocol.example(obj, protocol)
-    except Exception:
+try:
+    from agent_protocol import hint as _hint
+except Exception:           # a frozen module list lacking agent_protocol
+    def _hint(obj, as_json=None):
         import json
+        if as_json is not None:
+            return as_json
         return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -112,7 +105,7 @@ def _key(name, value):
 
 def _update_example():
     """A `plan update` that moves one step, written in the format in force."""
-    return _example({"action": "plan", "operation": "update",
+    return _hint({"action": "plan", "operation": "update",
                      "steps": [{"step": 2, "status": "completed"}]})
 
 
@@ -264,7 +257,7 @@ class Plan:
         """
         if not self._steps:
             raise PlanError("There is no plan yet. Create one first with %s."
-                            % _example({"action": "plan",
+                            % _hint({"action": "plan",
                                         "operation": "create",
                                         "steps": ["..."]}))
         text = str(reference).strip()
@@ -502,7 +495,7 @@ class Plan:
             if _protocol() == "tags":
                 raise PlanError(
                     "/steps/ must be a list of step titles, such as %s."
-                    % _example({"action": "plan", "operation": "create",
+                    % _hint({"action": "plan", "operation": "create",
                                 "steps": ["Inspect the repository",
                                           "Run the tests"]}))
             raise PlanError("\"steps\" must be a list of step titles, such as "
@@ -510,7 +503,7 @@ class Plan:
         if not steps:
             raise PlanError("A plan needs at least one step. To drop the plan "
                             "instead, use %s."
-                            % _example({"action": "plan",
+                            % _hint({"action": "plan",
                                         "operation": "clear"}))
         if len(steps) > MAX_STEPS:
             raise PlanError("A plan holds at most %d steps; that one has %d. "
@@ -612,7 +605,7 @@ def refusal(plan, action):
     remaining = plan.outstanding()
     listed = "\n".join("  %s: %s [%s]" % (step.id, step.title, step.status)
                        for step in remaining)
-    complete = _example(
+    complete = _hint(
         {"action": "plan", "operation": "update", "step": "N",
          "status": "completed"},
         as_json='{"action":"plan","operation":"update","step":N,'

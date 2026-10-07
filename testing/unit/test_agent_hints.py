@@ -40,6 +40,7 @@ import ast
 import json
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -53,6 +54,7 @@ import agent_prompt
 import agent_protocol
 import agent_review
 import agent_reviewbot
+import agent_shell
 import agent_verify as V
 
 from test_agent_reply_format import ReplyFormat
@@ -61,6 +63,14 @@ REPO = Path(agent_config.__file__).resolve().parent
 
 MODULES = ("agent_bash", "agent_plan", "agent_review", "agent_verify",
            "agent_reviewbot", "agent_file_ops", "agent_delegation")
+
+# The refusal of `&` as `agent_shell` has always said it under JSON, taken
+# from the literal that was in the module before it was built at call time.
+OLD_BACKGROUND = (
+    "Background execution with & is not available in a command line. Use the "
+    "bash tool's \"operation\": \"start\" instead, which registers the job so "
+    "it can be watched with status and logs, and stopped."
+)
 
 
 # --- a workspace, because three of the sites read the disk ------------------
@@ -861,7 +871,7 @@ def test_no_hint_is_built_at_import():
     one outside a function."""
     builders = {"_example", "_example_action", "_key", "_bash", "_run_review",
                 "_run_verify", "_update_example", "_path_action", "_flag_hint",
-                "_constraints_example", "_no_command", "_job_limit", "_protocol"}
+                "_constraints_example", "_no_command", "_job_limit", "_protocol", "_hint"}
     bad = []
     for module in MODULES:
         tree = ast.parse((REPO / (module + ".py")).read_text(encoding="utf-8"))
@@ -883,23 +893,76 @@ def test_a_missing_protocol_module_costs_the_json_example_and_never_the_sentence
     whose frozen module list lacks it -- the failure `_run_tool` exists for --
     still refuses in words. The fallback is JSON, because JSON is the format
     every reply has always been readable in."""
-    saved = sys.modules.get("agent_protocol", "absent")
-    sys.modules["agent_protocol"] = None        # an import that raises
+    # The modules bind `agent_protocol.hint` when they are imported, so the
+    # failure has to be present at THAT moment: a fresh interpreter whose
+    # `agent_protocol` import raises, with the setting on tags.
+    program = "\n".join((
+        "import sys",
+        "sys.modules['agent_protocol'] = None",
+        "import agent_config",
+        "agent_config.PROTOCOL = 'tags'",
+        "import agent_review, agent_verify, agent_plan, agent_reviewbot",
+        "import agent_bash, agent_delegation, agent_file_ops, agent_shell",
+        "assert agent_review._run_review() == '{\"action\":\"review\"}'",
+        "assert agent_verify._run_verify() == '{\"action\":\"verify\"}'",
+        "assert agent_plan._hint({'action': 'plan'}) == '{\"action\":\"plan\"}'",
+        "assert agent_reviewbot._hint({'action': 'x'}) == '{\"action\":\"x\"}'",
+        "assert agent_bash._bash(command='x') == '{\"action\":\"bash\",\"command\":\"x\"}'",
+        "assert agent_delegation._constraints_example().startswith('{\"read_only\":true')",
+        "assert agent_file_ops._path_action('view_image', 'p.png') == "
+        "'{\"action\":\"view_image\",\"path\":\"p.png\"}'",
+        "assert agent_shell._background() == OLD_BACKGROUND",
+    ))
+    program = program.replace("OLD_BACKGROUND", repr(OLD_BACKGROUND))
+    done = subprocess.run([sys.executable, "-c", program], cwd=str(REPO),
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+
+
+def _shell_refusal(command):
     try:
-        with ReplyFormat("tags"):
-            assert agent_review._run_review() == '{"action":"review"}'
-            assert V._run_verify() == '{"action":"verify"}'
-            assert agent_plan._example({"action": "plan"}) == '{"action":"plan"}'
-            assert agent_reviewbot._example({"action": "x"}) == '{"action":"x"}'
-            assert agent_bash._bash(command="x") == '{"action":"bash","command":"x"}'
-            assert agent_delegation._constraints_example().startswith('{"read_only":true')
-            assert agent_file_ops._path_action("view_image", "p.png") == (
-                '{"action":"view_image","path":"p.png"}')
-    finally:
-        if saved == "absent":
-            sys.modules.pop("agent_protocol", None)
-        else:
-            sys.modules["agent_protocol"] = saved
+        agent_shell.parse(command)
+    except agent_shell.ShellError as error:
+        return str(error)
+    raise AssertionError("%r was not refused" % command)
+
+
+def test_the_refusal_of_background_execution_is_unchanged_under_json():
+    """The `&` refusal in `agent_shell` was the one hint left as a literal. Under
+    json it is that literal, byte for byte; it is read when it is said."""
+    with ReplyFormat("json"):
+        assert _shell_refusal("sleep 60 &") == OLD_BACKGROUND
+
+
+def test_the_refusal_of_background_execution_names_start_as_tags_under_tags():
+    with ReplyFormat("tags"):
+        message = _shell_refusal("sleep 60 &")
+    shown = agent_protocol.example({"action": "bash", "operation": "start"}, "tags")
+    assert shown in message, message
+    assert message != OLD_BACKGROUND
+    assert not JSON_SHAPE.search(message), message
+    read = agent_protocol.parse(examples_in(message, "bash")[0])
+    assert read == {"action": "bash", "operation": "start"}, read
+
+
+def test_there_is_one_shared_hint_and_no_module_keeps_a_private_example():
+    """`agent_protocol.hint` is the one reading of the setting for a sentence.
+    The private `_example` copies the first conversion needed are gone, and a
+    new one is a def a sweep over every module finds."""
+    assert callable(agent_protocol.hint)
+    with ReplyFormat("json"):
+        assert agent_protocol.hint({"action": "review"}) == '{"action":"review"}'
+        assert agent_protocol.hint({"action": "x"}, as_json="as-is") == "as-is"
+    with ReplyFormat("tags"):
+        assert agent_protocol.hint({"action": "review"}) == "/review/ //review/"
+        assert agent_protocol.hint({"action": "x"}, as_json="as-is") == "/x/ //x/"
+    private = []
+    for path in sorted(REPO.glob("agent_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_example":
+                private.append("%s.py:%d" % (path.stem, node.lineno))
+    assert not private, "a private _example is back: %s" % ", ".join(private)
 
 
 # --- what is deliberately still JSON ----------------------------------------

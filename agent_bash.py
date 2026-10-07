@@ -153,16 +153,16 @@ _NETWORK_RANK = {agent_policy.OFFLINE: 0, agent_policy.DEPS: 1,
 # decided when the sentence is BUILT, never at import: the format is a setting
 # the user can change between two turns, and a refusal that taught the other
 # shape would be teaching the model to leave the one it was asked to use.
-# `agent_protocol` is imported lazily, for the reason `agent_actions` imports
-# its tool modules lazily.
+# `agent_protocol.hint` does the reading; the fallback below is JSON, for an
+# install whose frozen module list lacks `agent_protocol`.
 
-def _example(obj):
-    """An action object written in the reply format in force."""
-    try:
-        import agent_protocol
-        return agent_protocol.example(obj, agent_config.PROTOCOL)
-    except Exception:
+try:
+    from agent_protocol import hint as _hint
+except Exception:           # a frozen module list lacking agent_protocol
+    def _hint(obj, as_json=None):
         import json
+        if as_json is not None:
+            return as_json
         return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -170,7 +170,7 @@ def _bash(**keys):
     """A bash action carrying `keys`, written in the reply format in force."""
     action = {"action": "bash"}
     action.update(keys)
-    return _example(action)
+    return _hint(action)
 
 
 _NO_COMMAND = (

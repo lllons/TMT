@@ -892,6 +892,37 @@ def example(obj, protocol=TAGS):
     return _render_checked(obj, None)
 
 
+def hint(obj, as_json=None):
+    """An action written in the reply format in force right now, for a sentence.
+
+    This is what every refusal and result that shows the model an action that
+    would work calls, so the modules that build those sentences share one
+    reading of the setting instead of each carrying a private copy. The format
+    is read HERE, at call time and never at import: it is a setting the user
+    can change between two turns, and a hint that taught the other shape would
+    be teaching the model to leave the one it was asked to use. `agent_config`
+    is imported inside the function, for the reason the tool modules are
+    imported lazily everywhere in TMT: a module list frozen at install time
+    must not be able to stop a module loading. If the setting cannot be read,
+    or the object cannot be written in that format, the answer is compact
+    JSON, which is what these sentences were before there was a choice.
+
+    `as_json` is the exact text a sentence has always carried under JSON, for
+    the one hint `json.dumps` cannot reproduce byte for byte.
+    """
+    try:
+        import agent_config
+        protocol = agent_config.PROTOCOL
+    except Exception:
+        protocol = JSON
+    if protocol == JSON and as_json is not None:
+        return as_json
+    try:
+        return example(obj, protocol)
+    except Exception:
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
 def _known_protocol(protocol):
     if protocol not in PROTOCOLS:
         raise ProtocolError("%r is not a reply format; use %s."

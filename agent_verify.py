@@ -58,30 +58,21 @@ import time
 # format is a setting the user can change between two turns, and a refusal
 # that taught the other shape would be teaching the model to leave the one it
 # was asked to use. Reading `agent_config.PROTOCOL` is reading a module global
-# and `agent_protocol` is imported lazily, so this module stays pure state.
+# and `agent_protocol.hint` reads it lazily, so this module stays pure state.
 
-def _protocol():
-    """The reply format in force right now; "json" if it cannot be read."""
-    try:
-        import agent_config
-        return agent_config.PROTOCOL
-    except Exception:
-        return "json"
-
-
-def _example(obj):
-    """An action object written in the reply format in force."""
-    try:
-        import agent_protocol
-        return agent_protocol.example(obj, _protocol())
-    except Exception:
+try:
+    from agent_protocol import hint as _hint
+except Exception:           # a frozen module list lacking agent_protocol
+    def _hint(obj, as_json=None):
         import json
+        if as_json is not None:
+            return as_json
         return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
 def _run_verify():
     """The action that starts a verification, in the reply format in force."""
-    return _example({"action": "verify"})
+    return _hint({"action": "verify"})
 
 
 # --- what one check can be doing -------------------------------------------

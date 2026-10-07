@@ -59,7 +59,7 @@ Four things here are deliberate and are the ones to read before changing it:
 # format is a setting the user can change between two turns, and a refusal
 # that taught the other shape would be teaching the reviewer to leave the one
 # it was asked to use. Reading `agent_config.PROTOCOL` is reading a module
-# global and `agent_protocol` is imported lazily, so this module stays pure.
+# global and `agent_protocol.hint` reads it lazily, so this module stays pure.
 
 def _protocol():
     """The reply format in force right now; "json" if it cannot be read."""
@@ -70,13 +70,13 @@ def _protocol():
         return "json"
 
 
-def _example(obj):
-    """An action object written in the reply format in force."""
-    try:
-        import agent_protocol
-        return agent_protocol.example(obj, _protocol())
-    except Exception:
+try:
+    from agent_protocol import hint as _hint
+except Exception:           # a frozen module list lacking agent_protocol
+    def _hint(obj, as_json=None):
         import json
+        if as_json is not None:
+            return as_json
         return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -384,7 +384,7 @@ class Agenda:
         if not self._items:
             raise AgendaError(
                 "There is no agenda yet. Declare one first with %s."
-                % _example({"action": "review_agenda", "operation": "create",
+                % _hint({"action": "review_agenda", "operation": "create",
                             "items": ["..."]}))
         text = str(reference).strip()
         if text[:1] in ("a", "A"):
