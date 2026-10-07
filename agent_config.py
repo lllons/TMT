@@ -343,7 +343,14 @@ TMT_GIT_ROOT = os.environ.get("TMT_GIT_ROOT", "")
 # this is kept as the name the rest of the project already reads, and is
 # refreshed by agent_models.set_model. Read it through agent_config.MODEL rather
 # than binding it on import, or a change made in Settings will not be seen.
-MODEL = os.environ.get("OPENROUTER_MODEL", "").strip() or "minimax/minimax-m3:free"
+# THIS LITERAL MUST MATCH `agent_models.DEFAULT_MODEL`, and it is spelled out
+# rather than imported because `agent_models` imports THIS module -- reaching
+# the other way would close the cycle. It is the second place a default lives,
+# so a catalogue change that stops here leaves a fresh install pointing at
+# whatever used to be first. `test_the_two_places_a_default_model_lives_agree`
+# is what catches that.
+MODEL = (os.environ.get("OPENROUTER_MODEL", "").strip()
+         or "nvidia/nemotron-3-ultra-550b-a55b:free")
 
 
 def refresh_model():

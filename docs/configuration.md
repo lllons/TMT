@@ -5,7 +5,7 @@
 | `OPENROUTER_API_KEY` | from `.tmt_providers.json`, then `.tmt_key` |
 | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` | from `.tmt_providers.json`. See [Putting a key in by hand](api-keys.md#putting-a-key-in-by-hand) |
 | `TMT_PROVIDER` | the provider saved in `.tmt_providers.json`, else `openrouter` |
-| `OPENROUTER_MODEL` | `minimax/minimax-m3:free` |
+| `OPENROUTER_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b:free`, or the model saved in `.tmt_model` |
 | `TMT_STREAM` | `1` |
 | effort | `medium`, from `.tmt_effort`; set with `/effort` |
 | project context | on, from `.tmt_context`; set in Settings. See [Project context](project-context.md) |
