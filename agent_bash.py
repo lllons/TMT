@@ -147,11 +147,41 @@ _NETWORK_RANK = {agent_policy.OFFLINE: 0, agent_policy.DEPS: 1,
 # made. Each one says what happened and what would work instead, and none of
 # them describes a way round a guard: a refusal that explains how to avoid the
 # check has taught avoiding it.
+#
+# Where a sentence shows the model an action that would work, the action is
+# written in whichever reply format the model is being asked for. That is
+# decided when the sentence is BUILT, never at import: the format is a setting
+# the user can change between two turns, and a refusal that taught the other
+# shape would be teaching the model to leave the one it was asked to use.
+# `agent_protocol` is imported lazily, for the reason `agent_actions` imports
+# its tool modules lazily.
+
+def _example(obj):
+    """An action object written in the reply format in force."""
+    try:
+        import agent_protocol
+        return agent_protocol.example(obj, agent_config.PROTOCOL)
+    except Exception:
+        import json
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _bash(**keys):
+    """A bash action carrying `keys`, written in the reply format in force."""
+    action = {"action": "bash"}
+    action.update(keys)
+    return _example(action)
+
 
 _NO_COMMAND = (
     "FAILED: the `%s` operation needs a `command` -- the command line to run. "
-    "Emit {\"action\":\"bash\",\"command\":\"python run_tests.py\"}."
+    "Emit %s."
 )
+
+
+def _no_command(operation):
+    return _NO_COMMAND % (operation, _bash(command="python run_tests.py"))
+
 
 _NO_JOB_ID = (
     "FAILED: the `%s` operation needs an `id` -- which background job to act "
@@ -191,11 +221,15 @@ _BAD_CWD = (
 
 _JOB_LIMIT = (
     "FAILED: %d background jobs are already running, which is the limit. Stop "
-    "one with {\"action\":\"bash\",\"operation\":\"stop\",\"id\":\"...\"} "
+    "one with %s "
     "before starting another. There is no queue: TMT has no scheduler to put "
     "one in, and a job that claimed to be waiting would be a claim about "
     "something that is not happening."
 )
+
+
+def _job_limit():
+    return _JOB_LIMIT % (MAX_JOBS, _bash(operation="stop", id="..."))
 
 _JOB_ONE_COMMAND = (
     "FAILED: a background job runs ONE program. This line has %s, and TMT "
@@ -635,7 +669,7 @@ class _Verdict:
 def _parse(command, operation=RUN):
     """(stages, refusal). Exactly one is falsy."""
     if not isinstance(command, str) or not command.strip():
-        return None, _NO_COMMAND % operation
+        return None, _no_command(operation)
     try:
         return agent_shell.parse(command), ""
     except agent_shell.ShellError as error:
@@ -888,7 +922,7 @@ def _start(command, cwd, timeout, network, approve):
 
     with _JOB_LOCK:
         if _capacity() >= MAX_JOBS:
-            return _JOB_LIMIT % MAX_JOBS
+            return _job_limit()
 
     mode = _network_mode(network)
     decision, refusal = _authorise(stages, directory, root, mode, approve,
@@ -902,7 +936,7 @@ def _start(command, cwd, timeout, network, approve):
         # Re-checked inside the lock with the id taken in the same breath, so
         # two threads cannot both see the last free slot.
         if _capacity() >= MAX_JOBS:
-            return _JOB_LIMIT % MAX_JOBS
+            return _job_limit()
         identifier = str(_NEXT_ID[0])
         _NEXT_ID[0] += 1
 
@@ -943,11 +977,9 @@ def _start(command, cwd, timeout, network, approve):
              "in %s | sandbox: %s | it is stopped after %d seconds, and at the "
              "end of the session whatever happens"
              % (job.cwd, job.level, int(seconds)),
-             "Read what it prints with "
-             "{\"action\":\"bash\",\"operation\":\"logs\",\"id\":\"%s\"} and "
-             "stop it with "
-             "{\"action\":\"bash\",\"operation\":\"stop\",\"id\":\"%s\"}."
-             % (identifier, identifier)]
+             "Read what it prints with %s and stop it with %s."
+             % (_bash(operation="logs", id=identifier),
+                _bash(operation="stop", id=identifier))]
     if decision.note:
         lines.insert(0, decision.note)
     return "\n".join(lines)
@@ -985,9 +1017,8 @@ def _status(identifier):
             return refusal
         current = [job]
     if not current:
-        return ("%s Start one with "
-                "{\"action\":\"bash\",\"operation\":\"start\",\"command\":"
-                "\"...\"}." % _NO_JOBS)
+        return ("%s Start one with %s."
+                % (_NO_JOBS, _bash(operation="start", command="...")))
     lines = ["%d of %d background job slots in use."
              % (_running_count(), MAX_JOBS)]
     for job in current:
@@ -1114,7 +1145,7 @@ def bash(command=None, operation=RUN, cwd=None, timeout=None, id=None,
         return _UNKNOWN_OPERATION % (operation, ", ".join(OPERATIONS))
     if chosen in _NEEDS_COMMAND and not (isinstance(command, str)
                                          and command.strip()):
-        return _NO_COMMAND % chosen
+        return _no_command(chosen)
     try:
         if chosen == RUN:
             return _run(command, cwd, timeout, network, approve)

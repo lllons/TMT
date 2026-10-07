@@ -487,6 +487,36 @@ def _timeout(value):
     return value, ""
 
 
+def _constraints_example():
+    """The example a malformed `constraints` is answered with.
+
+    Written in whichever reply format the model is being asked for, decided
+    when the sentence is BUILT and never at import: the format is a setting
+    the user can change between two turns. Under JSON it is the object alone,
+    exactly as it has always read. Under tags there is no bare object to show
+    -- a key is a tag, and `constraints` is a tag inside an action -- so it is
+    a `spawn_agent` carrying it, written by `agent_protocol` so that how
+    /constraints/ and /report/ nest is the grammar's own and not a second
+    serializer's. Imports are lazy and guarded, so this module still imports
+    nothing and a missing `agent_protocol` costs the JSON example, not the
+    refusal.
+    """
+    constraints = {"read_only": True, "timeout_seconds": 600,
+                   "report": {"summary": True}}
+    try:
+        import agent_config
+        protocol = agent_config.PROTOCOL
+        if protocol != "json":
+            import agent_protocol
+            return agent_protocol.example(
+                {"action": "spawn_agent", "task": "...",
+                 "constraints": constraints}, protocol)
+    except Exception:
+        pass
+    import json
+    return json.dumps(constraints, separators=(",", ":"))
+
+
 def parse(value):
     """(DelegationConstraints, error) from a `spawn_agent`'s "constraints".
 
@@ -505,8 +535,7 @@ def parse(value):
         return DEFAULT, ""
     if not isinstance(value, dict):
         return DEFAULT, ("FAILED: \"constraints\" must be an object, not %r. "
-                         "Example: {\"read_only\":true,\"timeout_seconds\":600,"
-                         "\"report\":{\"summary\":true}}" % (value,))
+                         "Example: %s" % (value, _constraints_example()))
     if not value:
         # An empty object is a model saying "no constraints" the long way
         # round. It is not a mistake and there is nothing to refuse.

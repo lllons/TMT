@@ -46,6 +46,43 @@ Four things here are deliberate and are the ones to read before changing it:
 import json
 import re
 
+
+# --- the reply format the hints are written in ------------------------------
+#
+# Several refusals below end by showing the model the action that would work.
+# That action is written in whichever reply format the model is being asked
+# for, and the choice is made when the sentence is BUILT, never at import: the
+# format is a setting the user can change between two turns, and a refusal
+# that taught the other shape would be teaching the model to leave the one it
+# was asked to use. Reading `agent_config.PROTOCOL` is reading a module global
+# and `agent_protocol` is imported lazily, so this module stays pure state.
+#
+# What the REVIEWER writes back is a different matter and is not touched: its
+# verdict is JSON inside its `response`, whichever format the main agent uses.
+
+def _protocol():
+    """The reply format in force right now; "json" if it cannot be read."""
+    try:
+        import agent_config
+        return agent_config.PROTOCOL
+    except Exception:
+        return "json"
+
+
+def _example(obj):
+    """An action object written in the reply format in force."""
+    try:
+        import agent_protocol
+        return agent_protocol.example(obj, _protocol())
+    except Exception:
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _run_review():
+    """The action that starts a review, in the reply format in force."""
+    return _example({"action": "review"})
+
+
 # --- what a reviewer may conclude ------------------------------------------
 
 # The three verdicts a review can reach. PASS_WITH_WARNINGS is a pass: it is
@@ -471,9 +508,9 @@ class ReviewResult:
             return ("Required action: none. The review found nothing blocking. "
                     "Finish the remaining plan steps and answer.")
         return ("Required action: fix %s, run verification again, then request "
-                "review again with {\"action\":\"review\"}. Do not answer until "
+                "review again with %s. Do not answer until "
                 "a review passes."
-                % ", ".join(issue.id for issue in blocking))
+                % (", ".join(issue.id for issue in blocking), _run_review()))
 
     def __repr__(self):
         return "ReviewResult(#%d, %s, %d issues)" % (
@@ -721,7 +758,7 @@ _NO_REVIEW = (
     "BLOCKED: you cannot finish yet. This task changed %d file(s) against a "
     "%d-step plan, so it needs an independent review before it can be called "
     "done, and no review has been run.\n"
-    "Run one now with {\"action\":\"review\"}. It reads the diff, the plan and "
+    "Run one now with %s. It reads the diff, the plan and "
     "your request, and comes back with findings you must act on. Do not "
     "call end_conversation again until a review has passed."
 )
@@ -730,7 +767,7 @@ _REVIEW_FAILED = (
     "BLOCKED: you cannot finish yet. Review #%d found %d blocking issue(s):\n"
     "%s\n"
     "Fix them, run verification again, then request another review with "
-    "{\"action\":\"review\"}. A finding you believe is wrong is still yours to "
+    "%s. A finding you believe is wrong is still yours to "
     "investigate and answer in the next review -- disagreeing with it does not "
     "clear it, and you cannot mark the review passed yourself."
 )
@@ -739,7 +776,7 @@ _REVIEW_ERROR = (
     "BLOCKED: you cannot finish yet. The last review did not produce a usable "
     "result (%s), so nothing has actually been reviewed. A review that failed "
     "to run is not a review that passed.\n"
-    "Run {\"action\":\"review\"} again."
+    "Run %s again."
 )
 
 _REVIEW_STALE = (
@@ -747,7 +784,7 @@ _REVIEW_STALE = (
     "been changed since it ran (%s), so what passed is not what you are about "
     "to report.\n"
     "Run verification again, then request another review with "
-    "{\"action\":\"review\"}."
+    "%s."
 )
 
 _REVIEW_RUNNING = (
@@ -1221,14 +1258,16 @@ def refusal(review, plan=None, action=None):
         if review.state == RUNNING:
             return _REVIEW_RUNNING
         if review.state == ERROR:
-            return _REVIEW_ERROR % (review.error or "no reason was recorded")
+            return _REVIEW_ERROR % (review.error or "no reason was recorded",
+                                    _run_review())
         if review.state == IDLE:
             steps = len(getattr(plan, "steps", ()) or ())
-            return _NO_REVIEW % (len(review.changed_paths), steps)
+            return _NO_REVIEW % (len(review.changed_paths), steps,
+                                 _run_review())
         if review.stale:
             changed = review._changed_since
             return _REVIEW_STALE % (review.last.number, len(changed),
-                                    ", ".join(changed[:8]))
+                                    ", ".join(changed[:8]), _run_review())
         if review.passed:
             return ""
         last = review.last
@@ -1236,7 +1275,8 @@ def refusal(review, plan=None, action=None):
                            % (issue.id, issue.severity, issue.title,
                               " (%s)" % issue.location if issue.location else "")
                            for issue in last.blocking())
-        return _REVIEW_FAILED % (last.number, len(last.blocking()), listed)
+        return _REVIEW_FAILED % (last.number, len(last.blocking()), listed,
+                                 _run_review())
     except Exception:
         return ""
 
@@ -1364,7 +1404,7 @@ def is_review_step(title):
 _STEP_VETO = (
     "FAILED: %s (%s) is the review step and the review has not passed -- it is "
     "%s. %s A review step cannot be completed by saying it is complete; run "
-    "{\"action\":\"review\"} and let it report."
+    "%s and let it report."
 )
 
 
@@ -1399,7 +1439,7 @@ def plan_veto(review, plan, obj):
             if not is_review_step(step.title):
                 continue
             return _STEP_VETO % (step.id, step.title, _state_words(review),
-                                 _what_to_do(review))
+                                 _what_to_do(review), _run_review())
         return ""
     except Exception:
         # Every failure here lets the update through. A veto is a refinement
@@ -1442,7 +1482,7 @@ def _state_words(review):
 
 def _what_to_do(review):
     if review.state in (IDLE, ERROR) or review.stale:
-        return "Run {\"action\":\"review\"}."
+        return "Run %s." % _run_review()
     if review.state == RUNNING:
         return "Wait for it to report."
-    return "Fix the blocking findings, then run {\"action\":\"review\"} again."
+    return "Fix the blocking findings, then run %s again." % _run_review()

@@ -49,6 +49,41 @@ Five things here are deliberate and are the ones to read before changing it:
 import re
 import time
 
+
+# --- the reply format the hints are written in ------------------------------
+#
+# Several refusals below end by showing the model the action that would work.
+# That action is written in whichever reply format the model is being asked
+# for, and the choice is made when the sentence is BUILT, never at import: the
+# format is a setting the user can change between two turns, and a refusal
+# that taught the other shape would be teaching the model to leave the one it
+# was asked to use. Reading `agent_config.PROTOCOL` is reading a module global
+# and `agent_protocol` is imported lazily, so this module stays pure state.
+
+def _protocol():
+    """The reply format in force right now; "json" if it cannot be read."""
+    try:
+        import agent_config
+        return agent_config.PROTOCOL
+    except Exception:
+        return "json"
+
+
+def _example(obj):
+    """An action object written in the reply format in force."""
+    try:
+        import agent_protocol
+        return agent_protocol.example(obj, _protocol())
+    except Exception:
+        import json
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _run_verify():
+    """The action that starts a verification, in the reply format in force."""
+    return _example({"action": "verify"})
+
+
 # --- what one check can be doing -------------------------------------------
 
 # The statuses of a single check. Kept apart from the run's own states below
@@ -619,8 +654,8 @@ class VerificationResult:
         """What to do next, worked out from what actually happened."""
         rows = []
         for check in self.failures():
-            rows.append("Fix what %s reported, then run {\"action\":\"verify\"} "
-                        "again." % check.name)
+            rows.append("Fix what %s reported, then run %s "
+                        "again." % (check.name, _run_verify()))
         for check in self.errors():
             rows.append("%s could not be run (%s). Fix that or the "
                         "verification cannot report on it."
@@ -684,7 +719,7 @@ _NO_VERIFY = (
     "BLOCKED: you cannot finish yet. This task changed %d file(s) against a "
     "%d-step plan, so it must be verified before it can be called done, and "
     "no verification has been run.\n"
-    "Run one now with {\"action\":\"verify\"}. It inspects this repository, "
+    "Run one now with %s. It inspects this repository, "
     "works out which checks are worth running for what you changed, runs them, "
     "and reports what they said. Do not call end_conversation again until it "
     "passes."
@@ -693,7 +728,7 @@ _NO_VERIFY = (
 _VERIFY_FAILED = (
     "BLOCKED: you cannot finish yet. Verification #%d failed: %d check(s) did "
     "not pass.\n%s\n"
-    "Fix what they reported, then run {\"action\":\"verify\"} again. You cannot "
+    "Fix what they reported, then run %s again. You cannot "
     "mark verification passed yourself -- the only thing that moves it is a "
     "command actually exiting zero."
 )
@@ -702,14 +737,14 @@ _VERIFY_ERROR = (
     "BLOCKED: you cannot finish yet. Verification #%d could not complete "
     "(%s), so nothing has actually been verified. A verification that failed "
     "to run is not a verification that passed.\n"
-    "Fix what stopped it and run {\"action\":\"verify\"} again."
+    "Fix what stopped it and run %s again."
 )
 
 _VERIFY_STALE = (
     "BLOCKED: you cannot finish yet. Verification #%d passed, but %d file(s) "
     "have changed since it ran (%s), so what passed is not what you are about "
     "to report.\n"
-    "Run {\"action\":\"verify\"} again."
+    "Run %s again."
 )
 
 _VERIFY_RUNNING = (
@@ -719,7 +754,7 @@ _VERIFY_RUNNING = (
 
 _VERIFY_CANCELLED = (
     "BLOCKED: you cannot finish yet. The last verification was cancelled "
-    "(%s), so nothing was verified. Run {\"action\":\"verify\"} again."
+    "(%s), so nothing was verified. Run %s again."
 )
 
 
@@ -1109,23 +1144,27 @@ def refusal(verify, plan=None, action=None):
         if verify.running:
             return _VERIFY_RUNNING
         if verify.state == CANCELLED:
-            return _VERIFY_CANCELLED % (verify.error or "no reason was recorded")
+            return _VERIFY_CANCELLED % (verify.error or "no reason was recorded",
+                                        _run_verify())
         if verify.state == ERROR:
             number = last.number if last is not None else verify.cycles
             return _VERIFY_ERROR % (number,
-                                    verify.error or "no reason was recorded")
+                                    verify.error or "no reason was recorded",
+                                    _run_verify())
         if verify.state == IDLE:
             steps = len(getattr(plan, "steps", ()) or ())
-            return _NO_VERIFY % (len(verify.changed_paths), steps)
+            return _NO_VERIFY % (len(verify.changed_paths), steps,
+                                 _run_verify())
         if verify.stale:
             changed = verify.changed_since
             return _VERIFY_STALE % (last.number, len(changed),
-                                    ", ".join(changed[:8]))
+                                    ", ".join(changed[:8]), _run_verify())
         if verify.passed:
             return ""
         listed = "\n".join("  %s: %s" % (check.name, check.detail())
                            for check in last.failures())
-        return _VERIFY_FAILED % (last.number, len(last.failures()), listed)
+        return _VERIFY_FAILED % (last.number, len(last.failures()), listed,
+                                 _run_verify())
     except Exception:
         return ""
 
@@ -1245,7 +1284,7 @@ def is_verify_step(title):
 _STEP_VETO = (
     "FAILED: %s (%s) is the verification step and verification has not passed "
     "-- it is %s. %s A verification step cannot be completed by saying it is "
-    "complete; run {\"action\":\"verify\"} and let it report."
+    "complete; run %s and let it report."
 )
 
 
@@ -1283,7 +1322,7 @@ def plan_veto(verify, plan, obj):
             if not is_verify_step(step.title):
                 continue
             return _STEP_VETO % (step.id, step.title, _state_words(verify),
-                                 _what_to_do(verify))
+                                 _what_to_do(verify), _run_verify())
         return ""
     except Exception:
         # Every failure here lets the update through. A veto is a refinement
@@ -1331,5 +1370,5 @@ def _what_to_do(verify):
     if verify.running:
         return "Wait for it to report."
     if verify.state in (IDLE, ERROR, CANCELLED) or verify.stale:
-        return "Run {\"action\":\"verify\"}."
-    return "Fix the failing checks, then run {\"action\":\"verify\"} again."
+        return "Run %s." % _run_verify()
+    return "Fix the failing checks, then run %s again." % _run_verify()

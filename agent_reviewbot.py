@@ -50,6 +50,44 @@ Four things here are deliberate and are the ones to read before changing it:
   readout off is never the dangerous direction.
 """
 
+
+# --- the reply format the hints are written in ------------------------------
+#
+# A few refusals below end by showing the reviewer the action or the key that
+# would work. It is written in whichever reply format the agent is being asked
+# for, and the choice is made when the sentence is BUILT, never at import: the
+# format is a setting the user can change between two turns, and a refusal
+# that taught the other shape would be teaching the reviewer to leave the one
+# it was asked to use. Reading `agent_config.PROTOCOL` is reading a module
+# global and `agent_protocol` is imported lazily, so this module stays pure.
+
+def _protocol():
+    """The reply format in force right now; "json" if it cannot be read."""
+    try:
+        import agent_config
+        return agent_config.PROTOCOL
+    except Exception:
+        return "json"
+
+
+def _example(obj):
+    """An action object written in the reply format in force."""
+    try:
+        import agent_protocol
+        return agent_protocol.example(obj, _protocol())
+    except Exception:
+        import json
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _key(name, value):
+    """One key written in the reply format in force: `"item": 2` or `/item/ 2 //item/`."""
+    if _protocol() == "tags":
+        return "/%s/ %s //%s/" % (name, value, name)
+    import json
+    return "%s: %s" % (json.dumps(name), json.dumps(value))
+
+
 # --- what an item can be ---------------------------------------------------
 
 # Not started. The reviewer said it would do this and has not yet.
@@ -345,9 +383,9 @@ class Agenda:
         """
         if not self._items:
             raise AgendaError(
-                "There is no agenda yet. Declare one first with "
-                "{\"action\":\"review_agenda\",\"operation\":\"create\","
-                "\"items\":[\"...\"]}.")
+                "There is no agenda yet. Declare one first with %s."
+                % _example({"action": "review_agenda", "operation": "create",
+                            "items": ["..."]}))
         text = str(reference).strip()
         if text[:1] in ("a", "A"):
             text = text[1:]
@@ -616,8 +654,13 @@ class Agenda:
             return entries
         if reference is None:
             raise AgendaError(
-                "Say which item to update, as \"item\": 2 or \"item\": \"A2\".")
+                "Say which item to update, as %s or %s."
+                % (_key("item", 2), _key("item", "A2")))
         if status is None:
+            if _protocol() == "tags":
+                raise AgendaError(
+                    "Say what to move %s to by giving /status/ one of: %s."
+                    % (reference, ", ".join(STATUSES)))
             raise AgendaError(
                 "Say what to move %s to, as \"status\": one of: %s."
                 % (reference, ", ".join(STATUSES)))

@@ -65,6 +65,57 @@ MAX_TITLE = 120
 OPERATIONS = ("create", "update", "add", "remove", "clear", "show")
 
 
+# --- the reply format the hints are written in --------------------------------
+#
+# Several refusals below end by showing the model the action that would work.
+# That action is written in whichever reply format the model is being asked
+# for, and the choice is made when the sentence is BUILT, never at import: the
+# format is a setting the user can change between two turns, and a refusal
+# that taught the other shape would be teaching the model to leave the one it
+# was asked to use. Reading `agent_config.PROTOCOL` is reading a module global
+# and `agent_protocol` is imported lazily, so this module still imports
+# nothing and still does no I/O.
+
+def _protocol():
+    """The reply format in force right now; "json" if it cannot be read."""
+    try:
+        import agent_config
+        return agent_config.PROTOCOL
+    except Exception:
+        return "json"
+
+
+def _example(obj, as_json=None):
+    """An action object written in the reply format in force.
+
+    `as_json` is the exact text a sentence has always carried under JSON, for
+    the one hint that is not what `json.dumps` would make of its object.
+    """
+    protocol = _protocol()
+    if protocol == "json" and as_json is not None:
+        return as_json
+    try:
+        import agent_protocol
+        return agent_protocol.example(obj, protocol)
+    except Exception:
+        import json
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _key(name, value):
+    """One key written in the reply format in force: `"step": 2` or `/step/ 2 //step/`."""
+    if _protocol() == "tags":
+        return "/%s/ %s //%s/" % (name, value, name)
+    import json
+    return "%s: %s" % (json.dumps(name), json.dumps(value))
+
+
+def _update_example():
+    """A `plan update` that moves one step, written in the format in force."""
+    return _example({"action": "plan", "operation": "update",
+                     "steps": [{"step": 2, "status": "completed"}]})
+
+
 class PlanError(ValueError):
     """A plan operation the model got wrong, carrying the sentence to send it.
 
@@ -212,9 +263,10 @@ class Plan:
         one the model can make without another call.
         """
         if not self._steps:
-            raise PlanError("There is no plan yet. Create one first with "
-                            "{\"action\":\"plan\",\"operation\":\"create\","
-                            "\"steps\":[\"...\"]}.")
+            raise PlanError("There is no plan yet. Create one first with %s."
+                            % _example({"action": "plan",
+                                        "operation": "create",
+                                        "steps": ["..."]}))
         text = str(reference).strip()
         if text[:1] in ("s", "S"):
             text = text[1:]
@@ -447,12 +499,19 @@ class Plan:
     def _read_steps(steps):
         """[(title, status)] from what a model put in "steps"."""
         if isinstance(steps, str) or not isinstance(steps, (list, tuple)):
+            if _protocol() == "tags":
+                raise PlanError(
+                    "/steps/ must be a list of step titles, such as %s."
+                    % _example({"action": "plan", "operation": "create",
+                                "steps": ["Inspect the repository",
+                                          "Run the tests"]}))
             raise PlanError("\"steps\" must be a list of step titles, such as "
                             "[\"Inspect the repository\", \"Run the tests\"].")
         if not steps:
             raise PlanError("A plan needs at least one step. To drop the plan "
-                            "instead, use {\"action\":\"plan\","
-                            "\"operation\":\"clear\"}.")
+                            "instead, use %s."
+                            % _example({"action": "plan",
+                                        "operation": "clear"}))
         if len(steps) > MAX_STEPS:
             raise PlanError("A plan holds at most %d steps; that one has %d. "
                             "A plan is the milestones the user would "
@@ -479,12 +538,22 @@ class Plan:
             if isinstance(updates, dict):
                 updates = [updates]
             if not isinstance(updates, (list, tuple)) or not updates:
+                if _protocol() == "tags":
+                    raise PlanError(
+                        "/steps/ for an update must be a non-empty list of "
+                        "/item/ entries, each holding a /step/ and a "
+                        "/status/, as in %s." % _update_example())
                 raise PlanError("\"steps\" for an update must be a non-empty "
                                 "list of {\"step\":N,\"status\":\"...\"} "
                                 "objects.")
             batch = []
             for entry in updates:
                 if not isinstance(entry, dict):
+                    if _protocol() == "tags":
+                        raise PlanError(
+                            "Each update must be an /item/ holding a /step/ "
+                            "and a /status/, as in %s."
+                            % _update_example())
                     raise PlanError("Each update must be an object such as "
                                     "{\"step\":2,\"status\":\"completed\"}.")
                 batch.append(self._read_one(
@@ -495,8 +564,8 @@ class Plan:
 
     def _read_one(self, reference, status, title):
         if reference is None:
-            raise PlanError("Say which step to update, as \"step\": 2 or "
-                            "\"step\": \"S2\".")
+            raise PlanError("Say which step to update, as %s or %s."
+                            % (_key("step", 2), _key("step", "S2")))
         step = self.find(reference)
         return (step,
                 None if status is None else normalize_status(status),
@@ -507,13 +576,14 @@ class Plan:
 
 # The sentence the loop hands back when a final answer is refused. It names
 # the steps that are outstanding, because "finish the plan" is not actionable
-# and "S3 Run the tests is still in progress" is.
+# and "S3 Run the tests is still in progress" is. Its third slot is the
+# `plan update` the model should write, in the reply format in force when the
+# sentence is built -- see `refusal`.
 _INCOMPLETE = (
     "BLOCKED: you cannot finish yet. The plan you made is the contract for "
     "this task, and %s still outstanding:\n%s\n"
     "Do the work for the next step, then mark it completed with "
-    "{\"action\":\"plan\",\"operation\":\"update\",\"step\":N,"
-    "\"status\":\"completed\"}. If a step turned out not to be needed, say so "
+    "%s. If a step turned out not to be needed, say so "
     "in its title and complete it, or replace the plan with \"create\". Do "
     "not call end_conversation again until every step is completed."
 )
@@ -542,5 +612,11 @@ def refusal(plan, action):
     remaining = plan.outstanding()
     listed = "\n".join("  %s: %s [%s]" % (step.id, step.title, step.status)
                        for step in remaining)
+    complete = _example(
+        {"action": "plan", "operation": "update", "step": "N",
+         "status": "completed"},
+        as_json='{"action":"plan","operation":"update","step":N,'
+                '"status":"completed"}')
     return _INCOMPLETE % ("1 step is" if len(remaining) == 1
-                          else "%d steps are" % len(remaining), listed)
+                          else "%d steps are" % len(remaining), listed,
+                          complete)
