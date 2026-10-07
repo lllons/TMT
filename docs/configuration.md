@@ -8,7 +8,7 @@
 | `OPENROUTER_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b:free`, or the model saved in `.tmt_model` |
 | `TMT_STREAM` | `1` |
 | effort | `medium`, from `.tmt_effort`; set with `/effort` |
-| reply format | `tags`, from `.tmt_protocol`; set in Settings ("Model Reply Format"). `json` is the other value |
+| reply format | `tags`, from `.tmt_protocol`; set in Settings ("Model Reply Format"). `json` is the other value. See [Reply format](reply-format.md) |
 | project context | on, from `.tmt_context`; set in Settings. See [Project context](project-context.md) |
 | `TMT_GIT_NAME` | `TMT code` |
 | `TMT_GIT_EMAIL` | none — required before TMT will commit |

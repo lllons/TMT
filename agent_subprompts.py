@@ -55,6 +55,7 @@ files a worker has just rewritten.
 
 import agent_config
 import agent_prompt
+import agent_protocol
 from agent_execution import APP_REGISTRY
 
 # The tree's own ceilings unless something asks for others. They are named
@@ -140,30 +141,31 @@ REVIEW_VERBS = (
     "review_agenda",
 )
 
-_cached_worker = None
-_cached_note = None
-_cached_review = None
-_worker_dirty = True
-_note_dirty = True
-_review_dirty = True
+# One cache per prompt, and each is keyed by the wire protocol it teaches. A
+# worker started while the setting says "tags" and another started after
+# Settings changed it to "json" are different prompts, and the second must not
+# be served the first's. `invalidate_subprompts` empties all three, whatever
+# they hold, which is what the workspace moving needs.
+_cached_worker = {}
+_cached_note = {}
+_cached_review = {}
 
 
 def invalidate_subprompts():
-    """Drop both cached prompts. Called whenever the workspace changes.
+    """Drop every cached prompt, in every protocol. Called whenever the workspace changes.
 
     Cheap and safe to call more often than needed: the next agent to start
     rebuilds its tree, and a stale tree is a background agent reasoning about
     files that are no longer there.
     """
-    global _worker_dirty, _note_dirty, _review_dirty
-    _worker_dirty = True
-    _note_dirty = True
+    _cached_worker.clear()
+    _cached_note.clear()
     # The reviewer's tree describes files the implementing agent has just
     # rewritten, and a reviewer given a stale shape would go looking for a
     # module that has moved. It is invalidated with the others rather than
     # separately: a review runs immediately after work, which is the exact
     # moment the shape is most likely to be wrong.
-    _review_dirty = True
+    _cached_review.clear()
 
 
 # --- what a background agent is, and is not -------------------------------
@@ -535,6 +537,90 @@ Real findings that do not block. Say so plainly rather than inflating them.
   GOOD: the reads the questions actually need, then one internal_response carrying the result object."""
 
 
+# --- the same prompts, taught in tags ----------------------------------------
+#
+# What `agent_prompt` does for the main agent, done for the three background
+# ones, and for the same reasons (read the long comment above its
+# HEADER_TAGS). Each constant here that says anything about the wire format has
+# a `_TAGS` twin: the three HOW-YOU-ARE-READ paragraphs, the reviewer's result
+# reference, the three example sets and the closing reminder. Everything else a
+# background prompt carries -- the shared rules, the action reference, the
+# tool-choice table -- comes from `agent_prompt.section`, so it is the same
+# text the main agent reads in the same protocol.
+#
+# The three headers each carried the same paragraph about a JSON parser, word
+# for word, so it is swapped once and applied to all three: the day one of
+# them is reworded and the swap stops matching, `agent_prompt.rewrite` fails at
+# import rather than leaving a background agent told it is read as JSON.
+_PARSER_PARAGRAPH = (
+    'Your reply does not go to a person. It goes to a JSON parser. The parser '
+    'looks for one JSON object; it takes the "action" out of it and runs it. '
+    'Anything that is not inside that object is thrown away without being '
+    'shown to anyone.')
+_PARSER_PARAGRAPH_TAGS = (
+    'Your reply does not go to a person. It goes to a tag parser. The parser '
+    'reads your tag blocks: the outer tag of each block names an action, and '
+    'the parser runs it. Anything that is not inside a block is thrown away '
+    'without being shown to anyone.')
+_HEADER_SWAPS = ((_PARSER_PARAGRAPH, _PARSER_PARAGRAPH_TAGS),)
+
+WORKER_HEADER_TAGS = agent_prompt.as_tags("WORKER_HEADER", WORKER_HEADER, _HEADER_SWAPS)
+NOTE_HEADER_TAGS = agent_prompt.as_tags("NOTE_HEADER", NOTE_HEADER, _HEADER_SWAPS)
+REVIEWER_HEADER_TAGS = agent_prompt.as_tags("REVIEWER_HEADER", REVIEWER_HEADER, _HEADER_SWAPS)
+
+# The reviewer's VERDICT is a JSON object in either protocol: it is the review
+# result `agent_review.parse_result` reads, a different payload from the wire
+# format. What changes is how it is carried. Under JSON it is a string inside a
+# string, every quote escaped; under tags it is the plain text of the
+# internal_response, so it is written exactly as it is. The examples show it
+# that way (transliterate renders an internal_response that holds one key as
+# its bare body), and this is the sentence that says why there is nothing to
+# escape -- without it a model that had learned to escape the verdict in JSON
+# would go on doing it, and the parser would read a string full of backslashes.
+REVIEW_RESULT_REFERENCE_TAGS = agent_prompt.as_tags(
+    "REVIEW_RESULT_REFERENCE", REVIEW_RESULT_REFERENCE, (
+        ('Your single internal_response carries ONE JSON object as its "response" string.',
+         'Your single internal_response carries ONE JSON object as its response. '
+         'Write that object raw, as the body of the internal_response (the same '
+         'as inside a /response/ tag): a tag holds plain text, so the object\'s '
+         'quotes, backslashes and line breaks are written exactly as they are, '
+         'with no escaping and no quotes round the whole of it.'),
+    ))
+
+_ONE_BLOCK = (("one object at a time", "one block at a time"),)
+
+WORKER_EXAMPLES_TAGS = agent_prompt.as_tags("WORKER_EXAMPLES", WORKER_EXAMPLES, _ONE_BLOCK)
+NOTE_EXAMPLES_TAGS = agent_prompt.as_tags("NOTE_EXAMPLES", NOTE_EXAMPLES, _ONE_BLOCK)
+REVIEWER_EXAMPLES_TAGS = agent_prompt.as_tags("REVIEWER_EXAMPLES", REVIEWER_EXAMPLES, _ONE_BLOCK)
+
+# The closing line of every background prompt. It names the one thing all
+# three have in common at the end, which is why it is here and not beside each
+# builder.
+SUBPROMPT_REMINDER = ("Reminder: reply with one JSON object only. Start with { "
+                      "and end with }. Finish with exactly one internal_response.")
+SUBPROMPT_REMINDER_TAGS = ("Reminder: reply with tag blocks only. Every block "
+                           "opens with /name/ and closes with //name/, and "
+                           "nothing is written outside the blocks. Finish with "
+                           "exactly one internal_response.")
+
+
+def _section(name, protocol):
+    """A constant of this module, as `protocol` teaches it.
+
+    JSON is the constant itself, so a prompt built for it is the one that
+    existed before tags did. TAGS is its `_TAGS` twin when it has one, and
+    otherwise the same text with its JSON examples rewritten -- which for a
+    constant with no examples (a rules block, say) is the text unchanged.
+    """
+    text = globals()[name]
+    if protocol == agent_protocol.JSON:
+        return text
+    twin = globals().get(name + "_TAGS")
+    if twin is not None:
+        return twin
+    return agent_prompt.as_tags(name, text)
+
+
 def _tree():
     """The shape of the workspace, or a sentence saying why there is none.
 
@@ -559,7 +645,7 @@ def _shape_section():
 
 
 def _common(header, overrides, rules, examples, reference=None, extra=None,
-                    tool_choice=None):
+            tool_choice=None, protocol=None):
     """Assemble one background prompt from the shared parts and its own.
 
     The order matters and is the main prompt's order: what you are, how you
@@ -588,20 +674,29 @@ def _common(header, overrides, rules, examples, reference=None, extra=None,
 
 ".join` over a None would put one there, so the entry is
     left out of the list entirely.
+
+    `protocol` is the wire format every shared section is taught in, and None
+    means the live setting. The sections that are this module's own arrive
+    already in that protocol, chosen by the three builders below; what is
+    chosen here is what `agent_prompt` owns -- the format rules, the action
+    reference, the editing and tool-choice rules, the git rules -- and the
+    closing reminder.
     """
+    protocol = agent_prompt.resolve_protocol(protocol)
+    teach = lambda name: agent_prompt.section(name, protocol)
     apps = ", ".join("%s (%s)" % (key, value["description"])
                      for key, value in APP_REGISTRY.items()) or "none"
     return "\n\n".join([
         header,
-        agent_prompt.OUTPUT_RULES,
+        teach("OUTPUT_RULES"),
         overrides,
         rules,
-        INTERNAL_RESPONSE_REFERENCE if reference is None else reference,
+        _section("INTERNAL_RESPONSE_REFERENCE", protocol) if reference is None else reference,
     ] + ([extra] if extra else []) + [
-        agent_prompt.ACTION_REFERENCE,
+        teach("ACTION_REFERENCE"),
         "Permitted apps for open_app: %s" % apps,
-        agent_prompt.PREFERENCE_RULES,
-        agent_prompt.TOOL_CHOICE_RULES if tool_choice is None else tool_choice,
+        teach("PREFERENCE_RULES"),
+        teach("TOOL_CHOICE_RULES") if tool_choice is None else tool_choice,
         # Reused although the contract did not list it, deliberately:
         # git_commit IS dispatchable by a worker, and GIT_RULES is where the
         # co-author trailer, the "never ask for a credential" rule and the
@@ -610,13 +705,12 @@ def _common(header, overrides, rules, examples, reference=None, extra=None,
         # tokens it costs. The note agent cannot commit and gets it only so
         # that its reading of git_status and git_diff is informed by the same
         # facts.
-        agent_prompt.GIT_RULES,
+        teach("GIT_RULES"),
         examples,
         "Workspace root: %s" % agent_config.ROOT_DIR,
         agent_prompt._repository_line(),
         _shape_section(),
-        "Reminder: reply with one JSON object only. Start with { and end with }. "
-        "Finish with exactly one internal_response.",
+        _section("SUBPROMPT_REMINDER", protocol),
     ]).strip()
 
 
@@ -699,38 +793,49 @@ def delegation_section(constraints):
     return "\n".join(lines)
 
 
-def worker_prompt():
-    """The system prompt a background worker runs under. Cached."""
-    global _cached_worker, _worker_dirty
-    if not _worker_dirty and _cached_worker is not None:
-        return _cached_worker
-    _cached_worker = _common(
-        WORKER_HEADER, WORKER_OVERRIDES, WORKER_RULES, WORKER_EXAMPLES,
-        # Both sections a worker has and the other two background
-        # agents do not, joined rather than given a second parameter:
-        # `extra` is one slot and the note and review prompts must not
-        # gain a blank line where nothing is inserted, which is the
-        # whole reason it is a parameter at all.
-        extra=agent_prompt.WEB_REFERENCE + "\n\n" + agent_prompt.IMAGE_REFERENCE,
-        tool_choice=agent_prompt._with_image_row(
-            agent_prompt._with_web_row(agent_prompt.TOOL_CHOICE_RULES)))
-    _worker_dirty = False
-    return _cached_worker
+def worker_prompt(*, protocol=None):
+    """The system prompt a background worker runs under. Cached per protocol.
+
+    `protocol` is keyword-only, and that is deliberate: these builders took no
+    arguments for most of their life, and a caller that passes one by position
+    (a task, say) is speaking to the old signature. That has to stay a
+    TypeError, as it always was, rather than be read as a reply format.
+    """
+    protocol = agent_prompt.resolve_protocol(protocol)
+    if protocol not in _cached_worker:
+        teach = lambda name: agent_prompt.section(name, protocol)
+        _cached_worker[protocol] = _common(
+            _section("WORKER_HEADER", protocol),
+            _section("WORKER_OVERRIDES", protocol),
+            _section("WORKER_RULES", protocol),
+            _section("WORKER_EXAMPLES", protocol),
+            # Both sections a worker has and the other two background
+            # agents do not, joined rather than given a second parameter:
+            # `extra` is one slot and the note and review prompts must not
+            # gain a blank line where nothing is inserted, which is the
+            # whole reason it is a parameter at all.
+            extra=teach("WEB_REFERENCE") + "\n\n" + teach("IMAGE_REFERENCE"),
+            tool_choice=agent_prompt._with_image_row(
+                agent_prompt._with_web_row(teach("TOOL_CHOICE_RULES"))),
+            protocol=protocol)
+    return _cached_worker[protocol]
 
 
-def note_prompt():
-    """The system prompt the note agent runs under. Cached."""
-    global _cached_note, _note_dirty
-    if not _note_dirty and _cached_note is not None:
-        return _cached_note
-    _cached_note = _common(NOTE_HEADER, NOTE_OVERRIDES, NOTE_RULES,
-                           NOTE_EXAMPLES)
-    _note_dirty = False
-    return _cached_note
+def note_prompt(*, protocol=None):
+    """The system prompt the note agent runs under. Cached per protocol."""
+    protocol = agent_prompt.resolve_protocol(protocol)
+    if protocol not in _cached_note:
+        _cached_note[protocol] = _common(
+            _section("NOTE_HEADER", protocol),
+            _section("NOTE_OVERRIDES", protocol),
+            _section("NOTE_RULES", protocol),
+            _section("NOTE_EXAMPLES", protocol),
+            protocol=protocol)
+    return _cached_note[protocol]
 
 
-def review_prompt():
-    """The system prompt the review agent runs under. Cached.
+def review_prompt(*, protocol=None):
+    """The system prompt the review agent runs under. Cached per protocol.
 
     Assembled through `_common` like the other two, so the format rules, the
     action reference and the workspace shape are the same text every agent in
@@ -743,12 +848,14 @@ def review_prompt():
     section: its ending IS the result object, and describing the verb without
     the shape it must carry would teach half of the one thing that matters.
     """
-    global _cached_review, _review_dirty
-    if not _review_dirty and _cached_review is not None:
-        return _cached_review
-    _cached_review = _common(REVIEWER_HEADER, REVIEWER_OVERRIDES, REVIEWER_RULES,
-                             REVIEWER_EXAMPLES,
-                             reference=REVIEW_RESULT_REFERENCE,
-                             extra=REVIEW_AGENDA_REFERENCE)
-    _review_dirty = False
-    return _cached_review
+    protocol = agent_prompt.resolve_protocol(protocol)
+    if protocol not in _cached_review:
+        _cached_review[protocol] = _common(
+            _section("REVIEWER_HEADER", protocol),
+            _section("REVIEWER_OVERRIDES", protocol),
+            _section("REVIEWER_RULES", protocol),
+            _section("REVIEWER_EXAMPLES", protocol),
+            reference=_section("REVIEW_RESULT_REFERENCE", protocol),
+            extra=_section("REVIEW_AGENDA_REFERENCE", protocol),
+            protocol=protocol)
+    return _cached_review[protocol]

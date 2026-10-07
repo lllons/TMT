@@ -1,6 +1,9 @@
 """Cached system prompt and action validation."""
 
+import re
+
 import agent_config
+import agent_protocol
 from agent_config import (
     REQUIRED_KEYS, SNAPSHOT_MAX_BYTES, SNAPSHOT_MAX_FILES, SNAPSHOT_MAX_FILE_BYTES,
     WORKSPACE_MAX_SCAN,
@@ -666,6 +669,264 @@ GIT_RULES = r"""=== GIT ===
 - Never tell the user to run git config, and never ask them for a token, password, SSH key or any credential: TMT has its own identity and pushing uses the git authentication already set up on the machine. When TMT's co-author address is missing, git_identity reports exactly what to set; never state anything about TMT's identity from files you can see - call git_identity. If git refuses because the user has no identity of their own, pass that on; TMT will not stand in as the author.
 - Notes and logs in the workspace, including ones you wrote in an earlier task, are not evidence about git. Run git_status or git_identity and report what it actually returns."""
 
+# --- the same prompt, taught in tags -----------------------------------------
+#
+# TMT reads a reply in one of two wire protocols (agent_protocol): TAG blocks,
+# the default, or JSON objects. Which one the model is asked for is the
+# `agent_config.PROTOCOL` setting, and this section is the half of the prompt
+# that has to agree with it. The two teachings are kept in different places on
+# purpose:
+#
+#   * The JSON constants above are untouched and are the JSON prompt, byte for
+#     byte. A prompt built for "json" is what it was before there was a second
+#     protocol, and every test written against it still means what it meant.
+#   * The CONTRACT constants -- the ones whose PROSE is about the wire format:
+#     HEADER, SPEAKING_RULES, OUTPUT_RULES, ANSWERING_EXAMPLES, WORKFLOW_RULES,
+#     PROGRESS_RULES and the closing REMINDER -- each have a `_TAGS` twin.
+#     HEADER, OUTPUT_RULES and REMINDER are written out by hand, because they
+#     ARE the contract and a rule worth having is worth reading in one place.
+#     The other four are the JSON text with their prose rewritten by named,
+#     one-for-one swaps and their examples run through
+#     `agent_protocol.transliterate`.
+#   * Every other section -- every *_REFERENCE, the rule blocks, the rows
+#     spliced into the tool-choice table -- is the same text with its JSON
+#     examples rewritten the same way, built on first use and kept. Their
+#     handful of sentences that quote JSON syntax (`"apply":true`, an
+#     "actions" array) are swapped one for one in _TAG_PROSE.
+#
+# WHY THE EXAMPLES ARE GENERATED RATHER THAN WRITTEN AGAIN. A model learns the
+# format from the examples far more than from the rules, so an example that
+# the parser would refuse teaches a mistake. `transliterate` writes each one
+# with `agent_protocol.render`, which reads its own output back before handing
+# it out, so every example in the tags prompt is exactly what the parser
+# accepts -- and when somebody adds a JSON example to a reference, the tags
+# prompt gets its twin without anybody remembering to write it.
+#
+# WHY THE SWAPS ARE LOUD. `rewrite` raises if the sentence it was told to
+# replace is not there exactly once. A swap that silently matched nothing
+# would leave `"apply":true` in the tags prompt, teaching JSON inside a prompt
+# that forbids it; the same reasoning as `_with_plan_rules`. It fires at import
+# for the contract twins below, and the first time a section is built for the
+# rest -- which testing/unit/test_agent_prompt_tags.py does for every entry of
+# _TAG_PROSE, so the first test of anything catches it.
+
+HEADER_TAGS = r"""You are TMT, a coding agent working inside one workspace folder. You read and write files there, run commands, and use git.
+
+HOW YOU ARE READ. Your reply does not go to a person. It goes to a tag parser, which reads your tag blocks, takes the action each one names and runs it; anything outside the blocks reaches nobody and the turn fails. So you are not writing TO the user - you are writing blocks that CONTAIN what the user will read, in the message of a send_message or an end_conversation. Be warm, clear and conversational there. A greeting is an end_conversation whose message is a greeting. A refusal is an end_conversation whose message explains why. A question back to the user is an end_conversation whose message asks it. There is no situation, none, in which the right answer is text outside the tag blocks.
+
+Two things are always true: everything you emit is tag blocks, each opened with /name/ and closed with //name/, and nothing else; and every task ends with an end_conversation action, whatever happened. Anything you say before the work is finished is a send_message, which never ends anything."""
+
+# Rules 5, 10 and 11 keep their numbers and their meaning, and that is not
+# tidiness: agent_subprompts._SHARED_OVERRIDES tells every background agent
+# which of THESE rules is not for it by number, so renumbering this block
+# would make a worker be told that a rule about tags is a rule about an ending.
+#
+# The examples under rule 9 are at column 0 on purpose. Block form is
+# whitespace-exact for file text, so an example indented to sit under its rule
+# would put that indent into the file the model copies it into.
+OUTPUT_RULES_TAGS = r"""=== OUTPUT FORMAT - ABSOLUTE RULES ===
+1. Reply in TAG BLOCKS and nothing else. A tag opens as /name/ and closes as //name/. An action is one block: its name is the outer tag and its keys are tags inside it, so /path/ src/main.py //path/ is the key path holding src/main.py. Every tag you open, you close.
+2. NO JSON, NO code fences, NO language label, NO prose, greeting, explanation or apology before or after the blocks. Text outside a block is thrown away.
+3. Write a value exactly as it is, between its tags: no quotes around it, no commas, no braces, no escaping of any kind. Give each key once per action.
+4. true and false are the bare words and numbers are bare digits: /recursive/ true //recursive/ and /start/ 12 //start/. Nothing else is special, and there is no null.
+5. Everything you want the user to read goes in the message of a send_message or an end_conversation action. Text anywhere else is invisible to them.
+6. Code, file contents and search/replace text belong in the content, search and replace tags and nowhere else, written exactly as they stand in the file: indentation, quotes and backslashes included. Those three keep their text as written. In block form the newline right after the open tag is dropped and the newline before a closer on a line of its own is kept, so a file ends with a newline the way a heredoc does; put the closer at the end of the last line to leave that newline out. Every other value is trimmed of leading and trailing whitespace.
+7. If a value has to contain its own closer - file text that contains //content/, say - give that pair a suffix: /content:a/ ... //content:a/. Only //content:a/ ends it.
+8. Use only the actions listed below, with the keys listed for them, plus the three optional keys progress, events and next_step. Never invent an action or any other key.
+9. A reply is one or more action blocks, run in order; several blocks in one reply are a batch. Inline form and block form mean the same thing: inline for short values, block for anything long or multi-line. Three shorthands: bare text inside an action, with no key tags, is its first required key; a list is a run of /item/ entries, as in /paths/ /item/ a.py //item/ /item/ b.py //item/ //paths/; and inside /calls/ every tag is itself an action.
+   One action, in full and in shorthand:
+/read_file/ /path/ notes.txt //path/ //read_file/
+/read_file/ notes.txt //read_file/
+   A new file in block form, then an edit to it:
+/write_file/
+/path/ src/hello.py //path/
+/content/
+def main():
+    print("Hello")
+//content/
+//write_file/
+/patch_file/
+/path/ src/hello.py //path/
+/search/ print("Hello") //search/
+/replace/ print("Hello, world") //replace/
+//patch_file/
+   Several actions in one reply, the last one ending the task:
+/create_folder/ /path/ reports //path/ //create_folder/
+/write_file/
+/path/ reports/q3.md //path/
+/content/
+# Q3
+//content/
+//write_file/
+/end_conversation/ Created reports/q3.md. //end_conversation/
+10. If you cannot or will not do something, still answer with an end_conversation action explaining why. Silence and plain prose both fail.
+11. You HAVE to end every task with an end_conversation action whose message summarises what you made. It is the only thing the user is likely to read. See BEHAVIOUR below.
+
+Never any of these: a code fence around the blocks; prose before, between or after them; a tag that is never closed; the same key twice in one action; a value in quotes or written with backslash escapes; text sitting loose between key tags."""
+
+REMINDER = "Reminder: reply with one JSON object only. Start with { and end with }."
+REMINDER_TAGS = "Reminder: reply with tag blocks only. Every block opens with /name/ and closes with //name/, and nothing is written outside the blocks."
+
+
+def resolve_protocol(protocol=None):
+    """The protocol a prompt is being built for: the argument, else the setting.
+
+    The setting is read HERE, per call, and never cached by the caller, for the
+    reason `refresh_protocol` exists: Settings can change it between two
+    turns of one session, and a prompt built for the old answer is a model
+    taught one format and read in the other. Anything that is not one of the
+    two protocols raises rather than quietly choosing -- a typo would
+    otherwise be a JSON prompt in front of a tags reader, and nothing in the
+    reply would say why every turn failed.
+    """
+    chosen = agent_config.PROTOCOL if protocol is None else protocol
+    if chosen not in agent_config.PROTOCOLS:
+        raise ValueError("%r is not a reply format; use %s."
+                         % (chosen, " or ".join(agent_config.PROTOCOLS)))
+    return chosen
+
+
+def rewrite(name, text, swaps):
+    """`text` with each (old, new) swap applied, and loud when one cannot be.
+
+    Every `old` must occur exactly once. Zero means the sentence it was
+    written against has moved, and the swap would otherwise be silently
+    dropped; two means it is ambiguous and the wrong one may be rewritten.
+    """
+    for old, new in swaps:
+        found = text.count(old)
+        if found != 1:
+            raise AssertionError(
+                "%s has %d copies of %r; its tags rewrite needs exactly one, so "
+                "the JSON wording would be taught to a tags reader or the wrong "
+                "sentence rewritten" % (name, found, old))
+        text = text.replace(old, new)
+    return text
+
+
+def as_tags(name, text, swaps=()):
+    """`text` as the tags protocol teaches it: prose swapped, examples rewritten."""
+    return agent_protocol.transliterate(rewrite(name, text, swaps))
+
+
+# A quoted key name in PROSE is a JSON habit -- "progress" -- and the tags
+# prompt calls the same thing /progress/, which is also how the model has to
+# write it. Applied to the finished text, after the examples are tags: before
+# that the same pattern would also eat the keys inside the JSON examples.
+_QUOTED_KEY = re.compile(r'"(progress|events|next_step|message|stage|type)"')
+
+
+def _slashed(text):
+    return _QUOTED_KEY.sub(r"/\1/", text)
+
+
+SPEAKING_RULES_TAGS = as_tags("SPEAKING_RULES", SPEAKING_RULES)
+
+# Everything before the JSON prompt's own WHAT NEVER WORKS list, which is
+# rewritten whole below rather than swapped line by line: every entry in it
+# is about JSON, and a list of swaps over it would be longer than the list.
+_ANSWERING_HEAD = ANSWERING_EXAMPLES[:ANSWERING_EXAMPLES.index("=== WHAT NEVER WORKS ===")]
+
+# The first entry is a JSON object, deliberately: the one mistake a model
+# trained on years of JSON tool-calling makes is reaching for it, and a list of
+# what never works that left it out would be missing the commonest entry. It
+# is written so that it does not begin a line with `{"action"`, which is how
+# the prompt's JSON examples are found and what a tags prompt must not contain.
+_NEVER_WORKS_TAGS = r"""=== WHAT NEVER WORKS ===
+Each of these reaches the user as nothing at all, or ends the task with the work undone:
+  BAD: a JSON object, {"action":"end_conversation","message":"Added it."}   (the wrong format: this program reads tags, and a reply in JSON is reported as a mistake; the right reply is /end_conversation/ Added it. //end_conversation/)
+  BAD: Sure! I will add that for you now.   Here is the code: def percent(a, b): ...   (prose and raw code outside tags; nobody sees it and no file is written)
+  BAD: /end_conversation/ Added it. //end_conversation/ Anything else?   (text after the block, or a code fence around it)
+  BAD: /end_conversation/ I'll start by reading the tests. //end_conversation/   (ends the task with nothing read; it was a send_message)
+  BAD: /append_file/ /path/ n.txt //path/ /content/ one\ntwo\n //content/ //append_file/   (backslash escapes: in a tag the text is written exactly as it is, so \n reaches the file as a backslash and an n; put each line on a line of its own)
+  BAD: a block with no closer, such as /read_file/ /path/ a.py //path/   (every /name/ needs its //name/ after what it holds, or the reply cannot be read)
+  GOOD, in every case: tag blocks and nothing else, and a sentence about unfinished work goes in a send_message."""
+
+ANSWERING_EXAMPLES_TAGS = as_tags("ANSWERING_EXAMPLES", _ANSWERING_HEAD, (
+    ("Still JSON, and the task is over", "Still tag blocks, and the task is over"),
+    ("Refuse inside the JSON, with the reason.", "Refuse inside the tags, with the reason."),
+    ("Ask inside the JSON, and the task ends there",
+     "Ask inside the tags, and the task ends there"),
+)) + _NEVER_WORKS_TAGS
+
+WORKFLOW_RULES_TAGS = _slashed(as_tags("WORKFLOW_RULES", WORKFLOW_RULES, (
+    ("INSIDE THE JSON:", "INSIDE THE TAGS:"),
+)))
+
+PROGRESS_RULES_TAGS = _slashed(as_tags("PROGRESS_RULES", PROGRESS_RULES, (
+    ("Add these to the action you were going to emit anyway: they never replace",
+     "Add these as tags inside the action you were going to emit anyway (in a "
+     "batch, one /progress/ or /next_step/ may sit beside the blocks instead): "
+     "they never replace"),
+    ('"events" - a list of {"type": ..., "message": ...} entries, each optionally with "stage", allowed on ANY action.',
+     '"events" - a list of /item/ entries, each holding /type/ and /message/ and optionally /stage/, allowed on ANY action.'),
+)))
+
+# The sentences in the OTHER sections that quote JSON syntax. They are the whole
+# of the reference prose that mentions an object, an array or a quoted
+# key:value, found by reading every constant after transliteration; everything
+# else in those sections is wording that is true in either protocol.
+_TAG_PROSE = {
+    "ACTION_REFERENCE": (
+        ("files (a list of objects with path and content)",
+         "files (a list of /item/ entries, each holding its own path and content)"),
+        ("calls (a list of action objects)",
+         "calls (a list of actions, each written as its own tag)"),
+        ('send it again with "apply":true, after reading the counts.',
+         "send it again with /apply/ true //apply/, after reading the counts."),
+    ),
+    "BASH_REFERENCE": (
+        ('(use "operation":"start")',
+         "(use /operation/ start //operation/)"),
+    ),
+    "ORCHESTRATION_REFERENCE": (
+        ('  "read_only": true - it may read,',
+         "  read_only (true) - it may read,"),
+        ('  "timeout_seconds": 1 to 3600, covering',
+         "  timeout_seconds (1 to 3600) - covering"),
+        ('  "report": {"file_list":true,"diff":true,"summary":true} - what TMT collects',
+         "  report (holding /file_list/, /diff/ and /summary/, each true or false) - what TMT collects"),
+    ),
+    "PREFERENCE_RULES": (
+        ('put independent steps in a single "actions" array.',
+         "put independent steps in one reply as several action blocks, run in order."),
+    ),
+    "TOOL_CHOICE_RULES": (
+        ('send the same action again with "apply":true.',
+         "send the same action again with /apply/ true //apply/."),
+    ),
+    "GIT_RULES": (
+        ('use "all": true only when',
+         "use /all/ true //all/ only when"),
+    ),
+}
+
+_tagged = {}
+
+
+def section(name, protocol=None):
+    """The named teaching constant of this module, as `protocol` teaches it.
+
+    JSON is the constant itself -- the same object, so a prompt built for it
+    is the prompt that existed before tags did. TAGS is the hand-written or
+    derived `<name>_TAGS` twin when there is one, and otherwise the constant
+    with its examples rewritten and its JSON-syntax sentences swapped, built
+    once. The memo is keyed on the text as well as the name, so a constant
+    that is replaced is never answered from the copy of the one before it.
+    """
+    chosen = resolve_protocol(protocol)
+    text = globals()[name]
+    if chosen == agent_protocol.JSON:
+        return text
+    twin = globals().get(name + "_TAGS")
+    if twin is not None:
+        return twin
+    key = (name, text)
+    if key not in _tagged:
+        _tagged[key] = as_tags(name, text, _TAG_PROSE.get(name, ()))
+    return _tagged[key]
+
+
 def repository_root():
     """The repository the git actions address, or "" if there is not one.
 
@@ -720,7 +981,7 @@ def _context_key(block):
     return "%d:%x" % (len(block), hash(block) & 0xFFFFFFFF)
 
 
-def get_system_prompt(capabilities=None, context=None):
+def get_system_prompt(capabilities=None, context=None, protocol=None):
     """The main agent's prompt, teaching only the capabilities it may use.
 
     `context` is the session's `agent_context.ProjectContext`, or None. When
@@ -743,9 +1004,19 @@ def get_system_prompt(capabilities=None, context=None):
     see. It is not the guarantee. `agent_actions.execute_action` asks
     `agent_capabilities.refusal` again at dispatch, and that is what holds if
     a verb is reached for anyway.
+
+    `protocol` is the wire format the model is taught to answer in, "tags" or
+    "json", and None means the live `agent_config.PROTOCOL` setting, read now.
+    It is a third part of the cache key, because a prompt teaching one format
+    served to a session set to the other is a model told one thing and read
+    as another. With "json" the text is exactly what this function returned
+    before there was a second protocol.
     """
     global _cached_snapshot, _prompt_dirty
     import agent_capabilities
+    # Before anything is cached or built: a protocol that is not one of the two
+    # raises here, rather than being a key nobody ever asks for again.
+    protocol = resolve_protocol(protocol)
     if _prompt_dirty:
         # One invalidation empties both caches. The workspace has moved, so
         # every authorisation's prompt is stale for the same reason and the
@@ -756,15 +1027,20 @@ def get_system_prompt(capabilities=None, context=None):
     allowed = agent_capabilities.allowed_actions(capabilities)
     # Built before the key, because it is part of the key. See `_context_key`.
     context_block = _context_block(context)
-    key = (tuple(allowed), _context_key(context_block))
+    key = (tuple(allowed), _context_key(context_block), protocol)
     if key in _cached_prompts:
         return _cached_prompts[key]
     if _cached_snapshot is None:
         _cached_snapshot = _workspace_snapshot()
     snapshot = _cached_snapshot
     apps = ", ".join(f"{key_} ({value['description']})" for key_, value in APP_REGISTRY.items()) or "none"
+
+    def teach(name):
+        """One teaching section, in the protocol this prompt is built for."""
+        return section(name, protocol)
+
     sections = [
-        HEADER,
+        teach("HEADER"),
         # Immediately after the header and before the format rules, because the
         # header has just said "every task ends with an end_conversation" and
         # this is the sentence that stops a model reading that as "reach for it
@@ -772,10 +1048,10 @@ def get_system_prompt(capabilities=None, context=None):
         # agent_subprompts: a background agent has neither verb -- it ends on
         # internal_response -- so teaching it this would be teaching it two
         # actions it is refused.
-        SPEAKING_RULES,
-        OUTPUT_RULES,
-        ANSWERING_EXAMPLES,
-        ACTION_REFERENCE,
+        teach("SPEAKING_RULES"),
+        teach("OUTPUT_RULES"),
+        teach("ANSWERING_EXAMPLES"),
+        teach("ACTION_REFERENCE"),
         f"Permitted apps for open_app: {apps}",
         # Straight after the action reference it was cut out of, so it reads
         # where the execution verb has always sat, and before the capability
@@ -783,26 +1059,26 @@ def get_system_prompt(capabilities=None, context=None):
         # the user authorises. It is here rather than in ACTION_REFERENCE
         # because that constant is reused by every background prompt and this
         # verb is refused to all three. See the comment on BASH_REFERENCE.
-        BASH_REFERENCE,
+        teach("BASH_REFERENCE"),
         # Beside bash because it is the other verb held out of
         # ACTION_REFERENCE for being refused to every background agent,
         # and because the two are read together: one is how the model
         # acts without asking, this is the one time it should ask.
-        ASK_REFERENCE,
+        teach("ASK_REFERENCE"),
         # Beside bash, because they are the other two actions that reach
         # outside the workspace and the model should read them together: one
         # runs something here, the others read something out there. Held out
         # of ACTION_REFERENCE for the same reason bash is, but with a wider
         # set of readers -- agent_subprompts.worker_prompt includes this one
         # too. See the comment on WEB_REFERENCE.
-        WEB_REFERENCE,
+        teach("WEB_REFERENCE"),
         # Beside the web verbs, and included by the same two prompts.
         # A verb that reads one file in the workspace would ordinarily
         # belong in ACTION_REFERENCE with the other reads; it is out
         # here because that constant is reused by the note agent and
         # the reviewer, and both are refused this one. Neither of
         # those jobs is looking at pictures.
-        IMAGE_REFERENCE,
+        teach("IMAGE_REFERENCE"),
     ]
     # The three capability sections, each included only when the user's own
     # words authorised that capability for this task. Two isolations are at
@@ -820,15 +1096,15 @@ def get_system_prompt(capabilities=None, context=None):
     # down, so the honest prompt for a turn with no `/plan` in it is one that
     # never mentions planning.
     if agent_capabilities.PLAN in allowed:
-        sections.extend([PLAN_REFERENCE, PLANNING_RULES])
+        sections.extend([teach("PLAN_REFERENCE"), teach("PLANNING_RULES")])
     # Between the plan and the review, which is where verification sits in the
     # pipeline and how the three read together: the plan says what will be
     # done, verification says whether it works, and the review says whether it
     # is the right thing. The order holds however many of them are in.
     if agent_capabilities.VERIFY in allowed:
-        sections.extend([VERIFY_REFERENCE, VERIFY_RULES])
+        sections.extend([teach("VERIFY_REFERENCE"), teach("VERIFY_RULES")])
     if agent_capabilities.REVIEW in allowed:
-        sections.extend([REVIEW_REFERENCE, REVIEW_RULES])
+        sections.extend([teach("REVIEW_REFERENCE"), teach("REVIEW_RULES")])
     # What the user did NOT authorise, said once and plainly. Without this a
     # model that has planned in an earlier session, or that simply expects to,
     # reaches for a verb the prompt is silent about and spends a round finding
@@ -840,7 +1116,7 @@ def get_system_prompt(capabilities=None, context=None):
         sections.append(_withheld_section(agent_capabilities, withheld))
     # The two planning instructions live outside the rule blocks that carry
     # them, and are put back only for a turn that may actually plan.
-    tool_choice, workflow = TOOL_CHOICE_RULES, WORKFLOW_RULES
+    tool_choice, workflow = teach("TOOL_CHOICE_RULES"), teach("WORKFLOW_RULES")
     if agent_capabilities.PLAN in allowed:
         tool_choice, workflow = _with_plan_rules(tool_choice, workflow)
     # Unconditional, and after the plan rows so the two insertions cannot
@@ -859,15 +1135,15 @@ def get_system_prompt(capabilities=None, context=None):
     # governs it is a setting, which `_context_block` has already consulted by
     # returning "" when it is off.
     if context_block:
-        sections.extend([CONTEXT_REFERENCE, CONTEXT_RULES])
+        sections.extend([teach("CONTEXT_REFERENCE"), teach("CONTEXT_RULES")])
     sections.extend([
-        ORCHESTRATION_REFERENCE,
-        DELEGATION_RULES,
-        PREFERENCE_RULES,
+        teach("ORCHESTRATION_REFERENCE"),
+        teach("DELEGATION_RULES"),
+        teach("PREFERENCE_RULES"),
         tool_choice,
         workflow,
-        PROGRESS_RULES,
-        GIT_RULES,
+        teach("PROGRESS_RULES"),
+        teach("GIT_RULES"),
         f"Workspace root: {agent_config.ROOT_DIR}",
         _repository_line(),
         # BEFORE the snapshot, and that order is the feature rather than a
@@ -878,7 +1154,7 @@ def get_system_prompt(capabilities=None, context=None):
         # the whole reason the memory exists.
         context_block,
         f"=== CURRENT WORKSPACE FILES AND CONTENTS ===\n{snapshot}",
-        "Reminder: reply with one JSON object only. Start with { and end with }.",
+        teach("REMINDER"),
     ])
     # Empties dropped rather than joined. Every other entry in the list is a
     # constant or an f-string that always has content; the context block is
@@ -1051,7 +1327,7 @@ def validate_action(obj):
     """
     action = obj.get("action")
     if not action:
-        return "Missing 'action' key in JSON"
+        return "The reply named no action"
     if action not in REQUIRED_KEYS:
         return f"Unknown action: '{action}'. Allowed: {list(REQUIRED_KEYS)}"
     missing = [key for key in REQUIRED_KEYS[action] if key not in obj]
