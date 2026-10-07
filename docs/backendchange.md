@@ -14,7 +14,7 @@ bottom of each section. Nothing in `app/` is read or touched by this work.
 | 3 | Wire `agent_model`, both loops, session carry, correction strings | done 2026-10-07 | `a0e3ef1`, tag `restore-tags-3` |
 | 4 | Prompts: tag contract + transliterated examples, cache keys, subprompts | done 2026-10-07 | `9c170f6`, tag `restore-tags-4` |
 | 5 | Embedded JSON hints in refusal/result strings made protocol-aware | done 2026-10-07 | `b6d123b`, tag `restore-tags-5` |
-| 6 | Full suite in a clean clone, live API runs under both protocols, measurements | **NOT STARTED - see the handoff** | - |
+| 6 | Full suite in a clean clone, live API runs under both protocols, measurements | **in progress** - suite 3064/0 on `0f7cae1`; gaps closed in `4d18777`; SIMULATED acceptance runs PASS under tags and json; real-provider runs and the final clone suite still owed (see Step 6 and HANDOFF 2) | - |
 
 **NOT COMPLETE.** The code for every step is committed and the core modules
 pass (638 passed, 0 failed across the 16 protocol-bearing modules, verified
@@ -327,6 +327,163 @@ asked for low-cost models only.)
   (`test_agent_git.test_the_entry_point_is_tmt_and_nothing_still_names_the_old_module`,
   `test_agent_grep_glob_wiring.test_the_workflow_glob_then_grep_then_read_lines_lands_on_the_line`).
 
+## Step 6: verification (in progress, 2026-10-07)
+
+HEAD moved to `0f7cae1` (the handoff commit) before verification started; the
+clone was of that commit.
+
+Full suite in a clean clone: `bash verify_clone.sh head` (the script from the
+HANDOFF, copied into the new session's scratchpad), clone of `0f7cae1` on
+`alpha`, started 18:21:47 and finished 18:25:17 NZDT on 2026-10-07, **3064
+passed, 0 failed**, exit 0. That is 2,794 plus 270 new tests (the handoff
+estimated ~310). It ran in three and a half minutes rather than fifteen
+because the clone has no credentials, so the one live test in
+`test_agent_review` cannot start a reviewer and passes vacuously, exactly as
+the HANDOFF predicted; the live reviewer path is therefore NOT exercised by
+this run. No test that pins JSON wording went red, so the json
+byte-identity promised by Steps 3-5 held under the suite's json pin.
+
+Live API runs: **blocked, none attempted.** A probe through
+`agent_providers.complete` (max_tokens 600, key never printed) against the
+configured `nvidia/nemotron-3-ultra-550b-a55b:free` returned `OpenRouter HTTP
+429: Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000
+free model requests per day` twice, 30 seconds apart. Two alternatives probed
+by explicit id, `nvidia/nemotron-3-super-120b-a12b:free` and
+`cohere/north-mini-code:free`, returned the identical 429, so it is the
+account's daily free quota rather than one model's throttle. `live_run.sh` was
+not run; `.tmt_protocol` remains absent (tags, the default, in force); nothing
+in the install was modified. Keys are configured for openrouter (selected),
+openai and anthropic; none for gemini. Note that only the OpenRouter adapter
+has ever been exercised live (the project's notes say so), so a run through
+OpenAI or Anthropic would test an unverified adapter and the new protocol at
+once. The choice between waiting for the quota reset, adding OpenRouter
+credits, or using another configured provider was put to the owner.
+
+`HEADER_TAGS` observation: the tags header is a word-for-word twin of the
+JSON `HEADER`, including the clause that text outside the blocks makes "the
+turn fails"; the JSON header has carried the same overstatement all along
+(text outside the object is in fact ignored, and under tags a JSON reply is
+accepted and flagged). Recorded as a shared wording question for the owner,
+not a tags defect; nothing changed.
+
+The known-gaps work (HANDOFF item 3) is recorded in the subsection below.
+
+### Known gaps closed (HANDOFF item 3, commit 4d18777)
+
+Built by a Sonnet agent in an isolated git worktree (so the live install's imports could not be disturbed while runs were made), based on `0f7cae1`; its commit `738fd06` was cherry-picked onto `alpha` as **`4d18777`** by the session owner after reading the diff; the worktree and its branch were then removed. Nine files: agent_actions, agent_bash, agent_plan, agent_protocol, agent_review, agent_reviewbot, agent_shell, agent_verify and testing/unit/test_agent_hints.py; 190 insertions, 108 deletions. Line endings preserved (no whole-file diff on any file). Not pushed.
+
+`agent_shell.py`: the `&` refusal no longer hard-codes the JSON shape. The literal `_BACKGROUND` became `_BACKGROUND_SAID` plus a `_background()` function built when said; under json it is byte-identical to the old text via `as_json="the bash tool's \"operation\": \"start\""`, under tags the clause reads `/bash/ /operation/ start //operation/ //bash/`. Two tests added (json byte-identity against the old literal; the tags form, which must parse back to the action).
+
+`agent_protocol.hint(obj, as_json=None)` is the one shared helper: reads `agent_config.PROTOCOL` at call time with a lazy import, falls back to JSON if the setting cannot be read or the object cannot be rendered; `as_json` returns the exact historical json text for the one hint `json.dumps` cannot reproduce byte for byte (agent_plan's). The private `_example` copies in agent_bash, agent_plan, agent_review, agent_verify, agent_reviewbot and agent_actions were deleted; each module imports `hint` at module level inside a try, with a local JSON fallback for an install whose frozen module list lacks agent_protocol. agent_review and agent_verify also lost their now-unused `_protocol` helper (agent_plan and agent_reviewbot keep theirs; still used).
+
+NOT converted, deliberately, because they are not copies of the same behaviour: `agent_file_ops._example_action` (returns None under json, and its json fallbacks are hand-written so Windows paths are not escaped; `json.dumps` would change those bytes) and `agent_delegation._constraints_example` (shows the bare constraints object under json but a whole `spawn_agent` under tags). The handoff said seven modules carried private helpers; the count is eight, six plain copies plus these two.
+
+Tests: a sweep (AST over every `agent_*.py`) asserts no module defines a private `_example`; the old "agent_protocol missing" test, which set `sys.modules["agent_protocol"] = None` in-process, no longer works because the modules bind `hint` at import, so it now runs a fresh interpreter with the import blocked and tags set, and asserts JSON from all the converted modules plus agent_shell, agent_file_ops and agent_delegation. Run through a scratchpad subset runner pinned to json (the live test `test_retire_is_not_an_operation_the_model_can_reach` skipped by name): 17 modules, **933 passed before, 936 after, 0 failed** (test_agent_hints 15 -> 18; every other module unchanged). Mutations: (a) `hint` ignoring the setting and always rendering JSON killed 7 tests (six in test_agent_hints, one in test_agent_protocol_wiring); (b) `_background` reverted to the literal killed its tags test. One intermediate run saw `test_agent_delegation_wiring.test_the_whole_stack_delegates_under_a_contract_from_a_real_session` fail ("the contract is not in the main prompt"); it passed on two immediate reruns and in the final run and was not investigated — recorded as a possible flake, not a fix.
+
+30-column Settings row, confirmed and left alone: `render_settings_menu_frame(size=(30, 40))` draws `'   Model Reply Format     TAG'`; the neighbouring rows clip the same way (`'   Auto Update on Launch   ON'`, `'   Danger Zone            Uni'`), which is the shared `_option_row` rule. Observation made in passing, not investigated: the row read `TAG` even with `agent_config.PROTOCOL` set to json in memory, consistent with the Step 2 note that the row toggles from what is on disk rather than the live value.
+
+Line endings, `git ls-files --eol` in the fresh worktree (`core.autocrlf` true): agent_bash, agent_delegation, agent_multi, agent_protocol and agent_reviewbot are `i/lf w/crlf`; agent_actions is `i/crlf w/crlf`. A fresh checkout shows all six as CRLF in the working tree, so the working-copy LF drift the HANDOFF mentioned does not reproduce in a clean checkout; it was a property of the previous session's working copy only.
+
+`HEADER_TAGS` and the tags prompt size: untouched.
+
+---
+
+
+### Acceptance runs with a stand-in model (2026-10-07, evening)
+
+The free quota was exhausted (above) and the owner's instruction was to
+simulate the model with a cheap Claude agent rather than wait. So the runs
+below are NOT real-provider runs and must not be recorded as such. What they
+do exercise, unmodified: TMT's real OpenRouter adapter over HTTP (streaming
+SSE, keepalive comments, `usage`), `ask_model`, the streaming tag/JSON
+parsers, the main loop, the file actions, `bash` and the CI path. What they
+do not exercise: the configured model, OpenRouter itself, and `response_format`
+being honoured by a real provider.
+
+**The harness** (`output/sim/`, git-ignored; built and smoke-tested under
+both formats by a Sonnet agent, then copied there from the session scratchpad
+untested from that location). `sim_server.py` is a local `ThreadingHTTPServer`
+that writes each request body to `req/N.json` + a readable `req/N.prompt.md`,
+sends `: keepalive` SSE comments every 5 s (the client's read timeout is
+120 s), and when `resp/N.ready` appears streams `resp/N.txt` back as
+OpenRouter-shaped chunks ending in `finish_reason: stop`, an ESTIMATED `usage`
+(chars // 4) and `data: [DONE]`. It never writes request headers (the key is
+in them). `run_sim.py` imports `agent_config`, sets `OPENROUTER_URL` from
+`TMT_SIM_URL`, then imports `agent_model`/`agent_providers` and asserts both
+took the redirect before calling `TMT.main()`. `sim_run.sh <tags|json> <label>
+"<task>"` is `live_run.sh` with that wrapper, the same `.tmt_protocol`
+save/set/restore, `--max-turns 15 --timeout 1500`. `wait_request.py <simdir>`
+blocks until an unanswered request exists and prints where to write the
+reply; the stand-in model is a Haiku subagent looping on it, told only to be
+the model, to read the request file and reply exactly as its system message
+instructs, and NOTHING about tags or JSON. `canned_model.py` answers every
+request with a fixed file, for smoke tests. `run_ci` makes no other network
+call (no key check, no models listing, no updater), confirmed by the builder
+reading the path and by exactly one request per smoke run.
+
+**Tags run (`sim-tags1`, 18:42:28-18:42:59 NZDT): PASS, real work end to
+end.** Task: the HANDOFF's suggested goodbye(name) task. The stand-in
+answered in tags on its FIRST reply, unprompted, as a batch of five
+top-level blocks: three `patch_file`, one `bash`, one `end_conversation`
+with `/next_step/ Commit the changes //next_step/`. One request (63,195
+bytes, 2 messages), reply 1,227 chars in 52 chunks, no drift warning, no
+retry, no hand-back, exit 0. Transcript rows, in order:
+
+    · Adding the goodbye function to hello.py.
+    · Updating imports to include goodbye.
+    · Adding a test for the goodbye function.
+    · Running the test suite.
+      ▸ Patched file: hello.py        +6 -2
+      ▸ Patched file: test_hello.py   +1 -1
+      ▸ Patched file: test_hello.py   +6 -2
+      ▸ Bash python run_tests.py
+    TMT CI: completed (0 turns, 30.6s)
+    Changed 2 files: hello.py, test_hello.py
+
+Bytes on disk afterwards: `hello.py` ends `def goodbye(name):\r\n    return
+"Bye, " + name\r\n`; `test_hello.py` imports `hello, goodbye` and has
+`test_goodbye`; no tag residue anywhere. `python run_tests.py` in that
+workspace, run by hand afterwards: `PASS test_goodbye / PASS test_hello /
+0 failed`. The reply text and server log are in `output/sim/tags1-*`.
+
+Three observations from that run, none yet acted on:
+
+- **`patch_file` rewrote both files from LF to CRLF.** The originals were
+  LF (written by a bash heredoc, confirmed from the git blob); every line is
+  CRLF now. Almost certainly `agent_file_ops.patch_file` writing with the
+  platform newline and nothing to do with the protocol, but the json run has
+  to show the same before that can be stated. Whether it is a defect at all
+  is a separate question (TMT on Windows has always done whatever it does).
+- **The CI footer said `0 turns`** for a round that ran five actions; the
+  smoke run's single `end_conversation` said `1 turn`. Looks like the batch
+  path not counting. Display only. Check `run_ci` in TMT.py.
+- **`bash` and `end_conversation` in one batch means the summary cannot
+  reflect the command's output.** The stand-in wrote "all tests passed"
+  before any result could have reached it; it happened to be true. The JSON
+  protocol has the same batch feature, so this is not tags-specific, but a
+  prompt rule ("do not end in the same batch as a command whose result you
+  are about to report") is worth considering.
+
+**Json run (`sim-json1`, 18:57:34-18:58:18 NZDT): PASS, and the same shape
+to the byte.** A fresh Haiku stand-in (no memory of the tags run) answered
+with one JSON object holding a five-entry `actions` batch: the same three
+`patch_file`, `bash`, `end_conversation`, same progress sentences, same
+four-word `next_step`. One request (59,743 bytes, `response_format` PRESENT
+as it must be under json), reply 1,135 chars in 48 chunks, no retry, no
+hand-back, exit 0, footer `TMT CI: completed (0 turns, 42.9s)`, `Changed 2
+files`. `hello.py` and `test_hello.py` are BYTE-IDENTICAL to the tags run's,
+CRLF included; `python run_tests.py` by hand: both pass. `.tmt_protocol`
+absent afterwards. Evidence in `output/sim/json1-*` and `tmt-json1.log`.
+So the LF->CRLF rewrite and the `0 turns` footer are both independent of the
+protocol: they belong to `patch_file` and to the CI batch path respectively,
+and the third observation (ending in the same batch as a command) applies to
+both formats equally.
+
+What the pair proves and does not: two different model instances, given
+only TMT's prompt in each format, produced a correct, complete, parseable
+reply first time, and TMT ran it identically either way. It does NOT prove
+what the configured free model will do; see HANDOFF 2 item 4.
+
 ## HANDOFF: what the next session must do (written 2026-10-07 15:25 NZDT)
 
 The owner stopped this session on a time limit. Everything is committed on
@@ -401,3 +558,48 @@ work; the owner asked for low-cost models.
 > live runs with live_run.sh, then the known gaps, documenting progress in
 > docs/backendchange.md as you go and making an explicit-path restore
 > commit after each major change.
+
+## HANDOFF 2: what the next session must do (written 2026-10-07 19:00 NZDT)
+
+HEAD is `4d18777` plus this documentation change (committed as the next
+commit, explicit path). Nothing is pushed. `app/` is still another session's
+untracked directory: never stage it, never `git add -A`.
+
+1. **(Done above.)** Both simulated runs are recorded. To repeat one: start
+   a Haiku subagent looping on `wait_request.py <simdir>` with the
+   stand-in-model instructions (be the model; the request file is your only
+   context; reply exactly as the system message says; write `resp/N.txt`
+   then `resp/N.ready`) and in parallel `bash output/sim/sim_run.sh <tags|json>
+   <label> "<task>"`. The harness in `output/sim/` has not been run from that
+   location; its scripts locate `C:\Coding\TMT` absolutely, so it should.
+2. **Final clean-clone suite on the final HEAD**: `bash output/sim/verify_clone.sh
+   final` (3.5 minutes in a credential-less clone; it was 3064/0 on
+   `0f7cae1`, before `4d18777` landed). The gaps commit added 3 tests, so
+   expect 3067 passed, 0 failed.
+3. **Decide the three observations above** with the owner, and the
+   `HEADER_TAGS` "turn fails" wording (a shared overstatement with the JSON
+   header; recommendation: leave both or drop the clause from both).
+4. **A REAL provider run is still owed.** The owner chose simulation because
+   the quota was exhausted, not instead of a real run forever. When the
+   OpenRouter daily quota resets (or credits are added), run
+   `bash output/sim/live_run.sh tags real-tags "<task>"` and then `json`, and
+   record whether the configured model answers in tags unprompted. Only then
+   may the Status table say complete.
+5. Update the Status table and tell the owner. Push only on the owner's word.
+
+#### Paste-ready prompt for the next session
+
+> We are finishing the tag-protocol change in the TMT CLI at C:\Coding\TMT
+> (branch alpha; HEAD is the docs commit after 4d18777). Read
+> docs/backendchange.md first, especially "Step 6" and "HANDOFF 2" at the
+> end: they hold the clean-clone result (3064/0), the known-gaps commit, the
+> simulated acceptance runs under tags and json (both PASS, with a Claude
+> stand-in for the model because the free quota was exhausted). HARD RULES: never read, list or
+> edit C:\Coding\TMT\app or gui-report (another live session owns app/);
+> never git add -A, git add . or stage app/; never push unless the owner
+> says so in their own words; all building work goes to subagents (Sonnet
+> builds, Haiku for light work); call nothing complete until the final
+> clean-clone suite is green AND the real-provider runs in HANDOFF 2 item 4
+> have been made. Start with HANDOFF 2 item 1 (the json run's result, or
+> rerun it with the harness in output/sim/), then item 2, documenting in
+> docs/backendchange.md as you go and committing with explicit paths.
