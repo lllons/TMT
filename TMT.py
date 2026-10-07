@@ -2114,6 +2114,16 @@ def _session_loop(root, ci=None):
                             ci.note_action(sub_action,
                                            _paths_named(sub_action, sub_obj))
                         if sub_action == END_CONVERSATION:
+                            # The batch that ends the turn was a round, and the
+                            # single-action path counts its own before this same
+                            # test. This exit leaves by the bare `break` below
+                            # the for loop and never reaches the `else` that
+                            # counts a batch which goes on, so without this a
+                            # turn whose only reply was one batch reported 0
+                            # turns -- a figure nobody measured, in the CI
+                            # summary's `turns`. Once, and only here: the other
+                            # three batch exits count themselves.
+                            steps += 1
                             # The project's memory, written before the answer
                             # goes out and after every gate has agreed to let
                             # it. Both terminal paths do this and neither can
