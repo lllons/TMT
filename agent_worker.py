@@ -55,8 +55,6 @@ scope, so this module still imports cleanly when one of them is mid-edit or
 absent from a frozen install's module list.
 """
 
-import json
-
 import agent_delegation
 from agent_manager import WorkerCancelled, WorkerTimedOut, clip_activity
 
@@ -235,22 +233,34 @@ TERMINAL_ACTION = "internal_response"
 
 _FALLBACK_CHARS_PER_TOKEN = 4
 
-_UNREADABLE = (
-    "INVALID: that reply could not be read as JSON. The parser said: %s\n"
-    "Reply with exactly one JSON object and nothing else -- no prose before "
-    "it, no prose after it, no code fences."
-)
+def _protocol():
+    """The reply format in force, read at the moment a reply is answered.
 
-_PROSE_FEEDBACK = (
-    "That was prose, and nothing has run yet, so it described work rather "
-    "than doing it. Emit the action you just described, as one JSON object."
-)
+    `agent_config` is imported here for the reason every import in this module
+    is; a worker that cannot reach it answers in JSON, which is what every
+    sentence below was before tags existed.
+    """
+    try:
+        import agent_config
+        return agent_config.PROTOCOL
+    except Exception:
+        return "json"
 
-_ACTION_RAISED = (
-    "INVALID: the action '%s' could not run with those arguments -- it raised "
-    "%s: %s\nCheck the type of every key you sent: paths and text are strings, "
-    "line numbers are unquoted numbers, flags are unquoted true or false."
-)
+
+def _correction(kind, **fields):
+    """A sentence about the shape of a reply, in the reply format in force.
+
+    The unreadable reply, prose where an action belonged, an action that
+    raised, and the sentences a worker is stopped with all live in
+    `agent_protocol.correction`. Under JSON each is byte for byte the string
+    this module used to hold; under tags it states the tag contract instead.
+    The worker's versions are its own kinds (`worker_unreadable` and
+    friends) because they have always been a sentence shorter than the main
+    loop's: a background agent is not told "Emit the action you meant".
+    """
+    import agent_protocol
+    return agent_protocol.correction(kind, _protocol(), **fields)
+
 
 _MESSAGE_SENT = ("Noted, and nothing was shown. Nothing you write reaches "
                  "anybody -- you have no user -- so send_message costs a step "
@@ -277,9 +287,33 @@ _AGENDA_RESULT = ("Agenda: %s\nThat updated the readout only; it reviewed "
 _AGENDA_MISSING = (
     "\n\nReminder: you have not declared your agenda, and the person waiting "
     "can see that you are working but not what you are working through. Emit "
-    "{\"action\":\"review_agenda\",\"operation\":\"create\",\"items\":[...]} "
+    "%s "
     "with the four to eight things you are checking, then carry on."
 )
+
+# The action the reminder shows, in each reply format. Under JSON it is the
+# text the reminder has always carried, `[...]` and all -- an elision rather
+# than an object, so it is spelled rather than rendered. Under tags it is
+# rendered by `agent_protocol.example` at the moment it is said, so it is
+# exactly the shape the reader accepts.
+_AGENDA_EXAMPLE_JSON = '{"action":"review_agenda","operation":"create","items":[...]}'
+_AGENDA_EXAMPLE = {"action": "review_agenda", "operation": "create",
+                   "items": ["the first thing you are checking",
+                             "the second thing you are checking"]}
+
+
+def _agenda_missing():
+    """The agenda reminder, its example written in the reply format in force."""
+    example = _AGENDA_EXAMPLE_JSON
+    try:
+        import agent_protocol
+        protocol = _protocol()
+        if agent_protocol.normal(protocol) == agent_protocol.TAGS:
+            example = agent_protocol.example(_AGENDA_EXAMPLE, agent_protocol.TAGS)
+    except Exception:
+        pass
+    return _AGENDA_MISSING % example
+
 
 _REFUSED = (
     "REFUSED: '%s' is not available to you. %s Emit a different action, or "
@@ -528,7 +562,7 @@ def _validate(obj):
         import agent_prompt
     except Exception:
         action = obj.get("action")
-        return None if isinstance(action, str) and action else "Missing 'action' key in JSON"
+        return None if isinstance(action, str) and action else _correction("missing_action")
     return agent_prompt.validate_action(obj)
 
 
@@ -925,7 +959,7 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
         except Exception:
             return ""
         nudged[0] = True
-        return _AGENDA_MISSING
+        return _agenda_missing()
 
     while steps < rounds:
         _guard(record)
@@ -976,26 +1010,34 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
                          "stopped: the model sent the same reply three times "
                          "in a row without making progress")
 
+        # Either reply format, whichever the text is, exactly as the main
+        # loop reads it: the prompt is strict and the reader is not. `raw`
+        # stays the model's own text for the history and the breaker.
         try:
-            obj = json.loads(raw)
+            import agent_protocol
+            obj = agent_protocol.parse(raw)
             _adopt_verb(obj)
         except (ValueError, TypeError) as error:
-            if hand_back(raw, _UNREADABLE % error):
+            if hand_back(raw, _correction("worker_unreadable", error=error)):
                 continue
             return _stop(manager, record,
-                         "stopped: the model's reply could not be read as JSON "
-                         "after %d attempts" % retries)
+                         _correction("stop_unreadable", attempts=retries))
         if not isinstance(obj, dict):
-            if hand_back(raw, _UNREADABLE % "the reply was not a JSON object"):
+            if hand_back(raw, _correction("worker_unreadable",
+                                          error=_correction("not_an_object"))):
                 continue
             return _stop(manager, record,
-                         "stopped: the model did not send a JSON object after "
-                         "%d attempts" % retries)
+                         _correction("stop_not_object", attempts=retries))
+        # A reply in the format that is NOT in force is accepted and the
+        # model is told so on the result it gets back, once per reply. There
+        # is no user here to show a row to.
+        drifted = agent_protocol.drift(_protocol(), agent_protocol.detect(raw))
+        drift_tail = "\n" + drifted if drifted else ""
 
         parse_failed, provider_failed, prose = _reply_flags(obj)
         if parse_failed:
             complaint = str(obj.get("message") or "the reply could not be read")
-            if hand_back(raw, _UNREADABLE % complaint):
+            if hand_back(raw, _correction("worker_unreadable", error=complaint)):
                 continue
             return _stop(manager, record,
                          "stopped: the model's reply could not be read after "
@@ -1013,7 +1055,7 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
                 # and discarding it would throw away the only report of work
                 # that actually happened.
                 return said
-            if hand_back(raw, _PROSE_FEEDBACK):
+            if hand_back(raw, _correction("worker_prose")):
                 continue
             return _stop(manager, record,
                          "stopped: the model wrote prose instead of an action "
@@ -1039,7 +1081,8 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
             messages.append({"role": "user", "content": _with_images(
                 "Batch results:\n%s\nOutput your next action, or "
                 "internal_response when the task is done."
-                % "\n".join(response) + agenda_nudge(), obj["actions"])})
+                % "\n".join(response) + agenda_nudge() + drift_tail,
+                obj["actions"])})
             continue
 
         # Read before validation, deliberately. `internal_response` is
@@ -1052,7 +1095,7 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
 
         invalid = _validate(obj)
         if invalid:
-            if hand_back(raw, "INVALID: %s. Output a corrected action JSON." % invalid):
+            if hand_back(raw, _correction("invalid", error=invalid)):
                 continue
             return _stop(manager, record,
                          "stopped: the model could not produce a valid action "
@@ -1076,7 +1119,7 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
             steps += 1
             retries = 0
             messages.append({"role": "assistant", "content": raw})
-            messages.append({"role": "user", "content": _MESSAGE_SENT})
+            messages.append({"role": "user", "content": _MESSAGE_SENT + drift_tail})
             continue
         if action == AGENDA_ACTION:
             # The reviewbot's readout, applied here rather than dispatched.
@@ -1095,7 +1138,8 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
             retries = 0
             result = manager.apply_agenda(record.id, obj)
             messages.append({"role": "assistant", "content": raw})
-            messages.append({"role": "user", "content": _AGENDA_RESULT % result})
+            messages.append({"role": "user",
+                             "content": _AGENDA_RESULT % result + drift_tail})
             continue
 
         try:
@@ -1108,7 +1152,9 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
         except WorkerCancelled:
             raise
         except Exception as error:
-            if hand_back(raw, _ACTION_RAISED % (action, type(error).__name__, error)):
+            if hand_back(raw, _correction("worker_action_raised", action=action,
+                                          raised=type(error).__name__,
+                                          error=error)):
                 continue
             return _stop(manager, record,
                          "stopped: the action '%s' kept failing to run (%s: %s)"
@@ -1119,7 +1165,8 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
         messages.append({"role": "assistant", "content": raw})
         messages.append({"role": "user",
                          "content": _with_images(
-                             _result_message(action, result) + agenda_nudge(),
+                             _result_message(action, result) + agenda_nudge()
+                             + drift_tail,
                              [obj])})
 
     return _stop(manager, record,
@@ -1143,7 +1190,7 @@ def _run_batch(batch, record, manager, dispatch, allowed, forbidden,
         _adopt_verb(entry)
         if not isinstance(entry, dict):
             return "invalid", _batch_complaint(
-                "every entry in 'actions' must be a JSON object", results), ran
+                _correction("batch_entry"), results), ran
         if entry.get("action") == TERMINAL_ACTION:
             return "response", str(entry.get("response", "")), ran
         invalid = _validate(entry)
@@ -1184,7 +1231,9 @@ def _run_batch(batch, record, manager, dispatch, allowed, forbidden,
             raise
         except Exception as error:
             return "invalid", _batch_complaint(
-                _ACTION_RAISED % (action, type(error).__name__, error), results), ran
+                _correction("worker_action_raised", action=action,
+                            raised=type(error).__name__, error=error),
+                results), ran
         ran = True
         results.append("%s: %s" % (action, result))
     return "ok", results, ran

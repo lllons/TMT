@@ -3,6 +3,7 @@
 import json
 import re
 import agent_config
+import agent_protocol
 from agent_config import (
     APP_TITLE, APP_URL, OPENROUTER_URL, STREAM_ENABLED,
     VERIFY_SSL, _json_mode_ok, _session, console, requests,
@@ -32,6 +33,24 @@ JSON_MODE_REJECTIONS = ("response_format", "json_object", "structured output")
 # The flag is shared across threads on purpose: whether a provider accepts
 # JSON mode is a property of the provider, not of whoever asked. A worker that
 # discovers the rejection saves the main session from rediscovering it.
+
+def _protocol():
+    """The reply format in force for THIS call, read now rather than at import.
+
+    Settings can change it between two requests, and a worker on its own
+    thread asks at its own moment. Anything that is not one of the two words
+    answers as the setting itself answers a file edited into nonsense.
+    """
+    return agent_protocol.normal(getattr(_config, "PROTOCOL", None))
+
+
+def _kind(text):
+    """What a reply looks like -- JSON, TAGS or None -- and never an exception."""
+    try:
+        return agent_protocol.detect(text)
+    except Exception:
+        return None
+
 
 def clean_model_json(raw):
     return re.sub(r'"(\w+)"=(?!")', r'"\1":', raw)
@@ -477,8 +496,31 @@ def _prose_reply(full):
     text = " ".join(str(full).split())
     if len(text) > PROSE_REPLY_LIMIT:
         text = text[:PROSE_REPLY_LIMIT].rstrip() + " […]"
-    return json.dumps({"action": "end_conversation", "message": text,
-                       PROSE_KEY: True})
+    return _render({"action": "end_conversation", "message": text,
+                    PROSE_KEY: True})
+
+
+def _render(obj):
+    """An action object this module made up, written in the protocol in force.
+
+    Under JSON it is exactly the `json.dumps` it always was, byte for byte.
+    Under TAGS it is a tag block, because a fabricated reply is handed back to
+    the model as its own assistant turn when the loop asks again -- and a
+    session that speaks tags must never show the model a JSON object in its
+    own voice. The markers are ordinary key tags the parser already reads
+    (`tmt_synthetic` and `tmt_prose` as true/false), so nothing downstream
+    can tell which protocol carried them.
+
+    A tag rendering that cannot be made falls back to JSON rather than
+    failing: the loop accepts either, and a failure report that could not be
+    delivered would be worse than one in the other protocol.
+    """
+    if _protocol() == agent_protocol.TAGS:
+        try:
+            return agent_protocol.render(obj, agent_protocol.TAGS)
+        except Exception:
+            pass
+    return json.dumps(obj)
 
 
 # Marks an action object this module made up rather than one the model sent.
@@ -534,8 +576,8 @@ def _made_up(message, reason=PARSE_FAILURE):
     the completion gates out of the way -- there is no model behind this reply
     to send back to, and refusing it would hide a provider failure.
     """
-    return json.dumps({"action": "end_conversation", "message": message,
-                        SYNTHETIC_KEY: True, SYNTHETIC_REASON: reason})
+    return _render({"action": "end_conversation", "message": message,
+                    SYNTHETIC_KEY: True, SYNTHETIC_REASON: reason})
 
 
 def _extract_json(full):
@@ -557,6 +599,122 @@ def _extract_json(full):
             if depth == 0:
                 return clean_model_json(full[start:start + index + 1])
     return _made_up("invalid JSON structure")
+
+
+def _tags_reply(full, streamed=None):
+    """The reply text for the loop when the reply is (or should be) TAGS.
+
+    The mirror of `_extract_json`, and the same four outcomes:
+
+      blank                         -> `_made_up("empty response from model")`
+      tags that parse               -> the model's OWN text, trimmed of the
+                                       whitespace around it and nothing else,
+                                       so the history echoes what it wrote
+      tags that do not parse        -> a PARSE_FAILURE carrying the parser's
+                                       own sentence, which the loop hands back
+      no tags and no JSON object    -> `_prose_reply`, the model's sentence
+
+    A JSON reply is accepted rather than refused -- the owner's rule is a
+    strict prompt and a forgiving reader -- and is returned exactly as the
+    JSON protocol returns it: the object's own text, with any prose in front
+    of it cut away. `streamed` is the live JSON parser's completed object
+    when one was read off a stream, which is string-aware where the
+    blocking extraction is not. The loop notices the drift and says so.
+    """
+    text = full or ""
+    if not text.strip():
+        return _made_up("empty response from model")
+    try:
+        kind, at = agent_protocol.locate(text)
+    except Exception:
+        kind, at = None, -1
+    if kind == agent_protocol.JSON:
+        return streamed or _extract_json(text[at:])
+    if kind is None:
+        return _prose_reply(text)
+    try:
+        value = agent_protocol.parse(text)
+    except agent_protocol.ProtocolError as error:
+        return _made_up(str(error))
+    except Exception as error:
+        return _made_up("the reply could not be read: %s: %s"
+                        % (type(error).__name__, error))
+    if value is None:
+        return _prose_reply(text)
+    return text.strip()
+
+
+def _finish_blocking(full, protocol):
+    """A whole reply, read in the protocol in force, for the loop."""
+    if protocol == agent_protocol.TAGS or _kind(full) == agent_protocol.TAGS:
+        # A tags reply under JSON is accepted too, and the other way round:
+        # read as JSON it is prose, and prose after work ENDS the turn with
+        # the model's tags printed as its answer.
+        return _tags_reply(full)
+    return _extract_json(full)
+
+
+class _LiveReader(object):
+    """The streaming reader for one reply, chosen by what the reply turns out to be.
+
+    The protocol in force decides -- unless the reply's first character says
+    otherwise. `{` opens a JSON object and `/` a tag block, so a model that
+    drifted into the other protocol still has its message relayed live and
+    its progress shown as it arrives, rather than appearing all at once when
+    the turn ends. Anything else (prose first) gets the protocol's own
+    reader, which for JSON is exactly the reader it always was: the JSON
+    parser skips everything before the first `{` itself.
+
+    Nothing is chosen until a character that is not whitespace arrives, and
+    the whitespace before it is handed to whichever reader is chosen, so
+    feeding the reply one character at a time reports exactly what one large
+    chunk would.
+    """
+
+    def __init__(self, protocol):
+        self.protocol = protocol
+        self.raw = ""
+        self.parser = None
+
+    def _choose(self, first):
+        if first == "{":
+            return StreamingActionParser()
+        if first == "/":
+            return agent_protocol.StreamingTagParser()
+        if self.protocol == agent_protocol.TAGS:
+            return agent_protocol.StreamingTagParser()
+        return StreamingActionParser()
+
+    def feed(self, chunk):
+        if not chunk:
+            return []
+        self.raw += chunk
+        if self.parser is None:
+            if not self.raw.strip():
+                return []
+            self.parser = self._choose(self.raw.lstrip()[0])
+            return self.parser.feed(self.raw)
+        return self.parser.feed(chunk)
+
+    def json_result(self):
+        """The completed JSON object's text when the JSON reader read it."""
+        if isinstance(self.parser, StreamingActionParser):
+            return self.parser.result()
+        return None
+
+
+def _finish_stream(reader, protocol):
+    """A streamed reply, settled exactly as the blocking path settles one."""
+    full = reader.raw
+    if protocol == agent_protocol.TAGS or _kind(full) == agent_protocol.TAGS:
+        return _tags_reply(full, streamed=reader.json_result())
+    raw = reader.json_result()
+    if raw:
+        return raw
+    if not full.strip():
+        return _made_up("empty response from model")
+    return _extract_json(full)
+
 
 def _error_reply(message):
     # The provider that actually failed, asked at the moment it failed. It
@@ -604,13 +762,17 @@ def _ask_model_streaming(messages, on_event, model=None, max_tokens=None,
     is passed on so a single flag governs the whole call.
     """
     global _json_mode_ok
+    protocol = _protocol()
     for attempt in (0, 1):
         payload = {"model": model or _model_for_request(),
                    "max_tokens": max_tokens or _config.max_tokens_for_effort(),
                    "messages": messages, "stream": True}
-        if _json_mode_ok:
+        # JSON mode only when the reply is meant to BE JSON. Under tags it
+        # would make the provider force the reply back into the shape the
+        # prompt has just told the model not to use.
+        if protocol == agent_protocol.JSON and _json_mode_ok:
             payload["response_format"] = {"type": "json_object"}
-        parser = StreamingActionParser()
+        parser = _LiveReader(protocol)
         seen_content = False
         try:
             usage_sink = lambda tokens: on_event(("usage", tokens))
@@ -631,7 +793,10 @@ def _ask_model_streaming(messages, on_event, model=None, max_tokens=None,
             if seen_content:
                 on_event(("error", message))
                 return _error_reply(message), False
-            if attempt == 0 and _json_mode_ok and any(t in message.lower() for t in JSON_MODE_REJECTIONS):
+            # Only a request that asked for JSON mode can have been refused
+            # for it, so a tags request never enters this retry at all.
+            if (attempt == 0 and "response_format" in payload and _json_mode_ok
+                    and any(t in message.lower() for t in JSON_MODE_REJECTIONS)):
                 _json_mode_ok = False
                 continue
             return None, True
@@ -641,16 +806,18 @@ def _ask_model_streaming(messages, on_event, model=None, max_tokens=None,
                 on_event(("error", message))
                 return _error_reply(message), False
             return None, True
-        raw = parser.result()
-        if raw:
-            return raw, False
-        if not parser.raw.strip():
-            return _made_up("empty response from model"), False
-        return _extract_json(parser.raw), False
+        return _finish_stream(parser, protocol), False
     return None, True
 
 def ask_model(messages, on_event=None, model=None, max_tokens=None, quiet=False):
-    """Return the model's JSON reply as text.
+    """Return the model's reply as text, in the reply format in force.
+
+    Under JSON (`agent_config.PROTOCOL == "json"`) that is the reply's JSON
+    object, exactly as it always was. Under TAGS it is the model's own tag
+    text, trimmed of the whitespace around it; a JSON reply is still accepted
+    and comes back as its object. Every failure is still a fabricated
+    `end_conversation`, written in the protocol in force, so the loop always
+    receives something `agent_protocol.parse` reads.
 
     With ``on_event`` supplied and streaming available, the reply is consumed
     from the provider's stream and events are reported as they arrive:
@@ -684,16 +851,20 @@ def ask_model(messages, on_event=None, model=None, max_tokens=None, quiet=False)
     # The reply length the effort setting asks for, read now rather than
     # bound at import: /effort changes it between one turn and the next. An
     # explicit max_tokens overrides it for this call only.
+    protocol = _protocol()
     base = {"model": model or _model_for_request(),
             "max_tokens": max_tokens or _config.max_tokens_for_effort(),
             "messages": messages}
     payload = dict(base)
-    if _json_mode_ok:
+    # JSON mode only when the reply is meant to be JSON; see the streaming
+    # path for why it must stay off under tags.
+    if protocol == agent_protocol.JSON and _json_mode_ok:
         payload["response_format"] = {"type": "json_object"}
     # A quiet caller never gets the spinner, whether or not it streamed.
     show_spinner = not streaming and not quiet
     data, error = _post_chat(payload, spinner=show_spinner)
-    if error and _json_mode_ok and any(token in error.lower() for token in JSON_MODE_REJECTIONS):
+    if (error and "response_format" in payload and _json_mode_ok
+            and any(token in error.lower() for token in JSON_MODE_REJECTIONS)):
         if not quiet:
             console.print("[yellow]Model rejected JSON mode — retrying without it.[/yellow]")
         _json_mode_ok = False
@@ -716,4 +887,4 @@ def ask_model(messages, on_event=None, model=None, max_tokens=None, quiet=False)
             # Reported only when the provider actually sent it. A caller that
             # hears nothing keeps its estimate, and keeps the `~` that says so.
             on_event(("input_usage", prompt_tokens))
-    return _extract_json(full)
+    return _finish_blocking(full, protocol)

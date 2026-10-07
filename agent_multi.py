@@ -101,6 +101,36 @@ _LOOP_VERBS = {
                      "it in the \"actions\" batch beside the multi_tool instead",
 }
 
+# The same reasons in the words of the tag protocol, where a batch is not a
+# key called "actions" but several action blocks one after another. Under
+# JSON `_LOOP_VERBS` is said exactly as it always was.
+_LOOP_VERBS_TAGS = {
+    "send_message": "it talks to the user and the loop shows it; write it as "
+                    "its own block beside the multi_tool block instead",
+    "end_conversation": "it ends the task and only the loop can end one; write "
+                        "it as its own block after the multi_tool block instead",
+    "internal_response": "it is a background agent's ending and only the loop "
+                         "can end one; send it as its own block instead",
+    "review_agenda": "the loop applies it to the reviewer's own checklist; "
+                     "write it as its own block beside the multi_tool block "
+                     "instead",
+}
+
+
+def _tags():
+    """Whether the reply format in force is tags, read at the moment of asking.
+
+    Imported at call time for this module's reason, and anything that goes
+    wrong answers False: the JSON sentences are the ones this module said
+    before tags existed.
+    """
+    try:
+        import agent_config
+        import agent_protocol
+        return agent_protocol.normal(agent_config.PROTOCOL) == agent_protocol.TAGS
+    except Exception:
+        return False
+
 _NESTED = ("it is another multi_tool; put its calls in this one's list instead "
            "-- one flat list is the whole shape")
 
@@ -119,7 +149,10 @@ _CLIPPED = ("\n[... %d more characters not shown. Run this call on its own to "
 
 _NEEDS_CALLS = ("multi_tool needs \"calls\": a non-empty list of action "
                 "objects to run. Nothing ran.")
+_NEEDS_CALLS_TAGS = ("multi_tool needs /calls/ holding at least one action "
+                     "block to run. Nothing ran.")
 _ENTRY_NOT_OBJECT = "it is not a JSON object"
+_ENTRY_NOT_OBJECT_TAGS = "it is not an action block"
 _ENTRY_REFUSED = "multi_tool call %d of %d cannot run: %s. Nothing ran."
 _BAD_FOR_EACH = ("\"for_each\" must be a path pattern written as text, such "
                  "as \"**/*.py\"")
@@ -145,7 +178,14 @@ def _validate(entry):
         import agent_prompt
     except Exception:
         action = entry.get("action")
-        return "" if isinstance(action, str) and action else "Missing 'action' key in JSON"
+        if isinstance(action, str) and action:
+            return ""
+        try:
+            import agent_config
+            import agent_protocol
+            return agent_protocol.correction("missing_action", agent_config.PROTOCOL)
+        except Exception:
+            return "Missing 'action' key in JSON"
     return agent_prompt.validate_action(entry) or ""
 
 
@@ -169,14 +209,16 @@ def entries(obj):
     one. Refusing up front is the `agent_reviewbot` lesson: a refused update
     leaves no trace of having happened.
     """
+    tags = _tags()
     calls = obj.get(CALLS) if isinstance(obj, dict) else None
     if not isinstance(calls, list) or not calls:
-        return [], _NEEDS_CALLS
+        return [], _NEEDS_CALLS_TAGS if tags else _NEEDS_CALLS
     total = len(calls)
     templates = []
     for index, entry in enumerate(calls, 1):
         if not isinstance(entry, dict):
-            return [], _ENTRY_REFUSED % (index, total, _ENTRY_NOT_OBJECT)
+            return [], _ENTRY_REFUSED % (index, total, _ENTRY_NOT_OBJECT_TAGS
+                                         if tags else _ENTRY_NOT_OBJECT)
         entry = _adopt(entry)
         pattern = entry.get(FOR_EACH)
         if pattern is not None and (not isinstance(pattern, str)
@@ -199,8 +241,9 @@ def entries(obj):
         if action == MULTI_ACTION:
             return [], _ENTRY_REFUSED % (index, total, _NESTED)
         if action in _LOOP_VERBS:
+            reasons = _LOOP_VERBS_TAGS if tags else _LOOP_VERBS
             return [], _ENTRY_REFUSED % (index, total,
-                                         "%s: %s" % (action, _LOOP_VERBS[action]))
+                                         "%s: %s" % (action, reasons[action]))
         templates.append(entry)
     return templates, ""
 

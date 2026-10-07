@@ -808,6 +808,26 @@ def detect(text):
     return _locate(text)[0]
 
 
+def locate(text):
+    """(JSON, TAGS or None, the index the reply starts at, or -1).
+
+    `detect` with the position as well, for a caller that has to cut the
+    prose in front of a reply away before handing the rest to something
+    that only reads one protocol.
+    """
+    return _locate(text)
+
+
+def normal(protocol):
+    """`protocol` when it names one of the two, and the default otherwise.
+
+    The setting is validated where it is read, so this only ever matters to
+    a caller that was handed something else; it answers the way the setting
+    itself answers a file edited into nonsense.
+    """
+    return protocol if protocol in PROTOCOLS else DEFAULT_PROTOCOL
+
+
 def _parse_json(text, at):
     end = _object_end(text, at)
     if end < 0:
@@ -1233,3 +1253,162 @@ class StreamingTagParser(object):
             return None
         self.error = None
         return value
+
+
+# --- what a step loop tells a model about the shape of its reply -------------
+#
+# Every sentence the two step loops (TMT.py and agent_worker) and agent_multi
+# hand back to a model about the SHAPE of what it wrote, in both protocols, in
+# one place. Under JSON each is byte for byte the string the loop used before
+# tags existed: tests pin several of them and a transcript a user has read
+# should not change under them. Under TAGS the same sentence states the tag
+# contract instead, so a model that was asked for tags is never corrected
+# towards JSON -- the one thing a correction must not do is teach the shape
+# the prompt forbids.
+#
+# The protocol is passed in, never read here: this module chooses no protocol
+# for anybody (see the module docstring), and a loop that reads the setting
+# once per reply is the one place that knows which reply it is answering.
+
+TAG_CONTRACT = ("Reply with one or more tag blocks and nothing else -- no "
+                "JSON, no prose, no code fences; start with /action_name/ and "
+                "end with //action_name/.")
+
+_JSON_TYPES = ("Check the type of every key you sent: paths and text are "
+               "strings, line numbers are unquoted numbers, flags are unquoted "
+               "true or false.")
+_TAG_TYPES = ("Check every key you sent: flags are the words true or false, "
+              "numbers are bare digits, lists use /item/.")
+_TAG_BLOCK = "as a tag block: /action_name/ ... //action_name/."
+
+# kind: (the JSON sentence, the TAGS sentence). Fields are %(name)s.
+_CORRECTIONS = {
+    # The main loop's answer to a reply that could not be read at all.
+    "unreadable": (
+        "INVALID: that reply could not be read as JSON. The parser said: "
+        "%(error)s\nReply with exactly one JSON object and nothing else -- no "
+        "prose before it, no prose after it, no code fences. Emit the action "
+        "you meant.",
+        "INVALID: that reply could not be read as tags. The parser said: "
+        "%(error)s\n" + TAG_CONTRACT + " Emit the action you meant."),
+    # The worker loop's, which has always ended one sentence sooner.
+    "worker_unreadable": (
+        "INVALID: that reply could not be read as JSON. The parser said: "
+        "%(error)s\nReply with exactly one JSON object and nothing else -- no "
+        "prose before it, no prose after it, no code fences.",
+        "INVALID: that reply could not be read as tags. The parser said: "
+        "%(error)s\n" + TAG_CONTRACT),
+    # What a worker's reply that was no action at all is said to be.
+    "not_an_object": (
+        "the reply was not a JSON object",
+        "the reply held no action block"),
+    "prose_before_work": (
+        "That was prose, and nothing has run yet, so it announced work rather "
+        "than reporting it. Emit the action you just described, as one JSON "
+        "object.",
+        "That was prose, and nothing has run yet, so it announced work rather "
+        "than reporting it. Emit the action you just described, " + _TAG_BLOCK),
+    "worker_prose": (
+        "That was prose, and nothing has run yet, so it described work rather "
+        "than doing it. Emit the action you just described, as one JSON object.",
+        "That was prose, and nothing has run yet, so it described work rather "
+        "than doing it. Emit the action you just described, " + _TAG_BLOCK),
+    # Both loops, word for word the same.
+    "invalid": (
+        "INVALID: %(error)s. Output a corrected action JSON.",
+        "INVALID: %(error)s. Output the corrected action as a tag block."),
+    "invalid_in_batch": (
+        "INVALID: %(invalid)s\nRan before it:\n%(ran)s\nOutput a corrected "
+        "action JSON.",
+        "INVALID: %(invalid)s\nRan before it:\n%(ran)s\nOutput the corrected "
+        "action as a tag block."),
+    "actions_not_list": (
+        "INVALID: 'actions' must be a non-empty list. Try again.",
+        "INVALID: a batch must hold at least one action block. Try again."),
+    # `raised` is the exception's type name and `error` its text.
+    "action_raised": (
+        "INVALID: the action '%(action)s' could not run with those arguments "
+        "-- it raised %(raised)s: %(error)s\n" + _JSON_TYPES
+        + " Emit a corrected action.",
+        "INVALID: the action '%(action)s' could not run with those arguments "
+        "-- it raised %(raised)s: %(error)s\n" + _TAG_TYPES
+        + " Emit a corrected action."),
+    "worker_action_raised": (
+        "INVALID: the action '%(action)s' could not run with those arguments "
+        "-- it raised %(raised)s: %(error)s\n" + _JSON_TYPES,
+        "INVALID: the action '%(action)s' could not run with those arguments "
+        "-- it raised %(raised)s: %(error)s\n" + _TAG_TYPES),
+    # How a worker that never managed a readable reply is recorded as ending.
+    "stop_unreadable": (
+        "stopped: the model's reply could not be read as JSON after "
+        "%(attempts)d attempts",
+        "stopped: the model's reply could not be read as tags after "
+        "%(attempts)d attempts"),
+    "stop_not_object": (
+        "stopped: the model did not send a JSON object after %(attempts)d "
+        "attempts",
+        "stopped: the model did not send an action block after %(attempts)d "
+        "attempts"),
+    "batch_entry": (
+        "every entry in 'actions' must be a JSON object",
+        "every entry in a batch must be an action block"),
+    # The schema-free fallback both the worker and agent_multi validate with.
+    "missing_action": (
+        "Missing 'action' key in JSON",
+        "No action was named: every action is a block, /action_name/ ... "
+        "//action_name/"),
+}
+
+# The reply arrived in the protocol that is not in force. Keyed by the one
+# that IS in force, because that is the one the model is pointed back at.
+_DRIFT = {
+    JSON: ("The reply was tags but this session speaks JSON. It was accepted "
+           "this time; from now on reply in JSON."),
+    TAGS: ("The reply was JSON but this session speaks tags. It was accepted "
+           "this time; from now on reply in tags."),
+}
+
+# The row the user is shown for the same thing. Said, never refused: the
+# owner's rule is a strict prompt and a forgiving reader.
+_DRIFT_NOTICE = {
+    JSON: "The model replied in tags instead of JSON; accepted and told to use JSON.",
+    TAGS: "The model replied in JSON instead of tags; accepted and told to use tags.",
+}
+
+
+def correction_kinds():
+    """Every kind `correction` answers, for a caller (or a test) to walk."""
+    return tuple(sorted(_CORRECTIONS))
+
+
+def correction(kind, protocol, **fields):
+    """The sentence a loop hands back for `kind`, in `protocol`'s words.
+
+    Under JSON it is exactly the string that loop used before tags existed.
+    An unknown protocol answers as the default does (see `normal`); an
+    unknown kind is a KeyError, because that is a typo in TMT, not a model's
+    mistake, and it should fail where it was made.
+    """
+    json_form, tags_form = _CORRECTIONS[kind]
+    template = tags_form if normal(protocol) == TAGS else json_form
+    return template % fields
+
+
+def drift(expected, got):
+    """The line appended to a result when a reply was in the other protocol.
+
+    "" when there was no drift: `got` is the protocol in force, or neither
+    protocol at all (prose, which has its own path).
+    """
+    expected = normal(expected)
+    if got not in PROTOCOLS or got == expected:
+        return ""
+    return _DRIFT[expected]
+
+
+def drift_notice(expected, got):
+    """The transcript row saying the same thing to the user, or ""."""
+    expected = normal(expected)
+    if got not in PROTOCOLS or got == expected:
+        return ""
+    return _DRIFT_NOTICE[expected]
