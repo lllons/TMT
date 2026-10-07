@@ -597,6 +597,94 @@ def set_project_context(enabled):
     return value
 
 
+# --- the model reply format -------------------------------------------------
+#
+# How the model is asked to write its actions: "tags", blocks like
+# `/read_file/ ... //read_file/`, or "json", one JSON object per action.
+#
+# **This is NOT `USE_JSON_MODE`**, which sits further down and is a different
+# question entirely. That one is a flag sent to the PROVIDER asking it to
+# constrain a reply to valid JSON; this one is the wire format the MODEL is
+# taught to write, whatever the provider is asked. Asking a provider to force
+# JSON on a model that was told to write tags would fight the setting, so one
+# of the two has to give way -- which one is decided where the request is
+# built, not here. This section only knows where the choice lives and which
+# values are allowed.
+#
+# What each value means to a prompt and a parser belongs to `agent_protocol`:
+# two modules, one rule each, the split `TIP_FILE` and `agent_tips` already
+# keep. `PROTOCOLS` is therefore spelled in both places -- this module cannot
+# import that one without closing a cycle -- and a test asserts they agree.
+#
+# Kept in INSTALL_DIR beside the model and the effort level, for the reason
+# they are there: it belongs to the installation, not to whichever project
+# happens to be open.
+PROTOCOL_FILE = INSTALL_DIR / ".tmt_protocol"
+
+# Tags are what a fresh installation speaks. JSON stays offered because it is
+# what TMT spoke before this setting existed, and a user whose model does
+# better with it should be one keypress from it.
+DEFAULT_PROTOCOL = "tags"
+
+# The two values, in the order Settings offers them.
+PROTOCOLS = ("tags", "json")
+
+# The live value, re-read by `refresh_protocol` at startup.
+PROTOCOL = DEFAULT_PROTOCOL
+
+
+def protocol_names():
+    """The reply formats, in the order they are offered."""
+    return list(PROTOCOLS)
+
+
+def read_saved_protocol():
+    """The reply format stored on disk, or the default. Never raises.
+
+    Every failure is the default, which is the rule `read_saved_effort` already
+    follows: a missing file is a fresh installation, an unreadable one is
+    somebody's permissions, and a file edited by hand into nonsense is a typo.
+    None of the three is a reason to stop TMT starting. A file that is not text
+    at all raises ValueError rather than OSError when it is decoded, so both
+    are caught.
+    """
+    try:
+        stored = PROTOCOL_FILE.read_text(encoding="utf-8").strip().lower()
+    except (OSError, ValueError):
+        return DEFAULT_PROTOCOL
+    return stored if stored in PROTOCOLS else DEFAULT_PROTOCOL
+
+
+def refresh_protocol():
+    """Re-read the stored reply format. Called at startup, beside refresh_effort."""
+    global PROTOCOL
+    PROTOCOL = read_saved_protocol()
+    return PROTOCOL
+
+
+def set_protocol(name):
+    """Persist a reply format and make it live. Returns what was stored.
+
+    Raises ValueError for anything not offered, so a typo cannot become the
+    active setting and surface much later as a model being taught a format
+    nothing can parse.
+
+    A write that fails is reported by raising, not swallowed, exactly as
+    `set_auto_update` does and for the same reason: every OTHER path through
+    this setting defaults quietly, which is right for a read -- but a toggle
+    the user just pressed that silently did not persist would show one value
+    in the menu and be the other on the next launch.
+    """
+    global PROTOCOL
+    name = str(name or "").strip().lower()
+    if name not in PROTOCOLS:
+        raise ValueError("Reply format is one of %s; got %r."
+                         % (", ".join(protocol_names()), name))
+    PROTOCOL_FILE.write_text(name + "\n", encoding="utf-8")
+    PROTOCOL = name
+    return name
+
+
 # --- the tip cursor ---------------------------------------------------------
 #
 # Which tip the session header shows next. One integer, stored beside the
@@ -703,6 +791,9 @@ APP_URL = "http://localhost"
 # grammar constraint only -- our action schema is enforced by the system
 # prompt and validate_action. Models that reject response_format fall back
 # automatically (see JSON_MODE_REJECTIONS in agent_model).
+# This is the PROVIDER-side response_format flag. PROTOCOL (above) is the wire
+# format the model is taught to write; they are different questions, and a
+# later step gates one on the other.
 USE_JSON_MODE = True
 _json_mode_ok = USE_JSON_MODE
 # Live relay: stream model output as it is generated. Requires the real

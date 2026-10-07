@@ -1086,6 +1086,10 @@ def run_ci(args):
             return agent_ci.EXIT_USAGE
         agent_config.refresh_model()
         agent_config.refresh_effort()
+        # Included here, unlike refresh_auto_update below, because it changes
+        # what the model is asked to write -- a pipeline's reply format is part
+        # of what it runs, not a preference about how TMT looks after itself.
+        agent_config.refresh_protocol()
         agent_config.refresh_project_context()
         # Deliberately NOT refresh_auto_update: a CI run never updates itself.
         # `run_splash` is what performs an update and it is not called here, so
@@ -1154,6 +1158,10 @@ def main(argv=None):
     # and would otherwise be written but never read, so /effort would last a
     # session and quietly revert on the next launch.
     agent_config.refresh_effort()
+    # And the reply format, for the same reason: it is stored beside the model
+    # and the effort level, and a toggle in Settings that was written and never
+    # re-read would last one session and quietly revert.
+    agent_config.refresh_protocol()
     # And whether TMT checks itself for updates. Read here beside the other
     # two so a setting toggled in the menu is live on the next launch rather
     # than written and never read -- the exact bug refresh_effort exists for.
@@ -1341,6 +1349,9 @@ def _return_to_menu(session, manager, prompt_box, pad, root):
         return False
     agent_config.refresh_model()
     agent_config.refresh_effort()
+    # The reply format too: Settings is reachable from here, and the very next
+    # task should be asked in whichever format the user just chose.
+    agent_config.refresh_protocol()
     agent_config.refresh_auto_update()
     # And the project context, beside them and for the same reason. This is
     # the site that makes the toggle actually work mid-session: Settings is

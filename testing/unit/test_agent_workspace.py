@@ -289,6 +289,17 @@ def test_installation_state_does_not_follow_the_workspace():
                      agent_config.TIP_FILE):
             assert Path(path).resolve().parent == INSTALL_DIR, path
             assert box.path not in Path(path).resolve().parents
+        # The model reply format. It is NOT in the tuple above, and the reason
+        # is the one the checkpoint store gives below: the suite pins it to
+        # `json` by pointing PROTOCOL_FILE at a temporary file for the length
+        # of a run (see `run_tests.isolate_reply_format`), so the live
+        # attribute is not where the product keeps it. What the product would
+        # have chosen is asked of an unredirected copy of the module, which
+        # makes the SAME assertions as the tuple rather than a weaker one.
+        from test_agent_reply_format import real_protocol_file
+        protocol_path = real_protocol_file()[0]
+        assert protocol_path.resolve().parent == INSTALL_DIR, protocol_path
+        assert box.path not in protocol_path.resolve().parents
         # The before-pictures `/undo` puts back. It holds COPIES of whatever
         # was in the workspace, so a store that followed the workspace would
         # put a second copy of the project inside the project -- and, when TMT
