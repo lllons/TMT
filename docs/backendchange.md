@@ -9,8 +9,8 @@ bottom of each section. Nothing in `app/` is read or touched by this work.
 | Step | What | State | Restore point |
 |---|---|---|---|
 | 0 | Understand the code; write this plan; baseline commit of the pending catalogue files | done 2026-10-07 | `fb4e5f5`, tag `restore-tags-0` |
-| 1 | `agent_protocol.py`: grammar, parser, serializer, streaming parser, tests | building (Opus) | - |
-| 2 | Setting + Settings row + `/config` row + refresh sites + runner isolation + docs | building (Sonnet) | - |
+| 1 | `agent_protocol.py`: grammar, parser, serializer, streaming parser, tests | done 2026-10-07 | see Step 1 entry |
+| 2 | Setting + Settings row + `/config` row + refresh sites + runner isolation + docs | done 2026-10-07 | `679fd34`, tag `restore-tags-2` |
 | 3 | Wire `agent_model`, both loops, session carry, correction strings | not started | - |
 | 4 | Prompts: tag contract + transliterated examples, cache keys, subprompts | not started | - |
 | 5 | Embedded JSON hints in refusal/result strings made protocol-aware | not started | - |
@@ -209,6 +209,69 @@ Rules:
    with new tag tests alongside; Settings row "Model Reply Format" with
    TAGS/JSON and no new slash command; the reviewer's verdict stays JSON
    inside its `response` leaf.
+
+## Step 1: `agent_protocol.py` (done 2026-10-07)
+
+Built by an Opus agent; verified by me: `test_agent_protocol` (113),
+`test_agent_stream` (52) and `test_agent_cli` (46, holds the packaging test)
+**211 passed, 0 failed**. 37 mutations on the module, 36 killed; the survivor
+(removing the hold-back of a trailing `\r` while streaming) is equivalent now
+that streamed values are trimmed, and was left as a defence.
+
+- 1,235 lines, pure, CRLF, 3.8-safe. Imports `agent_config` lazily and only
+  for `REQUIRED_KEYS`. Registered in `pyproject.toml`.
+- API: `JSON`, `TAGS`, `PROTOCOLS`, `DEFAULT_PROTOCOL`, `ProtocolError`,
+  `detect`, `parse_tags`, `parse`, `render`, `example`, `StreamingTagParser`
+  (`feed`, `raw`, `result`, `error`), `transliterate`, `primary_key`,
+  `bool_keys`, `int_keys`, `container_keys`, `exact_keys`, `LEGACY_PRIMARY`.
+- **All 171 action objects in the two prompt modules round-trip** through
+  `render` and `example` (the test's floor is 150 so it cannot pass vacuously);
+  `render(obj, JSON)` is byte-identical to the prompt's own text for all 171.
+- Type tables, each entry naming its reader: bools `all, apply, diff,
+  file_list, summary, final, full, ignore_case, regex, read_only, recursive,
+  tmt_prose, tmt_synthetic`; ints `after, step, context, depth, start, end,
+  item, position, level, limit, max_results, timeout, timeout_seconds`.
+  `id` and `pages` stay text.
+- Decisions the spec left open, taken by the builder and accepted: a tag is a
+  key only if its own closer appears before the enclosing closer (so
+  `/read_file/ /usr/lib/x.py //read_file/` is a shorthand path);
+  `detect` reads past leading prose to the first action tag or JSON object,
+  as `_extract_json` does today; `render` reads its own output back and
+  refuses rather than hand out text that would parse differently; a
+  one-action batch renders with an explicit `/actions/` wrapper; `ids` joined
+  the container keys (`wait_for_agents`); `respond` joined the legacy table.
+- **Grammar rule 3 was narrowed after the first build**: the heredoc rule
+  (block form keeps the newline before a closer on its own line) is right for
+  file text and wrong for a path, which would have come back as
+  `"src/a.py\n"`. Only `content`, `search` and `replace` are EXACT now; every
+  other leaf is trimmed of surrounding whitespace at any depth. The module
+  docstring and `docs/reply-format.md` (Step 4) state the rule.
+
+## Step 2: the setting (done 2026-10-07, `679fd34`)
+
+Built by a Sonnet agent, verified by me with a fresh run of the eleven
+touched-or-neighbouring modules: **421 passed, 0 failed**. 47 mutations run on
+a copy of the tree, all killed after two tests were added (the toggle flipping
+from the live value instead of the file; the row's fallback label).
+
+- `agent_config.PROTOCOL` / `PROTOCOL_FILE` (`.tmt_protocol`) /
+  `read_saved_protocol` / `refresh_protocol` / `set_protocol`, the effort
+  pattern. `USE_JSON_MODE` (provider-side `response_format`) stays a separate
+  question, noted beside it.
+- Settings row `("protocol", "Model Reply Format", ...)` above Danger Zone,
+  value TAGS/JSON, Enter toggles from what is on disk. `/config` reports it.
+  Refreshed in `main`, `run_ci` and `_return_to_menu`.
+- **The suite is pinned to json at the runner** (`isolate_reply_format` in
+  `run_tests.py` and `testing/conftest.py`, kept in step): a redirected
+  `.tmt_protocol` holding `json`, so a developer's own setting cannot change
+  a result. Tag tests opt in with `ReplyFormat("tags")` from
+  `test_agent_reply_format`. The two installation-state tests read the
+  unredirected path through `real_protocol_file()` for the same reason.
+- Known gap: at exactly 30 columns the value clips to `TAG`. `_option_row`
+  pads every label to the widest (21 columns) and only protects a suffix that
+  fits beside that; `  OFF` fits by one column and `  TAGS` does not. Shared by
+  every menu, so left alone here; the width sweep in the new tests starts at
+  40 and says why.
 
 ### Model routing for the build
 
