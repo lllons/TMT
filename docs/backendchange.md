@@ -14,7 +14,7 @@ bottom of each section. Nothing in `app/` is read or touched by this work.
 | 3 | Wire `agent_model`, both loops, session carry, correction strings | done 2026-10-07 | `a0e3ef1`, tag `restore-tags-3` |
 | 4 | Prompts: tag contract + transliterated examples, cache keys, subprompts | done 2026-10-07 | `9c170f6`, tag `restore-tags-4` |
 | 5 | Embedded JSON hints in refusal/result strings made protocol-aware | done 2026-10-07 | `b6d123b`, tag `restore-tags-5` |
-| 6 | Full suite in a clean clone, live API runs under both protocols, measurements | **in progress** - suite 3064/0 on `0f7cae1`; gaps closed in `4d18777`; SIMULATED acceptance runs PASS under tags and json; real-provider runs and the final clone suite still owed (see Step 6 and HANDOFF 2) | - |
+| 6 | Full suite in a clean clone, live API runs under both protocols, measurements | **in progress** - suite 3064/0 on `0f7cae1`, 3067/0 on `5225964`, 3071/0 on `cf3a384` (the CI `0 turns` fix); gaps closed in `4d18777`; SIMULATED acceptance runs PASS under tags and json; owner decisions on the observations recorded; real-provider runs still owed, blocked by the free quota (see Step 6 "Session 3" and HANDOFF 3) | `cf3a384` |
 
 **NOT COMPLETE.** The code for every step is committed and the core modules
 pass (638 passed, 0 failed across the 16 protocol-bearing modules, verified
@@ -484,6 +484,95 @@ only TMT's prompt in each format, produced a correct, complete, parseable
 reply first time, and TMT ran it identically either way. It does NOT prove
 what the configured free model will do; see HANDOFF 2 item 4.
 
+### Session 3 (2026-10-08, from 09:10 NZDT; the owner gave it one hour)
+
+**HANDOFF 2 item 2, done.** `bash output/sim/verify_clone.sh final`, clone of
+`5225964` on `alpha`, 09:15:36-09:19:43 NZDT: **3067 passed, 0 failed**, exit
+0, no `^FAIL` line. Exactly the predicted 3064 + 3. Log in
+`output/sim/suite-final.log`. As before, the clone has no credentials, so the
+live reviewer test passes vacuously.
+
+**Quota probe (item 4), still blocked.** 09:16 NZDT (20:16 UTC on the 7th),
+one request through `agent_providers.complete` to the configured
+`nvidia/nemotron-3-ultra-550b-a55b:free` (scratchpad `probe.py`, key never
+printed): `OpenRouter HTTP 429: Rate limit exceeded: free-models-per-day`.
+OpenRouter's free daily limit resets at 00:00 UTC, which is **13:00 NZDT**, so
+no real run fits in this session's hour. Nothing in the install was changed
+(`.tmt_protocol` absent, tags in force).
+
+**Item 3: the owner's decisions (asked 09:20 NZDT)**, with what was found in
+the code first:
+
+- **`patch_file` LF -> CRLF.** Cause: `read_text` translates newlines and
+  `write_text` writes the platform newline, so on Windows EVERY file TMT
+  writes or patches comes out CRLF (`agent_file_ops.py` lines 155, 168, 207,
+  403). Protocol-independent; the json sim run showed the same bytes.
+  Owner: keep it as it is, unless it turns out to stop the tags work being
+  proved. It does not (both sims passed with it). **Recorded, not changed.**
+- **CI footer `0 turns`.** Cause: in `TMT.py`'s batch loop the
+  `if sub_action == END_CONVERSATION:` branch `break`s without `steps += 1`,
+  while the single-action path increments before its END_CONVERSATION check.
+  So a turn that is one terminal batch reports `turns: 0` in the CI summary,
+  a figure nobody measured. Owner: **fix now, separate commit** (see below).
+- **`bash` and `end_conversation` in one batch** (summary written before the
+  command's output exists; same under json). Owner: **record as a follow-up,
+  no change in this work.** Options for whoever picks it up: a one-sentence
+  prompt rule in both formats, or a runtime stop that runs the batch's work,
+  holds the `end_conversation`, and hands the results back for a real answer.
+- **`HEADER_TAGS` / `HEADER` "and the turn fails".** Owner: the protocol has
+  to work well for SMALLER models; if the clause makes it harder for them to
+  produce good answers, change it. That is a question for evidence, not
+  wording taste, so it is deferred to the real runs: in addition to the
+  configured 550B model, run the tags task once on a small free model
+  (`nvidia/nemotron-3.5-lightning:free` or `cohere/north-mini-code:free`) and
+  read whether it keeps the format and answers well. Change the clause (in
+  both headers, or in HEADER_TAGS alone if json must stay byte-identical) only
+  if that run shows a format or quality problem the clause plausibly causes.
+
+**The `0 turns` fix, commit `cf3a384`.** Built by a Sonnet agent in an
+isolated worktree; its commit `912f2a6` was cherry-picked onto `alpha` as
+**`cf3a384`** after the session owner read the diff, and the worktree and
+branch were removed. Two files, 91 insertions, no deletions: `TMT.py` gains
+`steps += 1` (with a comment) as the first line of the batch loop's
+`if sub_action == END_CONVERSATION:` branch, the one batch exit that did not
+count itself; `TMT.py` stays CRLF in the working tree and the diff is one
+hunk. `testing/integration/test_agent_ci_wiring.py` gains four tests through
+the existing `ci()` harness: one terminal batch is `turns == 1` (json
+summary), the footer of the same run says `completed (1 turn,`, a batch that
+goes on plus a terminal batch is 2 (no double count), and a batch that goes
+on plus a lone `end_conversation` is still 2. Mutation (increment removed):
+the first three fail, the fourth passes as it must. The agent's module runs
+with the fix: test_agent_ci 27/0, test_agent_ci_wiring 26/0, test_agent_cli
+46/0, test_agent_protocol_wiring 40/0, test_agent_multi_wiring 29/0.
+
+Worth knowing about that build: the agent's worktree was created at
+`8b3bf5b` (main), not at `alpha`; it reset its own scratch branch to
+`5225964` before editing. A future worktree build should be told to check
+`git log -1` first. In a wider sweep inside the worktree, two tests failed
+**with and without** the fix and were not touched:
+`test_agent_plan.test_the_three_statuses_take_the_three_positions_on_the_one_gradient`
+(no colour escape in the painted row) and
+`test_agent_delegation_wiring.test_the_whole_stack_delegates_under_a_contract_from_a_real_session`
+(`PermissionError` WinError 32 removing a temp workspace; the same test was
+recorded as a possible flake in the known-gaps entry above). Both passed in
+both clean-clone runs, so they look specific to that runner/environment.
+
+**`output/sim/live_run.sh` gained a model override** (git-ignored, built by a
+Haiku agent, reviewed and sent back once): an optional 4th argument MODEL
+sets the `openrouter` entry of the install's `.tmt_model` for the run and
+restores the file byte-for-byte afterwards, from a `trap ... EXIT` so a
+Ctrl-C restores too. The first version passed the Git Bash path
+`/c/Coding/TMT/.tmt_model` inside a `python -c` string; native Windows Python
+reads that as `C:\c\Coding\TMT\.tmt_model`, so the override would have
+silently not happened and a "small model" run would have used the 550B
+default. It now converts with `cygpath -w`, passes path and model as argv,
+reads the value back, and stops with exit 3 before TMT runs if it did not
+take. The same pass fixed a trap-ordering hole that could delete a
+pre-existing `.tmt_protocol` on an early exit. Checked by the agent against a
+fake install under the scratchpad (override visible mid-run, both files
+`cmp`-identical afterwards, early exit leaves `.tmt_protocol` alone); NOT
+yet run against the real install, because that makes real requests.
+
 ## HANDOFF: what the next session must do (written 2026-10-07 15:25 NZDT)
 
 The owner stopped this session on a time limit. Everything is committed on
@@ -603,3 +692,70 @@ untracked directory: never stage it, never `git add -A`.
 > have been made. Start with HANDOFF 2 item 1 (the json run's result, or
 > rerun it with the harness in output/sim/), then item 2, documenting in
 > docs/backendchange.md as you go and committing with explicit paths.
+
+## HANDOFF 3: what the next session must do (written 2026-10-08 09:35 NZDT)
+
+The owner gave session 3 one hour. HEAD on `alpha` is the docs commit after
+`cf3a384` (the `0 turns` fix). Nothing is pushed. `app/`, `gui-report/` and
+`.claude/` are untracked and belong to others: never stage them, never
+`git add -A` or `git add .`.
+
+Done in session 3: HANDOFF 2 item 2 (clean-clone suite 3067/0 on `5225964`),
+item 3 (the owner's four decisions, recorded under "Session 3" above), the
+`0 turns` fix (`cf3a384`, clean-clone suite 3071 passed, 0 failed, 09:29-09:34 NZDT), and a model
+override for `live_run.sh`. NOT done: any real-provider run, because the
+OpenRouter free quota was still exhausted at 09:16 NZDT.
+
+1. **Real-provider runs (HANDOFF 2 item 4), the only thing between this work
+   and "complete".** OpenRouter's free daily limit resets at 00:00 UTC
+   (13:00 NZDT). First `python -I output/sim/probe.py` (one small request to
+   the configured model, key never printed); go on only when it prints `OK`.
+   The free tier is about 50 requests a day without credits and each run may
+   use up to 15, so run these in order and stop if the quota runs out:
+   - `bash output/sim/live_run.sh tags real-tags "<task>"` (configured
+     `nvidia/nemotron-3-ultra-550b-a55b:free`)
+   - `bash output/sim/live_run.sh json real-json "<task>"`
+   - `bash output/sim/live_run.sh tags real-tags-small "<task>" nvidia/nemotron-3.5-lightning:free`
+     (or `cohere/north-mini-code:free`): the small-model evidence the owner
+     asked for. The 4th argument is the new model override; check the log's
+   `model override:` line and `model:` line say the small model.
+   Task text, as before: `Read hello.py and test_hello.py. Add a function
+   goodbye(name) to hello.py that returns "Bye, " plus the name, add a test
+   for it to test_hello.py, run python run_tests.py with bash, and finish
+   with a short summary of what you changed.` Logs land in
+   `output/sim/live-<label>.log`. Read each whole: tags unprompted? any drift
+   warning or retry? correct bytes on disk (CRLF is expected and accepted)?
+   did bash run? the footer's turn count now true (after `cf3a384`)?
+   Afterwards confirm `.tmt_protocol` is absent and `.tmt_model` is
+   unchanged (`live_run.sh` restores both). Record the key lines here.
+2. **The header clause.** Owner's rule: if the small-model run shows the
+   "and the turn fails" clause making it harder to answer well, change it
+   (drop it from both headers, or from `HEADER_TAGS` only if json must stay
+   byte-identical); otherwise leave it. Any change is built by a Sonnet
+   agent and followed by a clean-clone suite run
+   (`bash output/sim/verify_clone.sh <label>`).
+3. **Then** set the Status table's Step 6 row to complete, tell the owner,
+   and push only if the owner says so in their own words.
+4. **Follow-ups the owner chose NOT to do in this work** (record them, do not
+   build them unprompted): TMT's write paths turn LF files into CRLF on
+   Windows; a batch can hold `bash` and `end_conversation`, so the summary is
+   written before the command's output exists.
+
+#### Paste-ready prompt for session 4
+
+> We are finishing the tag-protocol change in the TMT CLI at C:\Coding\TMT
+> (branch alpha; HEAD is the docs commit after cf3a384). Read
+> docs/backendchange.md first, especially "Session 3" under Step 6 and
+> "HANDOFF 3" at the end: the clean-clone suite is green, the owner has
+> decided the open observations, the CI "0 turns" bug is fixed in cf3a384,
+> and output/sim/live_run.sh now takes an optional model id. HARD RULES:
+> never read, list or edit C:\Coding\TMT\app, gui-report or .claude (other
+> sessions own them); never git add -A, git add . or stage those; never push
+> unless the owner says so in their own words; all building work goes to
+> subagents (Sonnet builds, Haiku for light work); call nothing complete
+> until the real-provider runs in HANDOFF 3 item 1 have been made and
+> recorded. Start by checking the OpenRouter quota with
+> python -I output/sim/probe.py (it resets at 13:00 NZDT); then run the three
+> live runs in HANDOFF 3 item 1, read every log in full, decide the header
+> clause from the small-model run as item 2 says, and document in
+> docs/backendchange.md as you go, committing with explicit paths.
