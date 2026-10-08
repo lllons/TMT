@@ -14,7 +14,7 @@ bottom of each section. Nothing in `app/` is read or touched by this work.
 | 3 | Wire `agent_model`, both loops, session carry, correction strings | done 2026-10-07 | `a0e3ef1`, tag `restore-tags-3` |
 | 4 | Prompts: tag contract + transliterated examples, cache keys, subprompts | done 2026-10-07 | `9c170f6`, tag `restore-tags-4` |
 | 5 | Embedded JSON hints in refusal/result strings made protocol-aware | done 2026-10-07 | `b6d123b`, tag `restore-tags-5` |
-| 6 | Full suite in a clean clone, live API runs under both protocols, measurements | **in progress** - suite 3064/0 on `0f7cae1`, 3067/0 on `5225964`, 3071/0 on `cf3a384` (the CI `0 turns` fix); gaps closed in `4d18777`; SIMULATED acceptance runs PASS under tags and json; owner decisions on the observations recorded; real-provider runs still owed, blocked by the free quota (see Step 6 "Session 3" and HANDOFF 3) | `cf3a384` |
+| 6 | Full suite in a clean clone, live API runs under both protocols, measurements | **in progress** - suite 3064/0 on `0f7cae1`, 3067/0 on `5225964`, 3071/0 on `cf3a384` (the CI `0 turns` fix); gaps closed in `4d18777`; SIMULATED acceptance runs PASS under tags and json; owner decisions on the observations recorded; real-provider runs MADE 2026-10-08 (Step 6 "Session 4"): tags on the configured model is format-clean but gave a wrong result, json was correct, and the small model failed under tags; awaiting the owner's decision | `cf3a384` |
 
 **NOT COMPLETE.** The code for every step is committed and the core modules
 pass (638 passed, 0 failed across the 16 protocol-bearing modules, verified
@@ -572,6 +572,47 @@ pre-existing `.tmt_protocol` on an early exit. Checked by the agent against a
 fake install under the scratchpad (override visible mid-run, both files
 `cmp`-identical afterwards, early exit leaves `.tmt_protocol` alone); NOT
 yet run against the real install, because that makes real requests.
+
+### Session 4 (2026-10-08, from 15:54 NZDT): the real-provider runs
+
+The probe returned `OK ... reply='ready'` at 15:54 NZDT, so the quota had
+reset. All three HANDOFF 3 item 1 runs were made through `live_run.sh`
+against real OpenRouter, using the task text above. Afterwards
+`.tmt_protocol` was absent and `.tmt_model` was byte-unchanged. Logs are in
+`output/sim/live-<label>.log` and the workspaces in
+`output/sim/live-ws-<label>/`. The owner asked for the runs to be made and
+recorded and nothing more, so nothing below was acted on.
+
+| Run | Model | Format errors | Rounds | Outcome |
+|---|---|---|---|---|
+| `real-tags` | nemotron-3-ultra-550b (configured) | none: no retry, no drift warning | 1 (14.6s) | **Wrong result.** Patched both files and ran bash, but never changed `from hello import hello`, so `test_goodbye` fails (`name 'goodbye' is not defined`). The summary says "The test suite ran and passed both tests", which is **false**. |
+| `real-json` | same | none | 4 (52.0s) | **Correct.** Round 1 was a `multi_tool` (2 patches + bash). It saw the failure, fixed the import, re-ran bash, then ended. 2 passed, 0 failed. The summary was accurate. |
+| `real-tags-small` | nemotron-3.5-lightning (override confirmed in the log) | **2 retries**: "`/content/` is never closed", then "`/progress/` is given twice beside the actions" | 3 (218.7s) | **Failed.** Only `goodbye` was appended to hello.py, with no blank lines before it. No test was added and bash never ran. The final message shown to the user was the literal text `/end_conversations/`. |
+
+What this shows:
+
+- **Tags works mechanically on the configured model.** It answered in tags
+  with no warning or retry. The bytes landed (CRLF, as recorded), and the
+  footer's `1 turn` is true, so `cf3a384` holds live.
+- **The `bash` + `end_conversation` batch that the owner deferred has now
+  produced a false claim on a real model.** The tags run ended in the same
+  batch as its test command, so it reported a pass that did not happen. In
+  the json run the same model used `multi_tool` and saw the result. One run
+  of each is not evidence that the protocol caused the difference, but the
+  follow-up is no longer hypothetical.
+- **The small model struggled with the tag grammar.** It produced an
+  unclosed block, a duplicated key and a malformed ending. None of these is
+  text outside the blocks, so the "and the turn fails" clause is not a
+  plausible cause. Under the owner's rule for HANDOFF 3 item 2, **the header
+  clause is left unchanged.** No json run on the small model was made, so
+  nothing yet shows whether it does better under json.
+
+**Step 6 is not marked complete.** The runs it was waiting on have been
+made, but one of the two configured-model runs under tags gave a wrong
+result and the small model failed under tags. Whether that is good enough to
+call the work done is the owner's decision. Possible next steps, none
+started: a json run on the small model for comparison; the `bash` +
+`end_conversation` follow-up (a prompt rule, or a runtime hold).
 
 ## HANDOFF: what the next session must do (written 2026-10-07 15:25 NZDT)
 
