@@ -14,7 +14,7 @@ bottom of each section. Nothing in `app/` is read or touched by this work.
 | 3 | Wire `agent_model`, both loops, session carry, correction strings | done 2026-10-07 | `a0e3ef1`, tag `restore-tags-3` |
 | 4 | Prompts: tag contract + transliterated examples, cache keys, subprompts | done 2026-10-07 | `9c170f6`, tag `restore-tags-4` |
 | 5 | Embedded JSON hints in refusal/result strings made protocol-aware | done 2026-10-07 | `b6d123b`, tag `restore-tags-5` |
-| 6 | Full suite in a clean clone, live API runs under both protocols, measurements | **in progress** - suite 3064/0 on `0f7cae1`, 3067/0 on `5225964`, 3071/0 on `cf3a384` (the CI `0 turns` fix); gaps closed in `4d18777`; SIMULATED acceptance runs PASS under tags and json; owner decisions on the observations recorded; real-provider runs MADE 2026-10-08 (Step 6 "Session 4"): tags on the configured model is format-clean but gave a wrong result, json was correct, and the small model failed under tags; awaiting the owner's decision | `cf3a384` |
+| 6 | Full suite in a clean clone, live API runs under both protocols, measurements | **in progress** - suite 3064/0 on `0f7cae1`, 3067/0 on `5225964`, 3071/0 on `cf3a384` (the CI `0 turns` fix); gaps closed in `4d18777`; SIMULATED acceptance runs PASS under tags and json; owner decisions on the observations recorded; real-provider runs MADE 2026-10-08 (Step 6 "Session 4"): tags on the configured model is format-clean but gave a wrong result, json was correct, and the small model failed under tags. The owner chose the HANDOFF 4 redesign. Session 5: small model PASSES under json and FAILS under current tags (raw reply recorded); owner's answers recorded; build steps 1-5 not started | `cf3a384` |
 
 **NOT COMPLETE.** The code for every step is committed and the core modules
 pass (638 passed, 0 failed across the 16 protocol-bearing modules, verified
@@ -614,6 +614,95 @@ call the work done is the owner's decision. Possible next steps, none
 started: a json run on the small model for comparison; the `bash` +
 `end_conversation` follow-up (a prompt rule, or a runtime hold).
 
+### Session 5 (2026-10-08, 18:16-18:47 NZDT; the owner gave it 30 minutes)
+
+HANDOFF 4 step 0 done, and the owner answered the open questions. No product
+code changed.
+
+**Quota.** `python -I output/sim/probe.py` at 18:16 NZDT: `OK ... reply='ready'`.
+This is the same UTC day as session 4, so the two sessions share one day's
+free quota. About 15 requests were used across both by 18:30.
+
+**Small model under json, the baseline (`real-json-small`, 18:17:33-18:18:32
+NZDT): PASS.** Model `nvidia/nemotron-3.5-lightning:free`, and the log's
+override line confirms it. The run had no retry and no hand-back.
+`TMT CI: completed (3 turns, 57.7s)`. In order, the model read `hello.py`,
+appended `goodbye`, patched the import to `from hello import hello, goodbye`,
+appended `test_goodbye`, and ran `bash python run_tests.py`. Then it ended.
+Its summary says "The test suite ran: both tests passed with 0 failures",
+which is **true**. Running `python run_tests.py` in the workspace afterwards
+gave `PASS test_goodbye / PASS test_hello / 0 failed`. Both appended files
+end without a trailing newline, which is cosmetic. Log:
+`output/sim/live-real-json-small.log`. **So problem 2 (the small model's
+grammar errors) comes from the tag grammar, not from the model.** The same
+model with the same task did the work correctly under json.
+
+**Raw-reply capture (HANDOFF 4 step 0b), built.** A Sonnet agent built it in
+the git-ignored `output/sim/` and tested it only against a local fake
+upstream.
+- `record_proxy.py --dir OUT --port P [--upstream URL]` forwards to real
+  OpenRouter. It relays SSE live (first chunk at 0.01s of a 1.67s stream)
+  and writes `req/N.json`, `resp/N.raw`, `resp/N.txt` (the reassembled
+  assistant text) and `proxy.log`. **It never writes a header value.** The
+  test sent `Authorization: Bearer SECRET123` and checked all 13 output
+  files for it.
+- A 429 passes through with its body.
+- `test_record_proxy.py [--e2e]` and `fake_upstream.py` are its tests.
+- `live_run.sh` gained an opt-in `RECORD=1`. It starts the proxy on port
+  8766 or the next free one, runs TMT through `run_sim.py`, writes to
+  `output/sim/raw-<label>/`, and kills the proxy in the existing cleanup
+  trap. Without `RECORD=1` the old path is unchanged.
+
+Usage: `RECORD=1 bash output/sim/live_run.sh <tags|json> <label> "<task>" [MODEL]`.
+
+**`.tmt_protocol` was present before this session's run.** It held
+`tags\r\n`, the default, so nothing behaves differently. Session 4 recorded
+it absent, so something set it between the two sessions: Settings or
+another session. `live_run.sh` restored it byte for byte, as designed.
+`.tmt_model` was restored to the 550B model.
+
+**Recorded tags run on the small model under the CURRENT grammar
+(`real-tags-small-rec`, 18:25:55-18:26:09 NZDT): FAILED, and it is problem 1
+on a small model.** This was the first real run through `RECORD=1`, and the
+proxy worked: one request, 54,566 bytes in, status 200, 10.08s. The raw reply
+(`output/sim/raw-real-tags-small-rec/resp/1.txt`, 499 chars) is
+grammatically clean. It holds two `read_file` blocks, each with its own
+`/progress/`, then an `/end_conversation/` that has a `/message/` and a
+`/next_step/` in the same reply. So TMT read both files and **ended the turn
+having done none of the task**. The summary just reports the two files'
+contents. `TMT CI: completed (1 turn, 12.2s)`, `hello.py` unchanged, and
+`run_tests.py` shows only `PASS test_hello`. Under the agreed design, an old
+`/end_conversation/` beside actions does not end the turn, so this run would
+have gone on to its second round. This time there was no unclosed
+`/content/` to read; the next session can reproduce that with `RECORD=1`.
+`.tmt_protocol` (`tags\r\n`) and `.tmt_model` were restored.
+
+| Run | Model | Format | Outcome |
+|---|---|---|---|
+| `real-json-small` | nemotron-3.5-lightning | json | **PASS**, 3 turns, true summary |
+| `real-tags-small-rec` | nemotron-3.5-lightning | tags (current grammar) | **FAIL**, reads plus `end_conversation` in one reply, task not done |
+
+**The owner's answers to the HANDOFF 4 questions (18:20 NZDT)**:
+1. **`next_step`**: keep a reply-level `/next_step/` block. A reply holding
+   only text and `/next_step/` still ends the turn.
+2. **Old tags** (`/send_message/`, `/end_conversation/`, `/progress/`):
+   accept them but do not teach them. If a reply holds action blocks AND an
+   `/end_conversation/`, run the actions, show the end's text as a message,
+   and do NOT end the turn.
+3. **Prose that looks like a tag**: only a known action name or reply-level
+   key opens a block. A top-level `/name/` within edit distance 2 of a known
+   action name gets a "did you mean ..." correction. Anything else is prose.
+4. **Background agents**: the main agent only in this build. The owner
+   asked the next session to also bring the new rules to all subagents
+   (worker, note agent, reviewer) after the main agent works. The
+   reviewer's verdict is JSON inside a `response` leaf, so its shape needs a
+   decision when that happens.
+
+The prose-before-work question (HANDOFF 4 "Things to settle") was not asked
+separately. It follows from the design the owner already chose: a text-only
+reply always ends the turn, so the early-prose path at `TMT.py:2015` goes
+under tags.
+
 ## HANDOFF: what the next session must do (written 2026-10-07 15:25 NZDT)
 
 The owner stopped this session on a time limit. Everything is committed on
@@ -934,3 +1023,80 @@ into CRLF on Windows; the json protocol's `bash` + `end_conversation` batch
 > 1-5. Document in docs/backendchange.md as you go and commit with
 > explicit paths. Call nothing complete until the clean-clone suite is
 > green and the real runs in step 5 pass.
+
+## HANDOFF 5: build the plain-text tags rules (written 2026-10-08 18:35 NZDT)
+
+HEAD on `alpha` is the docs commit that adds "Session 5" above. Nothing is
+pushed. `app/`, `gui-report/` and `.claude/` belong to other sessions: never
+read, list, edit or stage them, and scope every search to the repo root
+files. `.tmt_protocol` holds `tags\r\n` and is not this work's to remove.
+
+Done: HANDOFF 4 step 0 (the json baseline on the small model PASSED, raw
+capture `RECORD=1` works against real OpenRouter, and one recorded tags run
+on the small model FAILED by ending in the same reply as its reads), and
+every question in "Things the builder must settle" is answered (Session 5
+above). **Building has not started.** The design and the answers are final.
+Do not ask them again.
+
+Steps, in order (Sonnet builds in isolated worktrees and is cherry-picked
+onto alpha after you read the diff; Haiku for light work; a worktree agent
+must check `git log -1` and reset its scratch branch to the alpha HEAD
+first, because worktrees have been created at `main`):
+
+1. **Parser** (`agent_protocol.py`), HANDOFF 4 step 1. Use these real
+   replies as unit-test fixtures:
+   `output/sim/raw-real-tags-small-rec/resp/1.txt` (reads plus an old
+   `/end_conversation/`), the `/end_conversations/` typo, and
+   `ok, I'll look at the repo first /list_files/ //list_files/`. Use the
+   owner's near-miss rule (edit distance 2 against known action names,
+   top-level only).
+2. **Loop**, HANDOFF 4 step 2, including the owner's old-tag rule: an
+   `/end_conversation/` beside actions is shown as a message and does NOT
+   end the turn. Keep `/next_step/` as reply-level.
+3. **Prompt**, HANDOFF 4 step 3, main agent only. Measure the tags prompt
+   size before and after.
+4. **Clean-clone suite**: `bash output/sim/verify_clone.sh <label>` (3071/0
+   on `cf3a384`). Every json-pinned test must stay green, because json is
+   byte-identical.
+5. **Real runs**, with `RECORD=1` so the raw replies are kept. Probe first
+   (`python -I output/sim/probe.py`); the quota resets at 00:00 UTC (13:00
+   NZDT). Run the small model under the new tags, then the 550B under the
+   new tags, with the task text from HANDOFF 3. **Passing** means:
+   `python run_tests.py` passes in the workspace, the summary makes no false
+   claim, and the small model does no worse than `real-json-small` (PASS,
+   3 turns). Watch for the risk HANDOFF 4 named: a model that announces
+   work in text and then stops, because a text-only reply now ends the turn.
+6. **Then, as the owner asked: bring the same rules to all subagents**
+   (worker, note agent, reviewer). The reviewer's verdict is JSON in a
+   `response` leaf and collides with "JSON is accepted under tags", so
+   propose its new shape to the owner before building that part. Same
+   suite and real-run bar afterwards; a delegated run is the real test.
+7. Set the Status table only with the owner's agreement. Push only on the
+   owner's own word.
+
+Still deferred (do not build unprompted): LF to CRLF on Windows writes;
+json's `bash` + `end_conversation` batch (json stays byte-identical).
+
+#### Paste-ready prompt for session 6
+
+> We are reworking the tag protocol in the TMT CLI at C:\Coding\TMT
+> (branch alpha; HEAD is the docs commit that adds "Session 5"). Read
+> docs/backendchange.md first: "Session 4" and "Session 5" under Step 6,
+> then "HANDOFF 4" (the owner's design: under tags, text outside the
+> blocks is the message to the user, a reply with no action blocks is the
+> final answer and ends the turn, and text before an action is its
+> progress; json stays byte-identical) and "HANDOFF 5" (the owner's
+> answers, which are final, and the build steps). HARD RULES: never read,
+> list or edit C:\Coding\TMT\app, gui-report or .claude (other sessions
+> own them; scope every search to the repo root files because a glob also
+> matches app/); never git add -A, git add . or stage those; never push
+> unless the owner says so in their own words; all building work goes to
+> subagents (Sonnet builds in isolated worktrees, cherry-picked onto alpha
+> after you read the diff; Haiku for light work). Start with HANDOFF 5
+> step 1 (parser) and go through step 5 (real runs with RECORD=1, small
+> model then 550B). When the main agent passes, do step 6: bring the same
+> rules to all subagents (worker, note agent, reviewer), proposing the
+> reviewer's verdict shape to the owner first. Document in
+> docs/backendchange.md as you go and commit with explicit paths. Call
+> nothing complete until the clean-clone suite is green and the real runs
+> pass.
