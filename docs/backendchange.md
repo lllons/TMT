@@ -800,3 +800,137 @@ OpenRouter free quota was still exhausted at 09:16 NZDT.
 > live runs in HANDOFF 3 item 1, read every log in full, decide the header
 > clause from the small-model run as item 2 says, and document in
 > docs/backendchange.md as you go, committing with explicit paths.
+
+## HANDOFF 4: plain text is the message (written 2026-10-08 16:15 NZDT)
+
+HEAD on `alpha` is the docs commit after `2689886`. Nothing is pushed.
+`app/`, `gui-report/` and `.claude/` belong to other sessions: never read,
+list, edit or stage them. Never `git add -A` or `git add .`. Note for
+searches: a repo-wide Grep with a glob also matches
+`app/backend/tmt-snapshot/`, so always scope searches to the root files.
+
+### Why
+
+The Session 4 real runs (above) found three problems under tags:
+
+1. **A false "tests passed" (550B).** The model put `bash` and
+   `end_conversation` in one reply, so its summary was written before the
+   test ran. The test actually failed: the import was never fixed.
+2. **Grammar errors from a small model (nemotron-3.5-lightning).** An
+   unclosed `/content/`, a `/progress/` given twice, and a final reply that
+   was the literal text `/end_conversations/`. The task was not done.
+3. **Too many tags.** Every action needs a `/progress/`, and every
+   user-facing sentence needs a `/send_message/` or `/end_conversation/`
+   wrapper. The owner thinks this overhead is what trips models up.
+
+### The owner's design (decided 2026-10-08)
+
+Tags stay, but under the **tags** protocol only:
+
+- **Text outside the tag blocks is a message to the user.** No message tag
+  is needed. Example reply: `ok, I'll look at the repo first /list_files/ //list_files/`.
+- **A reply with no action blocks is the final answer and ends the turn.**
+  Internally it becomes `end_conversation` with that text as the message,
+  so the plan, review and verify gates hold it exactly as before. Because
+  a reply that runs anything can never end the turn, the model always
+  sees the command's output before it answers. That fixes problem 1 by
+  construction.
+- **Text before an action is that action's progress line.** The
+  `/progress/` tag is no longer taught.
+- **json is untouched**, byte for byte. The suite's json pin must stay
+  green; Steps 3-5 promised this.
+
+### Things the builder must settle with the owner BEFORE building (recommendations given)
+
+- **`next_step`** (the hint shown after an answer): allow a reply-level
+  `/next_step/` block in the final reply. It is not an action, so a reply
+  holding only text and `/next_step/` still ends the turn.
+- **Old tags still sent by a model**: `/send_message/`, `/end_conversation/`
+  and `/progress/` are still accepted but no longer taught, the way
+  `canonical_action` handles old verbs. If a reply holds action blocks AND
+  an `/end_conversation/`, run the actions, show the end's text as a
+  message, and do NOT end the turn. This keeps the fix for problem 1 for
+  models that use the old shape.
+- **Prose that looks like a tag** (`/usr/bin`, `/c/Coding`, the
+  `/end_conversations/` typo): only a known action name or reply-level key
+  opens a block. A top-level `/name/` within edit distance 2 of a known
+  action name gets a correction ("did you mean ..."). Anything else is
+  prose.
+- **The prose-before-work rule goes, under tags.** `TMT.py:2015`
+  (`is_prose(obj) and not turn_state["acted"]`) shows early prose as
+  progress and asks for an action. Under the new rule a greeting must end
+  the turn, so a text-only reply always ends it. The prompt must say: if
+  you say you will do something, put its action in the same reply. Risk:
+  a model that announces and stops. Watch for it in the real runs.
+- **Background agents** (worker, note, reviewer): keep their current tag
+  contract in this step. The reviewer's verdict is JSON inside a
+  `response` leaf, and a text-only reviewer reply would collide with the
+  JSON-accepted-under-tags path. Main agent only, unless the owner says
+  otherwise.
+
+### Build steps (Sonnet builds in isolated worktrees and cherry-picks onto alpha; Haiku for light work)
+
+0. **Baseline and raw-reply capture first, before any code changes.**
+   (a) Run the small model under **json**, which has never been done:
+   `bash output/sim/live_run.sh json real-json-small "<task>" nvidia/nemotron-3.5-lightning:free`.
+   That shows whether problem 2 comes from tags or from the model.
+   (b) Give the git-ignored harness in `output/sim/` a pass-through mode
+   (a recording proxy that forwards to real OpenRouter and saves request
+   and response bodies, NEVER headers), so a real run's raw replies can be
+   read. Today CI logs show what TMT did, not what the model sent, which
+   is why the unclosed-`/content/` error cannot yet be diagnosed.
+1. **Parser** (`agent_protocol.py`): top-level text becomes ordered prose
+   segments around the action blocks. The streaming parser emits that
+   prose live, so it streams into the reply box. Unknown-name handling is
+   as decided above. Unit tests use real Session 4 shapes, including
+   `/end_conversations/`.
+2. **Loop** (`TMT.py`, single and batch paths, plus `agent_model`'s
+   `PROSE_KEY` path): a text-only reply becomes END_CONVERSATION through
+   the existing gates. Prose beside actions becomes progress rows. An
+   explicit `/end_conversation/` beside actions does not end the turn.
+   Session carry (`Turn.messages()`) must render a carried answer as plain
+   text under tags, or the history teaches the old shape.
+3. **Prompt** (`HEADER_TAGS` and the tag variants of the contract
+   sections): teach the three rules, drop `/progress/`, `/send_message/`
+   and `/end_conversation/` from every tag example, and say "end your
+   reply after any action whose result you need". Measure the tags prompt
+   size before and after.
+4. **Verify**: run `bash output/sim/verify_clone.sh <label>` (clean-clone
+   suite; it was 3071/0 on `cf3a384`). Every json-pinned test must stay
+   green.
+5. **Real runs**: probe first (`python -I output/sim/probe.py`). The free
+   quota is about 50 requests a day and resets at 13:00 NZDT. Run new-tags
+   on the small model, then new-tags on the configured 550B, with the same
+   task text. Passing means: `python run_tests.py` passes in the run's
+   workspace afterwards, no false claim in the summary, and the small
+   model under tags does no worse than its json baseline from step 0.
+   Record each run's key lines here.
+6. Set the Status table only with the owner's agreement. Push only on the
+   owner's own word.
+
+Still deferred (do not build unprompted): TMT's write paths turn LF files
+into CRLF on Windows; the json protocol's `bash` + `end_conversation` batch
+(json must stay byte-identical, so it keeps that behaviour).
+
+#### Paste-ready prompt for session 5
+
+> We are reworking the tag protocol in the TMT CLI at C:\Coding\TMT
+> (branch alpha; HEAD is the docs commit after 2689886). Read
+> docs/backendchange.md first: "Session 4" under Step 6 (three real-provider
+> runs and the problems they found) and "HANDOFF 4" at the end (the owner's
+> new design: under tags, text outside the blocks is the message to the
+> user, a reply with no action blocks is the final answer and ends the turn,
+> and text before an action is its progress; json stays byte-identical).
+> HARD RULES: never read, list or edit C:\Coding\TMT\app, gui-report or
+> .claude (other sessions own them; scope every search to the repo root
+> files because a glob also matches app/); never git add -A, git add . or
+> stage those; never push unless the owner says so in their own words; all
+> building work goes to subagents (Sonnet builds in isolated worktrees,
+> cherry-picked onto alpha after you read the diff; Haiku for light work);
+> consult the owner on the open questions in HANDOFF 4 before building.
+> Start with HANDOFF 4 step 0 (probe the quota with
+> python -I output/sim/probe.py, run the small model under json as the
+> baseline, add raw-reply capture to the output/sim harness), then steps
+> 1-5. Document in docs/backendchange.md as you go and commit with
+> explicit paths. Call nothing complete until the clean-clone suite is
+> green and the real runs in step 5 pass.
