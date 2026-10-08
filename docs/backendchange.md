@@ -614,14 +614,14 @@ call the work done is the owner's decision. Possible next steps, none
 started: a json run on the small model for comparison; the `bash` +
 `end_conversation` follow-up (a prompt rule, or a runtime hold).
 
-### Session 5 (2026-10-08, 18:16-18:47 NZDT; the owner gave it 30 minutes)
+### Session 5 (2026-10-08, from 18:16 NZDT; the owner gave it 30 minutes)
 
 HANDOFF 4 step 0 done, and the owner answered the open questions. No product
 code changed.
 
 **Quota.** `python -I output/sim/probe.py` at 18:16 NZDT: `OK ... reply='ready'`.
 This is the same UTC day as session 4, so the two sessions share one day's
-free quota. About 15 requests were used across both by 18:30.
+free quota. Session 5 made 1 probe and 4 model requests (3 json + 1 tags).
 
 **Small model under json, the baseline (`real-json-small`, 18:17:33-18:18:32
 NZDT): PASS.** Model `nvidia/nemotron-3.5-lightning:free`, and the log's
@@ -682,7 +682,7 @@ have gone on to its second round. This time there was no unclosed
 | `real-json-small` | nemotron-3.5-lightning | json | **PASS**, 3 turns, true summary |
 | `real-tags-small-rec` | nemotron-3.5-lightning | tags (current grammar) | **FAIL**, reads plus `end_conversation` in one reply, task not done |
 
-**The owner's answers to the HANDOFF 4 questions (18:20 NZDT)**:
+**The owner's answers to the HANDOFF 4 questions (about 18:18 NZDT)**:
 1. **`next_step`**: keep a reply-level `/next_step/` block. A reply holding
    only text and `/next_step/` still ends the turn.
 2. **Old tags** (`/send_message/`, `/end_conversation/`, `/progress/`):
@@ -1024,7 +1024,7 @@ into CRLF on Windows; the json protocol's `bash` + `end_conversation` batch
 > explicit paths. Call nothing complete until the clean-clone suite is
 > green and the real runs in step 5 pass.
 
-## HANDOFF 5: build the plain-text tags rules (written 2026-10-08 18:35 NZDT)
+## HANDOFF 5: build the plain-text tags rules (written 2026-10-08 18:27 NZDT)
 
 HEAD on `alpha` is the docs commit that adds "Session 5" above. Nothing is
 pushed. `app/`, `gui-report/` and `.claude/` belong to other sessions: never
@@ -1076,6 +1076,72 @@ first, because worktrees have been created at `main`):
 
 Still deferred (do not build unprompted): LF to CRLF on Windows writes;
 json's `bash` + `end_conversation` batch (json stays byte-identical).
+
+### Code sites for steps 1-3 (read-only map, 2026-10-08 18:28 NZDT, at `faccc4b`)
+
+A read-only Sonnet agent made this map. I spot-checked five of the lines and
+all five matched. Line numbers will drift once building starts.
+
+- **Where top-level text is dropped today**: `agent_protocol._Reader.reply()`
+  (about 429-467). It scans for `/` and skips anything that is not a tag
+  (`p = slash + 1`), including stray closers and unknown `/name/`
+  (463-464). An unknown top-level `/name/` counts as an action only if it
+  is not live, has a later closer, and is not in `self.known` (458-460).
+  No edit-distance logic exists.
+- **Prose before the first tag is also cut** in `parse()` (846-857, which
+  calls `parse_tags(text[at:])`) and in `_locate` / `_first_tag`
+  (770-803).
+- **Reply-level keys**: `REPLY_LEAVES` = {progress, next_step} (220) and
+  `REPLY_KEYS` adds events (221). They are handled at 444-452. `assemble`
+  (469-481) merges them into the action or into `{"actions": [...]}`, and
+  `_BOTH_PLACES` refuses a key given both beside and inside an action.
+- **Known names**: `_known_actions()` (278) = `REQUIRED_KEYS` |
+  `LEGACY_PRIMARY`.
+- **Streaming**: `StreamingTagParser` (1212-1286) re-runs
+  `_Reader(live=True)`. `("text", ...)` comes only from `until()`/`partial()`
+  (688-711), and only when `speak` is set by `action()` (512) for an action
+  whose primary key is `message`. **Nothing emits top-level prose today.**
+  `("progress"|"next_step", s)` comes from `leaf(live_kind=...)` (664-669)
+  and `("object", json)` from `whole()` (483-492).
+- **Corrections**: `_CORRECTIONS` (1316), including `unreadable` (1318) and
+  `prose_before_work` (1336). `TAG_CONTRACT` (1304) says "no prose".
+- **`agent_model.py`**: `_prose_reply` (481-500, capped at
+  `PROSE_REPLY_LIMIT` 2000, marked `PROSE_KEY`) is reached from
+  `_tags_reply` (604-644) when there is no tag and no object, or when
+  `parse` returns None. `_LiveReader._choose` (679-686) picks the stream
+  parser on the first non-space character; prose first under tags already
+  gets `StreamingTagParser`.
+- **`TMT.py`**:
+  - `stream_handler` (82-130) sends `"text"` to `relay.feed` and
+    `"progress"` to a progress row, and holds `"next_step"`.
+  - The early-prose hand-back is at 2015-2023 and is the site to change.
+  - `_adopt_verb` (2029), then `declared_events` (2030, defined at 895).
+  - Batch loop from 2043: its END_CONVERSATION exit is at 2116-2141.
+  - Single path: `validate_action` (2187), `send_message` (2201-2209,
+    defined at 881), the `completion_block` gate (2215-2224),
+    `execute_action` (2233) and END_CONVERSATION (2256-2274).
+- **`agent_session._carried`** (175-193) renders the carried answer as an
+  `end_conversation` tag block under tags. Under the new rules it becomes
+  plain text.
+- **`agent_prompt.py`**:
+  - Hand-written: `HEADER_TAGS` (713-717, which says outside text "reaches
+    nobody" and "every task ends with an end_conversation"),
+    `OUTPUT_RULES_TAGS` (727-765, rules 2, 5 and 9 teach the old shape;
+    rules 5, 10 and 11 must keep their numbers for `_SHARED_OVERRIDES`)
+    and `REMINDER_TAGS` (768).
+  - Twins built from the json constants: `SPEAKING_RULES_TAGS` (823),
+    `_NEVER_WORKS_TAGS` (835), `ANSWERING_EXAMPLES_TAGS` (845),
+    `WORKFLOW_RULES_TAGS` (852) and `PROGRESS_RULES_TAGS` (856).
+  - `_TAG_PROSE` (869-902) has no entries for progress, send_message or
+    end_conversation.
+  - The `ACTION_REFERENCE` examples for `send_message` and
+    `end_conversation` are at 226-229.
+- **Worker (step 6 only)**: `agent_worker.py` `agent_protocol.parse`
+  (1018), drift/detect (1034) and `agent_model.is_prose` (551).
+- **Tests**: `testing/unit/test_agent_protocol.py`,
+  `testing/integration/test_agent_protocol_wiring.py`,
+  `testing/unit/test_agent_prompt_tags.py` and
+  `testing/integration/test_agent_prompt_tags_wiring.py`.
 
 #### Paste-ready prompt for session 6
 
