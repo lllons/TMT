@@ -14,7 +14,7 @@ bottom of each section. Nothing in `app/` is read or touched by this work.
 | 3 | Wire `agent_model`, both loops, session carry, correction strings | done 2026-10-07 | `a0e3ef1`, tag `restore-tags-3` |
 | 4 | Prompts: tag contract + transliterated examples, cache keys, subprompts | done 2026-10-07 | `9c170f6`, tag `restore-tags-4` |
 | 5 | Embedded JSON hints in refusal/result strings made protocol-aware | done 2026-10-07 | `b6d123b`, tag `restore-tags-5` |
-| 6 | Full suite in a clean clone, live API runs under both protocols, measurements | **in progress** - suite 3064/0 on `0f7cae1`, 3067/0 on `5225964`, 3071/0 on `cf3a384` (the CI `0 turns` fix); gaps closed in `4d18777`; SIMULATED acceptance runs PASS under tags and json; owner decisions on the observations recorded; real-provider runs MADE 2026-10-08 (Step 6 "Session 4"): tags on the configured model is format-clean but gave a wrong result, json was correct, and the small model failed under tags. The owner chose the HANDOFF 4 redesign. Session 5: small model PASSES under json and FAILS under current tags (raw reply recorded); owner's answers recorded; build steps 1-5 not started | `cf3a384` |
+| 6 | Full suite in a clean clone, live API runs under both protocols, measurements | **in progress** - suite 3064/0 on `0f7cae1`, 3067/0 on `5225964`, 3071/0 on `cf3a384` (the CI `0 turns` fix); gaps closed in `4d18777`; SIMULATED acceptance runs PASS under tags and json; owner decisions on the observations recorded; real-provider runs MADE 2026-10-08 (Step 6 "Session 4"): tags on the configured model is format-clean but gave a wrong result, json was correct, and the small model failed under tags. The owner chose the HANDOFF 4 redesign. Session 5: small model PASSES under json and FAILS under current tags (raw reply recorded); owner's answers recorded; build steps 1-5 not started. Session 6 (2026-10-20): HANDOFF 5 step 1 parse side built (`02a771a`, tag `restore-tags-6`, 447/0 over the eleven protocol modules; whole suite not run); render/streaming/corrections and steps 2-5 open; see HANDOFF 6 | `02a771a` |
 
 **NOT COMPLETE.** The code for every step is committed and the core modules
 pass (638 passed, 0 failed across the 16 protocol-bearing modules, verified
@@ -703,6 +703,55 @@ separately. It follows from the design the owner already chose: a text-only
 reply always ends the turn, so the early-prose path at `TMT.py:2015` goes
 under tags.
 
+### Session 6 (2026-10-20, from 09:35 NZDT; the owner gave it until 10:15)
+
+The owner's instructions for this session, in substance: continue the build;
+keep json as a choice with the Settings toggle; when tags is selected inject
+a system prompt under which the model "completely forgets that it can use
+json and only uses tags"; when tags is selected JSON mode is false; run the
+tests when done; never touch `app/`; the manager delegates all building; and
+(sent later) "once done push all to alpha with tmt".
+
+**HANDOFF 5 step 1, parse side, built and committed: `02a771a`, tag
+`restore-tags-6`.** One Opus agent on `agent_protocol.py` and its unit tests,
+given a hard stop at 10:03 and stopped itself at 09:48. Its API: keyword-only
+`plain_text=False` on `parse`, `parse_tags`, `detect`, `locate` and
+`StreamingTagParser`; the default is byte-for-byte today's behaviour (the
+background agents keep the old contract until step 6). With `plain_text=True`
+under tags, rules A-G of HANDOFF 6 below hold. Verified by me, not only by the
+builder: `test_agent_protocol` 124, `_stream` 52, `_protocol_wiring` 40,
+`_prompt_tags` 42, `_prompt_tags_wiring` 24, `_hints` 18, `_reply_format` 17,
+`_reply_format_wiring` 19, `_session` 22, `_verbs` 60, `_multi_wiring` 29:
+**447 passed, 0 failed**. CRLF held on all three files. No mutation pass was
+run (cut for time). The whole suite was NOT run on this commit.
+
+**Not built** (the builder's own list): `render`, `example` and
+`transliterate` have no plain mode (rule H); top-level prose is not streamed
+live as `("text", ...)` (rule I, partial: `result()` agrees with `parse`);
+the plain forms of the `_CORRECTIONS` entries, the unclosed-`/end_conversation/`
+sentence and the progress-twice sentence still name the old tags (rule J,
+partial: the near-miss and top-level-key refusals are plain-text-safe).
+
+Decisions the builder took, accepted: a known name glued to text
+(`docs/plan/x`) opens a block only when its closer follows; a known name on
+its own with no closer is still "unclosed", so a truncated `/write_file/`
+never becomes a final answer; a KEY name at top level (`/path/ x //path/`) is
+refused with the near-miss guard; a lone old `/end_conversation/` takes
+trailing text into its message; near-miss candidates exclude `actions`, ties
+go alphabetical, legacy names map to current ones. One consequence for step
+3: prose such as "Use /plan/ to plan." is refused as unclosed, so the prompt
+must write commands as `/plan` with no trailing slash.
+
+Steps 2-5 of HANDOFF 5 were not started. The `/config` line still reports
+the static `USE_JSON_MODE` ("on") under tags, although no request carries
+`response_format` under tags (pinned by `test_agent_protocol_wiring`).
+
+**Push.** The owner asked for the push to alpha to be made with TMT. The
+docs commit after `02a771a` was driven through TMT in CI mode
+(`--ci --allow-push`, format pinned to json for the run because the tags
+parser is mid-change, `.tmt_protocol` restored afterwards); the outcome is
+recorded in the commit itself and in the next session's first `git log`.
+
 ## HANDOFF: what the next session must do (written 2026-10-07 15:25 NZDT)
 
 The owner stopped this session on a time limit. Everything is committed on
@@ -1166,3 +1215,135 @@ all five matched. Line numbers will drift once building starts.
 > docs/backendchange.md as you go and commit with explicit paths. Call
 > nothing complete until the clean-clone suite is green and the real runs
 > pass.
+
+## HANDOFF 6: finish the plain-text tags build (written 2026-10-20 10:00 NZDT)
+
+HEAD on `alpha` is the docs commit after `02a771a` (tag `restore-tags-6`).
+`app/`, `gui-report/` and `.claude/` belong to other sessions: never read,
+list, grep or edit them, and scope every search to the repo root files.
+
+### The owner's rules from session 6 (in force, in addition to HANDOFF 5)
+
+- json stays a choice: the Settings row "Model Reply Format" (TAGS/JSON)
+  stays as it is.
+- Under tags the model must "completely forget that it can use json": the
+  main tags prompt, and every correction, refusal or hint handed to the
+  model under tags, must never mention JSON, braces or `{"action"`. The one
+  allowed sense is a file format in `read_document`'s reference. A drift
+  notice answering a reply that WAS JSON may name JSON.
+- Under tags JSON mode is off. The request side already holds; `/config`
+  must report the effective value ("off (tags)"), not the static constant.
+- Commits with explicit paths; pushes to alpha driven through TMT when the
+  owner asks for them; never `git add -A`.
+
+### The API contract (built on the parse side; steps 2 and 3 are briefed from it)
+
+Keyword-only `plain_text=False` on `parse`, `parse_tags`, `detect`,
+`locate`, `StreamingTagParser` (done) and on `render`, `example`,
+`transliterate` (NOT done). Default False keeps today's behaviour for the
+background agents until step 6 flips them. With True, under TAGS only:
+- A. text outside the blocks is a message; nothing is dropped;
+- B. a reply with no action blocks is `end_conversation` with the text
+  trimmed and uncapped, plus reply-level `next_step`/`events`;
+- C. text before a block is its `progress` (outside text, a space, then an
+  explicit `/progress/` if both);
+- D. text after the last block is a trailing `send_message`;
+- E. old `/send_message/` and `/end_conversation/` alone parse as today; an
+  `/end_conversation/` beside work blocks becomes a `send_message` in place;
+- F. only a known name opens a top-level block; paths and braces in prose
+  are prose; JSON is read only for a whole-object reply or the existing
+  drift case;
+- G. near-miss (edit distance 2 of a known name, or a key name at top
+  level) refuses with "did you mean", only when a closer follows or the
+  token is the whole reply; the three untaught names are answered with the
+  plain-text rule;
+- H (to build). `render(..., plain_text=True)`: lone end_conversation ->
+  plain text (+ `/next_step/` block); lone send_message -> the legacy block;
+  `progress` -> a prose line before the block; trailing send_message ->
+  trailing text; an end_conversation inside a batch or a non-final
+  send_message RAISES; `transliterate` raises naming the example, so step 3
+  finds every prompt example that must be rewritten;
+- I (to build). streaming emits `("text", s)` for top-level prose live, with
+  the usual hold-back of a partial `/na`;
+- J (to build). plain forms of every `_CORRECTIONS` entry and of the
+  unclosed-tag and progress-twice sentences: no JSON, no old tags.
+
+### Steps, in order (Sonnet builds; Opus only if the parser work proves subtle; Haiku for docs)
+
+1. Finish step 1: rules H, I, J in `agent_protocol.py` and
+   `testing/unit/test_agent_protocol.py`, then the mutation pass that was
+   cut (ten mutations minimum, `.bak` on disk, `__pycache__` cleared). Keep
+   the twelve protocol-bearing modules green (the list is in Session 6).
+2. Step 2, loop (Sonnet; files: `TMT.py`, `agent_model.py`,
+   `agent_session.py`, `agent_actions.py`, `agent_plan.py`,
+   `agent_review.py`, `agent_verify.py`, `agent_commands.py`,
+   `testing/integration/test_agent_protocol_wiring.py`): pass
+   `plain_text=True` on the MAIN agent's paths only (`_tags_reply`,
+   `_LiveReader`, both loop paths, `_carried`). A text-only reply ends the
+   turn through the existing `completion_block` gates; prose beside actions
+   is a progress row; a converted old `/end_conversation/` beside actions is
+   shown and does not end the turn; the early-prose hand-back
+   (`is_prose(obj) and not turn_state["acted"]`) is skipped under tags; the
+   live box shows streamed prose once and the transcript records it once.
+   Sweep model-facing strings ("Now output an end_conversation action" in
+   `build_result_message`; `agent_plan.py:581`, `agent_review.py:755`,
+   `agent_verify.py:715`) so that under tags they say "answer in plain
+   text" and never say JSON. `/config` reports effective JSON mode. The
+   worker loop keeps the default. json byte-identical.
+3. Step 3, prompt (Sonnet, in parallel with 2; files: `agent_prompt.py`,
+   `testing/unit/test_agent_prompt_tags.py`,
+   `testing/integration/test_agent_prompt_tags_wiring.py`; its tests must
+   not drive the main loop): a THIRD variant of every format-bearing section
+   for the main agent under tags; the three background tags prompts stay
+   byte-identical (save before, compare after). Rewrite `HEADER_TAGS`,
+   `OUTPUT_RULES_TAGS` (rules 5/10/11 keep their numbers),
+   `REMINDER_TAGS`, the twins and `_TAG_PROSE`: teach rules A-D, say "end
+   your reply after any action whose result you need; if you say you will
+   do something, put its action in the same reply", drop `/progress/`,
+   `/send_message/` and `/end_conversation/` from every example, write
+   commands as `/plan` with no trailing slash, and remove every mention of
+   JSON. Tests build the tags prompt over an EMPTY fixture workspace (the
+   repo's own files contain the word) and assert: no reply-format mention of
+   JSON, none of the three old tags, every example parses with
+   `plain_text=True`, json prompt byte-identical, background tags prompts
+   byte-identical. Measure the tags prompt size before/after.
+4. Clean-clone suite: `bash output/sim/verify_clone.sh <label>` (3071/0 at
+   `cf3a384`; not run since). Every json-pinned test stays green.
+5. Real runs with `RECORD=1` (probe first: `python -I output/sim/probe.py`;
+   it answered `ready` on the 550B at 09:45 NZDT on 2026-10-20; quota
+   resets 13:00 NZDT): small model under new tags, then the 550B, with the
+   HANDOFF 3 task text. Pass = `python run_tests.py` passes in the
+   workspace, no false claim in the summary, small model no worse than
+   `real-json-small` (PASS, 3 turns). Watch for a model that announces and
+   stops.
+6. Step 6 from HANDOFF 5 (worker, note agent, reviewer; propose the
+   reviewer's verdict shape to the owner first), then delete the temporary
+   third prompt variant.
+7. Update `docs/reply-format.md` (its "Plain-text replies (being built)"
+   section), set the Status table only with the owner's agreement, push to
+   alpha through TMT when the owner asks (recipe: stage by hand, task text
+   "commit exactly what is staged ... pass no paths and no all flag to
+   git_commit ... push to alpha", CI mode `--ci --allow-push`, format pinned
+   to json for the drive while the tags parser is unfinished, then
+   `git log -1` and `git ls-remote` to verify, never the sha in TMT's answer).
+
+#### Paste-ready prompt for session 7
+
+> We are reworking the tag protocol in the TMT CLI at C:\Coding\TMT
+> (branch alpha). Read docs/backendchange.md first: "HANDOFF 4" (the
+> owner's design), "HANDOFF 5" (final answers), then "Session 6" under
+> Step 6 and "HANDOFF 6" at the end (what was built on 2026-10-20, the API
+> contract, the owner's rule that the tags prompt and every tags correction
+> must never mention JSON, and /config showing JSON mode off under tags).
+> HARD RULES: never read, list, grep or edit C:\Coding\TMT\app, gui-report
+> or .claude (other sessions own them; scope every search to the repo root
+> files because a glob also matches app/); never git add -A or git add .;
+> commit with explicit paths; never push unless the owner says so in their
+> own words, and then drive the push through TMT as HANDOFF 6 step 7
+> describes; all building goes to subagents (Sonnet for the loop and the
+> prompt, Opus only for the parser if it proves subtle, Haiku for docs);
+> never use a shell heredoc to write or search Python. Do HANDOFF 6 steps
+> 1-5 in order (steps 2 and 3 in parallel on disjoint files once step 1 is
+> green), run the clean-clone suite, make the real runs with RECORD=1, then
+> step 6. Document in docs/backendchange.md as you go. Call nothing
+> complete until the clean-clone suite is green and the real runs pass.
