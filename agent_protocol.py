@@ -111,6 +111,35 @@ legacy names included), a reply-level key, or `actions` -- or, for any other
 name, when its closer follows it, so an unknown action reaches
 `validate_action` and is refused there in words rather than vanishing. A
 tag-shaped token in prose ("TCP/IP/UDP") opens nothing.
+
+PLAIN TEXT
+----------
+
+`parse`, `parse_tags`, `detect` and `locate` take `plain_text=False`. With the
+default every rule above holds unchanged. With `plain_text=True` (the main
+agent under tags, from Step 2 on):
+
+A. Text outside the blocks is a message to the user; nothing is dropped.
+B. A reply with no action blocks is the final answer: `end_conversation`
+   carrying the text, trimmed and uncapped, plus any reply-level `/next_step/`,
+   `/events/` or `/progress/`. Blank text is still None.
+C. Text before an action block (since the previous block or the start) is its
+   `progress`; an explicit `/progress/` inside it follows after one space.
+   Reply-level blocks do not split the text around them.
+D. Text after the last action block is appended as a `send_message`. A lone
+   old ending block takes it into its message instead, after a blank line.
+E. Old tags are accepted. An ending block (`end_conversation`, `done`,
+   `respond`) beside any block that is not a speaking verb becomes a
+   `send_message` in place, and its `next_step` moves to reply level.
+F. Only a known action, a reply-level key or `actions` opens a top-level
+   block, and one glued to the text before it (`docs/plan/x`) opens one only
+   when its closer follows. Everything else is prose. JSON is read only for a
+   reply that is one JSON object, starts with an action object, or is the
+   JSON-drift case (an action object before the first tag).
+G. An unknown top-level name within edit distance 2 of a taught name, or a
+   key name at the top, is refused -- but only when its closer follows or it
+   is the whole reply. The untaught names are answered with the plain-text
+   rule, never with their old tag.
 """
 
 import json
@@ -711,14 +740,196 @@ class _Reader(object):
             self.emit(at, "text", raw)
 
 
-def parse_tags(text):
+    # -- PLAIN TEXT mode (parse only; see "PLAIN TEXT" in the docstring) --
+
+    def reply_plain(self):
+        text, low = self.text, self.low
+        items, extra, pieces = [], {}, []
+        p = mark = after = 0
+        while True:
+            slash = text.find("/", p)
+            if slash < 0:
+                break
+            found = self.tag_at(slash)
+            if found is None or found.group(1):
+                p = slash + 1 if found is None else found.end()
+                continue
+            name, suffix = found.group(2).lower(), found.group(3)
+            closer_after = low.find(_fold(_close(name, suffix)), found.end()) >= 0
+            glued = slash > 0 and slash != after and text[slash - 1] not in _SPACE
+            top = name in self.known or name in REPLY_KEYS or name == "actions"
+            if not top or (glued and not closer_after):
+                if not top:
+                    self.mistake(found, name, closer_after)
+                p = found.end()
+                continue
+            pieces.append(text[mark:slash])
+            if name in REPLY_KEYS:
+                if name == "events":
+                    value, p = self.container(name, suffix, found.end(), _NESTED)
+                else:
+                    value, p = self.leaf(name, suffix, found.end(), slash)
+                if name in extra:
+                    raise ProtocolError(_TWICE_BESIDE % name)
+                extra[name] = value
+            else:
+                outside = "".join(pieces).strip(_SPACE)
+                pieces = []
+                if name == "actions":
+                    value, p = self.container(name, suffix, found.end(), _TOP)
+                    for index, block in enumerate(value):
+                        items.append((block, outside if index == 0 else ""))
+                else:
+                    block, p = self.action(name, suffix, found.end(), _TOP, slash)
+                    items.append((block, outside))
+            mark = after = p
+        trailing = ("".join(pieces) + text[mark:]).strip(_SPACE)
+        return _assemble_plain(items, extra, trailing)
+
+    def mistake(self, found, name, closer_after):
+        """Rule G: refuse a near-miss of a known name, or a key at the top."""
+        if not (closer_after or self.text.strip(_SPACE) == found.group(0)):
+            return
+        if name in _key_names():
+            if name == "message":
+                raise ProtocolError(_KEY_MESSAGE)
+            raise ProtocolError(_KEY_AT_TOP % (_open(name), _open(name)))
+        near = _nearest(name)
+        if near is None:
+            return
+        if near in _UNTAUGHT:
+            raise ProtocolError(_UNTAUGHT_NEAR % found.group(0))
+        raise ProtocolError(_NEAR_MISS % (found.group(0), _open(near)))
+
+
+# Plain-text mode: the names that are no longer taught, the verbs that speak,
+# and the sentences a refusal hands back. None of them mentions JSON.
+_UNTAUGHT = frozenset({"progress", "send_message", "end_conversation"})
+_SPEAKING = frozenset({"send_message", "announce", "end_conversation", "done", "respond"})
+# A near-miss of a legacy name is answered with the name in force now.
+_LEGACY_TAUGHT = {"respond": "end_conversation", "done": "end_conversation",
+                  "announce": "send_message", "search_files": "grep",
+                  "find_text": "grep", "run_file": "bash", "run_python": "bash"}
+_PLAIN_MESSAGE = ("A message to the user is written as plain text outside any "
+                  "block, and a reply with no action blocks is the final answer.")
+_NEAR_MISS = "%s is not an action TMT knows; did you mean %s?"
+_UNTAUGHT_NEAR = "%s is not a tag TMT reads. " + _PLAIN_MESSAGE
+_KEY_MESSAGE = ("/message/ is not needed at the top of a reply. " + _PLAIN_MESSAGE)
+_KEY_AT_TOP = ("%s is a key, not an action: write %s inside the action block it "
+               "belongs to, as /read_file/ /path/ src/a.py //path/ //read_file/.")
+
+
+def _ends(obj):
+    """Whether an action object ends the turn (the old ending verbs)."""
+    name = obj.get("action")
+    return name in ("end_conversation", "done") or (
+        name == "respond" and obj.get("final", True) is not False)
+
+
+def _assemble_plain(items, extra, trailing):
+    """Rules B-E: the object a plain-text reply's blocks and text describe."""
+    if not items:
+        if not trailing:
+            return dict(extra) if extra else None
+        out = {"action": "end_conversation", "message": trailing}
+        out.update(extra)
+        return out
+    work = any(block.get("action") not in _SPEAKING for block, _ in items)
+    entries, inside = [], []
+    for block, outside in items:
+        had = "progress" in block
+        if work and _ends(block):
+            step = block.pop("next_step", None)
+            if step is not None:
+                if "next_step" in extra:
+                    raise ProtocolError(_BOTH_PLACES % ("next_step", block["action"]))
+                extra["next_step"] = step
+            block.pop("final", None)
+            block["action"] = "send_message"
+        if outside:
+            explicit = block.get("progress")
+            block["progress"] = outside + " " + explicit if explicit else outside
+        entries.append(block)
+        inside.append(had)
+    if trailing:
+        last = entries[-1]
+        if len(entries) == 1 and _ends(last):
+            said = last.get("message")
+            last["message"] = said + "\n\n" + trailing if said else trailing
+        else:
+            entries.append({"action": "send_message", "message": trailing})
+            inside.append(False)
+    if len(entries) > 1:
+        out = {"actions": entries}
+        out.update(extra)
+        return out
+    out = entries[0]
+    for key, value in extra.items():
+        if key == "progress" and not inside[0]:
+            out["progress"] = out["progress"] + " " + value if out.get("progress") else value
+            continue
+        if key in out:
+            raise ProtocolError(_BOTH_PLACES % (key, out["action"]))
+        out[key] = value
+    return out
+
+
+_KEYS = None
+
+
+def _key_names():
+    """Every key name an action is known to take, minus the top-level names."""
+    global _KEYS
+    if _KEYS is None:
+        keys = {key for keys in _required_keys().values() for key in keys}
+        keys |= BOOL_KEYS | INT_KEYS | CONTAINER_KEYS | set(EXACT_KEYS)
+        keys |= {"item", "message", "command"}
+        _KEYS = frozenset(keys - _known_actions() - REPLY_KEYS - {"actions"})
+    return _KEYS
+
+
+def _distance(a, b, limit=2):
+    """Levenshtein distance, or limit + 1 once it is certainly past `limit`."""
+    if abs(len(a) - len(b)) > limit:
+        return limit + 1
+    row = list(range(len(b) + 1))
+    for i, char in enumerate(a, 1):
+        new = [i]
+        for j, other in enumerate(b, 1):
+            new.append(min(row[j] + 1, new[j - 1] + 1, row[j - 1] + (char != other)))
+        if min(new) > limit:
+            return limit + 1
+        row = new
+    return row[-1]
+
+
+def _nearest(name):
+    """The taught name `name` is a near-miss of (distance 2 or less), or None.
+
+    Nearest wins; a tie goes to the first candidate in alphabetical order.
+    """
+    best = None
+    for known in sorted(_known_actions() | REPLY_KEYS):
+        gap = _distance(name, known)
+        if gap <= 2 and (best is None or gap < best[0]):
+            best = (gap, known)
+    if best is None:
+        return None
+    return _LEGACY_TAUGHT.get(best[1], best[1])
+
+
+def parse_tags(text, *, plain_text=False):
     """The object a TAGS reply describes, or None when it holds no tags.
+
+    With `plain_text`, the PLAIN TEXT rules in the module docstring apply and
+    the answer is None only for blank text.
 
     Raises ProtocolError with a sentence the model can act on.
     """
     if not isinstance(text, str):
         raise ProtocolError("A reply is text, not %r." % (type(text).__name__,))
-    return _Reader(text.replace("\r\n", "\n")).reply()
+    reader = _Reader(text.replace("\r\n", "\n"))
+    return reader.reply_plain() if plain_text else reader.reply()
 
 
 # --- telling the two apart, and reading either --------------------------------
@@ -781,13 +992,39 @@ def _first_tag(text):
     return -1
 
 
-def _locate(text):
+_JSON_START = re.compile(r'\{\s*"actions?"')
+
+
+def _locate_plain(text, start):
+    """Rule F: JSON only for an object reply or the JSON-drift case; else TAGS."""
+    if text[start] == "{":
+        if _JSON_START.match(text, start):
+            return JSON, start
+        end = _object_end(text, start)
+        if end >= 0 and not text[end:].strip():
+            try:
+                whole = json.loads(text[start:end])
+            except ValueError:
+                whole = None
+            if isinstance(whole, dict):
+                return JSON, start
+    at = _first_object(text)
+    if at >= 0:
+        tag = _first_tag(text)
+        if tag < 0 or at < tag:
+            return JSON, at
+    return TAGS, start
+
+
+def _locate(text, plain_text=False):
     """(protocol or None, where the reply starts)."""
     if not isinstance(text, str):
         return None, -1
     start = len(text) - len(text.lstrip())
     if start >= len(text):
         return None, -1
+    if plain_text:
+        return _locate_plain(text, start)
     if text[start] == "{":
         return JSON, start
     found = _TAG.match(text, start)
@@ -803,19 +1040,23 @@ def _locate(text):
     return kind, at
 
 
-def detect(text):
-    """What a reply looks like: JSON, TAGS, or None for neither."""
-    return _locate(text)[0]
+def detect(text, *, plain_text=False):
+    """What a reply looks like: JSON, TAGS, or None for neither.
+
+    With `plain_text` any text that is not blank and not JSON is TAGS.
+    """
+    return _locate(text, plain_text)[0]
 
 
-def locate(text):
+def locate(text, *, plain_text=False):
     """(JSON, TAGS or None, the index the reply starts at, or -1).
 
     `detect` with the position as well, for a caller that has to cut the
     prose in front of a reply away before handing the rest to something
-    that only reads one protocol.
+    that only reads one protocol. With `plain_text` a TAGS reply starts at its
+    first character that is not whitespace, because its prose is part of it.
     """
-    return _locate(text)
+    return _locate(text, plain_text)
 
 
 def normal(protocol):
@@ -843,17 +1084,20 @@ def _parse_json(text, at):
     return value
 
 
-def parse(text):
+def parse(text, *, plain_text=False):
     """The action object a reply describes, in whichever protocol it is in.
 
     None when the text is neither -- the caller's prose path. Raises
-    ProtocolError with a sentence the model can act on.
+    ProtocolError with a sentence the model can act on. With `plain_text`
+    the PLAIN TEXT rules apply, the whole text is read, and None means blank.
     """
-    kind, at = _locate(text)
+    kind, at = _locate(text, plain_text)
     if kind is None:
         return None
     if kind == JSON:
         return _parse_json(text, at)
+    if plain_text:
+        return parse_tags(text, plain_text=True)
     return parse_tags(text[at:])
 
 
@@ -1236,7 +1480,11 @@ class StreamingTagParser(object):
     reply that parses; where a reply is malformed they may stop early.
     """
 
-    def __init__(self):
+    def __init__(self, *, plain_text=False):
+        # PARTIAL: with plain_text only `result()` follows the plain-text
+        # rules; the live events are still the default reader's, so top-level
+        # prose is not yet streamed as ("text", ...).
+        self.plain_text = plain_text
         self.raw = ""
         self.error = None
         self._text = ""
@@ -1278,7 +1526,10 @@ class StreamingTagParser(object):
     def result(self):
         """The object the whole reply describes, or None; sets `error`."""
         try:
-            value = parse_tags(self.raw)
+            if self.plain_text:
+                value = parse(self.raw, plain_text=True)
+            else:
+                value = parse_tags(self.raw)
         except ProtocolError as error:
             self.error = str(error)
             return None

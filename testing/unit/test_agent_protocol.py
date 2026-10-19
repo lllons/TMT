@@ -1216,3 +1216,126 @@ def test_empty_chunks_are_ignored():
         events.extend(parser.feed(chunk))
     assert texts(events) == "ok"
     assert parser.feed("") == []
+
+
+# --- plain-text mode (parse only; render and streaming are not built yet) -----
+
+REAL_SMALL_REPLY = (
+    "/read_file/\n/path/ hello.py //path/\n"
+    "/progress/ Reading hello.py to see current content. //progress/\n//read_file/\n"
+    "/read_file/\n/path/ test_hello.py //path/\n"
+    "/progress/ Reading test_hello.py to see current test structure. //progress/\n"
+    "//read_file/\n\n/end_conversation/\n"
+    "/message/ Read hello.py: def hello(name) returns \"Hello, \" + name. Read "
+    "test_hello.py: has one test test_hello asserting hello(\"Ada\") == \"Hello, Ada\". "
+    "//message/\n/next_step/ Add goodbye function and test //next_step/\n"
+    "//end_conversation/")
+
+
+def plain(text):
+    return parse(text, plain_text=True)
+
+
+def plain_refused(text, *words):
+    try:
+        got = plain(text)
+    except ProtocolError as error:
+        for word in words:
+            assert word in str(error), (word, str(error))
+        return str(error)
+    raise AssertionError("not refused: %r -> %r" % (text, got))
+
+
+def test_plain_the_real_small_model_reply_runs_its_reads_and_does_not_end():
+    got = plain(REAL_SMALL_REPLY)
+    assert got == {"actions": [
+        {"action": "read_file", "path": "hello.py",
+         "progress": "Reading hello.py to see current content."},
+        {"action": "read_file", "path": "test_hello.py",
+         "progress": "Reading test_hello.py to see current test structure."},
+        {"action": "send_message", "message":
+         "Read hello.py: def hello(name) returns \"Hello, \" + name. Read test_hello.py: "
+         "has one test test_hello asserting hello(\"Ada\") == \"Hello, Ada\"."}],
+        "next_step": "Add goodbye function and test"}
+    # The default is untouched: the same reply still ends the turn.
+    assert parse(REAL_SMALL_REPLY)["actions"][-1]["action"] == "end_conversation"
+
+
+def test_plain_the_end_conversations_typo_is_refused_with_the_plain_rule():
+    message = plain_refused("/end_conversations/", "plain text", "final answer")
+    assert "//end_conversation" not in message and "JSON" not in message
+    plain_refused("/end_conversations/ Done. //end_conversations/", "plain text")
+    plain_refused("/raed_file/ a.py //raed_file/", "did you mean /read_file/")
+
+
+def test_plain_text_before_a_block_is_its_progress():
+    assert plain("ok, I'll look at the repo first /list_files/ //list_files/") == {
+        "action": "list_files", "progress": "ok, I'll look at the repo first"}
+    assert plain("Outside /read_file/ /path/ a //path/ /progress/ inside //progress/ "
+                 "//read_file/") == {"action": "read_file", "path": "a",
+                                     "progress": "Outside inside"}
+
+
+def test_plain_text_only_is_the_final_answer():
+    long = "word " * 900 + "end"
+    assert plain(long) == {"action": "end_conversation", "message": long.strip()}
+    assert plain("Done.\n/next_step/ Run it //next_step/") == {
+        "action": "end_conversation", "message": "Done.", "next_step": "Run it"}
+    assert plain("   \n ") is None and parse_tags("", plain_text=True) is None
+
+
+def test_plain_prose_between_and_after_blocks():
+    got = plain("a /read_file/ x //read_file/ b /read_file/ y //read_file/ c")
+    assert got == {"actions": [{"action": "read_file", "path": "x", "progress": "a"},
+                               {"action": "read_file", "path": "y", "progress": "b"},
+                               {"action": "send_message", "message": "c"}]}
+    assert plain("/git_status/ //git_status/ That is all.") == {"actions": [
+        {"action": "git_status"}, {"action": "send_message", "message": "That is all."}]}
+
+
+def test_plain_paths_braces_stray_closers_and_log_are_prose():
+    for text in ("Run /usr/bin/python in /c/Coding/TMT", "src/a.py, /tmp/ and path/to/x",
+                 "a stray //content/ here", 'the config is {"a": 1}',
+                 "see /log/ for details", "docs/plan/x and https://x.org/review/3"):
+        assert plain(text) == {"action": "end_conversation", "message": text}, text
+
+
+def test_plain_a_key_at_the_top_is_refused_not_mistaken_for_an_action():
+    plain_refused("/path/ a.py //path/", "is a key")
+    plain_refused("/message/ Hello //message/", "plain text")
+
+
+def test_plain_old_tags_alone_parse_as_today():
+    for text in ("/send_message/ X //send_message/", "/end_conversation/ Done. //end_conversation/"):
+        assert plain(text) == parse(text), text
+
+
+def test_plain_json_is_read_only_as_a_whole_reply_or_the_drift_case():
+    assert plain('{"action":"git_status"}') == {"action": "git_status"}
+    assert plain('Sure: {"action":"git_status"}') == {"action": "git_status"}
+    assert plain("{braces} are fine") == {"action": "end_conversation",
+                                          "message": "{braces} are fine"}
+
+
+def test_plain_default_is_unchanged():
+    for text in ("Sure.\n/end_conversation/ All done. //end_conversation/\nBye",
+                 "Sure, here it is:\n\n/read_file/ a.py //read_file/\n\nThat should do it.",
+                 "I fixed the parser.", "/frobnicate/ /path/ a //path/ //frobnicate/",
+                 REAL_SMALL_REPLY):
+        assert parse(text, plain_text=False) == parse(text), text
+    assert parse("I fixed the parser.") is None
+    assert detect("I fixed it.") is None and detect("I fixed it.", plain_text=True) == TAGS
+
+
+def test_plain_the_streaming_result_agrees_with_parse():
+    # Only result() is plain-aware so far; live prose events are not built.
+    for text in (REAL_SMALL_REPLY, "ok, I'll look at the repo first /list_files/ //list_files/",
+                 "Just text.", "/end_conversations/"):
+        parser = StreamingTagParser(plain_text=True)
+        for char in text:
+            parser.feed(char)
+        try:
+            want, said = plain(text), None
+        except ProtocolError as error:
+            want, said = None, str(error)
+        assert parser.result() == want and parser.error == said, text

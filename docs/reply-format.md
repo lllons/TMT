@@ -103,6 +103,17 @@ the text //content/ is part of the file
 
 If a tag is never closed the reply is refused with a sentence that names this mechanism, and the model is asked again.
 
+## Plain-text replies (being built)
+
+The parser can now read a `tags` reply under newer, lighter rules, asked for with `plain_text=True`. Nothing uses them yet: the main loop and the prompt move over in later steps, and until then every reply is read as described above.
+
+- **Text outside the blocks is a message to you.** Nothing is dropped.
+- **A reply with no action blocks is the final answer** and ends the turn. A `/next_step/` block beside the text is still the hint shown afterwards.
+- **Text before an action is that action's progress line**, so `ok, I'll look at the repo first /list_files/ //list_files/` lists the files and shows the sentence as it does.
+- **Text after the last action is shown without ending the turn.** A reply that runs anything never ends the turn, so the model always sees a command's output before it answers.
+- **The old `/send_message/`, `/end_conversation/` and `/progress/` tags are still accepted.** An `/end_conversation/` beside actions is shown as a message and does not end the turn.
+- **Only a name TMT knows opens a block.** `/usr/bin/python`, `/c/Coding`, `src/a.py` and `docs/plan/x` are text. A name one or two letters away from a real one, such as `/end_conversations/` or `/raed_file/`, is refused with a correction, but only when it is closed later or is the whole reply, so `see /log/ for details` stays text.
+
 ## When the model answers in JSON anyway
 
 The prompt is strict: under `tags` the model is told that its reply is read by a tag parser, that nothing outside tag blocks reaches anybody, and that JSON is the wrong format. A reply written in JSON is nevertheless **accepted** rather than thrown away, so a model that slips does not lose the turn, and it is **noted visibly** in the transcript so you can see it happened. It is a mistake and is shown as one.
