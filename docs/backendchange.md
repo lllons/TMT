@@ -1228,7 +1228,16 @@ which follows `02a771a` (tag `restore-tags-6`). Everything is pushed to
 sessions: never read, list, grep or edit them, and scope every search to the
 repo root files. A README.md edit that no lane of session 6 made was found
 in the working tree at 09:54 NZDT and was left unstaged; it is somebody
-else's.
+else's. The remote branch `worktree-agent-aa53547f2eae4b856` (a leftover
+of an earlier worktree agent) is an old snapshot of alpha at `5225964`
+with no commit alpha lacks (`git rev-list --left-right --count
+alpha...origin/worktree-agent-aa53547f2eae4b856` = `10 0`), so nothing
+needs merging. The owner asked for it to be removed so that only `main`
+and `alpha` remain; the session's permission layer refused the deletion as
+destructive, so the owner runs it by hand:
+`git push origin --delete worktree-agent-aa53547f2eae4b856` then
+`git remote prune origin`. If it is still listed by `git branch -r` at the
+start of session 7, say so to the owner rather than deleting it unasked.
 
 ### The owner's rules from session 6 (in force, in addition to HANDOFF 5)
 
