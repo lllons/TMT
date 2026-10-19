@@ -742,9 +742,13 @@ go alphabetical, legacy names map to current ones. One consequence for step
 3: prose such as "Use /plan/ to plan." is refused as unclosed, so the prompt
 must write commands as `/plan` with no trailing slash.
 
-Steps 2-5 of HANDOFF 5 were not started. The `/config` line still reports
-the static `USE_JSON_MODE` ("on") under tags, although no request carries
-`response_format` under tags (pinned by `test_agent_protocol_wiring`).
+Steps 2-5 of HANDOFF 5 were not started. One small item was taken out of
+step 2 and done on its own (Sonnet, 09:53-09:54): the `/config` line used to
+report the static `USE_JSON_MODE` ("on") under tags although no request
+carries `response_format` there (pinned by `test_agent_protocol_wiring`);
+it now reads the live `PROTOCOL` and says "off (tags)", json unchanged. Two
+tests in `test_agent_reply_format_wiring` (21/0), `test_agent_orchestration`
+37/0. Committed with explicit paths after `02a771a`.
 
 **Push.** The owner asked for the push to alpha to be made with TMT. The
 docs commit after `02a771a` was driven through TMT in CI mode
@@ -1218,9 +1222,13 @@ all five matched. Line numbers will drift once building starts.
 
 ## HANDOFF 6: finish the plain-text tags build (written 2026-10-20 10:00 NZDT)
 
-HEAD on `alpha` is the docs commit after `02a771a` (tag `restore-tags-6`).
-`app/`, `gui-report/` and `.claude/` belong to other sessions: never read,
-list, grep or edit them, and scope every search to the repo root files.
+HEAD on `alpha` is the docs commit after `ede08e3` (the `/config` change),
+which follows `02a771a` (tag `restore-tags-6`). Everything is pushed to
+`origin/alpha`. `app/`, `gui-report/` and `.claude/` belong to other
+sessions: never read, list, grep or edit them, and scope every search to the
+repo root files. A README.md edit that no lane of session 6 made was found
+in the working tree at 09:54 NZDT and was left unstaged; it is somebody
+else's.
 
 ### The owner's rules from session 6 (in force, in addition to HANDOFF 5)
 
@@ -1231,8 +1239,8 @@ list, grep or edit them, and scope every search to the repo root files.
   model under tags, must never mention JSON, braces or `{"action"`. The one
   allowed sense is a file format in `read_document`'s reference. A drift
   notice answering a reply that WAS JSON may name JSON.
-- Under tags JSON mode is off. The request side already holds; `/config`
-  must report the effective value ("off (tags)"), not the static constant.
+- Under tags JSON mode is off. The request side already held, and `/config`
+  now reports the effective value ("off (tags)"); done in session 6.
 - Commits with explicit paths; pushes to alpha driven through TMT when the
   owner asks for them; never `git add -A`.
 
@@ -1288,8 +1296,8 @@ background agents until step 6 flips them. With True, under TAGS only:
    Sweep model-facing strings ("Now output an end_conversation action" in
    `build_result_message`; `agent_plan.py:581`, `agent_review.py:755`,
    `agent_verify.py:715`) so that under tags they say "answer in plain
-   text" and never say JSON. `/config` reports effective JSON mode. The
-   worker loop keeps the default. json byte-identical.
+   text" and never say JSON. The worker loop keeps the default. json
+   byte-identical. (`/config` already reports effective JSON mode.)
 3. Step 3, prompt (Sonnet, in parallel with 2; files: `agent_prompt.py`,
    `testing/unit/test_agent_prompt_tags.py`,
    `testing/integration/test_agent_prompt_tags_wiring.py`; its tests must
