@@ -429,6 +429,25 @@ def test_config_reports_the_live_value_and_not_the_stored_one():
         assert line.split()[-1] == "tags", line
 
 
+def _json_mode_line(text):
+    return [row for row in text.splitlines() if "JSON mode" in row][0]
+
+
+def test_config_says_json_mode_is_off_under_tags():
+    """Under tags no `response_format` is sent, so the row says so."""
+    with ReplyFormat("tags"):
+        line = _json_mode_line(agent_commands.dispatch("/config").text())
+        assert line.endswith("off (tags)"), line
+
+
+def test_config_json_mode_row_is_unchanged_under_json():
+    with ReplyFormat("json"):
+        line = _json_mode_line(agent_commands.dispatch("/config").text())
+        expected = "on" if agent_config.USE_JSON_MODE else "off"
+        assert line.split()[-1] == expected, line
+        assert "(tags)" not in line, line
+
+
 # --- the three refresh sites ---------------------------------------------------------
 
 def _called_in(tree, function):
