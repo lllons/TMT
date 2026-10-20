@@ -1218,7 +1218,7 @@ def test_empty_chunks_are_ignored():
     assert parser.feed("") == []
 
 
-# --- plain-text mode (parse only; render and streaming are not built yet) -----
+# --- plain-text mode -----------------------------------------------------------
 
 REAL_SMALL_REPLY = (
     "/read_file/\n/path/ hello.py //path/\n"
@@ -1328,7 +1328,6 @@ def test_plain_default_is_unchanged():
 
 
 def test_plain_the_streaming_result_agrees_with_parse():
-    # Only result() is plain-aware so far; live prose events are not built.
     for text in (REAL_SMALL_REPLY, "ok, I'll look at the repo first /list_files/ //list_files/",
                  "Just text.", "/end_conversations/"):
         parser = StreamingTagParser(plain_text=True)
@@ -1339,3 +1338,385 @@ def test_plain_the_streaming_result_agrees_with_parse():
         except ProtocolError as error:
             want, said = None, str(error)
         assert parser.result() == want and parser.error == said, text
+
+
+# --- rule H: writing a reply in plain text ---------------------------------------
+
+OLD_TAGS = ("/progress/", "/send_message/", "/end_conversation/")
+FORBIDDEN = ("JSON", "json", "{", "}") + OLD_TAGS
+
+PLAIN_SHAPES = [
+    {"action": "end_conversation", "message": "All done."},
+    {"action": "end_conversation", "message": "Line one.\nLine two.",
+     "next_step": "Run the tests"},
+    {"action": "end_conversation", "message": "Done.", "next_step": "Push it",
+     "events": [{"kind": "note", "text": "x"}]},
+    {"action": "send_message", "message": "Working on it."},
+    {"action": "send_message", "message": "Working on it.", "progress": "Saying so."},
+    {"action": "read_file", "path": "a.py", "progress": "Reading it first."},
+    {"action": "read_file", "path": "a.py"},
+    {"action": "bash", "command": "python run_tests.py", "progress": "Running the suite.",
+     "next_step": "Read the failures"},
+    {"actions": [{"action": "read_file", "path": "a.py", "progress": "Reading a."},
+                 {"action": "read_file", "path": "b.py"},
+                 {"action": "send_message", "message": "Both read; checking next."}]},
+    {"actions": [{"action": "read_file", "path": "a.py"},
+                 {"action": "bash", "command": "ls", "progress": "Listing."}],
+     "next_step": "Look again"},
+    {"actions": [{"action": "git_status", "progress": "Checking."},
+                 {"action": "send_message", "message": "Clean."}],
+     "next_step": "Commit"},
+]
+
+
+def plain_equivalent(obj, back):
+    """Same action(s), message, progress and next_step."""
+    def facts(entry):
+        return {key: entry.get(key) for key in ("action", "message", "progress",
+                                                "next_step", "path", "command")}
+    if "actions" in obj:
+        return ("actions" in back and back.get("next_step") == obj.get("next_step")
+                and [facts(e) for e in back["actions"]] == [facts(e) for e in obj["actions"]])
+    return facts(back) == facts(obj)
+
+
+def test_plain_render_round_trips_every_shape():
+    for obj in PLAIN_SHAPES:
+        for written in (render(obj, TAGS, plain_text=True),
+                        example(obj, TAGS, plain_text=True)):
+            back = parse(written, plain_text=True)
+            assert back == obj and plain_equivalent(obj, back), (obj, written, back)
+            assert "/progress/" not in written and "/end_conversation/" not in written, written
+            assert "{" not in written, written
+
+
+def test_plain_render_a_lone_ending_is_its_message_then_next_step():
+    assert render({"action": "end_conversation", "message": "  All done. "}, TAGS,
+                  plain_text=True) == "All done."
+    written = render(PLAIN_SHAPES[1], TAGS, plain_text=True)
+    assert written == "Line one.\nLine two.\n/next_step/ Run the tests //next_step/"
+    assert example({"action": "end_conversation", "message": "Done.", "next_step": "Go"},
+                   TAGS, plain_text=True) == "Done. /next_step/ Go //next_step/"
+    assert "/events/" in render(PLAIN_SHAPES[2], TAGS, plain_text=True)
+
+
+def test_plain_render_a_lone_send_message_is_the_legacy_block():
+    obj = {"action": "send_message", "message": "Working on it."}
+    assert render(obj, TAGS, plain_text=True) == render(obj, TAGS) == \
+        "/send_message/ Working on it. //send_message/"
+
+
+def test_plain_render_progress_is_a_prose_line_before_the_block():
+    obj = {"action": "read_file", "path": "a.py", "progress": "Reading it first."}
+    assert render(obj, TAGS, plain_text=True) == \
+        "Reading it first.\n/read_file/ /path/ a.py //path/ //read_file/"
+    assert example(obj, TAGS, plain_text=True) == \
+        "Reading it first. /read_file/ /path/ a.py //path/ //read_file/"
+    assert "/progress/" in render(obj, TAGS)
+
+
+def test_plain_render_a_final_send_message_is_trailing_text():
+    written = render(PLAIN_SHAPES[8], TAGS, plain_text=True)
+    assert written.endswith("//read_file/\nBoth read; checking next.")
+    assert "/send_message/" not in written
+    written = render(PLAIN_SHAPES[10], TAGS, plain_text=True)
+    assert written == ("Checking.\n/git_status/ //git_status/\nClean.\n"
+                       "/next_step/ Commit //next_step/")
+
+
+def plain_render_refused(obj, *words):
+    for write in (render, example):
+        try:
+            got = write(obj, TAGS, plain_text=True)
+        except ProtocolError as error:
+            for word in words:
+                assert word in str(error), (word, str(error))
+            continue
+        raise AssertionError("not refused: %r -> %r" % (obj, got))
+
+
+def test_plain_render_refuses_what_plain_text_cannot_say():
+    plain_render_refused({"actions": [{"action": "bash", "command": "x"},
+                                      {"action": "end_conversation", "message": "y"}]},
+                         "end_conversation inside a batch")
+    plain_render_refused({"actions": [{"action": "send_message", "message": "a"},
+                                      {"action": "bash", "command": "x"}]},
+                         "not the last entry")
+    plain_render_refused({"actions": [{"action": "bash", "command": "x"},
+                                      {"action": "done", "message": "y"}]}, "inside a batch")
+    plain_render_refused({"actions": [{"action": "bash", "command": "x"}]}, "batch of one")
+    plain_render_refused({"actions": [{"action": "bash", "command": "x"},
+                                      {"action": "bash", "command": "y"}],
+                          "progress": "p"}, "beside a batch")
+    plain_render_refused({"actions": [{"action": "bash", "command": "x"},
+                                      {"action": "send_message", "message": "m",
+                                       "progress": "p"}]}, "its message alone")
+    plain_render_refused({"action": "end_conversation", "message": "m", "progress": "p"},
+                         "'progress'")
+    plain_render_refused({"action": "end_conversation", "message": "  "}, "without a message")
+    # A message that would read back as a block is refused rather than mangled.
+    plain_render_refused({"action": "end_conversation",
+                          "message": "Use /read_file/ /path/ a //path/ //read_file/ then"},
+                         "plain-text tags exactly")
+
+
+def test_plain_render_json_ignores_the_flag_and_the_default_is_unchanged():
+    for obj in PLAIN_SHAPES + [{"actions": [{"action": "bash", "command": "x"},
+                                            {"action": "end_conversation", "message": "y"}]}]:
+        assert render(obj, JSON, plain_text=True) == render(obj, JSON)
+        assert example(obj, JSON, plain_text=True) == example(obj, JSON)
+        assert render(obj, TAGS, plain_text=False) == render(obj, TAGS)
+    assert render({"action": "end_conversation", "message": "All done."}) == \
+        "/end_conversation/ All done. //end_conversation/"
+
+
+def test_plain_transliterate_writes_examples_in_plain_form():
+    line = ('  You emit:  {"action":"read_file","path":"a.py",'
+            '"progress":"Reading it first."}')
+    out = transliterate(line, plain_text=True)
+    assert out == ("  You emit:\nReading it first.\n"
+                   "/read_file/ /path/ a.py //path/ //read_file/")
+    line = '  GOOD: {"action":"end_conversation","message":"Done."} and nothing else'
+    assert transliterate(line, plain_text=True) == "  GOOD: Done. and nothing else"
+    assert transliterate("No example here {x}.", plain_text=True) == "No example here {x}."
+    # The default is unchanged.
+    assert transliterate(line) == "  GOOD: /end_conversation/ Done. //end_conversation/ " \
+        "and nothing else"
+
+
+def test_plain_transliterate_raises_naming_an_example_it_cannot_express():
+    for line in ('You emit:  {"actions":[{"action":"bash","command":"x"},'
+                 '{"action":"end_conversation","message":"Done."}]}',
+                 'You emit:  {"actions":[{"action":"send_message","message":"a"},'
+                 '{"action":"bash","command":"x"}]}',
+                 'BAD: {"action":"read_file","path": } and more',
+                 'BAD: {"action":"read_file","path":"a"'):
+        try:
+            got = transliterate("intro\n" + line + "\noutro", plain_text=True)
+        except ProtocolError as error:
+            assert line.strip() in str(error), (line, str(error))
+            assert "rewritten by hand" in str(error)
+            continue
+        raise AssertionError("not refused: %r -> %r" % (line, got))
+    # The default leaves the same lines alone or falls back, as it always did.
+    assert transliterate('BAD: {"action":"read_file","path":"a"') == \
+        'BAD: {"action":"read_file","path":"a"'
+
+
+def test_plain_transliterate_finds_the_prompt_examples_to_rewrite():
+    import agent_prompt
+    found = 0
+    for name in dir(agent_prompt):
+        value = getattr(agent_prompt, name)
+        if not name.isupper() or not isinstance(value, str):
+            continue
+        for line in value.split("\n"):
+            try:
+                out = transliterate(line, plain_text=True)
+            except ProtocolError as error:
+                assert "rewritten by hand" in str(error)
+                found += 1
+                continue
+            if out != line:
+                assert '{"action' not in out, (name, out)
+    assert found > 0
+
+
+def test_plain_a_fabricated_ending_keeps_its_markers():
+    import agent_model
+    for obj in ({"action": "end_conversation", "message": "bad reply",
+                 "tmt_synthetic": True, "tmt_synthetic_reason": "parse"},
+                {"action": "end_conversation", "message": "The provider is down.",
+                 "next_step": "Try again", "tmt_synthetic": True,
+                 "tmt_synthetic_reason": "provider"},
+                {"action": "end_conversation", "message": "Model prose.", "tmt_prose": True}):
+        for written in (render(obj, TAGS, plain_text=True),
+                        example(obj, TAGS, plain_text=True)):
+            assert "/end_conversation/" not in written, written
+            back = parse(written, plain_text=True)
+            assert back == obj, (written, back)
+            assert agent_model.is_synthetic(back) == bool(obj.get("tmt_synthetic"))
+            assert agent_model.synthetic_reason(back) == obj.get("tmt_synthetic_reason", "")
+    assert render({"action": "end_conversation", "message": "bad reply",
+                   "tmt_synthetic": True, "tmt_synthetic_reason": "parse"}, TAGS,
+                  plain_text=True) == ("bad reply\n/tmt_synthetic/ true //tmt_synthetic/\n"
+                                       "/tmt_synthetic_reason/ parse //tmt_synthetic_reason/")
+
+
+def test_plain_a_marker_block_is_reply_level_and_does_not_split_the_prose():
+    assert plain("Before.\n/tmt_synthetic/ true //tmt_synthetic/\nAfter.") == {
+        "action": "end_conversation", "message": "Before.\n\nAfter.", "tmt_synthetic": True}
+    assert plain("a /read_file/ x //read_file/ /tmt_prose/ false //tmt_prose/ b") == {
+        "actions": [{"action": "read_file", "path": "x", "progress": "a"},
+                    {"action": "send_message", "message": "b"}], "tmt_prose": False}
+    plain_refused("Hi /tmt_synthetic/ maybe //tmt_synthetic/", "true or false")
+    # The default reader is unchanged: there it is an unknown action block.
+    refused("Hi /tmt_synthetic/ true //tmt_synthetic/", "takes no bare value")
+    text = "Done. /tmt_synthetic/ true //tmt_synthetic/ ok"
+    for size in (1, 5, len(text)):
+        parser, events = feed_plain(text, size)
+        assert texts(events) == plain(text)["message"] == "Done.  ok"
+        assert parser.result() == plain(text)
+
+
+# --- rule I: streaming top-level prose live --------------------------------------
+
+def feed_plain(text, size=1):
+    parser = StreamingTagParser(plain_text=True)
+    events = []
+    for index in range(0, len(text), size):
+        events.extend(parser.feed(text[index:index + size]))
+    return parser, events
+
+
+MIXED = ("Reading it first.\n/read_file/ /path/ a.py //path/ //read_file/\n"
+         "Then the tests.\n/bash/ python run_tests.py //bash/\nAll queued.")
+
+
+def test_plain_streaming_prose_only_streams_the_whole_message():
+    for text in ("Hello there, I fixed the parser.", "  Lead and\n\ntrail  \n",
+                 "Done.\n/next_step/ Run it //next_step/\nThanks.",
+                 "Run /usr/bin/python in /c/Coding/TMT now", "a/b and c/d e"):
+        want = plain(text)["message"]
+        for size in (1, 2, 3, 7, len(text)):
+            parser, events = feed_plain(text, size)
+            assert texts(events) == want, (text, size, events)
+            assert parser.result() == plain(text)
+    # A tail that could still be an opener is held: the stream cannot know it
+    # has ended, so the last "/TMT" waits for result().
+    parser, events = feed_plain("Run it in /c/Coding/TMT")
+    assert texts(events) == "Run it in /c/Coding"
+    assert parser.result()["message"] == "Run it in /c/Coding/TMT"
+
+
+def test_plain_streaming_prose_before_between_and_after_blocks():
+    whole = merged(feed_plain(MIXED, len(MIXED))[1])
+    assert values(whole, "text") == ["Reading it first.", "Then the tests.", "All queued."]
+    assert values(whole, "action") == ["read_file", "bash"]
+    assert len(values(whole, "object")) == 2
+    assert [kind for kind, _ in whole] == ["text", "action", "object", "text", "action",
+                                           "object", "text"]
+    for size in range(1, 12):
+        parser, events = feed_plain(MIXED, size)
+        assert merged(events) == whole, size
+        assert parser.result() == plain(MIXED)
+
+
+def test_plain_streaming_holds_back_a_partial_opener():
+    parser = StreamingTagParser(plain_text=True)
+    first = parser.feed("Look first /re")
+    assert first == [("text", "Look first")]
+    second = parser.feed("ad_file/ /path/ a //path/ //read_file/ ok")
+    assert texts(second) == "ok" and "/re" not in texts(first + second)
+    assert values(second, "action") == ["read_file"]
+    # A partial that turns out to be prose is released once it is decided.
+    parser = StreamingTagParser(plain_text=True)
+    said = parser.feed("see /us")
+    assert texts(said) == "see"
+    said += parser.feed("r/ now")
+    assert texts(said) == "see /usr/ now"
+
+
+def test_plain_streaming_splits_a_reply_level_opener_across_chunks():
+    parser = StreamingTagParser(plain_text=True)
+    events = parser.feed("Done. /next_")
+    events += parser.feed("step/ Run it //next_step/")
+    assert texts(events) == "Done."
+    assert values(events, "next_step") == ["Run it"]
+
+
+def test_plain_streaming_never_says_what_the_result_takes_back():
+    for text in ("see docs/plan/x for it", "a /read_file/ x //read_file/ b",
+                 "/end_conversations/", "ok /list_files/ //list_files/",
+                 REAL_SMALL_REPLY, "Sure: /send_message/ hi //send_message/ bye"):
+        for size in (1, 4, len(text)):
+            parser, events = feed_plain(text, size)
+            try:
+                got = plain(text)
+            except ProtocolError:
+                got = None
+            spoken = [str(v) for v in _leaves(got)] if got else []
+            for said in values(merged(events), "text"):
+                assert any(value.startswith(said) for value in spoken), \
+                    (text, size, said, spoken)
+
+
+def test_plain_streaming_a_malformed_reply_never_raises_from_feed():
+    for text in ("/progress/ a //progress/ /progress/ b //progress/ /git_status/ //git_status/",
+                 "/next_step/ a //next_step/ /next_step/ b //next_step/ Done.",
+                 "Hi /end_conversation/ never closed", "/raed_file/ x //raed_file/",
+                 "/path/ a.py //path/"):
+        for size in (1, 3, len(text)):
+            parser, events = feed_plain(text, size)
+            assert parser.result() is None and parser.error, (text, size)
+
+
+def test_plain_streaming_default_streams_no_prose():
+    text = "Hello /read_file/ /path/ a //path/ //read_file/ bye"
+    parser, events = feed(text)
+    assert texts(events) == ""
+    assert [kind for kind, _ in events] == ["action", "object"]
+    parser, events = feed_plain(text)
+    assert values(merged(events), "text") == ["Hello", "bye"]
+    assert [kind for kind, _ in merged(events)] == ["text", "action", "object", "text"]
+
+
+# --- rule J: the model-facing sentences in plain form ----------------------------
+
+FIELDS = dict(error="E", invalid="I", ran="R", action="A", raised="X", attempts=3)
+
+
+def test_plain_corrections_name_no_json_and_no_old_tags():
+    for kind in P.correction_kinds():
+        said = P.correction(kind, TAGS, plain_text=True, **FIELDS)
+        for word in FORBIDDEN:
+            assert word not in said, (kind, word, said)
+    for sentence in (P.TAG_CONTRACT_PLAIN, P._PLAIN_UNCLOSED, P._PLAIN_PROGRESS_UNCLOSED,
+                     P._PLAIN_PROGRESS_TWICE, P._PLAIN_TWICE % "next_step"):
+        for word in FORBIDDEN:
+            assert word not in sentence, (word, sentence)
+    assert "plain text" in P.TAG_CONTRACT_PLAIN and "ends the turn" in P.TAG_CONTRACT_PLAIN
+    for kind in ("unreadable", "worker_unreadable", "prose_before_work", "worker_prose"):
+        said = P.correction(kind, TAGS, plain_text=True, **FIELDS)
+        assert "plain text" in said and "ends the turn" in said, kind
+
+
+def test_plain_corrections_leave_the_defaults_byte_identical():
+    import hashlib
+    parts = []
+    for kind in P.correction_kinds():
+        for proto in (JSON, TAGS, "bogus"):
+            parts.append(kind + "|" + proto + "|" + P.correction(kind, proto, **FIELDS))
+            assert P.correction(kind, proto, plain_text=False, **FIELDS) == \
+                P.correction(kind, proto, **FIELDS)
+        assert P.correction(kind, JSON, plain_text=True, **FIELDS) == \
+            P.correction(kind, JSON, **FIELDS)
+    parts.append(P.TAG_CONTRACT)
+    digest = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+    # Taken from HEAD (02a771a's agent_protocol.py) before rule J was built.
+    assert digest == "07d9775b44ea3f58cdc8ab874493d4a036220321291e41abb510c51b86c30aef"
+    assert P.correction("unreadable", TAGS, plain_text=True, error="E") != \
+        P.correction("unreadable", TAGS, error="E")
+
+
+def test_plain_unclosed_and_twice_refusals_name_no_old_tag():
+    cases = [("/end_conversation/ All done.", "none is needed"),
+             ("/send_message/ hi", "none is needed"),
+             ("/end_conversation/ /message/ hi //message/", "none is needed"),
+             ("/progress/ working on it", "progress tag is never closed"),
+             ("/progress/ a //progress/ /progress/ b //progress/ /git_status/ //git_status/",
+              "given twice"),
+             ("/read_file/ /path/ x //path/ /progress/ a //progress/ /progress/ b "
+              "//progress/ //read_file/", "given twice"),
+             ("/progress/ a //progress/ /read_file/ /path/ x //path/ /progress/ b "
+              "//progress/ //read_file/", "given twice"),
+             ("/end_conversation/ /message/ a //message/ /message/ b //message/ "
+              "//end_conversation/", "given twice")]
+    for text, words in cases:
+        message = plain_refused(text, words)
+        for word in FORBIDDEN:
+            assert word not in message, (text, word, message)
+    # The default reader still names the tag, as it always did.
+    refused("/end_conversation/ All done.", "//end_conversation/")
+    refused("/read_file/ /path/ x //path/ /progress/ a //progress/ /progress/ b "
+            "//progress/ //read_file/", "/progress/ is given twice")

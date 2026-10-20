@@ -140,6 +140,18 @@ G. An unknown top-level name within edit distance 2 of a taught name, or a
    key name at the top, is refused -- but only when its closer follows or it
    is the whole reply. The untaught names are answered with the plain-text
    rule, never with their old tag.
+H. `render`, `example` and `transliterate` take `plain_text=False` too, and
+   with it write what the rules above read back (see `render`); a shape
+   plain text cannot say raises, and `transliterate` names the example.
+I. `StreamingTagParser(plain_text=True)` streams the prose outside every
+   block as ("text", ...) as it arrives, held back at an undecided tag.
+J. `correction(..., plain_text=True)` and `TAG_CONTRACT_PLAIN` are the
+   model-facing sentences in plain form, and the parser's refusals about an
+   unclosed or doubled untaught tag are too: no JSON, no braces, none of
+   /progress/, /send_message/ or /end_conversation/.
+K. TMT's three markers (rule 9) are reply-level keys here, like /next_step/:
+   a top-level marker block is carried onto the object and does not split
+   the prose around it, so a fabricated ending survives `render` and `parse`.
 """
 
 import json
@@ -248,6 +260,11 @@ ACTION_CONTAINERS = frozenset({"calls", "actions"})
 # What may sit beside the action blocks at the top of a reply.
 REPLY_LEAVES = frozenset({"progress", "next_step"})
 REPLY_KEYS = frozenset({"progress", "next_step", "events"})
+# TMT's own markers (rule 9). Under the plain-text rules they are reply-level
+# keys as well (rule K), so a reply TMT fabricated keeps them when it is
+# written back as plain text and read again.
+MARKER_KEYS = frozenset({"tmt_synthetic", "tmt_synthetic_reason", "tmt_prose"})
+PLAIN_REPLY_KEYS = REPLY_KEYS | MARKER_KEYS
 # The verbs `render` writes in the shorthand. Everything else is written with
 # its keys named, which is the form the model is taught.
 SHORTHAND_VERBS = frozenset({"send_message", "end_conversation", "internal_response"})
@@ -409,6 +426,9 @@ class _Reader(object):
         self.events = []
         self.done = 0
         self.known = _known_actions()
+        # Set by reply_plain: the refusals about the three untaught tags then
+        # take their plain-text wording (rule J).
+        self.plain = False
 
     # -- small helpers --
 
@@ -435,7 +455,14 @@ class _Reader(object):
 
     def need(self, p, name, suffix):
         if p >= self.n:
-            self.fail(_UNCLOSED % (_open(name, suffix), _close(name, suffix)))
+            self.fail(self.unclosed(name, _UNCLOSED % (_open(name, suffix),
+                                                       _close(name, suffix))))
+
+    def unclosed(self, name, sentence):
+        """An unclosed-tag refusal; in plain-text mode an untaught tag is not named."""
+        if self.plain and name in _UNTAUGHT:
+            return _PLAIN_PROGRESS_UNCLOSED if name == "progress" else _PLAIN_UNCLOSED
+        return sentence
 
     def coerce(self, key, value):
         if key in BOOL_KEYS:
@@ -580,7 +607,8 @@ class _Reader(object):
         # says otherwise; finished, the block is simply unclosed.
         if self.live:
             return True
-        raise ProtocolError(_UNCLOSED % (_open(name, suffix), _close(name, suffix)))
+        raise ProtocolError(self.unclosed(name, _UNCLOSED % (_open(name, suffix),
+                                                             _close(name, suffix))))
 
     def body(self, closer, p, name, suffix, where):
         owner = _open(name, suffix)
@@ -609,6 +637,10 @@ class _Reader(object):
             if key == "action" and not self.live:
                 raise ProtocolError(_ACTION_KEY)
             if key in out and not self.live:
+                if self.plain and key == "progress":
+                    raise ProtocolError(_PLAIN_PROGRESS_TWICE)
+                if self.plain and name in _UNTAUGHT:
+                    raise ProtocolError(_PLAIN_TWICE % key)
                 raise ProtocolError(_TWICE % (_open(key), owner))
             if key in CONTAINER_KEYS:
                 value, p = self.container(key, ksuffix, found.end(), where)
@@ -710,9 +742,9 @@ class _Reader(object):
                     self.partial(at, self.text[pos:], closer)
                 raise _Incomplete()
             other = "b" if _fold(suffix or "") == "a" else "a"
-            raise ProtocolError(_NEVER_CLOSED % (
+            raise ProtocolError(self.unclosed(name, _NEVER_CLOSED % (
                 _open(name, suffix), _close(name, suffix), _close(name, suffix),
-                _open(name, other), _close(name, other)))
+                _open(name, other), _close(name, other))))
         value = _leaf_value(self.text[pos:end], exact)
         if speak and value:
             self.emit(at, "text", value)
@@ -743,34 +775,62 @@ class _Reader(object):
     # -- PLAIN TEXT mode (parse only; see "PLAIN TEXT" in the docstring) --
 
     def reply_plain(self):
-        text, low = self.text, self.low
+        """The plain-text reading; live, it also streams the top-level prose.
+
+        Live (rule I), the prose of a segment -- the text between two action
+        blocks, which reply-level blocks do not split -- is reported as
+        ("text", ...) under its own key as far as it is certain: trimmed, and
+        held back at a tag that is not yet decided (a partial opener, a glued
+        known name whose closer may still come, a tag that may yet be
+        refused). `done` is the start of the open segment, so the next pass
+        re-reads the whole segment under the same key.
+        """
+        self.plain = True
+        text, low, live = self.text, self.low, self.live
         items, extra, pieces = [], {}, []
-        p = mark = after = 0
+        p = mark = after = seg = 0
+        self.done = 0
+
+        def say(upto):
+            self.prose(seg, "".join(pieces) + text[mark:upto])
+
         while True:
             slash = text.find("/", p)
             if slash < 0:
                 break
-            found = self.tag_at(slash)
+            try:
+                found = self.tag_at(slash)
+            except _Incomplete:
+                say(slash)
+                raise
             if found is None or found.group(1):
                 p = slash + 1 if found is None else found.end()
                 continue
             name, suffix = found.group(2).lower(), found.group(3)
             closer_after = low.find(_fold(_close(name, suffix)), found.end()) >= 0
             glued = slash > 0 and slash != after and text[slash - 1] not in _SPACE
-            top = name in self.known or name in REPLY_KEYS or name == "actions"
+            top = name in self.known or name in PLAIN_REPLY_KEYS or name == "actions"
             if not top or (glued and not closer_after):
+                if live and (top or self.mistaken(found, name, closer_after)):
+                    say(slash)
+                    raise _Incomplete()
                 if not top:
                     self.mistake(found, name, closer_after)
                 p = found.end()
                 continue
+            say(slash)
             pieces.append(text[mark:slash])
-            if name in REPLY_KEYS:
+            if name in PLAIN_REPLY_KEYS:
                 if name == "events":
                     value, p = self.container(name, suffix, found.end(), _NESTED)
                 else:
-                    value, p = self.leaf(name, suffix, found.end(), slash)
-                if name in extra:
-                    raise ProtocolError(_TWICE_BESIDE % name)
+                    value, p = self.leaf(
+                        name, suffix, found.end(), slash,
+                        live_kind=name if name in REPLY_LEAVES else None)
+                    value = self.coerce(name, value)
+                if name in extra and not live:
+                    raise ProtocolError(_PLAIN_PROGRESS_TWICE if name == "progress"
+                                        else _TWICE_BESIDE % name)
                 extra[name] = value
             else:
                 outside = "".join(pieces).strip(_SPACE)
@@ -782,24 +842,42 @@ class _Reader(object):
                 else:
                     block, p = self.action(name, suffix, found.end(), _TOP, slash)
                     items.append((block, outside))
+                self.whole(slash, p)
+                seg = self.done = p
             mark = after = p
+        if live:
+            say(len(text))
+            return None
         trailing = ("".join(pieces) + text[mark:]).strip(_SPACE)
         return _assemble_plain(items, extra, trailing)
 
+    def prose(self, at, raw):
+        """Live: one segment's top-level prose, trimmed, as a text event."""
+        if self.live:
+            value = raw.strip(_SPACE)
+            if value:
+                self.events.append((("prose", self.base + at), "text", value))
+
     def mistake(self, found, name, closer_after):
         """Rule G: refuse a near-miss of a known name, or a key at the top."""
+        sentence = self.mistaken(found, name, closer_after)
+        if sentence:
+            raise ProtocolError(sentence)
+
+    def mistaken(self, found, name, closer_after):
+        """The rule-G refusal for this tag, or None when it is prose."""
         if not (closer_after or self.text.strip(_SPACE) == found.group(0)):
-            return
+            return None
         if name in _key_names():
             if name == "message":
-                raise ProtocolError(_KEY_MESSAGE)
-            raise ProtocolError(_KEY_AT_TOP % (_open(name), _open(name)))
+                return _KEY_MESSAGE
+            return _KEY_AT_TOP % (_open(name), _open(name))
         near = _nearest(name)
         if near is None:
-            return
+            return None
         if near in _UNTAUGHT:
-            raise ProtocolError(_UNTAUGHT_NEAR % found.group(0))
-        raise ProtocolError(_NEAR_MISS % (found.group(0), _open(near)))
+            return _UNTAUGHT_NEAR % found.group(0)
+        return _NEAR_MISS % (found.group(0), _open(near))
 
 
 # Plain-text mode: the names that are no longer taught, the verbs that speak,
@@ -817,6 +895,22 @@ _UNTAUGHT_NEAR = "%s is not a tag TMT reads. " + _PLAIN_MESSAGE
 _KEY_MESSAGE = ("/message/ is not needed at the top of a reply. " + _PLAIN_MESSAGE)
 _KEY_AT_TOP = ("%s is a key, not an action: write %s inside the action block it "
                "belongs to, as /read_file/ /path/ src/a.py //path/ //read_file/.")
+# Rule J: the parser's own refusals about the untaught tags, in plain form.
+_PLAIN_UNCLOSED = "That tag is never closed, and none is needed. " + _PLAIN_MESSAGE
+_PLAIN_PROGRESS = ("A progress line needs no tag: write it as plain text just "
+                   "before the action block it describes.")
+_PLAIN_PROGRESS_UNCLOSED = "That progress tag is never closed. " + _PLAIN_PROGRESS
+_PLAIN_PROGRESS_TWICE = "The progress line is given twice. " + _PLAIN_PROGRESS
+_PLAIN_TWICE = "/%s/ is given twice. Give it once."
+
+
+def _plain_both(key, action):
+    """A key given inside a block and beside it, said in plain-text words."""
+    if key == "progress":
+        return _PLAIN_PROGRESS_TWICE
+    if action in _SPEAKING:
+        return _PLAIN_TWICE % key
+    return _BOTH_PLACES % (key, action)
 
 
 def _ends(obj):
@@ -842,7 +936,7 @@ def _assemble_plain(items, extra, trailing):
             step = block.pop("next_step", None)
             if step is not None:
                 if "next_step" in extra:
-                    raise ProtocolError(_BOTH_PLACES % ("next_step", block["action"]))
+                    raise ProtocolError(_plain_both("next_step", block["action"]))
                 extra["next_step"] = step
             block.pop("final", None)
             block["action"] = "send_message"
@@ -869,7 +963,7 @@ def _assemble_plain(items, extra, trailing):
             out["progress"] = out["progress"] + " " + value if out.get("progress") else value
             continue
         if key in out:
-            raise ProtocolError(_BOTH_PLACES % (key, out["action"]))
+            raise ProtocolError(_plain_both(key, out["action"]))
         out[key] = value
     return out
 
@@ -1103,8 +1197,19 @@ def parse(text, *, plain_text=False):
 
 # --- writing ------------------------------------------------------------------
 
-def render(obj, protocol=TAGS):
+def render(obj, protocol=TAGS, *, plain_text=False):
     """An action object written in a protocol. TAGS is the inverse of parse_tags.
+
+    With `plain_text` under TAGS (rule H) the reply is written the way the
+    PLAIN TEXT rules read it, and checked by reading it back with
+    `parse(..., plain_text=True)`: a lone end_conversation is its message as
+    plain text, followed by any /next_step/ and /events/ blocks; a `progress`
+    is a prose line before its block; a batch's final send_message is
+    trailing text; a lone send_message is the old /send_message/ block. An
+    end_conversation inside a batch, a send_message that is not a batch's
+    last entry, a batch of one, a batch-level progress, and any key an ending
+    cannot carry as plain text all raise ProtocolError. Under JSON
+    `plain_text` is ignored.
 
     JSON is the compact form the prompt's examples are written in. TAGS is
     inline when the action fits on a line of INLINE_WIDTH and no value holds a
@@ -1121,18 +1226,23 @@ def render(obj, protocol=TAGS):
     if protocol == JSON:
         return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
     _known_protocol(protocol)
+    if plain_text:
+        return _render_plain_checked(obj, INLINE_WIDTH)
     return _render_checked(obj, INLINE_WIDTH)
 
 
-def example(obj, protocol=TAGS):
+def example(obj, protocol=TAGS, *, plain_text=False):
     """An action written on one line, for use inside a sentence.
 
     Block form only when a value cannot be written inline: it holds a newline,
     or it is file text (an EXACT_KEYS value) that starts with a space or tab.
+    `plain_text` is `render`'s (rule H).
     """
     if protocol == JSON:
         return render(obj, JSON)
     _known_protocol(protocol)
+    if plain_text:
+        return _render_plain_checked(obj, None)
     return _render_checked(obj, None)
 
 
@@ -1192,6 +1302,105 @@ def _render_checked(obj, width):
         raise ProtocolError("That object cannot be written as tags exactly: it "
                             "would read back as %r." % (back,))
     return text
+
+
+_PLAIN_END_IN_BATCH = ("An end_conversation inside a batch has no plain-text "
+                       "form: a reply that runs anything cannot end the turn.")
+_PLAIN_EARLY_MESSAGE = ("A send_message that is not the last entry of a batch "
+                        "has no plain-text form: only text after the last block "
+                        "is a message.")
+_PLAIN_ONE = "A batch of one action has no plain-text form: write the action alone."
+_PLAIN_BATCH_PROGRESS = ("A progress beside a batch has no plain-text form: give "
+                         "each action its own.")
+_PLAIN_ENDING_KEY = ("%s cannot carry %r as plain text: an ending is its message, "
+                     "with only next_step and events beside it.")
+_PLAIN_BLANK = "%s has no plain-text form without a message."
+
+
+def _render_plain_checked(obj, width):
+    """Rule H: `obj` as a plain-text reply, read back before it is handed out."""
+    if not isinstance(obj, dict):
+        raise ProtocolError("Only an object can be written as tags, not %r." % (obj,))
+    pieces = _render_plain(obj, width)
+    if width is None and all(len(piece) == 1 for piece in pieces):
+        text = " ".join(piece[0] for piece in pieces)
+    else:
+        text = "\n".join(line for piece in pieces for line in piece)
+    try:
+        back = parse(text, plain_text=True)
+    except ProtocolError as error:
+        raise ProtocolError("That object cannot be written as plain-text tags "
+                            "exactly: %s" % error)
+    if back != _canonical(obj):
+        raise ProtocolError("That object cannot be written as plain-text tags "
+                            "exactly: it would read back as %r." % (back,))
+    return text
+
+
+def _prose_piece(value):
+    return _scalar(value).strip(_SPACE).split("\n")
+
+
+def _plain_ending(obj, width):
+    """A lone end_conversation: its message as text, then its reply-level blocks."""
+    beside = [key for key in obj if key not in ("action", "message")]
+    for key in beside:
+        if key not in PLAIN_REPLY_KEYS or key == "progress":
+            raise ProtocolError(_PLAIN_ENDING_KEY % (obj["action"], key))
+    message = obj.get("message")
+    if not isinstance(message, str) or not message.strip(_SPACE):
+        raise ProtocolError(_PLAIN_BLANK % obj["action"])
+    return [_prose_piece(message)] + [_render_key(key, obj[key], width)
+                                      for key in beside]
+
+
+def _plain_block(obj, width):
+    """An action with its progress, if any, as a prose line before the block."""
+    if not isinstance(obj, dict):
+        raise ProtocolError("An action must be an object, not %r." % (obj,))
+    rest = {key: value for key, value in obj.items() if key != "progress"}
+    block = _render_block(rest, width)
+    if "progress" in obj:
+        return [_prose_piece(obj["progress"]), block]
+    return [block]
+
+
+def _render_plain(obj, width):
+    if "action" in obj:
+        if obj.get("action") == "end_conversation":
+            return _plain_ending(obj, width)
+        return _plain_block(obj, width)
+    if "actions" not in obj:
+        if "progress" in obj:
+            raise ProtocolError(_PLAIN_BATCH_PROGRESS)
+        return _render_reply(obj, width)
+    actions = obj["actions"]
+    if not isinstance(actions, (list, tuple)) or not actions:
+        raise ProtocolError("\"actions\" must be a list of actions.")
+    if len(actions) == 1:
+        raise ProtocolError(_PLAIN_ONE)
+    extra = [key for key in obj if key != "actions"]
+    for key in extra:
+        if key not in PLAIN_REPLY_KEYS:
+            raise ProtocolError("%r cannot sit beside a batch; only %s can."
+                                % (key, ", ".join(sorted(PLAIN_REPLY_KEYS))))
+    if "progress" in extra:
+        raise ProtocolError(_PLAIN_BATCH_PROGRESS)
+    pieces, last = [], len(actions) - 1
+    for index, entry in enumerate(actions):
+        if isinstance(entry, dict) and _ends(entry):
+            raise ProtocolError(_PLAIN_END_IN_BATCH)
+        if isinstance(entry, dict) and entry.get("action") == "send_message":
+            if index != last:
+                raise ProtocolError(_PLAIN_EARLY_MESSAGE)
+            if set(entry) != {"action", "message"} or not isinstance(
+                    entry["message"], str) or not entry["message"].strip(_SPACE):
+                raise ProtocolError("A closing send_message is its message alone, "
+                                    "written as text after the last block.")
+            pieces.append(_prose_piece(entry["message"]))
+            continue
+        pieces.extend(_plain_block(entry, width))
+    return pieces + [_render_key(key, obj[key], width) for key in extra]
 
 
 def _render_reply(obj, width):
@@ -1387,7 +1596,7 @@ _EXAMPLE_LINE = re.compile(
     r"([ \t]*)((?:You emit:|BAD:|GOOD:|WRONG:|RIGHT:|Then:)[ \t]*)?(?=\{\"actions?\")")
 
 
-def transliterate(text):
+def transliterate(text, *, plain_text=False):
     """A prompt constant with every JSON example rewritten as tags.
 
     A line that is an example -- optionally after a label such as "You emit:"
@@ -1397,11 +1606,22 @@ def transliterate(text):
     label; an object sharing its line with commentary is written with
     `example`, in place. Every other line comes back byte for byte, and an
     object that cannot be read or written is left exactly as it was.
+
+    With `plain_text` every object is written in the plain-text form (rule H)
+    and nothing is left as it was: an example that cannot be read, or cannot
+    be expressed in plain text (an end_conversation inside a batch, a
+    send_message that is not a batch's last entry), raises ProtocolError
+    naming the example, so the prompt builder finds every one that has to be
+    rewritten by hand.
     """
-    return "\n".join(_transliterate_line(line) for line in text.split("\n"))
+    return "\n".join(_transliterate_line(line, plain_text) for line in text.split("\n"))
 
 
-def _transliterate_line(line):
+_PLAIN_EXAMPLE = ("This prompt example has no plain-text tags form and must be "
+                  "rewritten by hand: %s -- %s")
+
+
+def _transliterate_line(line, plain_text=False):
     found = _EXAMPLE_LINE.match(line)
     if found is None:
         return line
@@ -1412,6 +1632,8 @@ def _transliterate_line(line):
         at = rest.find('{"action', pos)
         end = _object_end(rest, at) if at >= 0 else -1
         if at < 0 or end < 0:
+            if plain_text and at >= 0:
+                raise ProtocolError(_PLAIN_EXAMPLE % (line.strip(), "it never closes"))
             pieces.append(rest[pos:])
             break
         pieces.append(rest[pos:at])
@@ -1420,7 +1642,9 @@ def _transliterate_line(line):
             if not isinstance(value, dict):
                 raise ValueError("not an object")
             pieces.append(value)
-        except ValueError:
+        except ValueError as error:
+            if plain_text:
+                raise ProtocolError(_PLAIN_EXAMPLE % (line.strip(), error))
             pieces.append(rest[at:end])
         pos = end
     objects = [piece for piece in pieces if isinstance(piece, dict)]
@@ -1429,8 +1653,10 @@ def _transliterate_line(line):
     if len(objects) == 1 and all(isinstance(piece, dict) or not piece.strip()
                                  for piece in pieces):
         try:
-            written = render(objects[0], TAGS)
-        except ProtocolError:
+            written = render(objects[0], TAGS, plain_text=plain_text)
+        except ProtocolError as error:
+            if plain_text:
+                raise ProtocolError(_PLAIN_EXAMPLE % (line.strip(), error))
             return line
         if "\n" not in written:
             return indent + label + written
@@ -1441,8 +1667,10 @@ def _transliterate_line(line):
             out += piece
             continue
         try:
-            written = example(piece, TAGS)
-        except ProtocolError:
+            written = example(piece, TAGS, plain_text=plain_text)
+        except ProtocolError as error:
+            if plain_text:
+                raise ProtocolError(_PLAIN_EXAMPLE % (line.strip(), error))
             written = json.dumps(piece, ensure_ascii=False, separators=(",", ":"))
         if "\n" in written:
             out = out.rstrip(" \t") + "\n" + written + "\n"
@@ -1481,9 +1709,11 @@ class StreamingTagParser(object):
     """
 
     def __init__(self, *, plain_text=False):
-        # PARTIAL: with plain_text only `result()` follows the plain-text
-        # rules; the live events are still the default reader's, so top-level
-        # prose is not yet streamed as ("text", ...).
+        # With plain_text (rule I) the live events come from the plain-text
+        # reader: everything above, plus ("text", chars) for the prose outside
+        # every block as it arrives -- trimmed, and held back at a tag not
+        # yet decided (`_Reader.reply_plain`). `result()` reads the reply
+        # with `parse(..., plain_text=True)`.
         self.plain_text = plain_text
         self.raw = ""
         self.error = None
@@ -1504,7 +1734,10 @@ class StreamingTagParser(object):
         settled = self._text[:-1] if self._text.endswith("\r") else self._text
         reader = _Reader(settled[self._resume:], live=True, base=self._resume)
         try:
-            reader.reply()
+            if self.plain_text:
+                reader.reply_plain()
+            else:
+                reader.reply()
         except _Incomplete:
             pass
         out = []
@@ -1555,6 +1788,12 @@ class StreamingTagParser(object):
 TAG_CONTRACT = ("Reply with one or more tag blocks and nothing else -- no "
                 "JSON, no prose, no code fences; start with /action_name/ and "
                 "end with //action_name/.")
+# The same contract under the plain-text rules (rule J): prose is allowed, and
+# none of JSON, braces or the three untaught tags is named.
+TAG_CONTRACT_PLAIN = ("Write each action as a tag block, /action_name/ ... "
+                      "//action_name/, and anything the user should read as "
+                      "plain text outside the blocks. A reply with no action "
+                      "blocks is your final answer and ends the turn.")
 
 _JSON_TYPES = ("Check the type of every key you sent: paths and text are "
                "strings, line numbers are unquoted numbers, flags are unquoted "
@@ -1641,6 +1880,28 @@ _CORRECTIONS = {
         "//action_name/"),
 }
 
+# kind: the sentence under TAGS with the plain-text rules (rule J). Every kind
+# has one; where the TAGS sentence names nothing the plain rules forbid it is
+# that sentence, and the four that told the model to reply in blocks alone say
+# where prose goes instead.
+_PLAIN_CORRECTIONS = dict((kind, forms[1]) for kind, forms in _CORRECTIONS.items())
+_PLAIN_CORRECTIONS.update({
+    "unreadable": (
+        "INVALID: that reply could not be read. The parser said: %(error)s\n"
+        + TAG_CONTRACT_PLAIN + " Write the action you meant."),
+    "worker_unreadable": (
+        "INVALID: that reply could not be read. The parser said: %(error)s\n"
+        + TAG_CONTRACT_PLAIN),
+    "prose_before_work": (
+        "That was plain text, and nothing has run yet, so it announced work "
+        "rather than reporting it. Put the action you just described in the "
+        "same reply, as a tag block: " + TAG_CONTRACT_PLAIN),
+    "worker_prose": (
+        "That was plain text, and nothing has run yet, so it described work "
+        "rather than doing it. Put the action you just described in the same "
+        "reply, as a tag block: " + TAG_CONTRACT_PLAIN),
+})
+
 # The reply arrived in the protocol that is not in force. Keyed by the one
 # that IS in force, because that is the one the model is pointed back at.
 _DRIFT = {
@@ -1663,16 +1924,22 @@ def correction_kinds():
     return tuple(sorted(_CORRECTIONS))
 
 
-def correction(kind, protocol, **fields):
+def correction(kind, protocol, *, plain_text=False, **fields):
     """The sentence a loop hands back for `kind`, in `protocol`'s words.
 
     Under JSON it is exactly the string that loop used before tags existed.
     An unknown protocol answers as the default does (see `normal`); an
     unknown kind is a KeyError, because that is a typo in TMT, not a model's
-    mistake, and it should fail where it was made.
+    mistake, and it should fail where it was made. With `plain_text` under
+    TAGS the plain-text form (rule J) is used: it names no JSON, no braces
+    and none of /progress/, /send_message/ and /end_conversation/. Under
+    JSON `plain_text` is ignored.
     """
     json_form, tags_form = _CORRECTIONS[kind]
-    template = tags_form if normal(protocol) == TAGS else json_form
+    if normal(protocol) == TAGS:
+        template = _PLAIN_CORRECTIONS[kind] if plain_text else tags_form
+    else:
+        template = json_form
     return template % fields
 
 
