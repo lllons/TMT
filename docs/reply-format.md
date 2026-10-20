@@ -103,11 +103,12 @@ the text //content/ is part of the file
 
 If a tag is never closed the reply is refused with a sentence that names this mechanism, and the model is asked again.
 
-## Plain-text replies (being built)
+## Plain-text replies (main agent, being wired)
 
-The parser can now read a `tags` reply under newer, lighter rules, asked for with `plain_text=True`. Nothing uses them yet: the main loop and the prompt move over in later steps, and until then every reply is read as described above.
+The parser reads AND writes these rules (`plain_text=True`). The main agent's loop and prompt are moving to them on branch alpha. The worker, note agent and reviewer still use the block-only rules described above until a later step.
 
 - **Text outside the blocks is a message to you.** Nothing is dropped.
+- TMT's own markers (`tmt_synthetic`, `tmt_synthetic_reason`, `tmt_prose`) ride beside the plain text as blocks, so a reply TMT fabricates to report a failure still reads back as one.
 - **A reply with no action blocks is the final answer** and ends the turn. A `/next_step/` block beside the text is still the hint shown afterwards.
 - **Text before an action is that action's progress line**, so `ok, I'll look at the repo first /list_files/ //list_files/` lists the files and shows the sentence as it does.
 - **Text after the last action is shown without ending the turn.** A reply that runs anything never ends the turn, so the model always sees a command's output before it answers.
