@@ -1,7 +1,6 @@
 """Command-line entry point for TMT, the CLI coding agent."""
 
 import argparse
-import json
 import shutil
 import sys
 from pathlib import Path
@@ -25,6 +24,7 @@ import agent_config
 import agent_history
 import agent_images
 import agent_menu
+import agent_protocol
 from agent_menu import (
     BottomPad, PromptBox, TypeAhead, clear_screen, opening_pad, render_command,
     render_status, render_task, run_startup,
@@ -141,31 +141,40 @@ def stream_handler(live_ui, relay, state, transcript=None, session=None):
 # model with a comma out of place could exhaust a question it had not started.
 MAX_INVALID_RETRIES = 6
 
-# What the model is told when its reply could not be read at all. It names the
-# parser's own complaint, because "invalid JSON" without the position is a
-# thing to guess at rather than a thing to fix.
-_UNREADABLE_FEEDBACK = (
-    "INVALID: that reply could not be read as JSON. The parser said: %s\n"
-    "Reply with exactly one JSON object and nothing else -- no prose before "
-    "it, no prose after it, no code fences. Emit the action you meant."
-)
+# What the model is told about the SHAPE of a reply -- one that could not be
+# read at all, prose where an action belonged, an action that would not
+# validate or would not run -- lives in `agent_protocol.correction`, in both
+# reply formats. Under JSON each sentence is byte for byte the one this module
+# used to hold; under tags the same sentence states the tag contract, because
+# a model asked for tags must never be corrected towards JSON. The unreadable
+# one names the parser's own complaint, because "invalid JSON" without the
+# position is a thing to guess at rather than a thing to fix; the one for an
+# action that raised names the types, because `execute_action` reads its
+# arguments straight off the object and a key of the wrong type is the mistake
+# being made.
+def _correction(kind, **fields):
+    """A sentence about the shape of a reply, in the reply format in force now.
+
+    Read at call time: Settings can change the format between two questions.
+    """
+    return agent_protocol.correction(kind, agent_config.PROTOCOL, **fields)
+
+
+# A tag parser's complaint quotes the model's own text back ("Text '...' sits
+# loose inside ..."), and `console.print` reads square brackets as markup: a
+# quoted "[/x]" is a closing tag with nothing open, which rich raises on. The
+# JSON parser's complaints never carried the model's words, so this is new.
+try:
+    from rich.markup import escape as _escape_markup
+except Exception:  # no rich: the plain console strips markup-shaped text itself
+    def _escape_markup(text):
+        return str(text)
+
 
 # And what the turn records when the model never managed a usable reply. It
 # says how many attempts it took rather than "it failed", because the next
 # turn is shown this sentence and a count is a fact it can act on.
 _UNUSABLE_OUTCOME = "the model could not produce a usable action in %d attempts"
-
-# What the model is told when the action was well formed but would not run.
-# `execute_action` reads its arguments straight out of the object, so a key of
-# the wrong type raised out of the loop and took the whole program with it --
-# a model writing "start": "12" instead of 12 could end the session. The types
-# are named in the complaint because that is the mistake being made.
-_ACTION_RAISED = (
-    "INVALID: the action '%s' could not run with those arguments -- it raised "
-    "%s: %s\nCheck the type of every key you sent: paths and text are strings, "
-    "line numbers are unquoted numbers, flags are unquoted true or false. Emit "
-    "a corrected action."
-)
 
 # What the model is told after a `send_message`, so the turn goes on. It says
 # the task is NOT finished in as many words, because the one mistake this verb
@@ -1086,6 +1095,10 @@ def run_ci(args):
             return agent_ci.EXIT_USAGE
         agent_config.refresh_model()
         agent_config.refresh_effort()
+        # Included here, unlike refresh_auto_update below, because it changes
+        # what the model is asked to write -- a pipeline's reply format is part
+        # of what it runs, not a preference about how TMT looks after itself.
+        agent_config.refresh_protocol()
         agent_config.refresh_project_context()
         # Deliberately NOT refresh_auto_update: a CI run never updates itself.
         # `run_splash` is what performs an update and it is not called here, so
@@ -1154,6 +1167,10 @@ def main(argv=None):
     # and would otherwise be written but never read, so /effort would last a
     # session and quietly revert on the next launch.
     agent_config.refresh_effort()
+    # And the reply format, for the same reason: it is stored beside the model
+    # and the effort level, and a toggle in Settings that was written and never
+    # re-read would last one session and quietly revert.
+    agent_config.refresh_protocol()
     # And whether TMT checks itself for updates. Read here beside the other
     # two so a setting toggled in the menu is live on the next launch rather
     # than written and never read -- the exact bug refresh_effort exists for.
@@ -1341,6 +1358,9 @@ def _return_to_menu(session, manager, prompt_box, pad, root):
         return False
     agent_config.refresh_model()
     agent_config.refresh_effort()
+    # The reply format too: Settings is reachable from here, and the very next
+    # task should be asked in whichever format the user just chose.
+    agent_config.refresh_protocol()
     agent_config.refresh_auto_update()
     # And the project context, beside them and for the same reason. This is
     # the site that makes the toggle actually work mid-session: Settings is
@@ -1926,9 +1946,22 @@ def _session_loop(root, ci=None):
                     console.print("[bold red]Circuit Breaker Tripped:[/bold red] Identical response 3 times in a row. Stopping.")
                     turn_state["outcome"] = "the model repeated itself and was stopped"
                     break
+                # Whatever is appended to what the model is handed back for
+                # THIS reply when it came in the other reply format. Empty
+                # until the reply has been read, so a reply that could not be
+                # read is never told it "was accepted".
+                drift_tail = ""
                 try:
-                    obj = json.loads(raw)
-                except json.JSONDecodeError as error:
+                    # Either protocol, whichever the text is: the prompt is
+                    # strict about the format and the reader is not, so a JSON
+                    # reply under tags (or tags under JSON) is read rather
+                    # than refused. `raw` itself is left exactly as the model
+                    # wrote it -- it is what the history echoes, what the
+                    # breaker compares and what the session records.
+                    obj = agent_protocol.parse(raw)
+                    if not isinstance(obj, dict):
+                        raise agent_protocol.ProtocolError(_correction("not_an_object"))
+                except (ValueError, TypeError) as error:
                     # Handed back rather than fatal. An action that fails
                     # validation has always been returned to the model to be
                     # corrected; a reply that would not parse was not, and it
@@ -1936,13 +1969,25 @@ def _session_loop(root, ci=None):
                     # the turn had already done and making the user ask the
                     # same question again. The two are the same kind of
                     # mistake and now get the same answer.
-                    console.print(f"[yellow]Unreadable reply, asking again:[/yellow] {error}")
-                    if hand_back(raw, _UNREADABLE_FEEDBACK % error):
+                    console.print("[yellow]Unreadable reply, asking again:[/yellow] "
+                                  + _escape_markup(str(error)))
+                    if hand_back(raw, _correction("unreadable", error=error)):
                         continue
                     relay.release()
                     console.print("[red]Gave up:[/red] the reply still could not be read.")
                     turn_state["outcome"] = _UNUSABLE_OUTCOME % retries
                     break
+                # The reply was read, but in the format that is NOT in force.
+                # Accepted -- never refused for this -- and said twice: one
+                # row for the user, and one line on the result the model is
+                # handed for this action, which is the `_MISSING_PROGRESS`
+                # shape: it rides on a result, so it costs no step.
+                came_as = agent_protocol.detect(raw)
+                drifted = agent_protocol.drift(agent_config.PROTOCOL, came_as)
+                if drifted:
+                    transcript.emit_kind("warning", agent_protocol.drift_notice(
+                        agent_config.PROTOCOL, came_as))
+                    drift_tail = "\n" + drifted
                 # A reply this program made up because it could not read what
                 # the model sent. Which failure it stands for decides what to
                 # do with it: a parse failure is the model's to correct, so it
@@ -1954,8 +1999,9 @@ def _session_loop(root, ci=None):
                 # falls through and is shown, which is the safety valve.
                 if synthetic_reason(obj) == PARSE_FAILURE:
                     complaint = str(obj.get("message") or "the reply could not be read")
-                    console.print(f"[yellow]Unreadable reply, asking again:[/yellow] {complaint}")
-                    if hand_back(raw, _UNREADABLE_FEEDBACK % complaint):
+                    console.print("[yellow]Unreadable reply, asking again:[/yellow] "
+                                  + _escape_markup(complaint))
+                    if hand_back(raw, _correction("unreadable", error=complaint)):
                         continue
                     relay.release()
                     turn_state["outcome"] = _UNUSABLE_OUTCOME % retries
@@ -1970,9 +2016,7 @@ def _session_loop(root, ci=None):
                     said = str(obj.get("message") or "").strip()
                     if said:
                         transcript.emit_kind("progress", said)
-                    if hand_back(raw, "That was prose, and nothing has run yet, so it "
-                                      "announced work rather than reporting it. Emit the "
-                                      "action you just described, as one JSON object."):
+                    if hand_back(raw, _correction("prose_before_work")):
                         continue
                     relay.release()
                     turn_state["outcome"] = _UNUSABLE_OUTCOME % retries
@@ -1987,7 +2031,7 @@ def _session_loop(root, ci=None):
                 if "actions" in obj:
                     batch = obj["actions"]
                     if not isinstance(batch, list) or not batch:
-                        if hand_back(raw, "INVALID: 'actions' must be a non-empty list. Try again."):
+                        if hand_back(raw, _correction("actions_not_list")):
                             continue
                         relay.release()
                         turn_state["outcome"] = _UNUSABLE_OUTCOME % retries
@@ -2051,8 +2095,9 @@ def _session_loop(root, ci=None):
                             # can fix it, so it is handed back with the rest of
                             # the batch's results, exactly as a validation
                             # failure is.
-                            invalid = _ACTION_RAISED % (sub_action,
-                                                        type(error).__name__, error)
+                            invalid = _correction("action_raised", action=sub_action,
+                                                  raised=type(error).__name__,
+                                                  error=error)
                             break
                         turn_state["acted"] = True
                         session.count_event(
@@ -2069,6 +2114,16 @@ def _session_loop(root, ci=None):
                             ci.note_action(sub_action,
                                            _paths_named(sub_action, sub_obj))
                         if sub_action == END_CONVERSATION:
+                            # The batch that ends the turn was a round, and the
+                            # single-action path counts its own before this same
+                            # test. This exit leaves by the bare `break` below
+                            # the for loop and never reaches the `else` that
+                            # counts a batch which goes on, so without this a
+                            # turn whose only reply was one batch reported 0
+                            # turns -- a figure nobody measured, in the CI
+                            # summary's `turns`. Once, and only here: the other
+                            # three batch exits count themselves.
+                            steps += 1
                             # The project's memory, written before the answer
                             # goes out and after every gate has agreed to let
                             # it. Both terminal paths do this and neither can
@@ -2099,7 +2154,8 @@ def _session_loop(root, ci=None):
                         messages.extend([{"role": "assistant", "content": raw},
                                          {"role": "user",
                                           "content": result_content(
-                                              f"Batch results:\n{chr(10).join(results)}\nOutput your next action.",
+                                              f"Batch results:\n{chr(10).join(results)}\nOutput your next action."
+                                              + drift_tail,
                                               batch)}])
                         continue
                     if held:
@@ -2115,14 +2171,14 @@ def _session_loop(root, ci=None):
                             {"role": "assistant", "content": raw},
                             {"role": "user",
                              "content": result_content(
-                                 "Batch results:\n%s\n%s" % (ran, held),
+                                 "Batch results:\n%s\n%s" % (ran, held) + drift_tail,
                                  batch)}])
                         continue
                     if invalid:
                         console.print(f"[red]Invalid action in batch:[/red] {invalid}")
                         ran = chr(10).join(results) if results else "Nothing ran."
-                        if hand_back(raw, f"INVALID: {invalid}\nRan before it:\n{ran}\n"
-                                          "Output a corrected action JSON."):
+                        if hand_back(raw, _correction("invalid_in_batch",
+                                                      invalid=invalid, ran=ran)):
                             continue
                         relay.release()
                         turn_state["outcome"] = _UNUSABLE_OUTCOME % retries
@@ -2131,7 +2187,7 @@ def _session_loop(root, ci=None):
                 error = validate_action(obj)
                 if error:
                     console.print(f"[red]Invalid action:[/red] {error}")
-                    if hand_back(raw, f"INVALID: {error}. Output a corrected action JSON."):
+                    if hand_back(raw, _correction("invalid", error=error)):
                         continue
                     relay.release()
                     turn_state["outcome"] = _UNUSABLE_OUTCOME % retries
@@ -2149,7 +2205,7 @@ def _session_loop(root, ci=None):
                     steps += 1
                     retries = 0
                     messages.extend([{"role": "assistant", "content": raw},
-                                     {"role": "user", "content": _MESSAGE_SENT}])
+                                     {"role": "user", "content": _MESSAGE_SENT + drift_tail}])
                     continue
                 # The plan's gate, and it is taken BEFORE the action runs.
                 # `respond` has no side effect worth avoiding, but running it
@@ -2164,7 +2220,7 @@ def _session_loop(root, ci=None):
                     steps += 1
                     retries = 0
                     messages.extend([{"role": "assistant", "content": raw},
-                                     {"role": "user", "content": held}])
+                                     {"role": "user", "content": held + drift_tail}])
                     continue
                 # The before-picture, taken once per turn and only when
                 # something that could change the workspace is about to run.
@@ -2182,7 +2238,9 @@ def _session_loop(root, ci=None):
                     # and out of main. It is the model's mistake, so it is
                     # handed back like every other one.
                     console.print(f"[red]Action failed:[/red] {type(error).__name__}: {error}")
-                    if hand_back(raw, _ACTION_RAISED % (action, type(error).__name__, error)):
+                    if hand_back(raw, _correction("action_raised", action=action,
+                                                  raised=type(error).__name__,
+                                                  error=error)):
                         continue
                     relay.release()
                     turn_state["outcome"] = _UNUSABLE_OUTCOME % retries
@@ -2231,7 +2289,8 @@ def _session_loop(root, ci=None):
                 messages.extend([{"role": "assistant", "content": raw},
                                  {"role": "user",
                                   "content": result_content(
-                                      build_result_message(action, result, obj),
+                                      build_result_message(action, result, obj)
+                                      + drift_tail,
                                       [obj])}])
             else:
                 # Thirty-five rounds and no final action. The work that did

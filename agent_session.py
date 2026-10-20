@@ -142,9 +142,11 @@ class Turn:
     def messages(self):
         """The turn as TMT's own provider-independent messages.
 
-        The answer is carried as the JSON action the model speaks in, not as
-        the bare sentence. Every other assistant message in a request is a
-        JSON object -- that is the whole of what the system prompt demands --
+        The answer is carried as the action the model speaks in -- a JSON
+        object or a tag block, whichever reply format is in force (see
+        `_carried`) -- not as the bare sentence. Every other assistant message
+        in a request is an action in that format -- that is the whole of what
+        the system prompt demands --
         and dropping loose prose into the same array put examples of the
         forbidden shape in front of the model, in its own voice, immediately
         before asking it not to use that shape. The words are the model's own
@@ -163,13 +165,32 @@ class Turn:
             message = self.answer
             if self.facts:
                 message += "\n\nIn that turn: " + ", ".join(self.facts)
-            out.append({"role": "assistant",
-                        "content": json.dumps({"action": "end_conversation",
-                                               "message": message})})
+            out.append({"role": "assistant", "content": _carried(message)})
         return out
 
     def size(self):
         return sum(estimate_tokens(message["content"]) for message in self.messages())
+
+
+def _carried(message):
+    """A carried answer, written as the ending the model speaks in NOW.
+
+    The reply format is read at the moment the request is built -- this runs
+    inside `begin_turn` every turn -- so a session that switched formats in
+    Settings carries its earlier answers in the new one. Under JSON it is the
+    exact `json.dumps` it always was; under tags it is the tag block, because
+    an assistant turn in the other format is a worked example of the shape the
+    prompt has just forbidden, in the model's own voice. A message the tag
+    writer cannot express falls back to JSON rather than dropping the answer.
+    """
+    obj = {"action": "end_conversation", "message": message}
+    try:
+        import agent_protocol
+        if agent_protocol.normal(getattr(agent_config, "PROTOCOL", None)) == agent_protocol.TAGS:
+            return agent_protocol.render(obj, agent_protocol.TAGS)
+    except Exception:
+        pass
+    return json.dumps(obj)
 
     def __repr__(self):
         return "Turn(task=%r, answer=%r, outcome=%r)" % (

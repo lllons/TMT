@@ -342,7 +342,10 @@ def _config(argument, session):
                 agent_config.max_tokens_for_effort(),
                 agent_config.rounds_for_effort())),
             ("Streaming", "on" if agent_config.STREAM_ENABLED else "off"),
-            ("JSON mode", "on" if agent_config.USE_JSON_MODE else "off"),
+            ("Reply format", agent_config.PROTOCOL),
+            ("JSON mode", "off (tags)"
+             if getattr(agent_config, "PROTOCOL", "json") == "tags"
+             else ("on" if agent_config.USE_JSON_MODE else "off")),
             ("Workspace", str(workspace)),
             ("Install", str(agent_config.INSTALL_DIR))]
     # Whether a key exists. Not the key, and not a masked form of it either:

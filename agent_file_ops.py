@@ -256,6 +256,40 @@ def _unreadable_document(head, path):
         return ""
 
 
+def _example_action(obj):
+    """An action written in the reply format in force, or None.
+
+    Read when the sentence is BUILT, never at import: the reply format is a
+    setting the user can change between two turns, and a hint that taught the
+    other shape would be teaching the model to leave the one it was asked to
+    use. Lazy for `_unreadable_document`'s reason. Only TAGS goes through
+    `agent_protocol`; JSON hints below are written by hand, exactly as they
+    always were, so what a model has been told under JSON does not move.
+    """
+    if agent_config.PROTOCOL != "tags":
+        return None
+    try:
+        import agent_protocol
+        return agent_protocol.example(obj, "tags")
+    except Exception:
+        return None
+
+
+def _flag_hint(name):
+    """One flag set to true, as the model should write it: `"apply": true`
+    under JSON, `/apply/ true //apply/` under tags. A key on its own, because
+    the rest of the action is whatever the model already wrote."""
+    if agent_config.PROTOCOL == "tags":
+        return f"/{name}/ true //{name}/"
+    return f'"{name}": true'
+
+
+def _path_action(action, path):
+    """`action` reading `path`, as the model should write it back to us."""
+    return (_example_action({"action": action, "path": path})
+            or f'{{"action":"{action}","path":"{path}"}}')
+
+
 def read_file(path):
     """The whole of a text file, or a sentence saying why it is not text.
 
@@ -288,7 +322,7 @@ def read_file(path):
     if media:
         return (f"{path} is a {media.split('/')[-1].upper()} image, not text. "
                 f"Use view_image to look at it: "
-                f'{{"action":"view_image","path":"{path}"}}')
+                f'{_path_action("view_image", path)}')
     # And the same question again for a document. Asked before the NUL sniff
     # for the reason the image question is: `sniff` reads a signature, which
     # is a fact, and `_looks_binary` is a heuristic. It is asked SECOND
@@ -298,7 +332,7 @@ def read_file(path):
     if document:
         return (f"{path} is {document}, not text. Use read_document to read "
                 f"it -- it converts the file to Markdown: "
-                f'{{"action":"read_document","path":"{path}"}}')
+                f'{_path_action("read_document", path)}')
     if _looks_binary(head):
         return (f"{path} is a binary file, not text. read_file only reads "
                 f"text. If it is an image use view_image, and if it is a "
@@ -653,8 +687,8 @@ def replace_across(search, replace, glob=None, path=None, apply=False):
         out.append(f"  The walk stopped at {WORKSPACE_MAX_SCAN} entries, so "
                    "files beyond that were never examined.")
     if changed and not apply:
-        out.append('Nothing on disk was touched. Re-run with "apply": true to '
-                   "make these changes.")
+        out.append(f"Nothing on disk was touched. Re-run with {_flag_hint('apply')} "
+                   "to make these changes.")
     return "\n".join(out)
 
 
@@ -687,7 +721,11 @@ def delete_folder(path, recursive=False, confirm=None):
         return f"Not a folder: {path} — use delete_file instead"
     contents = list(p.rglob("*"))
     if contents and not recursive:
-        return f"{path} is not empty ({len(contents)} items). Retry with \"recursive\": true to delete everything inside."
+        # JSON hints at the key, as ever; tags show the whole action, which
+        # is what a model acts on.
+        retry = _example_action({"action": "delete_folder", "path": path,
+                                 "recursive": True}) or '"recursive": true'
+        return f"{path} is not empty ({len(contents)} items). Retry with {retry} to delete everything inside."
     label = f"{path} and {len(contents)} items inside" if contents else path
     if not _confirmed(f"Delete {label}?", confirm):
         return "Delete cancelled"

@@ -55,6 +55,44 @@ def isolate_checkpoints():
         return None
 
 
+def isolate_reply_format():
+    """Pin the model reply format to "json" for this run, whatever is on disk.
+
+    The reply format is a per-installation setting (`.tmt_protocol` in
+    INSTALL_DIR) with a default of "tags", and a developer can change it in
+    Settings. The 2,794 tests that existed before the setting did were all
+    written against the JSON protocol, and they must keep meaning what they
+    meant whichever format this machine happens to be set to -- the same
+    argument as the credential sandbox: a test that reads the machine is
+    asking a question about the machine it is running on. So the file is
+    pointed at a temporary one that says "json", and the live value with it.
+
+    Tests of the tag protocol opt in explicitly, through `ReplyFormat` in
+    `test_agent_reply_format`, which redirects the file again for the length of
+    one test and puts this one back.
+
+    Nothing is restored: the process ends and the directory is removed by the
+    caller, the same lifecycle as `isolate_checkpoints`. `testing/conftest.py`
+    does the same for a pytest run, and the two are kept in step.
+
+    Must run before any test module is imported, because a module that read
+    `agent_config.PROTOCOL` at import would otherwise have read the real one.
+
+    Returns the directory to remove afterwards, or None when it could not be
+    redirected -- which must not stop the suite running.
+    """
+    try:
+        import agent_config
+        temporary = Path(tempfile.mkdtemp(prefix="tmt_rf_suite_")).resolve()
+        protocol_file = temporary / ".tmt_protocol"
+        protocol_file.write_text("json\n", encoding="utf-8")
+        agent_config.PROTOCOL_FILE = protocol_file
+        agent_config.PROTOCOL = "json"
+        return temporary
+    except Exception:
+        return None
+
+
 def add_to_path(directory):
     """Put a directory first on sys.path, once."""
     text = str(directory)
@@ -80,11 +118,15 @@ def run():
     # single test runs, because the first driven session that writes a file
     # takes a checkpoint.
     checkpoints = isolate_checkpoints()
+    # Beside it, and for the same reason: before a single test module is
+    # imported, so nothing reads the reply format this machine is set to.
+    reply_format = isolate_reply_format()
     try:
         return _collect(paths)
     finally:
-        if checkpoints is not None:
-            shutil.rmtree(str(checkpoints), ignore_errors=True)
+        for temporary in (checkpoints, reply_format):
+            if temporary is not None:
+                shutil.rmtree(str(temporary), ignore_errors=True)
 
 
 def _collect(paths):

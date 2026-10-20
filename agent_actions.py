@@ -320,12 +320,30 @@ _WORKERS_STILL_RUNNING = (
     "stop them with kill_agent), then request the review again."
 )
 
-_REVIEW_AGENDA_ELSEWHERE = (
+_REVIEW_AGENDA_ELSEWHERE_SAID = (
     "REFUSED: 'review_agenda' belongs to the independent reviewer and is "
     "applied inside its own run. It writes to that reviewer's checklist, and "
     "you do not have one. Nothing was changed. Start a review with "
-    "{\"action\":\"review\"} if this task needs one."
+    "%s if this task needs one."
 )
+# The sentence as JSON says it, which is the sentence it always was. What is
+# actually returned is `_review_agenda_elsewhere()`, whose example is written
+# in the reply format in force at the moment it is said.
+_REVIEW_AGENDA_ELSEWHERE = _REVIEW_AGENDA_ELSEWHERE_SAID % '{"action":"review"}'
+
+
+try:
+    from agent_protocol import hint as _hint
+except Exception:           # a frozen module list lacking agent_protocol
+    def _hint(obj, as_json=None):
+        import json
+        if as_json is not None:
+            return as_json
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _review_agenda_elsewhere():
+    return _REVIEW_AGENDA_ELSEWHERE_SAID % _hint({"action": "review"})
 
 # The values "scope" understands. One, for now, and a wrong one is named
 # rather than ignored: a model that asked for "changed_files" and silently got
@@ -1641,7 +1659,7 @@ def execute_action(obj, context=None):
     # Answered with a sentence rather than left to fall through to "Unknown
     # action", which would be a true statement that sends the reader looking
     # for a typo. This one names where the verb lives and who may use it.
-    if action == "review_agenda": return _REVIEW_AGENDA_ELSEWHERE
+    if action == "review_agenda": return _review_agenda_elsewhere()
     # The project's persistent memory. It DOES write files -- two markdown
     # files in the workspace -- but deliberately not to MUTATING_ACTIONS: the
     # cached system prompt describes the project's SOURCE, and TMT_Context is
@@ -1873,8 +1891,14 @@ LEGACY_BLOCKED_KEY = "_legacy_blocked"
 _LEGACY_RUN_REFUSED = (
     "FAILED: run_file and run_python are gone -- commands run through the bash "
     "action now. TMT could not translate that one for you because %s. Emit "
-    "{\"action\":\"bash\",\"command\":\"...\"} with the command that runs it."
+    "%s with the command that runs it."
 )
+
+
+def _legacy_run_refused(reason):
+    """The refusal, its example written in the reply format in force now."""
+    return _LEGACY_RUN_REFUSED % (reason, _hint({"action": "bash", "command": "..."}))
+
 
 # Whether a path can go into a command line as it stands. A WHITELIST of the
 # characters that are certainly ordinary, so anything else -- a space, a
@@ -1921,17 +1945,17 @@ def _legacy_bash_command(obj):
     """
     path = obj.get("path")
     if not isinstance(path, str) or not path.strip():
-        return "", _LEGACY_RUN_REFUSED % "it named no path to run"
+        return "", _legacy_run_refused("it named no path to run")
     path = path.strip()
     extension = _legacy_extension(path)
     runner = RUNNERS.get(extension)
     if not runner:
-        return "", _LEGACY_RUN_REFUSED % (
+        return "", _legacy_run_refused(
             "'%s' has no runner TMT knows about (it knows %s)" % (extension, ", ".join(RUNNERS))
             if extension else
             "that path has no extension for TMT to choose a runner from")
     if "'" in path:
-        return "", _LEGACY_RUN_REFUSED % (
+        return "", _legacy_run_refused(
             "that path contains a quote and TMT will not guess how to escape it")
     quoted = "'%s'" % path if _LEGACY_PLAIN_PATH.search(path) else path
     return " ".join(part.replace("{file}", quoted) for part in runner), ""

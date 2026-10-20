@@ -14,24 +14,22 @@ import agent_config
 # text-capable chat models. The zero-priced list also carries audio models, a
 # safety classifier and a router alias; none of those can drive a coding agent,
 # so none of them are here.
+# A FREE TIER IS SOMEBODY ELSE'S BUSINESS DECISION, AND THIS LIST ROTS.
+# `minimax/minimax-m3:free` and `z-ai/glm-5.2:free` were both here until
+# 2026-09-08, when both began answering HTTP 404 with "This model is
+# unavailable for free. The paid version is available now" -- and the first of
+# them was DEFAULT_MODEL, so a fresh install picked a dead model off its own
+# first screen. Every entry below was checked against OpenRouter's live model
+# listing on that date: zero-priced for both prompt and completion, text
+# input, and each one sent a real request that came back with the JSON it was
+# asked for. That is a measurement with a date on it, not a guarantee; when a
+# model here starts 404ing, this is the list to re-check.
 FREE_MODELS = (
     {
-        "id": "minimax/minimax-m3:free",
-        "label": "MiniMax M3",
-        "context": 1048576,
-        "note": "very large context, good all-rounder",
-    },
-    {
-        "id": "z-ai/glm-5.2:free",
-        "label": "GLM 5.2",
-        "context": 256000,
-        "note": "strong on code",
-    },
-    {
-        "id": "cohere/north-mini-code:free",
-        "label": "Cohere North Mini Code",
-        "context": 256000,
-        "note": "built for code",
+        "id": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "label": "Nemotron 3 Ultra 550B",
+        "context": 1000000,
+        "note": "frontier reasoning, very large context",
     },
     {
         "id": "nvidia/nemotron-3-super-120b-a12b:free",
@@ -40,10 +38,31 @@ FREE_MODELS = (
         "note": "large reasoning model",
     },
     {
+        "id": "nvidia/nemotron-3.5-lightning:free",
+        "label": "Nemotron 3.5 Lightning",
+        "context": 1000000,
+        "note": "fast, very large context",
+    },
+    {
+        "id": "cohere/north-mini-code:free",
+        "label": "Cohere North Mini Code",
+        "context": 256000,
+        "note": "built for code",
+    },
+    {
         "id": "poolside/laguna-s-2.1:free",
         "label": "Poolside Laguna S 2.1",
         "context": 262144,
         "note": "code-focused",
+    },
+    {
+        # Last, and the note says what it is for rather than how big it is:
+        # its vendor describes it as finance-tuned, which is the one thing a
+        # reader choosing a model to write code with needs to know about it.
+        "id": "inclusionai/ling-3.0-flash-fin:free",
+        "label": "Ling 3.0 Flash Fin",
+        "context": 262144,
+        "note": "finance-tuned",
     },
 )
 
@@ -140,7 +159,24 @@ def current_model(provider_id=None):
         override = os.environ.get("OPENROUTER_MODEL", "").strip()
         if override:
             return override
-    return read_saved_model(provider_id) or provider_default(provider_id)
+    saved = read_saved_model(provider_id)
+    # A SAVED CHOICE THE CATALOGUE NO LONGER OFFERS IS DROPPED, and that is
+    # what makes a catalogue change reach anybody who has already used
+    # Settings. `set_model` refuses an id the provider does not offer, so a
+    # saved id was valid when it was written -- what invalidates it later is
+    # the list moving underneath it, which is exactly what happened on
+    # 2026-09-08 when `minimax/minimax-m3:free` left the free tier. Without
+    # this, updating TMT changed the catalogue and every existing user went on
+    # running the dead model, because the file wins over the default.
+    #
+    # Only where the provider HAS a catalogue to check against: `set_model`
+    # allows any id for a provider that offers no list, and dropping one of
+    # those would throw away a deliberate choice.
+    if saved:
+        offered = known_ids(provider_id)
+        if not offered or saved in offered:
+            return saved
+    return provider_default(provider_id)
 
 
 def set_model(model_id, provider_id=None):

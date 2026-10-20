@@ -182,6 +182,11 @@ SETTINGS_ITEMS = (
     # than into TMT's own directory, which is true of nothing else in here.
     ("projectcontext", "Project Context",
      "Keep TMT_Context/notes.md and progress.md in each project"),
+    # The third switch, drawn the same way. Its detail names both values
+    # because there is no screen behind it to explain them: Enter flips it, so
+    # the row has to say what it is flipping between.
+    ("protocol", "Model Reply Format",
+     "The shape the model writes its actions in"),
     # Last before Back, and it is the position that does the work: everything
     # above it changes what TMT does next, and this ends TMT. A row that can
     # remove the program does not sit between two rows that set a preference,
@@ -229,6 +234,11 @@ AUTO_UPDATE_LABELS = ("OFF", "ON")
 # shared one so that either row can change its wording without silently
 # changing the other's.
 PROJECT_CONTEXT_LABELS = ("OFF", "ON")
+
+# The third switch, and the first whose two states are names rather than on and
+# off: keyed by what `agent_config` stores, upper case for the reason ON and OFF
+# are, so the state reads as a state next to the sentence that describes it.
+PROTOCOL_LABELS = {"tags": "TAGS", "json": "JSON"}
 
 # One per keystroke, and the only thing the key screen ever echoes. ASCII on
 # purpose: it is drawn on every terminal, including the ones that cannot carry
@@ -2107,6 +2117,41 @@ def toggle_project_context():
     return project_context_text()
 
 
+def protocol_text():
+    """"TAGS" or "JSON" for the model reply format, read from disk each time.
+
+    The same shape as `auto_update_text` and for the same two reasons: read
+    rather than cached so the row is right immediately after a toggle without
+    anything having to invalidate anything, and guarded to the default so a
+    settings file that cannot be read draws a menu rather than stopping one.
+    """
+    try:
+        return PROTOCOL_LABELS[agent_config.read_saved_protocol()]
+    except Exception:
+        return PROTOCOL_LABELS[agent_config.DEFAULT_PROTOCOL]
+
+
+def toggle_protocol():
+    """Flip the reply format and return what it now says. Never raises.
+
+    A failed write is reported by leaving the row where it was rather than by
+    stopping the menu, exactly as `toggle_auto_update` does: the user is
+    standing in Settings and the honest signal that nothing happened is that
+    nothing changed on the row they are looking at.
+
+    The flip is made from what is on DISK, not from the live value in
+    `agent_config.PROTOCOL`, because the row draws from disk. Flipping from
+    the live value would make the row and the next press disagree whenever the
+    two differ.
+    """
+    try:
+        current = agent_config.read_saved_protocol()
+        agent_config.set_protocol("json" if current == "tags" else "tags")
+    except Exception:
+        pass
+    return protocol_text()
+
+
 def _settings_suffix(entry):
     """The value drawn on the right of a Settings row, or "" for a screen.
 
@@ -2120,6 +2165,8 @@ def _settings_suffix(entry):
         return "  " + auto_update_text()
     if entry == "projectcontext":
         return "  " + project_context_text()
+    if entry == "protocol":
+        return "  " + protocol_text()
     return ""
 
 
@@ -4924,6 +4971,11 @@ def settings_screen(stream=None, key_reader=None, region=None, active_id=None,
                 # rebuilt on the next pass of `_drive`, which re-reads the
                 # setting, so the row shows the new value immediately.
                 toggle_auto_update()
+            elif entry == "protocol":
+                # The third switch, toggled in place for the same reason as
+                # the other two: there is no screen behind it, and the row
+                # re-reads the file on the next pass of `_drive`.
+                toggle_protocol()
             elif entry == "provider":
                 provider_setup(stream=stream, key_reader=key_reader, region=region,
                                text_reader=text_reader)

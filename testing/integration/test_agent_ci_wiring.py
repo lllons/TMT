@@ -233,6 +233,87 @@ def test_a_run_that_writes_reports_the_files_it_named():
         box.close()
 
 
+def batch_reply(*actions):
+    """One reply carrying several actions: the `{"actions": [...]}` shape."""
+    return json.dumps({"actions": list(actions)})
+
+
+READ = {"action": "read_file", "path": "app.py", "progress": "reading it"}
+ENDING = {"action": "end_conversation", "message": "Fixed it. Tests pass."}
+
+
+# --- the turn count ----------------------------------------------------------
+
+def test_a_batch_that_ends_the_turn_is_counted_as_the_round_it_was():
+    """One reply, one batch, and the batch ends with `end_conversation`: one
+    round. That exit leaves the loop by a `break` of its own and used to skip
+    the count the single-action path makes, so the summary said `turns: 0` and
+    the footer `0 turns` for a run that took exactly one -- a number nobody
+    measured, in the one field a pipeline reads to see how long a task took."""
+    code, out, err, box, seen = ci(
+        ["--ci", "--json", "read it and finish"],
+        [batch_reply(READ, ENDING)])
+    try:
+        assert code == agent_ci.EXIT_OK, (code, err)
+        body = json.loads(out)
+        assert body["status"] == "completed", body
+        assert body["turns"] == 1, body["turns"]
+        assert len(seen) == 1, "one reply was all the model was asked for"
+    finally:
+        box.close()
+
+
+def test_the_footer_of_a_batch_that_ends_the_turn_says_one_turn():
+    """The same run read the way a build log reads it. The footer is the
+    human form of the number above and is printed only without `--json`, so
+    it is its own run: it said `completed (0 turns, ...)` for a task that had
+    taken a round."""
+    code, out, err, box, _ = ci(
+        ["--ci", "read it and finish"],
+        [batch_reply(READ, ENDING)])
+    try:
+        assert code == agent_ci.EXIT_OK, (code, err)
+        assert "TMT CI: completed (1 turn," in err, err
+        assert "(0 turns" not in err, err
+    finally:
+        box.close()
+
+
+def test_a_batch_that_goes_on_then_a_batch_that_ends_are_two_rounds():
+    """Two replies, two rounds: the batch that goes on counts itself in the
+    `else` of its for loop and the one that ends counts itself at the answer.
+    Each exactly once, so the run reports 2 and not 3, and the round budget is
+    spent by what was done rather than by how the exit was reached -- two
+    rounds fit a `--max-turns 2` run and it still completes."""
+    code, out, err, box, seen = ci(
+        ["--ci", "--json", "--max-turns", "2", "read it twice and finish"],
+        [batch_reply(READ), batch_reply(READ, ENDING)])
+    try:
+        assert code == agent_ci.EXIT_OK, (code, err)
+        body = json.loads(out)
+        assert body["status"] == "completed", body
+        assert body["turns"] == 2, body["turns"]
+        assert len(seen) == 2, len(seen)
+    finally:
+        box.close()
+
+
+def test_a_batch_that_goes_on_then_a_single_ending_is_two_rounds():
+    """The path that already counted, pinned beside the one that did not: a
+    batch that goes on and then a lone `end_conversation` is two rounds, so the
+    fix to the batch exit is shown not to double count either neighbour."""
+    code, out, err, box, seen = ci(
+        ["--ci", "--json", "read it and finish"],
+        [batch_reply(READ), DONE])
+    try:
+        body = json.loads(out)
+        assert body["status"] == "completed", body
+        assert body["turns"] == 2, body["turns"]
+        assert len(seen) == 2, len(seen)
+    finally:
+        box.close()
+
+
 # --- the bounds --------------------------------------------------------------
 
 def test_max_turns_stops_the_run_with_its_own_status_and_code():

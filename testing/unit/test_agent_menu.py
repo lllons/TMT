@@ -27,6 +27,16 @@ from pathlib import Path
 import agent_config
 import agent_models
 
+# The model these tests draw frames with, taken FROM THE CATALOGUE rather than
+# written out. `z-ai/glm-5.2:free` was the literal here until 2026-09-08, when
+# it left OpenRouter's free tier and was removed -- and every frame test that
+# named it began drawing a raw id where it expected a friendly label, because
+# `describe()` resolves an id through this same list. What these tests need is
+# a model the catalogue KNOWS, not a particular one.
+SAMPLE = agent_models.FREE_MODELS[1]
+SAMPLE_ID = SAMPLE["id"]
+SAMPLE_LABEL = SAMPLE["label"]
+
 from test_agent_credentials import FAKE_KEY, Credentials
 
 # Colour and cursor moves, so a frame can be read as the terminal shows it.
@@ -212,12 +222,12 @@ def start(box, *names, **kwargs):
 
 # --- the catalogue and the saved choice -------------------------------------
 
-def test_the_catalogue_is_five_distinct_free_models():
+def test_the_catalogue_is_six_distinct_free_models():
     """A paid id in this list bills the user without warning, and a duplicate
     would make the Settings cursor land on two rows that mean the same thing."""
     ids = [model["id"] for model in agent_models.FREE_MODELS]
-    assert len(agent_models.FREE_MODELS) == 5, len(agent_models.FREE_MODELS)
-    assert len(set(ids)) == 5, ids
+    assert len(agent_models.FREE_MODELS) == 6, len(agent_models.FREE_MODELS)
+    assert len(set(ids)) == 6, ids
     for model in agent_models.FREE_MODELS:
         assert model["id"].endswith(":free"), model["id"]
         assert model["label"].strip(), model
@@ -225,17 +235,94 @@ def test_the_catalogue_is_five_distinct_free_models():
     assert agent_models.known_ids() == ids
 
 
-def test_the_default_is_the_model_users_already_have():
-    """The one that must not drift. Someone who never opens Settings has to
-    keep running on exactly what they ran on before the menu existed."""
+def test_the_catalogue_holds_no_model_known_to_have_left_the_free_tier():
+    """Named rather than described, because this list has rotted once already.
+
+    On 2026-09-08 both of these began answering HTTP 404 with "This model is
+    unavailable for free", and the first of them was the DEFAULT -- so a fresh
+    install picked a dead model off its own first screen and could not start a
+    turn. Nothing can stop a vendor withdrawing a free tier; what this stops is
+    the two known-dead ids coming back in a later edit.
+    """
+    ids = agent_models.known_ids()
+    assert "minimax/minimax-m3:free" not in ids
+    assert "z-ai/glm-5.2:free" not in ids
+
+
+def test_a_saved_model_the_catalogue_no_longer_offers_falls_back_to_the_default():
+    """What makes a catalogue change reach somebody who has used Settings.
+
+    `set_model` refuses an id the provider does not offer, so anything in the
+    file was valid when it was written; what invalidates it later is the list
+    moving underneath it. On 2026-09-08 `minimax/minimax-m3:free` left the
+    free tier and was removed from the catalogue -- and without this, every
+    user who had ever opened Settings went on running it after updating,
+    because the saved file wins over the default. The fix to the catalogue
+    would have reached only people who had never chosen a model.
+    """
+    box = Sandbox(saved="minimax/minimax-m3:free")
+    try:
+        assert agent_models.read_saved_model() == "minimax/minimax-m3:free"
+        assert agent_models.current_model() == agent_models.DEFAULT_MODEL
+    finally:
+        box.close()
+
+
+def test_a_saved_model_the_catalogue_still_offers_is_kept():
+    """The other direction, or the fallback above would ignore every choice."""
     box = Sandbox()
     try:
-        assert agent_models.DEFAULT_MODEL == "minimax/minimax-m3:free"
+        chosen = agent_models.FREE_MODELS[3]["id"]
+        agent_models.set_model(chosen)
+        assert agent_models.current_model() == chosen
+    finally:
+        box.close()
+
+
+def test_a_provider_with_no_catalogue_keeps_whatever_was_saved_for_it():
+    """`set_model` allows any id where a provider offers no list, so dropping
+    one of those would throw away a deliberate choice rather than a stale one."""
+    box = Sandbox()
+    try:
+        if not agent_models.known_ids("anthropic"):
+            agent_models.set_model("some/custom-model", "anthropic")
+            assert agent_models.current_model("anthropic") == "some/custom-model"
+    finally:
+        box.close()
+
+
+def test_the_two_places_a_default_model_lives_agree():
+    """`agent_config.MODEL` spells the default out a second time.
+
+    It cannot import `agent_models` -- that module imports this one -- so the
+    literal is duplicated, and a catalogue change that stops at the catalogue
+    leaves a fresh install pointing at whatever used to be first. That is
+    exactly how the dead default survived: the id was in two files and only
+    one of them was being looked at.
+
+    Read out of the SOURCE rather than off `agent_config.MODEL`, which is the
+    live value: `set_model` writes to it, `refresh_model` re-reads the saved
+    file into it, and by the time any test runs it holds whatever this machine
+    has chosen. The literal is the thing that has to agree.
+    """
+    source = Path(agent_config.__file__).read_text(encoding="utf-8")
+    found = re.search(r'MODEL = \(os\.environ.*?or\s+"([^"]+)"', source, re.S)
+    assert found, "the MODEL default in agent_config.py has moved"
+    assert found.group(1) == agent_models.DEFAULT_MODEL, found.group(1)
+
+
+def test_the_default_is_the_first_model_in_the_catalogue():
+    """Someone who never opens Settings runs on this one, so it has to be a
+    model that answers -- the first entry, and the catalogue is ordered."""
+    box = Sandbox()
+    try:
+        expected = agent_models.FREE_MODELS[0]["id"]
+        assert agent_models.DEFAULT_MODEL == expected
         assert not agent_models.MODEL_FILE.exists()
         assert os.environ.get("OPENROUTER_MODEL") is None
-        assert agent_models.current_model() == "minimax/minimax-m3:free"
+        assert agent_models.current_model() == expected
         assert agent_models.read_saved_model() == ""
-        assert agent_models.describe() == "MiniMax M3"
+        assert agent_models.describe() == agent_models.FREE_MODELS[0]["label"]
     finally:
         box.close()
 
@@ -541,11 +628,11 @@ def test_the_running_status_states_every_fact_the_next_turn_runs_under():
     at the prompt itself rather than by scrolling back to the launch."""
     moment = datetime.datetime(2026, 8, 29, 15, 42, 7)
     probe = Path(os.sep + "tmt_probe" + os.sep + "chosen_workspace")
-    frame = "\n".join(status(provider_id="openrouter", model_id="z-ai/glm-5.2:free",
+    frame = "\n".join(status(provider_id="openrouter", model_id=SAMPLE_ID,
                              workspace=probe, moment=moment))
     assert has_wordmark(frame), frame
     assert "OpenRouter" in frame, frame
-    assert "GLM 5.2" in frame or "z-ai/glm-5.2:free" in frame, frame
+    assert SAMPLE_LABEL in frame or SAMPLE_ID in frame, frame
     assert str(probe) in frame, frame
     assert "29 Aug 2026" in frame, frame
     assert "15:42:07" in frame, frame
@@ -635,10 +722,10 @@ def test_the_meter_rides_on_the_caption_and_nothing_narrows_the_scrolling():
     This test is the guard. `\\033[...r` is DECSTBM; it must not appear."""
     caption = visible(menu().prompt_caption(
         Console(), 100, datetime.datetime(2026, 8, 29, 15, 42, 7),
-        provider_id="openrouter", model_id="z-ai/glm-5.2:free",
+        provider_id="openrouter", model_id=SAMPLE_ID,
         session=meter_session()))
     assert "+1231" in caption and "-123" in caption, caption   # the meter, left
-    assert "15:42:07" in caption and "GLM 5.2" in caption, caption  # facts, right
+    assert "15:42:07" in caption and SAMPLE_LABEL in caption, caption  # facts, right
     assert caption.index("+1231") < caption.index("15:42:07"), caption
     assert menu().display_width(caption) == 100, menu().display_width(caption)
 
@@ -646,7 +733,7 @@ def test_the_meter_rides_on_the_caption_and_nothing_narrows_the_scrolling():
     bare = visible(menu().prompt_caption(Console(), 100,
                                          datetime.datetime(2026, 8, 29, 15, 42, 7),
                                          provider_id="openrouter",
-                                         model_id="z-ai/glm-5.2:free"))
+                                         model_id=SAMPLE_ID))
     assert "+1231" not in bare, bare
     assert bare.strip().startswith("15:42:07"), bare
 
@@ -1126,7 +1213,7 @@ def test_an_uninstall_closes_tmt_rather_than_returning_to_a_menu():
         answer = menu().settings_screen(stream=stream,
                                         key_reader=Keys(*steps),
                                         region=menu().LiveRegion(stream),
-                                        active_id="z-ai/glm-5.2:free")
+                                        active_id=SAMPLE_ID)
     finally:
         menu().uninstall_screen = saved
     assert answer is menu().UNINSTALLED, answer
@@ -1170,17 +1257,17 @@ def test_the_settled_facts_are_in_the_header_and_the_moving_ones_on_the_box():
     probe = Path(os.sep + "tmt_probe" + os.sep + "chosen_workspace")
     header = "\n".join(visible(line) for line in menu().render_status_lines(
         stream=Console(), size=(100, 40), workspace=probe, moment=moment,
-        provider_id="openrouter", model_id="z-ai/glm-5.2:free"))
+        provider_id="openrouter", model_id=SAMPLE_ID))
     caption = visible(menu().prompt_caption(Console(), 80, moment,
                                             provider_id="openrouter",
-                                            model_id="z-ai/glm-5.2:free"))
+                                            model_id=SAMPLE_ID))
 
     assert "29 Aug 2026" in header and str(probe) in header, header
     assert "15:42:07" not in header, header
-    assert "OpenRouter" not in header and "GLM 5.2" not in header, header
+    assert "OpenRouter" not in header and SAMPLE_LABEL not in header, header
 
     assert "15:42:07" in caption and "OpenRouter" in caption, caption
-    assert "GLM 5.2" in caption, caption
+    assert SAMPLE_LABEL in caption, caption
     # Right-aligned, so it ends where the rule below it ends and the left
     # column stays clear for the markers and the '>'.
     assert caption.startswith(" "), repr(caption)
@@ -1191,16 +1278,16 @@ def test_the_running_status_reads_the_clock_rather_than_keeping_one():
     """The time on screen is the time the turn began, so it cannot be a value
     captured at launch and it cannot need a thread to move it."""
     first = status(moment=datetime.datetime(2026, 8, 29, 9, 5, 1),
-                   provider_id="openrouter", model_id="z-ai/glm-5.2:free")
+                   provider_id="openrouter", model_id=SAMPLE_ID)
     later = status(moment=datetime.datetime(2026, 8, 29, 9, 5, 2),
-                   provider_id="openrouter", model_id="z-ai/glm-5.2:free")
+                   provider_id="openrouter", model_id=SAMPLE_ID)
     assert "09:05:01" in "\n".join(first), first
     assert "09:05:02" in "\n".join(later), later
 
     # And with nothing passed, the clock is read from the system on each call.
     before = datetime.datetime.now()
     drawn = "\n".join(status(provider_id="openrouter",
-                             model_id="z-ai/glm-5.2:free"))
+                             model_id=SAMPLE_ID))
     after = datetime.datetime.now()
     stamps = {before.strftime("%H:%M:%S"), after.strftime("%H:%M:%S")}
     assert any(stamp in drawn for stamp in stamps), (drawn, sorted(stamps))
@@ -1249,7 +1336,7 @@ def test_the_running_status_fits_a_narrow_terminal_and_degrades_to_ascii():
                 rows = status(columns=columns, stream=stream,
                               workspace=workspace,
                               provider_id="openrouter",
-                              model_id="z-ai/glm-5.2:free")
+                              model_id=SAMPLE_ID)
                 # One spare column, and no upper bound on the other side: the
                 # interface fills the window it was given. The floor is the
                 # one known limit -- a terminal narrower than 24 columns
@@ -1263,14 +1350,25 @@ def test_the_running_status_fits_a_narrow_terminal_and_degrades_to_ascii():
                 assert has_wordmark(joined), (columns, joined)
                 assert "Task>" in joined, (columns, joined)
                 # What survives a narrow terminal is decided rather than
-                # incidental. The clock and which model answers are the last
-                # two facts standing; the provider's name is given up before
-                # either, because "GLM 5.2" says more about the next request
-                # than "OpenRouter" does.
-                assert "GLM 5.2" in joined, (columns, joined)
+                # incidental, and the ladder is asserted where it is actually
+                # observable: at 40 columns the provider's name has been given
+                # up and the model's is still there, because which model
+                # answers says more about the next request than which service
+                # does. The clock outlasts both.
+                #
+                # THIS USED TO ASSERT THE MODEL SURVIVED AT 24 COLUMNS, and it
+                # passed only because the fixture's label was the seven
+                # characters of "GLM 5.2". Every model in the catalogue today
+                # is around twenty, and none of them fits beside a clock in
+                # twenty-three columns -- so the old assertion was a fact
+                # about one label rather than about the ladder.
                 assert ":" in joined, (columns, joined)
                 if columns >= 40:
+                    assert SAMPLE_LABEL in joined, (columns, joined)
+                if columns >= 60:
                     assert "OpenRouter" in joined, (columns, joined)
+                if columns == 40:
+                    assert "OpenRouter" not in joined, (columns, joined)
 
     # The plain console gets the ASCII set rather than replacement marks, and
     # nothing it was handed can fail to encode. The rule lives on the prompt
@@ -1278,7 +1376,7 @@ def test_the_running_status_fits_a_narrow_terminal_and_degrades_to_ascii():
     box = menu().PromptBox(stream=plain_console)
     drawn = "\n".join(status(columns=60, stream=plain_console,
                              workspace=long_path, provider_id="openrouter",
-                             model_id="z-ai/glm-5.2:free")
+                             model_id=SAMPLE_ID)
                       + [visible(line) for line
                          in box.lines(editor(SUGGESTION), size=(60, 24))])
     drawn.encode("cp1252")
@@ -1301,7 +1399,7 @@ def test_the_interface_fills_the_window_it_was_given():
         assert menu().display_width(rule) == columns - 1, (columns, len(rule))
         # And the header agrees with it, so the two read as one interface.
         header = status(columns=columns, workspace="C:\\Coding\\TMT",
-                        provider_id="openrouter", model_id="z-ai/glm-5.2:free")
+                        provider_id="openrouter", model_id=SAMPLE_ID)
         for line in header:
             assert menu().display_width(line) <= columns - 1, (columns, line)
 
@@ -1428,7 +1526,7 @@ def test_a_long_path_is_shortened_in_the_middle_and_keeps_both_ends():
     long_path = "C:\\Users\\Someone\\Documents\\Development\\2026" \
                 "\\northwind-replatform\\services\\ingestion-worker"
     rows = status(columns=60, workspace=long_path, provider_id="openrouter",
-                  model_id="z-ai/glm-5.2:free")
+                  model_id=SAMPLE_ID)
     path_row = [row for row in rows if row.strip().startswith("C:")]
     assert path_row, rows
     shown = path_row[0].strip()
@@ -1443,7 +1541,7 @@ def test_a_long_path_is_shortened_in_the_middle_and_keeps_both_ends():
     for columns in (100, 60, 40):
         for line in status(columns=columns, workspace=wide,
                            provider_id="openrouter",
-                           model_id="z-ai/glm-5.2:free"):
+                           model_id=SAMPLE_ID):
             assert menu().display_width(line) <= max(24, columns - 1), (
                 columns, line)
 
@@ -2212,7 +2310,7 @@ def option_screens():
         ("danger", lambda sel, size, stream: menu().render_danger_frame(
             sel, stream, size=size, phase=0.0), len(menu().DANGER_ITEMS)),
         ("model", lambda sel, size, stream: menu().render_settings_frame(
-            sel, "z-ai/glm-5.2:free", stream, size=size, phase=0.0),
+            sel, SAMPLE_ID, stream, size=size, phase=0.0),
          len(agent_models.catalogue())),
         ("provider", lambda sel, size, stream: menu().render_provider_frame(
             sel, "openrouter", stream, size=size, phase=0.0),

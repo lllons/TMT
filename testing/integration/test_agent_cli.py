@@ -28,6 +28,7 @@ import agent_config
 import agent_file_ops
 import agent_git
 import TMT
+from test_agent_reply_format import real_protocol_file
 from test_agent_workspace import INSTALL_DIR, Workspace
 
 PYPROJECT = INSTALL_DIR / "pyproject.toml"
@@ -173,6 +174,11 @@ def test_application_resources_stay_in_the_installation():
             "GIT_IDENTITY_FILE": agent_config.GIT_IDENTITY_FILE,
             "GIT_IDENTITY_LOCAL_FILE": agent_config.GIT_IDENTITY_LOCAL_FILE,
             "EFFORT_FILE": agent_config.EFFORT_FILE,
+            # Not `agent_config.PROTOCOL_FILE`: the suite points that at a
+            # temporary file so every test runs against the JSON protocol, so
+            # the live attribute says nothing about the product. The location
+            # the product would have chosen is asked of an unredirected copy.
+            "PROTOCOL_FILE": real_protocol_file()[0],
             "agent_git.LOG_DIR": agent_git.LOG_DIR,
         }
         for name, value in resources.items():

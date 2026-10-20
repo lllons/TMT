@@ -54,6 +54,15 @@ from pathlib import Path
 
 import agent_file_ops
 
+try:
+    from agent_protocol import hint as _hint
+except Exception:           # a frozen module list lacking agent_protocol
+    def _hint(obj, as_json=None):
+        import json
+        if as_json is not None:
+            return as_json
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
 
 # --- what the parse is made of ---------------------------------------------
 
@@ -237,11 +246,22 @@ _LITERAL_DOLLAR_HINT = (
     " To pass a literal dollar sign, escape it outside single quotes: \\$."
 )
 
-_BACKGROUND = (
-    "Background execution with & is not available in a command line. Use the "
-    "bash tool's \"operation\": \"start\" instead, which registers the job so "
-    "it can be watched with status and logs, and stopped."
+_BACKGROUND_SAID = (
+    "Background execution with & is not available in a command line. Use %s "
+    "instead, which registers the job so it can be watched with status and "
+    "logs, and stopped."
 )
+
+
+def _background():
+    """The refusal of `&`, naming `start` in the reply format in force.
+
+    Built when it is said, never at import: the format is a setting. Under
+    JSON the clause is the exact text this sentence has always carried.
+    """
+    start = _hint({"action": "bash", "operation": "start"},
+                  as_json="the bash tool's \"operation\": \"start\"")
+    return _BACKGROUND_SAID % start
 
 _HEREDOC = (
     "Here-documents (<<) and here-strings (<<<) are not supported. Write the "
@@ -506,7 +526,7 @@ def _tokenize(text):
         if text.startswith("&>", i):
             raise ShellError(_DUPLICATION)
         if ch == "&":
-            raise ShellError(_BACKGROUND)
+            raise ShellError(_background())
         if text.startswith("||", i):
             started = flush()
             emit("||")

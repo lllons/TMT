@@ -13,7 +13,7 @@ page` — the line is that task, with the capability turned on for it. See
 | Command | What it does |
 |---|---|
 | `/context` | the conversation so far: model, provider, workspace, how many turns are carried into the next request, estimated tokens in and out, lines added and removed, and the last few questions |
-| `/config` | the settings a request runs under: model, provider, effort, streaming, JSON mode, workspace, and whether an API key is set |
+| `/config` | the settings a request runs under: model, provider, effort, streaming, reply format, JSON mode, workspace, and whether an API key is set |
 | `/clear` | forget the conversation and start fresh. The model, effort, workspace and every other setting are kept, and no file is touched |
 | `/effort` | show the current effort level |
 | `/effort low\|medium\|high` | set it |
