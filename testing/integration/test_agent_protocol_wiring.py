@@ -589,7 +589,7 @@ def test_malformed_tags_are_handed_back_with_the_parsers_own_sentence():
                                                    real_model=real_model)
         complaint = handed_back(seen, 1)
         assert complaint.startswith(
-            "INVALID: that reply could not be read as tags. The parser said: "
+            "INVALID: that reply could not be read. The parser said: "
             "/content/ is never closed"), (real_model, complaint)
         assert "/action_name/" in complaint, complaint
         assert "JSON object" not in complaint, complaint
@@ -1093,6 +1093,34 @@ def test_a_fabricated_parse_failure_is_plain_text_under_plain_tags():
     assert obj["action"] == "end_conversation", obj
     assert agent_model.is_synthetic(obj), obj
     assert agent_model.synthetic_reason(obj) == agent_model.PARSE_FAILURE, obj
+
+
+UNCLOSED = "/write_file/ /path/ a.py //path/ /content/ x"
+
+
+def test_a_correction_under_plain_tags_is_in_plain_words():
+    for real_model in (True, False):
+        with ReplyFormat("tags"):
+            drawn, seen, _console, _written = drive(
+                ["go", "quit"], [UNCLOSED, "Recovered."], real_model=real_model)
+        told = handed_back(seen, 1)
+        assert told.startswith("INVALID"), told
+        for word in ("JSON", "no prose", "{", "/progress/", "/send_message/",
+                     "/end_conversation/"):
+            assert word not in told, (real_model, word, told)
+        assert "Recovered." in drawn, drawn
+
+
+def test_the_json_correction_is_unchanged_by_plain_text():
+    with ReplyFormat("json"):
+        drawn, seen, _console, _written = drive(
+            ["go", "quit"], ["{not json", compact({"action": "end_conversation",
+                                                   "message": "ok"})],
+            real_model=True)
+        told = handed_back(seen, 1)
+        assert "JSON" in told and "Reply with exactly one JSON object" in told, told
+        assert TMT._correction("invalid", error="x") == \
+            "INVALID: x. Output a corrected action JSON."
 
 
 def test_a_worker_is_still_asked_for_the_old_contract():

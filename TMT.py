@@ -182,6 +182,11 @@ def _correction(kind, **fields):
 
     Read at call time: Settings can change the format between two questions.
     """
+    if plain_text_in_force():
+        # The main agent under tags is taught plain text, so it is corrected
+        # in plain text: no JSON, no "no prose", no old tags.
+        return agent_protocol.correction(kind, agent_config.PROTOCOL,
+                                         plain_text=True, **fields)
     return agent_protocol.correction(kind, agent_config.PROTOCOL, **fields)
 
 
