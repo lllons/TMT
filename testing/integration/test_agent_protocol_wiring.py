@@ -561,20 +561,18 @@ def test_a_message_then_work_then_the_answer():
     assert len(seen) == 3, len(seen)
 
 
-def test_prose_before_any_work_is_handed_back_in_the_words_of_tags():
+def test_prose_before_any_work_is_the_final_answer_under_plain_tags():
+    """Was: handed back as an announcement. Under plain text a sentence is a
+    valid answer, so the first reply ends the turn and nothing is requested
+    again."""
     replies = ["I will write the file first.",
-               tags({"action": "write_file", "path": "p.txt", "content": "p\n"}),
-               tags({"action": "end_conversation", "message": "Done after all."})]
+               tags({"action": "write_file", "path": "p.txt", "content": "p\n"})]
     with ReplyFormat("tags"):
         drawn, seen, _console, written = drive(["go", "quit"], replies,
                                                real_model=True)
-        said = agent_protocol.correction("prose_before_work", TAGS)
-    assert handed_back(seen, 1) == said, handed_back(seen, 1)
-    assert "JSON" not in handed_back(seen, 1)
-    # What it was handed back WITH is the prose reply, as tags.
-    assert agent_protocol.detect(echoed(seen, 1)) == TAGS, echoed(seen, 1)
-    assert written.get("p.txt") == on_disk("p\n"), written
-    assert "Done after all." in drawn
+    assert len(seen) == 1, len(seen)
+    assert "p.txt" not in written, written
+    assert "I will write the file first." in drawn, drawn
 
 
 def test_malformed_tags_are_handed_back_with_the_parsers_own_sentence():
@@ -674,7 +672,9 @@ def test_the_drift_line_rides_on_every_kind_of_result_the_model_is_handed():
     told = handed_back(batch_seen, 1)
     assert told.startswith("Batch results:") and told.endswith(line), told
     told = handed_back(message_seen, 1)
-    assert told == TMT._MESSAGE_SENT + line, told
+    # The main agent under tags answers in plain text, so the sentence says so.
+    assert told == TMT._MESSAGE_SENT_PLAIN + line, told
+    assert "end_conversation" not in TMT._MESSAGE_SENT_PLAIN
     told = handed_back(held_seen, 2)
     assert "BLOCKED" in told and told.endswith(line), told
     told = handed_back(batch_held_seen, 2)
@@ -729,14 +729,14 @@ def test_the_circuit_breaker_still_trips_on_three_identical_tag_replies():
 
 # --- the session carry ---------------------------------------------------------
 
-def test_the_carried_answer_is_a_tag_block_under_tags_and_json_under_json():
+def test_the_carried_answer_is_plain_text_under_tags_and_json_under_json():
     with ReplyFormat("tags"):
         session = Session(workspace="C:\\project")
         session.record("Build it.", "Built it in Calc.py.")
         carried = session.carried_messages()[1]["content"]
-    assert carried == tags({"action": "end_conversation",
-                            "message": "Built it in Calc.py."}), carried
-    assert agent_protocol.parse(carried)["message"] == "Built it in Calc.py."
+    assert carried == "Built it in Calc.py.", carried
+    assert agent_protocol.parse(carried, plain_text=True)["message"] == \
+        "Built it in Calc.py."
     with ReplyFormat("json"):
         session = Session(workspace="C:\\project")
         session.record("Build it.", "Built it in Calc.py.")
@@ -751,7 +751,8 @@ def test_the_carried_answer_keeps_its_facts_under_tags():
         session = Session(workspace="C:\\project")
         session.record("push to main", "Pushed.", [
             agent_ui.AgentEvent.make("milestone", "Committed 6f0a4f5 on main")])
-        carried = agent_protocol.parse(session.carried_messages()[1]["content"])
+        carried = agent_protocol.parse(session.carried_messages()[1]["content"],
+                                       plain_text=True)
     assert carried["action"] == "end_conversation"
     assert "Committed 6f0a4f5 on main" in carried["message"], carried
 
@@ -767,13 +768,16 @@ def test_the_next_turns_request_carries_the_answer_in_the_format_in_force():
         assistant = [m for m in second if m["role"] == "assistant"]
         assert len(assistant) == 1, second
         content = assistant[0]["content"]
-        assert agent_protocol.detect(content) == protocol, (protocol, content)
-        carried = agent_protocol.parse(content)
+        plain = protocol == TAGS
+        assert agent_protocol.detect(content, plain_text=plain) == protocol, (
+            protocol, content)
+        carried = agent_protocol.parse(content, plain_text=plain)
         assert carried["action"] == "end_conversation", carried
         # The answer, plus whatever facts the turn carried with it.
         assert carried["message"].startswith("First answer."), carried
         expected = {"action": "end_conversation", "message": carried["message"]}
-        assert content == (tags(expected) if protocol == TAGS
+        # Under tags the carried answer is the plain text itself.
+        assert content == (carried["message"] if plain
                            else json.dumps(expected)), (protocol, content)
 
 
@@ -933,3 +937,180 @@ def test_multi_tool_says_its_shape_in_the_format_in_force():
         _templates, entry = agent_multi.entries({"action": "multi_tool",
                                                   "calls": ["read a.py"]})
         assert "JSON" not in entry and "action block" in entry, entry
+
+
+# --- plain text for the main agent (HANDOFF 6, step 2) --------------------------
+
+def test_plain_text_is_asked_for_under_tags_only_and_only_of_a_reader_that_takes_it():
+    def takes(messages, on_event=None, plain_text=False):
+        return ""
+
+    def takes_any(messages, on_event=None, **kwargs):
+        return ""
+
+    def old(messages, on_event=None):
+        return ""
+
+    with ReplyFormat("tags"):
+        assert TMT.plain_text_in_force() is True
+        assert TMT._plain_kwargs(takes, True) == {"plain_text": True}
+        assert TMT._plain_kwargs(takes_any, True) == {"plain_text": True}
+        assert TMT._plain_kwargs(old, True) == {}
+    with ReplyFormat("json"):
+        assert TMT.plain_text_in_force() is False
+    # Nothing is passed when plain text is not in force, whatever `fn` accepts.
+    assert TMT._plain_kwargs(takes, False) == {}
+    assert TMT._plain_kwargs(takes_any, False) == {}
+
+
+def test_a_text_only_reply_ends_the_turn_under_plain_tags():
+    for real_model in (True, False):
+        with ReplyFormat("tags"):
+            drawn, seen, _console, _written = drive(
+                ["hello", "quit"], ["Nothing to change; it already works."],
+                real_model=real_model)
+        assert len(seen) == 1, (real_model, len(seen))
+        assert "Nothing to change; it already works." in drawn, drawn
+        assert " ".join(drawn.split()).count(
+            "Nothing to change; it already works.") == 1, drawn
+
+
+def test_a_text_only_reply_goes_through_the_completion_gates_and_is_refused_in_plain_words():
+    plan = tags({"action": "plan", "operation": "create", "steps": ["Do it"]})
+    finish = tags({"action": "plan", "operation": "update", "step": 1,
+                   "status": "completed"})
+    with ReplyFormat("tags"):
+        drawn, seen, _console, _written = drive(
+            ["go /plan", "quit"],
+            [plan, "Too early, but done.", finish, "Truly done."])
+    told = handed_back(seen, 2)
+    assert "BLOCKED" in told, told
+    assert "end_conversation" not in told and "JSON" not in told, told
+    assert "give your final answer again" in told, told
+    assert "Truly done." in drawn, drawn
+
+
+def test_prose_beside_an_action_is_its_progress_and_the_turn_goes_on():
+    replies = ["Writing the file now.\n"
+               + tags({"action": "write_file", "path": "q.txt", "content": "q\n"}),
+               "All written."]
+    with ReplyFormat("tags"):
+        drawn, seen, _console, written = drive(["go", "quit"], replies,
+                                               real_model=True)
+    assert written.get("q.txt") == on_disk("q\n"), written
+    assert shown(drawn, "Writing the file now."), drawn
+    assert " ".join(drawn.split()).count("Writing the file now.") == 1, drawn
+    assert len(seen) == 2, len(seen)
+    assert handed_back(seen, 1).startswith("Result:"), handed_back(seen, 1)
+    # Nothing in what the model is handed tells it to send a progress key.
+    assert "No \"progress\"" not in handed_back(seen, 1), handed_back(seen, 1)
+    assert "All written." in drawn, drawn
+
+
+def test_an_old_end_conversation_beside_work_is_shown_and_does_not_end_the_turn():
+    replies = [tags({"action": "write_file", "path": "r.txt", "content": "r\n"})
+               + "\n" + tags({"action": "end_conversation",
+                              "message": "Shown but not final."}),
+               "Finished it."]
+    with ReplyFormat("tags"):
+        drawn, seen, _console, written = drive(["go", "quit"], replies,
+                                               real_model=True)
+    assert written.get("r.txt") == on_disk("r\n"), written
+    assert "Shown but not final." in drawn, drawn
+    assert len(seen) == 2, len(seen)          # the turn carried on
+    assert "Finished it." in drawn, drawn
+
+
+def test_the_json_path_still_hands_prose_before_work_back():
+    replies = ["I will write the file first.",
+               compact({"action": "write_file", "path": "p.txt", "content": "p\n"}),
+               compact({"action": "end_conversation", "message": "Done after all."})]
+    with ReplyFormat("json"):
+        drawn, seen, _console, written = drive(["go", "quit"], replies,
+                                               real_model=True)
+        said = agent_protocol.correction("prose_before_work", JSON)
+    assert handed_back(seen, 1) == said, handed_back(seen, 1)
+    assert written.get("p.txt") == on_disk("p\n"), written
+    assert "Done after all." in drawn
+
+
+def test_the_json_path_is_handed_the_old_sentences_byte_for_byte():
+    with ReplyFormat("json"):
+        assert agent_actions.build_result_message("read_file", "x") == (
+            "Result:\nx\nNow output an end_conversation action that naturally "
+            "answers the user's question using this data.")
+        assert "end_conversation" in TMT._MESSAGE_SENT
+        plan = agent_plan_with_open_step()
+        assert "call end_conversation again" in agent_plan_refusal(plan)
+
+
+def agent_plan_with_open_step():
+    import agent_plan
+    plan = agent_plan.Plan()
+    plan.create(["Only step"])
+    return plan
+
+
+def agent_plan_refusal(plan):
+    import agent_plan
+    return agent_plan.refusal(plan, "end_conversation")
+
+
+def test_under_plain_tags_the_sentences_handed_to_the_model_name_no_action_to_end_with():
+    import agent_review
+    import agent_verify
+    with ReplyFormat("tags"):
+        said = agent_actions.build_result_message(
+            "read_file", "x", plain_text=True)
+        assert "plain text" in said and "end_conversation" not in said, said
+        refused = agent_plan_refusal(agent_plan_with_open_step())
+        assert "end_conversation" not in refused and "JSON" not in refused, refused
+        assert "give your final answer again" in refused, refused
+        assert "end_conversation" not in agent_review._plain(agent_review._NO_REVIEW)
+        assert "end_conversation" not in agent_verify._plain(agent_verify._NO_VERIFY)
+        nudge = agent_actions.build_result_message(
+            "write_file", "ok", {"action": "write_file"}, plain_text=True)
+        assert "Write one sentence before the next action" in nudge, nudge
+        assert "\"progress\"" not in nudge, nudge
+        no_plan = agent_actions.execute_action(
+            {"action": "plan", "operation": "show"}, {"capabilities": None})
+        assert "end_conversation" not in no_plan, no_plan
+
+
+def test_a_fabricated_parse_failure_is_plain_text_under_plain_tags():
+    with ReplyFormat("tags"):
+        plain = agent_model._tags_reply("  ", plain_text=True)
+        old = agent_model._tags_reply("  ")
+        # A message that quotes tag text cannot be written as plain text, so
+        # it keeps the block form rather than failing.
+        quoted = agent_model._tags_reply(
+            "/write_file/ /path/ a.txt //path/ /content/ abc //write_file/",
+            plain_text=True)
+    assert "/end_conversation/" not in plain, plain
+    assert "/end_conversation/" in old, old        # default path unchanged
+    assert agent_model.is_synthetic(agent_protocol.parse(quoted)), quoted
+    obj = agent_protocol.parse(plain, plain_text=True)
+    assert obj["action"] == "end_conversation", obj
+    assert agent_model.is_synthetic(obj), obj
+    assert agent_model.synthetic_reason(obj) == agent_model.PARSE_FAILURE, obj
+
+
+def test_a_worker_is_still_asked_for_the_old_contract():
+    """The worker loop never passes plain_text, so its reader is the default."""
+    seen_kwargs = []
+    finish = tags({"action": "internal_response", "response": "done"})
+
+    def ask(messages, **kwargs):
+        seen_kwargs.append(kwargs)
+        return finish
+
+    manager = agent_manager.AgentManager(clock=Clock())
+    record = manager.spawn("do it")
+    with ReplyFormat("tags"):
+        assert run_agent(record, manager, ask, Executor("x")) == "done"
+    assert seen_kwargs and all("plain_text" not in kwargs for kwargs in seen_kwargs)
+    # And the reader it gets from `agent_model` is the default one.
+    assert agent_model._LiveReader(TAGS).plain_text is False
+    assert agent_model.ask_model.__defaults__ is not None
+    import inspect
+    assert inspect.signature(agent_model.ask_model).parameters["plain_text"].default is False

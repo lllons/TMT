@@ -731,7 +731,16 @@ def test_a_sentence_that_is_not_about_the_format_is_the_same_under_both():
     # /item/. Each is checked on its own above.
     reworded = {"plan_steps_not_a_list", "plan_updates_empty",
                 "plan_update_entry_not_an_object",
-                "reviewbot_update_without_a_status"}
+                "reviewbot_update_without_a_status",
+                # Reworded under tags on purpose: the main agent answers in
+                # plain text there, so they cannot tell it to call an action.
+                "plan_incomplete", "review_refusal_idle",
+                "verify_refusal_not_run"}
+    for name in ("plan_incomplete", "review_refusal_idle",
+                 "verify_refusal_not_run"):
+        said = tags_text[name]
+        assert "end_conversation" not in said, said
+        assert "JSON" not in said and "{" not in said and "}" not in said, said
     bad = []
     for name in sorted(json_text):
         if name in reworded:

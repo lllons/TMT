@@ -3,6 +3,7 @@
 import re
 from collections import Counter
 
+import agent_config
 import agent_ui
 from agent_config import MUTATING_ACTIONS
 from agent_execution import RUNNERS, open_app
@@ -239,7 +240,11 @@ def _plan(context, obj):
     plan = _plan_state(context)
     operation = str(obj.get("operation", "")).strip().lower()
     if plan is None:
-        return _NO_PLAN_STATE % (operation or "plan")
+        text = _NO_PLAN_STATE % (operation or "plan")
+        if getattr(agent_config, "PROTOCOL", None) == "tags":
+            text = text.replace("in your final end_conversation.",
+                                "in your final answer.")
+        return text
     try:
         import agent_plan
     except Exception as error:
@@ -2080,6 +2085,13 @@ _MISSING_PROGRESS = (
     "reason for it. Put a one-sentence \"progress\" on the next action.]"
 )
 
+# The same reminder for the main agent under tags, where a sentence written
+# before an action IS its progress and nothing is "sent" as a key.
+_MISSING_PROGRESS_PLAIN = (
+    "\n[You wrote no sentence before that %s, so the user saw a tool run and "
+    "no reason for it. Write one sentence before the next action.]"
+)
+
 # The actions that ARE the thing being said, and so need nothing said about
 # them. Kept beside the reminder rather than inferred, so adding an action
 # cannot silently make it exempt.
@@ -2103,7 +2115,9 @@ def _said_something(obj):
     return False
 
 
-def build_result_message(action, result, obj=None):
+def build_result_message(action, result, obj=None, plain_text=False):
+    """What the model is handed after an action. ``plain_text`` is the main
+    agent under tags, whose final answer is plain text rather than an action."""
     result_str = str(result)
     if "SyntaxError" in result_str:
         return f"FAILED with SyntaxError: {result_str}\nOutput a corrected action that fixes the exact syntax error above."
@@ -2119,7 +2133,9 @@ def build_result_message(action, result, obj=None):
     # action.
     if "not found" in result_str.lower() and action in ("read_file", "patch_file", "read_lines", "copy_file"):
         return f"FAILED: {result_str}\nCheck the file path with list_files and retry."
-    if action in READ_ONLY_ACTIONS:
+    if action in READ_ONLY_ACTIONS and plain_text:
+        message = f"Result:\n{result_str}\nNow answer the user's question in plain text, using this data."
+    elif action in READ_ONLY_ACTIONS:
         message = f"Result:\n{result_str}\nNow output an end_conversation action that naturally answers the user's question using this data."
     else:
         message = f"Result: {result_str}"
@@ -2127,7 +2143,7 @@ def build_result_message(action, result, obj=None):
     # last thing read before the next action is written and never displaces
     # the correction a failed action needs.
     if action not in _SPEAKS_FOR_ITSELF and not _said_something(obj):
-        message += _MISSING_PROGRESS % action
+        message += (_MISSING_PROGRESS_PLAIN if plain_text else _MISSING_PROGRESS) % action
     return message
 
 ACTION_LABELS = {action: action.replace("_", " ").title() for action in (

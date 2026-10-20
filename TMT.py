@@ -1,6 +1,7 @@
 """Command-line entry point for TMT, the CLI coding agent."""
 
 import argparse
+import inspect
 import shutil
 import sys
 from pathlib import Path
@@ -130,6 +131,30 @@ def stream_handler(live_ui, relay, state, transcript=None, session=None):
     return handle
 
 
+def plain_text_in_force():
+    """Whether the main agent's replies are read as plain text: tags only."""
+    return (agent_protocol.normal(getattr(agent_config, "PROTOCOL", None))
+            == agent_protocol.TAGS)
+
+
+def _plain_kwargs(fn, plain):
+    """`{"plain_text": True}` when asked for and `fn` can take it, else nothing.
+
+    Nothing is passed under JSON, so that path calls `ask_model` exactly as it
+    always did; and a stand-in written against the older signature keeps
+    working rather than raising on a keyword it never heard of.
+    """
+    if not plain:
+        return {}
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "plain_text" in params or any(p.kind == p.VAR_KEYWORD for p in params.values()):
+        return {"plain_text": True}
+    return {}
+
+
 # How many unusable replies in a row a question may absorb before it is given
 # up on. Unusable means the model produced nothing the loop could act on --
 # JSON that would not parse, an action that failed validation, arguments the
@@ -183,6 +208,18 @@ _MESSAGE_SENT = ("That was shown to the user. It did NOT end the task and the "
                  "task is not finished: send_message never ends anything. "
                  "Carry on with the work, and use end_conversation only when "
                  "you have actually finished.")
+
+# The same, for the main agent under tags, whose final answer is plain text.
+_MESSAGE_SENT_PLAIN = ("That was shown to the user. It did NOT end the task and "
+                       "the task is not finished. Carry on with the work, and "
+                       "give your final answer, in plain text with no action, "
+                       "only when you have actually finished.")
+
+
+def _plain_result(plain):
+    """Keyword for `build_result_message`: nothing under JSON, so it is called as before."""
+    return {"plain_text": True} if plain else {}
+
 
 # What the USER is shown when a final answer is refused because the plan is
 # not finished. One line, naming the step being waited on, because the plan
@@ -1926,9 +1963,13 @@ def _session_loop(root, ci=None):
                 # no longer a list to measure. An estimate, and the readout
                 # says so.
                 session.record_request(messages)
+                # Read once per reply (Settings can change it between two
+                # questions). Plain text is the main agent under tags only.
+                plain = plain_text_in_force()
                 raw = ask_model(messages,
                                 on_event=stream_handler(live_ui, relay, state,
-                                                        transcript, session))
+                                                        transcript, session),
+                                **_plain_kwargs(ask_model, plain))
                 session.record_reply(raw, state["usage"])
                 turn_state["next_step"] = state["next_step"] or turn_state["next_step"]
                 live_ui.meaningful_output()
@@ -1958,7 +1999,8 @@ def _session_loop(root, ci=None):
                     # than refused. `raw` itself is left exactly as the model
                     # wrote it -- it is what the history echoes, what the
                     # breaker compares and what the session records.
-                    obj = agent_protocol.parse(raw)
+                    obj = (agent_protocol.parse(raw, plain_text=True) if plain
+                           else agent_protocol.parse(raw))
                     if not isinstance(obj, dict):
                         raise agent_protocol.ProtocolError(_correction("not_an_object"))
                 except (ValueError, TypeError) as error:
@@ -1982,7 +2024,8 @@ def _session_loop(root, ci=None):
                 # row for the user, and one line on the result the model is
                 # handed for this action, which is the `_MISSING_PROGRESS`
                 # shape: it rides on a result, so it costs no step.
-                came_as = agent_protocol.detect(raw)
+                came_as = (agent_protocol.detect(raw, plain_text=True) if plain
+                           else agent_protocol.detect(raw))
                 drifted = agent_protocol.drift(agent_config.PROTOCOL, came_as)
                 if drifted:
                     transcript.emit_kind("warning", agent_protocol.drift_notice(
@@ -2011,8 +2054,11 @@ def _session_loop(root, ci=None):
                 # of that work and ends the turn, which is what it has always
                 # meant. When nothing has run yet it cannot be a summary -- it
                 # is an announcement of work not started -- so it is shown and
-                # the model is asked for the action it just described.
-                if is_prose(obj) and not turn_state["acted"]:
+                # the model is asked for the action it just described. Under
+                # plain text a sentence IS a valid final answer, so this
+                # hand-back is skipped and the reply ends the turn through
+                # the same gates as any end_conversation.
+                if is_prose(obj) and not turn_state["acted"] and not plain:
                     said = str(obj.get("message") or "").strip()
                     if said:
                         transcript.emit_kind("progress", said)
@@ -2144,7 +2190,8 @@ def _session_loop(root, ci=None):
                         # batch is told exactly as plainly as one that
                         # emits them one at a time.
                         results.append(build_result_message(
-                            sub_action, f"{sub_action}: {result}", sub_obj))
+                            sub_action, f"{sub_action}: {result}", sub_obj,
+                            **_plain_result(plain)))
                     else:
                         relay.reset()
                         # The batch ran and the model is asked what is next, so
@@ -2205,7 +2252,7 @@ def _session_loop(root, ci=None):
                     steps += 1
                     retries = 0
                     messages.extend([{"role": "assistant", "content": raw},
-                                     {"role": "user", "content": _MESSAGE_SENT + drift_tail}])
+                                     {"role": "user", "content": (_MESSAGE_SENT_PLAIN if plain else _MESSAGE_SENT) + drift_tail}])
                     continue
                 # The plan's gate, and it is taken BEFORE the action runs.
                 # `respond` has no side effect worth avoiding, but running it
@@ -2289,7 +2336,8 @@ def _session_loop(root, ci=None):
                 messages.extend([{"role": "assistant", "content": raw},
                                  {"role": "user",
                                   "content": result_content(
-                                      build_result_message(action, result, obj)
+                                      build_result_message(action, result, obj,
+                                                           **_plain_result(plain))
                                       + drift_tail,
                                       [obj])}])
             else:

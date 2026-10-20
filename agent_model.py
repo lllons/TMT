@@ -500,7 +500,7 @@ def _prose_reply(full):
                     PROSE_KEY: True})
 
 
-def _render(obj):
+def _render(obj, plain_text=False):
     """An action object this module made up, written in the protocol in force.
 
     Under JSON it is exactly the `json.dumps` it always was, byte for byte.
@@ -516,6 +516,14 @@ def _render(obj):
     delivered would be worse than one in the other protocol.
     """
     if _protocol() == agent_protocol.TAGS:
+        if plain_text:
+            # The main agent under tags: the message as plain text with the
+            # marker keys as blocks after it, never an /end_conversation/.
+            try:
+                return agent_protocol.render(obj, agent_protocol.TAGS,
+                                             plain_text=True)
+            except Exception:
+                pass
         try:
             return agent_protocol.render(obj, agent_protocol.TAGS)
         except Exception:
@@ -567,7 +575,7 @@ def is_prose(obj):
     return bool(isinstance(obj, dict) and obj.get(PROSE_KEY))
 
 
-def _made_up(message, reason=PARSE_FAILURE):
+def _made_up(message, reason=PARSE_FAILURE, plain_text=False):
     """An ending carrying an explanation, marked as not the model's words.
 
     `end_conversation`, because the loop has no other shape to receive a
@@ -577,7 +585,8 @@ def _made_up(message, reason=PARSE_FAILURE):
     to send back to, and refusing it would hide a provider failure.
     """
     return _render({"action": "end_conversation", "message": message,
-                    SYNTHETIC_KEY: True, SYNTHETIC_REASON: reason})
+                    SYNTHETIC_KEY: True, SYNTHETIC_REASON: reason},
+                   plain_text=plain_text)
 
 
 def _extract_json(full):
@@ -601,7 +610,7 @@ def _extract_json(full):
     return _made_up("invalid JSON structure")
 
 
-def _tags_reply(full, streamed=None):
+def _tags_reply(full, streamed=None, plain_text=False):
     """The reply text for the loop when the reply is (or should be) TAGS.
 
     The mirror of `_extract_json`, and the same four outcomes:
@@ -620,12 +629,18 @@ def _tags_reply(full, streamed=None):
     of it cut away. `streamed` is the live JSON parser's completed object
     when one was read off a stream, which is string-aware where the
     blocking extraction is not. The loop notices the drift and says so.
+
+    With `plain_text` (the main agent under tags) the plain-text rules read
+    the reply: text with no action blocks is itself the final answer, which
+    `agent_protocol.parse` returns as an `end_conversation`, so the reply
+    text is handed back as written and the loop reads it the same way.
     """
     text = full or ""
     if not text.strip():
-        return _made_up("empty response from model")
+        return _made_up("empty response from model", plain_text=plain_text)
     try:
-        kind, at = agent_protocol.locate(text)
+        kind, at = agent_protocol.locate(text, plain_text=True) if plain_text \
+            else agent_protocol.locate(text)
     except Exception:
         kind, at = None, -1
     if kind == agent_protocol.JSON:
@@ -633,24 +648,25 @@ def _tags_reply(full, streamed=None):
     if kind is None:
         return _prose_reply(text)
     try:
-        value = agent_protocol.parse(text)
+        value = agent_protocol.parse(text, plain_text=True) if plain_text \
+            else agent_protocol.parse(text)
     except agent_protocol.ProtocolError as error:
-        return _made_up(str(error))
+        return _made_up(str(error), plain_text=plain_text)
     except Exception as error:
         return _made_up("the reply could not be read: %s: %s"
-                        % (type(error).__name__, error))
+                        % (type(error).__name__, error), plain_text=plain_text)
     if value is None:
         return _prose_reply(text)
     return text.strip()
 
 
-def _finish_blocking(full, protocol):
+def _finish_blocking(full, protocol, plain_text=False):
     """A whole reply, read in the protocol in force, for the loop."""
     if protocol == agent_protocol.TAGS or _kind(full) == agent_protocol.TAGS:
         # A tags reply under JSON is accepted too, and the other way round:
         # read as JSON it is prose, and prose after work ENDS the turn with
         # the model's tags printed as its answer.
-        return _tags_reply(full)
+        return _tags_reply(full, plain_text=plain_text)
     return _extract_json(full)
 
 
@@ -671,18 +687,24 @@ class _LiveReader(object):
     chunk would.
     """
 
-    def __init__(self, protocol):
+    def __init__(self, protocol, plain_text=False):
         self.protocol = protocol
+        self.plain_text = plain_text
         self.raw = ""
         self.parser = None
+
+    def _tag_parser(self):
+        if self.plain_text:
+            return agent_protocol.StreamingTagParser(plain_text=True)
+        return agent_protocol.StreamingTagParser()
 
     def _choose(self, first):
         if first == "{":
             return StreamingActionParser()
         if first == "/":
-            return agent_protocol.StreamingTagParser()
+            return self._tag_parser()
         if self.protocol == agent_protocol.TAGS:
-            return agent_protocol.StreamingTagParser()
+            return self._tag_parser()
         return StreamingActionParser()
 
     def feed(self, chunk):
@@ -703,11 +725,12 @@ class _LiveReader(object):
         return None
 
 
-def _finish_stream(reader, protocol):
+def _finish_stream(reader, protocol, plain_text=False):
     """A streamed reply, settled exactly as the blocking path settles one."""
     full = reader.raw
     if protocol == agent_protocol.TAGS or _kind(full) == agent_protocol.TAGS:
-        return _tags_reply(full, streamed=reader.json_result())
+        return _tags_reply(full, streamed=reader.json_result(),
+                           plain_text=plain_text)
     raw = reader.json_result()
     if raw:
         return raw
@@ -745,7 +768,7 @@ def _open_stream(payload, on_usage, on_input_usage):
 
 
 def _ask_model_streaming(messages, on_event, model=None, max_tokens=None,
-                         quiet=False):
+                         quiet=False, plain_text=False):
     """Consume the reply as a stream, reporting events as they arrive.
 
     Returns (reply_text, fall_back). ``fall_back`` is True only when the stream
@@ -772,7 +795,7 @@ def _ask_model_streaming(messages, on_event, model=None, max_tokens=None,
         # prompt has just told the model not to use.
         if protocol == agent_protocol.JSON and _json_mode_ok:
             payload["response_format"] = {"type": "json_object"}
-        parser = _LiveReader(protocol)
+        parser = _LiveReader(protocol, plain_text=plain_text)
         seen_content = False
         try:
             usage_sink = lambda tokens: on_event(("usage", tokens))
@@ -806,10 +829,11 @@ def _ask_model_streaming(messages, on_event, model=None, max_tokens=None,
                 on_event(("error", message))
                 return _error_reply(message), False
             return None, True
-        return _finish_stream(parser, protocol), False
+        return _finish_stream(parser, protocol, plain_text=plain_text), False
     return None, True
 
-def ask_model(messages, on_event=None, model=None, max_tokens=None, quiet=False):
+def ask_model(messages, on_event=None, model=None, max_tokens=None, quiet=False,
+              *, plain_text=False):
     """Return the model's reply as text, in the reply format in force.
 
     Under JSON (`agent_config.PROTOCOL == "json"`) that is the reply's JSON
@@ -838,12 +862,19 @@ def ask_model(messages, on_event=None, model=None, max_tokens=None, quiet=False)
     JSON-mode notice below, and either one painted from a background thread
     lands on top of the session's live region and moves the rows its next
     repaint is aiming at.
+
+    ``plain_text=True`` is for the main agent under tags: the plain-text rules
+    of `agent_protocol` read the reply (text with no action is the final
+    answer; text before an action is its progress). It has no effect under
+    JSON, and the default leaves every other caller exactly as it was.
     """
     global _json_mode_ok
+    plain_text = bool(plain_text) and _protocol() == agent_protocol.TAGS
     streaming = on_event is not None and STREAM_ENABLED
     if streaming:
         raw, fall_back = _ask_model_streaming(messages, on_event, model=model,
-                                              max_tokens=max_tokens, quiet=quiet)
+                                              max_tokens=max_tokens, quiet=quiet,
+                                              plain_text=plain_text)
         if raw is not None:
             return raw
         if not fall_back:
@@ -887,4 +918,4 @@ def ask_model(messages, on_event=None, model=None, max_tokens=None, quiet=False)
             # Reported only when the provider actually sent it. A caller that
             # hears nothing keeps its estimate, and keeps the `~` that says so.
             on_event(("input_usage", prompt_tokens))
-    return _finish_blocking(full, protocol)
+    return _finish_blocking(full, protocol, plain_text=plain_text)

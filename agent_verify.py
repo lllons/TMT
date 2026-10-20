@@ -70,6 +70,22 @@ except Exception:           # a frozen module list lacking agent_protocol
         return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
+def _plain(text):
+    """`text` worded for a plain-text reply when tags are in force; else as written.
+
+    Under tags the main agent answers in plain text, so a refusal must not
+    tell it to call an `end_conversation` action. Under JSON it is untouched.
+    """
+    try:
+        import agent_config
+        if getattr(agent_config, "PROTOCOL", None) == "tags":
+            return text.replace("call end_conversation again",
+                                "give your final answer again")
+    except Exception:
+        pass
+    return text
+
+
 def _run_verify():
     """The action that starts a verification, in the reply format in force."""
     return _hint({"action": "verify"})
@@ -1144,8 +1160,8 @@ def refusal(verify, plan=None, action=None):
                                     _run_verify())
         if verify.state == IDLE:
             steps = len(getattr(plan, "steps", ()) or ())
-            return _NO_VERIFY % (len(verify.changed_paths), steps,
-                                 _run_verify())
+            return _plain(_NO_VERIFY % (len(verify.changed_paths), steps,
+                                        _run_verify()))
         if verify.stale:
             changed = verify.changed_since
             return _VERIFY_STALE % (last.number, len(changed),

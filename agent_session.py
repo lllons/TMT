@@ -187,7 +187,10 @@ def _carried(message):
     try:
         import agent_protocol
         if agent_protocol.normal(getattr(agent_config, "PROTOCOL", None)) == agent_protocol.TAGS:
-            return agent_protocol.render(obj, agent_protocol.TAGS)
+            # Plain text: the main agent's final answer under tags is the
+            # text itself, so that is what a carried answer looks like too.
+            return agent_protocol.render(obj, agent_protocol.TAGS,
+                                         plain_text=True)
     except Exception:
         pass
     return json.dumps(obj)

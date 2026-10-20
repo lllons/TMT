@@ -610,6 +610,11 @@ def refusal(plan, action):
          "status": "completed"},
         as_json='{"action":"plan","operation":"update","step":N,'
                 '"status":"completed"}')
-    return _INCOMPLETE % ("1 step is" if len(remaining) == 1
+    text = _INCOMPLETE % ("1 step is" if len(remaining) == 1
                           else "%d steps are" % len(remaining), listed,
                           complete)
+    if _protocol() == "tags":
+        # The main agent answers in plain text under tags: no action to call.
+        text = text.replace("call end_conversation again",
+                            "give your final answer again")
+    return text
