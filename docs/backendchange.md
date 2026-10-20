@@ -1001,6 +1001,21 @@ agreement); the push (needs the owner's word). Nothing was pushed. Local
 alpha into main on the remote during the session (PR #6) and said pushes still
 go to alpha only.
 
+**The push attempt found a gap (09:36 NZDT).** The owner said "yes push to
+alpha". TMT was driven in CI mode under plain tags on the 550B, with a task
+saying everything is committed, stage and commit nothing, push alpha with
+git_push. Its single reply was `/ git_push/ /branch/ alpha //branch/
+//git_push/`: a space after the opening slash, so no known name opened a
+block. The whole reply was prose, and under rule B a prose-only reply is the
+final answer. The turn ended in 12 s having pushed nothing, and the "answer"
+shown to the user was the malformed tag itself. Rule G's near-miss guard looks
+at the NAME (edit distance 2, or a key at top level) and does not cover a slash
+followed by whitespace before a known name. So this shape falls straight
+through to the silent-ending case HANDOFF 4 feared. Origin/alpha was unmoved
+(`9ba7a1c`). The push was retried; the outcome is below.
+
+The push was retried through TMT after this docs commit, so its outcome cannot be in this file: it is recorded in the next session's first `git log origin/alpha`. If that log does not show this commit, the retry failed too and the push is still owed.
+
 ## HANDOFF: what the next session must do (written 2026-10-07 15:25 NZDT)
 
 The owner stopped this session on a time limit. Everything is committed on
@@ -1657,6 +1672,13 @@ Steps, in order:
    claim, and the small model is no worse than `real-json-small` (PASS,
    3 turns). Watch for a model that announces and stops. The clean-clone suite
    must be green on the final HEAD. Quota resets at 13:00 NZDT.
+5a. Near-miss gap: `/ name/` (whitespace between the slash and a known action
+   name, with its closer following) must be refused with a did-you-mean
+   correction, not read as prose. Add it to rule G in `agent_protocol.py`, with
+   the real reply above as the unit-test fixture. Re-run the mutation pass on
+   that guard, and consider the same for `/name /` and `//name /`. Until then a
+   model that writes it ends its turn silently. This is placed after step 5
+   and before step 6 so that the existing numbering does not change.
 6. HANDOFF 6 step 6: bring the plain-text rules to the worker, note agent and
    reviewer. Propose the reviewer's verdict shape to the owner before building
    it. Do not build it on the manager's own judgement.
