@@ -61,10 +61,14 @@ EVERYTHING = "Build it /plan /review /verify"
 
 PROMPT_NAMES = ("main", "main (all three)", "worker", "note", "review")
 
+# The main agent under tags is taught the plain-text variant (the temporary
+# third variant in agent_prompt); its own checks are the plain-text tests at the end of this file.
+PLAIN_NAMES = ("main", "main (all three)")
+
 # A floor per prompt, below what each measured when this was written (111, 124,
 # 75, 67 and 76 blocks). They are not the point; a scrape that came back empty
 # passing every assertion below is, and these are what stop it.
-FLOORS = {"main": 100, "main (all three)": 120, "worker": 65, "note": 60, "review": 65}
+FLOORS = {"main": 80, "main (all three)": 95, "worker": 65, "note": 60, "review": 65}
 
 
 def build(protocol):
@@ -168,7 +172,7 @@ def test_an_explicit_protocol_beats_the_setting_in_both_directions():
     def check(box):
         with ReplyFormat("json"):
             assert agent_prompt.get_system_prompt(protocol="tags") \
-                .endswith(agent_prompt.REMINDER_TAGS)
+                .endswith(agent_prompt.REMINDER_TAGS_PLAIN)
             assert agent_subprompts.worker_prompt(protocol="tags") \
                 .endswith(agent_subprompts.SUBPROMPT_REMINDER_TAGS)
         with ReplyFormat("tags"):
@@ -229,6 +233,8 @@ def test_no_json_example_was_lost_in_the_translation():
     def check(box):
         json_prompts, tags_prompts = build("json"), build("tags")
         for name in PROMPT_NAMES:
+            if name in PLAIN_NAMES:
+                continue  # taught as plain-text replies; the plain-text tests at the end of this file cover them
             lines = len(JSON_EXAMPLE_LINE.findall(json_prompts[name]))
             blocks = len(tag_examples(tags_prompts[name]))
             assert lines > 0, name
@@ -271,7 +277,7 @@ ALLOWED_JSON_LINES = (
 def test_the_word_json_appears_in_a_tags_prompt_only_where_it_is_allowed():
     def check(box):
         expected = {
-            "main": 3, "main (all three)": 3, "worker": 2, "note": 2, "review": 3}
+            "main": 1, "main (all three)": 1, "worker": 2, "note": 2, "review": 3}
         for name, prompt in build("tags").items():
             lines = [line for line in prompt.split("\n") if re.search(r"\bJSON\b", line)]
             for line in lines:
@@ -309,6 +315,8 @@ def test_the_json_prompt_says_json_often_so_the_count_above_means_something():
 def test_the_strict_sentences_are_in_every_tags_prompt():
     def check(box):
         for name, prompt in build("tags").items():
+            if name in PLAIN_NAMES:
+                continue
             for needle in ("Reply in TAG BLOCKS and nothing else.",
                            "NO JSON, NO code fences, NO language label",
                            "Text outside a block is thrown away.",
@@ -319,15 +327,16 @@ def test_the_strict_sentences_are_in_every_tags_prompt():
             assert agent_prompt.OUTPUT_RULES_TAGS in prompt, name
             assert agent_prompt.OUTPUT_RULES not in prompt, name
         main = build("tags")["main"]
-        assert agent_prompt.HEADER_TAGS in main
-        assert agent_prompt.SPEAKING_RULES_TAGS in main
-        assert agent_prompt.ANSWERING_EXAMPLES_TAGS in main
-        assert agent_prompt.PROGRESS_RULES_TAGS in main
+        assert agent_prompt.HEADER_TAGS_PLAIN in main
+        assert agent_prompt.SPEAKING_RULES_TAGS_PLAIN in main
+        assert agent_prompt.ANSWERING_EXAMPLES_TAGS_PLAIN in main
+        assert agent_prompt.PROGRESS_RULES_TAGS_PLAIN in main
+        assert agent_prompt.OUTPUT_RULES_TAGS_PLAIN in main
         assert agent_prompt.HEADER not in main
         assert agent_prompt.ANSWERING_EXAMPLES not in main
-        assert agent_prompt.section("ACTION_REFERENCE", "tags") in main
+        assert agent_prompt.plain_section("ACTION_REFERENCE") in main
         assert agent_prompt.ACTION_REFERENCE not in main
-        assert agent_prompt.WORKFLOW_RULES_TAGS in main
+        assert agent_prompt.WORKFLOW_RULES_TAGS_PLAIN in main
         assert agent_prompt.WORKFLOW_RULES not in main
     with_project(check)
 
@@ -339,6 +348,11 @@ def test_the_output_rules_in_every_tags_prompt_keep_the_numbers_that_are_cited()
             end = prompt.index("Never any of these:", start)
             rules = numbered_rules(prompt[start:end])
             assert sorted(rules) == list(range(1, 12)), (name, sorted(rules))
+            if name in PLAIN_NAMES:
+                assert "plain text" in rules[5] and "final answer" in rules[5], (name, rules[5])
+                assert "final" in rules[10], (name, rules[10])
+                assert "HAVE to end every task with a final answer" in rules[11], (name, rules[11])
+                continue
             assert "message" in rules[5] and "end_conversation" in rules[5], (name, rules[5])
             assert "end_conversation" in rules[10], (name, rules[10])
             assert "HAVE to end every task with an end_conversation" in rules[11], (name, rules[11])
@@ -388,7 +402,7 @@ def test_the_closing_reminder_is_the_protocols_own_in_all_five_prompts():
     def check(box):
         tags, json_ = build("tags"), build("json")
         for name in ("main", "main (all three)"):
-            assert tags[name].endswith(agent_prompt.REMINDER_TAGS), name
+            assert tags[name].endswith(agent_prompt.REMINDER_TAGS_PLAIN), name
             assert json_[name].endswith(agent_prompt.REMINDER), name
             assert agent_prompt.REMINDER not in tags[name], name
             assert agent_prompt.REMINDER_TAGS not in json_[name], name
@@ -495,11 +509,12 @@ def test_the_rows_and_rules_spliced_into_the_tables_are_in_the_tags_prompt():
         plan = agent_prompt.get_system_prompt(C.Capabilities("/plan"), protocol="tags")
         for text in (agent_prompt.PLAN_TOOL_ROW, agent_prompt.BASH_TOOL_ROW,
                      agent_prompt.WEB_TOOL_ROW, agent_prompt.IMAGE_TOOL_ROW,
-                     agent_prompt.PLAN_BEHAVIOUR_RULE):
+                     agent_prompt.PLAN_BEHAVIOUR_RULE_PLAIN):
             assert text in plan, text
         none_ = agent_prompt.get_system_prompt(protocol="tags")
         assert agent_prompt.PLAN_TOOL_ROW not in none_
         assert agent_prompt.PLAN_BEHAVIOUR_RULE not in none_
+        assert agent_prompt.PLAN_BEHAVIOUR_RULE_PLAIN not in none_
         for text in (agent_prompt.BASH_TOOL_ROW, agent_prompt.WEB_TOOL_ROW,
                      agent_prompt.IMAGE_TOOL_ROW):
             assert text in none_, text
@@ -554,3 +569,165 @@ def test_a_reply_with_no_action_is_refused_in_words_that_fit_either_protocol():
     assert agent_prompt.validate_action({"message": "hi"}) == "The reply named no action"
     parsed = agent_protocol.parse("/progress/ thinking //progress/")
     assert agent_prompt.validate_action(parsed) == "The reply named no action"
+
+
+# =============================================================================
+# The main agent under tags, taught plain-text replies (HANDOFF 6 step 3)
+# =============================================================================
+#
+# Built over an EMPTY fixture workspace: the repository's own files contain the
+# word JSON and the old tags, and a test about where a word appears in a prompt
+# must not be about the repository.
+
+import hashlib
+
+from test_agent_prompt_tags import forbidden_in_plain, plain_replies
+
+EMPTY_TREE = {}
+
+
+def with_empty_project(test):
+    box = Project(files=EMPTY_TREE)
+    try:
+        return test(box)
+    finally:
+        box.close()
+
+
+def plain_prompts():
+    return {
+        "main": agent_prompt.get_system_prompt(protocol="tags"),
+        "main (all three)": agent_prompt.get_system_prompt(C.Capabilities(EVERYTHING),
+                                                           protocol="tags"),
+    }
+
+
+def test_the_plain_main_prompt_never_mentions_json_braces_or_the_old_tags():
+    def check(box):
+        for name, prompt in plain_prompts().items():
+            assert not forbidden_in_plain(prompt), (name, forbidden_in_plain(prompt))
+            for tag in ("/progress/", "/send_message/", "/end_conversation/"):
+                assert tag not in prompt, (name, tag)
+            assert '{"action"' not in prompt, name
+            # The one JSON left is the file format read_document converts.
+            said = [line for line in prompt.split("\n")
+                    if "json" in line.replace("package.json", "").lower()]
+            assert len(said) == 1 and said[0].startswith("read_document - keys:"), (name, said)
+    with_empty_project(check)
+
+
+def test_every_block_in_the_plain_main_prompt_is_read_by_the_plain_parser():
+    def check(box):
+        for name, prompt in plain_prompts().items():
+            blocks = tag_examples(prompt)
+            assert len(blocks) >= FLOORS[name], (name, len(blocks))
+            for block in blocks:
+                check_example(block)
+                try:
+                    got = agent_protocol.parse(block, plain_text=True)
+                except agent_protocol.ProtocolError as error:
+                    raise AssertionError("%s: plain parse refuses (%s):\n%s" % (name, error, block))
+                assert got is not None and got.get("action"), (name, block)
+    with_empty_project(check)
+
+
+def test_every_whole_reply_in_the_plain_main_prompt_parses_as_what_it_shows():
+    def check(box):
+        for name, prompt in plain_prompts().items():
+            replies = plain_replies(prompt)
+            assert len(replies) >= 12, (name, len(replies))
+            for reply in replies:
+                got = agent_protocol.parse(reply, plain_text=True)
+                assert got is not None, (name, reply)
+    with_empty_project(check)
+
+
+def test_the_plain_main_prompt_teaches_the_four_rules_and_the_stop_rule():
+    def check(box):
+        for name, prompt in plain_prompts().items():
+            for sentence in (
+                    "a reply with NO action blocks is your final answer",
+                    "Text before an action block is that action's progress line",
+                    "Text after the last block is shown to the user as a message",
+                    "End your reply after any action whose result you need; if you say you will "
+                    "do something, put its action in the same reply."):
+                assert sentence.lower() in prompt.lower(), (name, sentence)
+            assert prompt.endswith(agent_prompt.REMINDER_TAGS_PLAIN), name
+            assert "/next_step/" in prompt, name
+    with_empty_project(check)
+
+
+def test_the_plain_main_prompt_keeps_the_numbered_output_rules_and_the_commands_unslashed():
+    def check(box):
+        for name, prompt in plain_prompts().items():
+            start = prompt.index("=== OUTPUT FORMAT - ABSOLUTE RULES ===")
+            rules = numbered_rules(prompt[start:prompt.index("Never any of these:", start)])
+            assert sorted(rules) == list(range(1, 12)), (name, sorted(rules))
+            assert "final answer" in rules[5] and "final" in rules[10]
+            assert "final answer" in rules[11]
+        text = plain_prompts()["main"]
+        # The withheld notice names the commands with no trailing slash, and
+        # says "final answer" where it used to name the old ending verb.
+        assert "/plan" in text and "/review" in text and "/verify" in text
+        for command in ("/plan/", "/review/", "/verify/"):
+            assert command not in text, command
+        assert "say so in your final answer and name the command" in text
+        assert "end_conversation" not in text
+    with_empty_project(check)
+
+
+def test_the_plain_main_prompt_still_teaches_every_verb_the_old_one_did():
+    def check(box):
+        for name, prompt in plain_prompts().items():
+            old = build("json")[name]
+            verbs = set(re.findall(r'^(?:  )?([a-z_]+) - keys:', old, re.M))
+            verbs -= {"send_message", "end_conversation"}
+            assert len(verbs) > 30, len(verbs)
+            for verb in sorted(verbs):
+                assert re.search(r"^(?:  )?%s - keys:" % verb, prompt, re.M), (name, verb)
+    with_empty_project(check)
+
+
+def test_the_plan_review_verify_sections_follow_the_authorisation_in_the_plain_prompt():
+    def check(box):
+        none_, everything = plain_prompts()["main"], plain_prompts()["main (all three)"]
+        assert "=== THE PLAN" not in none_ and "=== THE PLAN" in everything
+        assert "CAPABILITIES YOU WERE NOT GIVEN" in none_
+        assert "CAPABILITIES YOU WERE NOT GIVEN" not in everything
+        assert agent_prompt.PLAN_BEHAVIOUR_RULE_PLAIN in everything
+        assert agent_prompt.PLAN_BEHAVIOUR_RULE not in everything
+    with_empty_project(check)
+
+
+def test_the_json_main_prompt_is_unchanged_by_the_plain_variant():
+    def check(box):
+        for caps in (None, C.Capabilities(EVERYTHING)):
+            prompt = agent_prompt.get_system_prompt(caps, protocol="json")
+            assert "plain text" not in prompt.lower().split("=== current workspace")[0].replace(
+                "plain text file", ""), "plain-text teaching leaked into the JSON prompt"
+            assert agent_prompt.HEADER_TAGS_PLAIN not in prompt
+            assert agent_prompt.REMINDER_TAGS_PLAIN not in prompt
+            assert prompt.endswith(agent_prompt.REMINDER)
+        # Byte-identity of the constants it is made of is pinned in the unit file.
+    with_empty_project(check)
+
+
+def test_the_three_background_tags_prompts_are_not_taught_the_plain_variant():
+    def check(box):
+        for name, prompt in (("worker", agent_subprompts.worker_prompt(protocol="tags")),
+                             ("note", agent_subprompts.note_prompt(protocol="tags")),
+                             ("review", agent_subprompts.review_prompt(protocol="tags"))):
+            for constant in ("HEADER_TAGS_PLAIN", "SPEAKING_RULES_TAGS_PLAIN",
+                             "OUTPUT_RULES_TAGS_PLAIN", "REMINDER_TAGS_PLAIN"):
+                assert getattr(agent_prompt, constant) not in prompt, (name, constant)
+            assert agent_prompt.OUTPUT_RULES_TAGS in prompt, name
+    with_empty_project(check)
+
+
+def test_the_plain_main_prompt_size_is_reported_and_close_to_the_old_tags_prompt():
+    def check(box):
+        plain = tokens(plain_prompts()["main"])
+        old = tokens(agent_prompt.get_system_prompt(protocol="json"))
+        print("plain tags main prompt: %d estimated tokens (json %d)" % (plain, old))
+        assert old * 0.8 < plain < old * 1.35, (plain, old)
+    with_empty_project(check)

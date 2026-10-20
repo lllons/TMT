@@ -660,3 +660,236 @@ def test_the_scraper_finds_inline_block_labelled_and_multi_block_examples():
         pass
     else:
         raise AssertionError("an action with no path was accepted as a valid example")
+
+
+# =============================================================================
+# The plain-text variant (the temporary third variant, HANDOFF 6 step 3)
+# =============================================================================
+#
+# The main agent under tags is taught plain-text replies: text outside the
+# blocks is its message, a reply with no blocks is its final answer, text
+# before a block is that block's progress line. These tests protect the
+# constants one at a time; the assembled prompt is in
+# testing/integration/test_agent_prompt_tags_wiring.py.
+
+import hashlib
+
+PLAIN_HAND_WRITTEN = ("HEADER_TAGS_PLAIN", "SPEAKING_RULES_TAGS_PLAIN", "OUTPUT_RULES_TAGS_PLAIN",
+                      "ANSWERING_EXAMPLES_TAGS_PLAIN", "PROGRESS_RULES_TAGS_PLAIN",
+                      "WORKFLOW_RULES_TAGS_PLAIN", "REMINDER_TAGS_PLAIN")
+
+# Every teaching section the main prompt is made of, by the name plain_section takes.
+PLAIN_SECTION_NAMES = (
+    "HEADER", "SPEAKING_RULES", "OUTPUT_RULES", "ANSWERING_EXAMPLES", "ACTION_REFERENCE",
+    "BASH_REFERENCE", "ASK_REFERENCE", "WEB_REFERENCE", "IMAGE_REFERENCE", "PLAN_REFERENCE",
+    "PLANNING_RULES", "VERIFY_REFERENCE", "VERIFY_RULES", "CONTEXT_REFERENCE", "CONTEXT_RULES",
+    "REVIEW_REFERENCE", "REVIEW_RULES", "ORCHESTRATION_REFERENCE", "DELEGATION_RULES",
+    "PREFERENCE_RULES", "TOOL_CHOICE_RULES", "WORKFLOW_RULES", "PROGRESS_RULES", "GIT_RULES",
+    "REMINDER")
+
+OLD_TAGS = ("/progress/", "/send_message/", "/end_conversation/")
+
+# `{path}`, `{name}` and `{stem}` are multi_tool's for_each placeholders, not JSON.
+_PLACEHOLDERS = re.compile(r"\{(?:path|name|stem)\}")
+
+
+def forbidden_in_plain(text):
+    """What a plain-text-taught tags prompt must never say, found in `text`.
+
+    JSON in any case is allowed only as a file format (the read_document line)
+    and as the filename package.json; braces only as for_each placeholders.
+    """
+    found = []
+    for line in text.split("\n"):
+        if line.startswith("read_document - keys:"):
+            continue
+        scrubbed = _PLACEHOLDERS.sub("", line.replace("package.json", ""))
+        if re.search(r"json", scrubbed, re.I):
+            found.append("json: " + line[:120])
+        if "{" in scrubbed or "}" in scrubbed:
+            found.append("brace: " + line[:120])
+    for tag in OLD_TAGS:
+        if tag in text:
+            found.append("old tag " + tag)
+    for word in ("send_message", "end_conversation"):
+        if word in text:
+            found.append("verb " + word)
+    return found
+
+
+def plain_replies(text):
+    """The whole replies written after a "You emit:" line in `text`.
+
+    A reply starts on the line after the label and runs to the first blank
+    line or to a line indented as prose, so a block example with its own
+    progress line is returned whole.
+    """
+    lines, replies, i = text.split("\n"), [], 0
+    while i < len(lines):
+        if lines[i].strip() == "You emit:":
+            i += 1
+            chunk = []
+            while i < len(lines):
+                text_so_far = "\n".join(chunk)
+                inside_content = text_so_far.count("/content/") > 2 * text_so_far.count("//content/")
+                if not inside_content and (not lines[i].strip() or lines[i].startswith("  ")):
+                    break
+                chunk.append(lines[i])
+                i += 1
+            replies.append("\n".join(chunk))
+        else:
+            i += 1
+    return replies
+
+
+def test_every_plain_hand_written_constant_exists_and_is_not_the_tags_one():
+    for name in PLAIN_HAND_WRITTEN:
+        text = getattr(agent_prompt, name)
+        original = getattr(agent_prompt, name.replace("_TAGS_PLAIN", "_TAGS"), None)
+        assert text and text != original, name
+        assert agent_prompt.plain_section(name.replace("_TAGS_PLAIN", "")) is text, name
+
+
+def test_no_plain_section_mentions_json_braces_or_the_three_old_tags():
+    for name in PLAIN_SECTION_NAMES:
+        text = agent_prompt.plain_section(name)
+        assert not forbidden_in_plain(text), (name, forbidden_in_plain(text))
+
+
+def test_the_only_json_in_the_plain_sections_is_the_read_document_file_format():
+    said = [line for name in PLAIN_SECTION_NAMES
+            for line in agent_prompt.plain_section(name).split("\n")
+            if re.search(r"json", line.replace("package.json", ""), re.I)]
+    assert len(said) == 1 and said[0].startswith("read_document - keys:"), said
+
+
+def test_the_plain_sections_are_built_once_and_served_again():
+    assert agent_prompt.plain_section("ACTION_REFERENCE") is agent_prompt.plain_section("ACTION_REFERENCE")
+
+
+def test_every_block_in_every_plain_section_is_read_by_the_plain_parser():
+    count = 0
+    for name in PLAIN_SECTION_NAMES:
+        for block in tag_examples(agent_prompt.plain_section(name)):
+            check_example(block)
+            try:
+                got = agent_protocol.parse(block, plain_text=True)
+            except agent_protocol.ProtocolError as error:
+                raise AssertionError("plain parse refuses an example in %s (%s):\n%s"
+                                     % (name, error, block))
+            assert got is not None and got.get("action"), (name, block)
+            count += 1
+    assert count >= 80, count
+
+
+def test_every_hand_written_reply_is_read_as_the_action_it_means():
+    replies = plain_replies(agent_prompt.ANSWERING_EXAMPLES_TAGS_PLAIN)
+    assert len(replies) >= 12, len(replies)
+    for reply in replies:
+        got = agent_protocol.parse(reply, plain_text=True)
+        assert got is not None, reply
+        first = reply.split("\n", 1)[0]
+        work = re.search(r"^/(?!next_step/|events/|item/|type/|message/)[a-z_]+/", reply, re.M)
+        if work:
+            # Work: the text above the first block is its progress line.
+            actions = got["actions"] if "actions" in got else [got]
+            assert actions[0]["action"] not in ("end_conversation", "send_message"), reply
+            if not first.startswith("/"):
+                assert actions[0].get("progress", "").startswith(first[:20]), (first, got)
+        else:
+            assert got["action"] == "end_conversation", reply
+            assert got["message"].startswith(first[:20]), (first, got)
+            if "/next_step/" in reply:
+                assert got.get("next_step"), got
+
+
+def test_the_output_rules_keep_the_numbers_the_overrides_cite():
+    rules = numbered_rules(agent_prompt.OUTPUT_RULES_TAGS_PLAIN)
+    assert sorted(rules) == list(range(1, 12)), sorted(rules)
+    assert "plain text" in rules[5] and "final answer" in rules[5]
+    assert "final" in rules[10] and "explains why" in rules[10]
+    assert "HAVE to end every task with a final answer" in rules[11]
+
+
+def test_the_plain_header_and_speaking_rules_state_rules_a_to_d_and_the_stop_rule():
+    both = agent_prompt.HEADER_TAGS_PLAIN + "\n" + agent_prompt.SPEAKING_RULES_TAGS_PLAIN
+    for sentence in ("a reply with NO action blocks is your final answer",
+                     "Text before an action block is that action's progress line",
+                     "Text after the last block is shown to the user as a message",
+                     "End your reply after any action whose result you need; if you say you will do "
+                     "something, put its action in the same reply."):
+        assert sentence.lower() in both.lower(), sentence
+    assert "/next_step/" in agent_prompt.ANSWERING_EXAMPLES_TAGS_PLAIN
+
+
+def test_the_plain_reminder_and_behaviour_rule_say_nothing_of_the_old_verbs():
+    assert not forbidden_in_plain(agent_prompt.REMINDER_TAGS_PLAIN)
+    assert not forbidden_in_plain(agent_prompt.PLAN_BEHAVIOUR_RULE_PLAIN)
+    assert "final answer" in agent_prompt.PLAN_BEHAVIOUR_RULE_PLAIN
+
+
+def test_plain_transliterate_writes_progress_as_the_line_above_the_block():
+    got = agent_prompt.plain_transliterate(
+        '  You emit:  {"action":"read_file","path":"a.py","progress":"Reading a."}')
+    assert got == "  You emit:\nReading a.\n/read_file/ /path/ a.py //path/ //read_file/", got
+    assert agent_protocol.parse(got.split("\n", 1)[1], plain_text=True)["progress"] == "Reading a."
+
+
+def test_plain_transliterate_writes_a_lone_ending_as_text_and_drops_a_batch_ending():
+    got = agent_prompt.plain_transliterate(
+        '  You emit:  {"action":"end_conversation","message":"Done it.","next_step":"Run tests"}')
+    assert got == "  You emit:\nDone it.\n/next_step/ Run tests //next_step/", got
+    batch = agent_prompt.plain_transliterate(
+        '{"actions":[{"action":"git_status","progress":"Looking."},'
+        '{"action":"end_conversation","message":"x"}]}')
+    assert batch == "Looking.\n/git_status/ //git_status/", batch
+
+
+def test_plain_transliterate_is_loud_about_an_example_it_cannot_write():
+    for line in ('{"action":"send_message","message":"hi"}',
+                 '{"actions":[{"action":"end_conversation","message":"a"},{"action":"git_status"}]}'):
+        try:
+            agent_prompt.plain_transliterate(line)
+        except ValueError:
+            continue
+        raise AssertionError("an example with no plain form was written anyway: " + line)
+
+
+def test_every_plain_prose_swap_matches_exactly_once_in_its_json_section():
+    for name, swaps in agent_prompt._PLAIN_PROSE.items():
+        text = getattr(agent_prompt, name)
+        for old, new in agent_prompt._TAG_PROSE.get(name, ()) + swaps:
+            assert text.count(old) == 1, (name, old[:60])
+        built = agent_prompt.plain_section(name)
+        for old, _ in swaps:
+            assert old not in built, (name, old[:60])
+
+
+# --- the constants every other prompt is built from did not move ---------------------------
+
+_JSON_DIGEST = "077f797726b996dac65f4bb35d2037453946a235b5793724ba079e111816d6eb"
+_TAGS_DIGEST = "cec0ae5d9d1cf1a3431a09a8ca146ae6c5a7cb772c3702381439596d662470d9"
+_SUB_DIGEST = "15dd288ea8b522d5fc7f8d34c52a2a5b6eda6e14de3b73d3085da3d062c130ca"
+
+
+def _digest(texts):
+    return hashlib.sha256("\x00".join(texts).encode("utf-8")).hexdigest()
+
+
+def test_the_json_constants_are_byte_identical_to_before_the_plain_variant():
+    got = _digest([getattr(agent_prompt, name) for name in PLAIN_SECTION_NAMES])
+    assert got == _JSON_DIGEST, "a JSON prompt constant changed"
+
+
+def test_the_tags_constants_the_background_prompts_use_are_byte_identical_to_before():
+    names = ("HEADER_TAGS SPEAKING_RULES_TAGS OUTPUT_RULES_TAGS ANSWERING_EXAMPLES_TAGS "
+             "WORKFLOW_RULES_TAGS PROGRESS_RULES_TAGS REMINDER_TAGS").split()
+    texts = [getattr(agent_prompt, name) for name in names]
+    texts += [agent_prompt.section(name, "tags") for name in PLAIN_SECTION_NAMES]
+    assert _digest(texts) == _TAGS_DIGEST, "a _TAGS constant or a derived tags section changed"
+
+
+def test_the_background_prompts_own_tags_constants_are_byte_identical_to_before():
+    names = sorted(n for n in dir(agent_subprompts)
+                   if n.endswith("_TAGS") and isinstance(getattr(agent_subprompts, n), str))
+    assert _digest([getattr(agent_subprompts, n) for n in names]) == _SUB_DIGEST
