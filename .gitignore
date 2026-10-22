@@ -88,8 +88,15 @@ TMT_Context/
 # TMT is run on TMT this is the workspace -- and the same answer.
 .tmt_sandbox/
 
-# Working notes for the assistant. Per-checkout, not source.
-CLAUDE.local.md
+# The desktop app lives in app/ in this checkout only and must NEVER be staged,
+# committed or pushed from this repository (owner, 2026-10-22). It is also listed
+# in .git/info/exclude so the rule holds even if this line is edited.
+/app/
+
+# Working notes for the assistant. Per-checkout, not source. The wildcard also
+# covers renamed copies such as No_Need_To_load_Unless_Editing_Cli_CLAUDE.local.md
+# (renamed 2026-10-22 so it no longer auto-loads into every app agent).
+*CLAUDE.local.md
 
 # The publishing runbook: what the maintainer types to put this on npm, written
 # for one person on one machine. It names PATH entries, a local clone and an
