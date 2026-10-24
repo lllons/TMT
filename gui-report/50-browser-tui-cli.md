@@ -1,0 +1,118 @@
+# Local browser UI, Textual TUI, and CLI-only packaging (research, 2026-10-01)
+
+Fills the gaps flagged in `TMT-GUI-Report.md` sections 4.5, 4.6 and 4.7. Facts come from the cited pages (several via search summaries; marked where only a summary was seen). "UNVERIFIED" marks one weak source or my own reasoning. Effort figures are my estimates for one developer, not sourced, and assume the engine refactor in section 3 of the main report is done (except item 3).
+
+---
+
+## 1. Local browser UI (OpenHands style)
+
+**What it is.** The agent engine runs as a local HTTP server on `127.0.0.1`; the UI is a web app opened in the default browser, in an Edge/Chrome app-mode window (`msedge --app=URL`), or installed as a PWA. Same engine, no desktop shell.
+
+### How others do it
+
+| Project | Architecture | Notes | Source |
+|---|---|---|---|
+| OpenHands | React frontend + FastAPI backend (uvicorn) on `localhost:3000`; started with `openhands serve`, which launches a **Docker** container (about 2 GB of images); `--mount-cwd` mounts the project at `/workspace`; port 3000 not configurable from the CLI | Docker is there to sandbox execution, which TMT already does with its own policy and Job-Object sandbox, so the Docker part would not carry over. WebSocket/Socket.io use is implied but not confirmed by the pages I read | [OpenHands docs](https://docs.openhands.dev/openhands/usage/cli/gui-server), [DeepWiki](https://deepwiki.com/OpenHands/OpenHands/2-getting-started) |
+| gptme | Flask app (`gptme.server.create_app()`), `gptme-server` on `http://127.0.0.1:5700` (REST + tool execution); React/Vite/shadcn web UI served separately in dev at 5701; a desktop build bundles the same UI. CORS is explicit: `--cors-origin` must match the origin the UI loads from (comma-separated, e.g. `tauri://localhost`) | The closest analogue to TMT: a Python CLI agent with a local server and a separate web UI | [gptme server docs](https://gptme.org/docs/server.html), [webui](https://github.com/gptme/gptme/tree/master/webui) |
+| Open WebUI | FastAPI backend serving a pre-built SvelteKit frontend; `pip install open-webui` then `open-webui serve` on port 8080; SQLite by default; Python 3.11 | Single process, pip-installable: the model to copy if TMT wants "pip install and open a browser" | [quick start](https://docs.openwebui.com/getting-started/quick-start/), [DeepWiki](https://deepwiki.com/open-webui/open-webui/3-installation-and-deployment) |
+| Jupyter Server | Tornado server on loopback; random token generated per launch and printed as a URL; Host-header check; token or cookie auth; "execute" permission covers websocket channels for kernels and terminals | Jupyter is the reference design for "a local server that can run arbitrary code" | [security docs](https://jupyter-server.readthedocs.io/en/latest/operators/security.html) |
+| Aider | Optional Streamlit `--browser` mode | See main report section 5 | [docs](https://aider.chat/docs/usage/browser.html) |
+
+### Security for a local server that can run shell commands
+Anything that can reach the port can ask TMT to run commands, so this is the whole game. Checklist (the Jupyter and MCP sources support the numbered items; items 6-8 are my reasoning):
+1. **Bind to `127.0.0.1` only**, never `0.0.0.0`. Windows Firewall does not prompt for loopback listeners, but does for listeners on external interfaces (one weak source: [search summary](https://learn.microsoft.com/en-us/answers/questions/982358/im-unable-to-connect-to-my-python-http-server-ssh?page=1), and a PR comment in [goodcomp4x #210](https://github.com/dampfhub/goodcomp4x/pull/210)); confirm on a clean Windows 11 VM.
+2. **Random per-launch token.** Jupyter generates a token on every launch and prints a URL containing it; accepted as `Authorization: token ...`, URL parameter, or login form ([docs](https://jupyter-server.readthedocs.io/en/latest/operators/security.html)). In Python: `secrets.token_urlsafe(32)`. Exchange the first URL's token for an `HttpOnly; SameSite=Strict` cookie and strip it from the address bar.
+3. **Host header check against DNS rebinding.** Jupyter returns 403 when the Host header names a non-local domain ([Jupyter changelog/docs via search](https://jupyter-notebook.readthedocs.io/en/5.7.3/changelog.html)). In 2025 the official MCP SDKs and others shipped fixes for exactly this (CVE-2025-66414 / CVE-2025-66416; TypeScript SDK 1.24.0, Python SDK 1.23.0 added Host validation) ([vulnerablemcp](https://vulnerablemcp.info/vuln/cve-2025-66414-66416-dns-rebinding-mcp-sdks.html), [rust-sdk advisory](https://github.com/modelcontextprotocol/rust-sdk/security/advisories/GHSA-89vp-x53w-74fx)). Accept only `127.0.0.1:<port>` and `localhost:<port>`.
+4. **Origin check** on every state-changing request and on the event stream, same-origin only; the guidance for local MCP servers is to enforce both Origin and Host ([Rafter](https://rafter.so/blog/mcp-dns-rebinding-localhost), [Apollo MCP advisory](https://github.com/apollographql/apollo-mcp-server/security/advisories/GHSA-wqrj-vp8w-f8vh)). Note Jupyter skips the Origin check for requests authenticated with a token header; a cookie-authenticated browser session must not skip it.
+5. **CORS: none by default.** gptme needs explicit `--cors-origin` only because its UI is served from a different origin; serving the UI from the same server avoids CORS entirely.
+6. **CSRF:** require a custom header (for example `X-TMT-Token`) or JSON content type on all POSTs so a cross-site form cannot submit; do not allow GET to change state.
+7. **Other local users and processes:** a loopback port is reachable by every local account (shared PC, RDP, Windows Server). The token is the real access control; keep it out of process arguments visible in Task Manager (pass through the launch URL or a file with user-only ACL).
+8. **Approvals must be unforgeable by page content:** all XSS rules from main-report section 7 apply, and the approval reply must carry the engine-issued request id.
+9. **Port choice:** a random free port avoids conflicts (OpenHands' fixed 3000 is a known annoyance) but see the PWA caveat below.
+
+### Stdlib-only option vs FastAPI or aiohttp
+- **Stdlib is feasible for the server-to-browser direction.** `http.server.ThreadingHTTPServer` (since Python 3.7, so fine for TMT's 3.8 floor) handles each request in a thread; Server-Sent Events are plain HTTP and need no special server ([Python docs](https://docs.python.org/3/library/http.server.html), [SSE in Flask without deps](https://maxhalford.github.io/blog/flask-sse-no-deps/), [overview](https://rednafi.com/python/server_sent_events/)). The browser sends approvals, cancel and prompts with ordinary `POST`s. That keeps the "blocking approve" pattern: the engine thread waits on a `threading.Event` that a POST handler sets.
+- **WebSockets are not in the stdlib** (no WebSocket server). A hand-rolled RFC 6455 handshake and framing is possible (roughly 150 lines, my estimate) but is a security-sensitive thing to hand-roll; SSE plus POST is simpler and sufficient for this app.
+- **Costs of stdlib:** one OS thread per open stream; no built-in routing, auth, or static file caching; you must write the Host/Origin/CSRF checks yourself (about 50 lines). Fine for one user and a handful of streams.
+- **FastAPI/uvicorn or aiohttp:** better ergonomics and WebSockets, but they add third-party dependencies (and uvicorn/FastAPI pull Pydantic, which needs a modern Python). TMT's stdlib-only rule survives only if these live in an optional extra (`pip install tmt[web]`), as `requests` and `rich` do today. Open WebUI shows the FastAPI route works but its install is heavy and Python 3.11-only (see table).
+- **Recommendation within this route:** stdlib `ThreadingHTTPServer` + SSE + POST, with the same NDJSON message shapes as the stdio protocol, so one protocol serves WPF, Electron and browser front ends.
+
+### PWA and "app mode" for a desktop feel
+- **Installable from loopback.** PWAs must be served over https, or from `localhost`/`127.0.0.1` (with or without a port); Chromium browsers (Edge, Chrome) need a manifest with `name`/`short_name`, a 192 px and a 512 px icon, `start_url`, and `display` ([MDN](https://developer.mozilla.org/en-US/docs/Web/Progressive_web_apps/Guides/Making_PWAs_installable)). Once installed it opens in its own window and can be pinned to the taskbar; in Edge: Settings and more > Apps > Install this site as an app ([NinjaOne](https://www.ninjaone.com/blog/install-pwas-on-microsoft-edge-in-windows/)).
+- **Caveat (origin includes the port; supported by [web.dev multi-origin PWAs](https://web.dev/articles/multi-origin-pwas) and the Chromium manifest-scope discussions in a search summary, though not tested with Edge on loopback):** an installed PWA is bound to its origin, so `127.0.0.1:8080` and `127.0.0.1:8081` are different apps. A random port each launch would create a new origin every time and orphan the installed app; use a fixed port with a fallback, and the per-launch token must then be handled outside the URL (for example a one-time launch URL that sets the cookie). Whether Edge installs a PWA from a plain-http loopback origin on current builds was not tested.
+- **`msedge --app=http://127.0.0.1:PORT/`** opens a chromeless window, but with `--app` alone you cannot pin it with a custom icon to the taskbar or Start menu; a Group Policy route gives an app id that can be used in start and taskbar layouts ([Microsoft Q&A summary](https://answers.microsoft.com/en-us/microsoftedge/forum/all/how-install-this-site-as-an-app-using-command-line/b6bb2f52-6a6b-4114-ab48-c16e5205cc4a)). Practical recipe: installer creates a Start Menu shortcut running a small launcher (starts the server, then `msedge --app=...`); pinning the running window works but groups under Edge's icon unless installed as a PWA.
+- **Limits versus a real shell:** no native notifications from a plain page without the Notifications API permission, no taskbar progress, no jump lists, no global shortcuts, no file-system access except through the server, and a browser-dependent experience (default browser may not be Chromium).
+
+### Effort (ESTIMATE)
+- Server (stdlib, SSE + POST, auth and checks, protocol reuse): 1-2 weeks, on top of the engine refactor. Web front end (React or Svelte, markdown-it/shiki, diff view, dialogs, sidebar, settings): 3-4 weeks. PWA manifest and app-mode launcher: 2-3 days. **Total about 4-6 weeks.** Because the front end is the same TypeScript code as an Electron or Tauri renderer, the work is largely reusable if a shell is added later (gptme did exactly this).
+
+### Pros and cons versus a desktop shell
+| | Local browser UI | Desktop shell (Electron / WPF) |
+|---|---|---|
+| Install size | None for the UI (browser already there) | 40-150 MB |
+| Native Windows integration | Weak (no jump lists, taskbar progress; notifications need permission) | Strong (WPF) or moderate (Electron) |
+| Security surface | An open local port: token, Host, Origin, CSRF all required | Stdio pipe, no port |
+| Code signing / SmartScreen | Only the engine exe | Whole app |
+| Process lifetime | Server must be stopped; tabs can outlive it | Shell owns the engine |
+| Cross-platform | Yes | Electron yes, WPF no |
+| Accessibility | Standard browser a11y | Depends |
+| "Feels like an app" | PWA or `--app` window is close | Best |
+**Verdict:** a legitimate, cheap interim route and a useful first web front end, but not "a native Windows app". Use it if reach and low install cost matter more than integration. Not recommended as the final answer for the stated goal. Doing the security checklist properly is mandatory.
+
+---
+
+## 2. Modernise the TUI with Textual
+
+### What Textual offers (versions and facts)
+- Textual 8.2.8 (2026-06-30), MIT, Python 3.9 to <4.0, Windows 10/11 supported ([PyPI](https://pypi.org/project/textual/)); 37.4k stars, last push 2026-07-11 ([GitHub API](https://api.github.com/repos/Textualize/textual)). Note Python 3.9+ against TMT's 3.8 floor, and a third-party dependency tree against the stdlib-only rule: Textual 8.2.8 requires markdown-it-py[linkify], mdit-py-plugins, platformdirs, pygments (2.19.2 to <3), rich (14.2.0 or newer), tree-sitter (0.25.0 or newer) and typing-extensions ([PyPI metadata](https://pypi.org/pypi/textual/json)).
+- **Streaming Markdown:** the `Markdown` widget has `update()`/`append()`, and `Markdown.get_stream()` returns a `MarkdownStream` whose `write(fragment)` queues fragments and combines updates when they arrive faster than the UI can render; `stop()` awaits completion ([Markdown docs](https://textual.textualize.io/widgets/markdown/)). Syntax-highlighted code blocks, tables and block quotes are supported. This is the right primitive for TMT's character-by-character replies.
+- **Modal approvals:** `ModalScreen` blocks the app's key bindings and darkens the screen behind it; a screen returns data with `dismiss(value)`, delivered to a callback, or awaited with `push_screen_wait()`, which "can only be done from a worker" ([Screens guide](https://textual.textualize.io/guide/screens/)). The engine thread can wait on a `threading.Event` set from the callback (via `call_from_thread`). Directly matches the approve/choose pattern.
+- **Agent sidebar:** a docked `Vertical` of widgets updated from `AgentManager.subscribe`; the listener runs on worker threads, so it must hop to the UI with `app.call_from_thread(...)`.
+- **Workers and threads:** `@work(thread=True)` turns a method into a threaded worker; from it, `call_from_thread` updates widgets such as `Markdown`, the documented pattern for LLM streaming ([search summary of Textual guide](https://textual.textualize.io/blog/2024/09/15/anatomy-of-a-textual-user-interface/)). The engine already runs on its own thread, so the adapter is similar to the PySide6 bridge in `10-python-native.md`.
+
+### The conflict with TMT's no-alternate-screen rule (call-out)
+This is the decisive point. TMT's own source says it in capitals: `agent_splash.py` line 17: "**THERE IS NO ALTERNATE SCREEN BUFFER, AND THERE MUST NOT BE.**" because the alternate buffer "throws the terminal's scrollback away, and that scrollback is the user's own shell session"; DECSTBM scroll regions are banned for the same reason; `agent_panel.py` adds that the scrollback is "the only record a finished session leaves", and "a test greps the modules to keep them out" (both escapes). Textual's default is a full-screen app in the alternate screen buffer.
+- Textual's **inline mode** (`run(inline=True)`, added in 0.55) avoids the alternate screen and writes completed content into real scrollback ([Textual blog](https://textual.textualize.io/blog/2024/04/20/behind-the-curtain-of-inline-terminal-applications/)). **But the guide states: "Inline mode is not currently supported on Windows"** ([App guide](https://textual.textualize.io/guide/app/)). TMT's target is Windows, so the one mode that honours the principle is unavailable there. Inline mode also has had reported input lag ([issue 4403](https://github.com/Textualize/textual/issues/4403), 0.56.2-era; current status unchecked).
+- Consequences: on Windows a Textual TMT would be a full-screen alternate-buffer app, with no terminal-native scrollback or search during the session (the same alternate-screen property that screen-reader users complain about, see [hermes-agent #120584](https://github.com/NousResearch/hermes-agent/issues/120584)). Mitigations: print the whole transcript to the normal screen on exit (so the record survives), keep a session log file, and scroll inside the app. That changes a founding decision of the project, and the existing grep test would need an explicit exemption for the Textual front end.
+
+### Textual in a browser: textual-serve and textual-web
+- `textual-serve` serves a Textual app to a browser over a websocket; its last release was 2025-11-01 (quiet) ([releases](https://github.com/Textualize/textual-serve/releases)). `textual-web` publishes apps and terminals on the web and was still labelled beta ([repo](https://github.com/Textualize/textual-web)). Commentary says textual-serve is for demos, not a production web app ([search summary](https://textual.textualize.io/blog/2024/09/08/towards-textual-web-applications/)). Neither gives a native window; both would give a browser version of the TUI with the same limits as route 1 for security (a local server that can run commands: apply section 1's checklist).
+
+### Windows Terminal
+- Textual targets modern terminals (Windows Terminal, iTerm2, kitty) and has trouble in `cmd.exe`/legacy conhost ([search summary, johal.in / configcrate](https://configcrate.com/textual-python-tui.html), weak source). TMT today already works in a terminal via `msvcrt`; Textual would require Windows Terminal as the supported host.
+
+### Effort (ESTIMATE) and verdict
+- Replacing about 10,600 lines (`agent_menu` 4,586, `agent_panel` 2,163, `agent_splash` 1,085, `agent_ui` 1,103, `agent_live_renderer` 737, `agent_markdown` 540, `agent_setup` 289, `agent_tips` 147) with Textual screens and widgets, preserving type-ahead, the agent panel, the approval and `ask_user` flows, settings menus, and the splash: **about 6-10 weeks**, after the same engine refactor. Parts of `agent_markdown` (ANSI renderer) and `agent_live_renderer` (repaint arithmetic) disappear. Gains: a maintained widget set, mouse support, a command palette, streaming Markdown. Costs: a new dependency tree, Python 3.9+, the alternate-screen conflict on Windows, rewriting 2,600-test-adjacent UI tests.
+- **Verdict: not recommended for this goal.** It is still a terminal app, it does not deliver a Windows GUI window, and on Windows it forces the abandonment of the "scrollback is the record" principle. Consider it only if the aim becomes "a nicer terminal UI", not "a desktop app".
+
+---
+
+## 3. Package the CLI only (Option 0) in 2026
+
+### Components
+1. **Freeze the CLI.** PyInstaller `--onedir` (faster start and fewer antivirus flags than onefile; main report section 8: onedir about 0.4 s vs onefile 1.8 s startup in one blog benchmark) or Nuitka `--standalone` (smaller and faster start, longer builds). TMT is stdlib-only, so there are few hidden imports; `requests`/`rich` are optional and should be bundled. Bundle a current Python (for example 3.13), which sidesteps the 3.8 source floor.
+2. **Installer.** Inno Setup (active: 7.0.2 on 2026-07-14, per the .NET research file) for a per-user install under `%LOCALAPPDATA%\Programs\TMT`, adding the install directory to the user `PATH` and creating a Start Menu shortcut. Or Velopack (also works for console apps; it needs `--onedir`) for delta updates. Updates: `agent_update.py` fast-forwards a git checkout, which does not exist in a frozen install, so updates must move to Velopack/winget or be disabled.
+3. **Windows Terminal profile via a JSON fragment extension.** Drop a JSON file in `%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\TMT\tmt.json` for a per-user install, or `C:\ProgramData\Microsoft\Windows Terminal\Fragments\TMT\` for all users; create the folders if missing; the terminal reads every `.json` in the directory ([Microsoft Learn, updated 2025-11](https://learn.microsoft.com/en-us/windows/terminal/json-fragment-extensions)). A new profile must define a `name`; `commandline` runs the exe; generate the GUID with UUID v5 from the terminal namespace GUID `{f65ddb7e-706b-4499-8a50-40313caf510a}`, application name and profile name (the docs give the Python snippet). Windows Terminal 1.24+ can load an `icon` from the fragment directory; older versions ignored local icon paths. Minimal fragment:
+```json
+{ "profiles": [ { "name": "TMT", "commandline": "\"%LOCALAPPDATA%\\Programs\\TMT\\tmt.exe\"",
+                  "startingDirectory": "%USERPROFILE%", "icon": "tmt.ico" } ] }
+```
+   If PowerShell generates the file, write UTF-8 (`Out-File -Encoding Utf8`), not the default UTF-16 (the docs warn about this). I did not verify that `%LOCALAPPDATA%` environment variables expand in `commandline`; the docs example uses a bare executable name (UNVERIFIED), so have the installer write absolute paths.
+4. **Start Menu shortcut that opens Windows Terminal with the profile:** target `wt.exe -p "TMT"` (or `wt.exe new-tab -p "TMT" -d <dir>`); `wt.exe` is an app execution alias (enabled by default; its folder is `%LOCALAPPDATA%\Microsoft\WindowsApps`). Verified syntax from the [command line docs](https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments): `wt -p "Profile"` opens a new window with that profile, `-d <dir>` / `--startingDirectory` sets the directory, `new-tab` is the default command, and `wt -w 0 -p "Profile"` reuses the most recent window (in PowerShell, escape `;` as backtick-semicolon). For "run TMT in this folder": an Explorer context-menu verb under `HKCU\Software\Classes\Directory\shell\TMT\command` running `wt.exe -d "%V" -p "TMT"` (the registry-verb approach is described in the .NET research file Part 4; it appears under "Show more options" on Windows 11; `%V` for the folder is general knowledge, UNVERIFIED).
+5. **winget.** Package the onedir build as a zip with a portable nested installer: for archive installers the manifest takes `NestedInstallerType: portable`, `NestedInstallerFiles`, and an optional `PortableCommandAlias` to put a command on PATH; portable packages need Windows Package Manager 1.3 and zip archives 1.5 ([manifest schema](https://github.com/microsoft/winget-pkgs/blob/master/doc/manifest/schema/1.12.0/installer.md)). Alternatively submit the Inno Setup `.exe` with silent switches (`/VERYSILENT`). Automate with `winget-releaser` as in the .NET file. The first manifest submission is manual.
+6. **Signing and AV.** The same signing options apply (NZ: Artifact Signing for a company, SignPath Foundation for the Apache-2.0 repo, Certum, SSL.com; see main report section 8); an unsigned frozen CLI will trigger SmartScreen and may trip antivirus. Sign every exe/DLL.
+7. **What TMT already ships:** an npm launcher (`bin/tmtcode.js`) that installs a git checkout into `~/.tmtcode` and runs `TMT.py`; `requires-python >=3.8` in `pyproject.toml`. The Option 0 build would replace the Python and git prerequisites for Windows users.
+
+### Effort (ESTIMATE) and verdict
+- About 3-5 days for a PyInstaller onedir build, an Inno Setup installer with PATH, shortcut and fragment, and CI; plus 1-2 days for a winget manifest and 1-2 days for signing once a certificate route is chosen. Needs no engine refactor. Ongoing cost: replacing git-based self-update.
+- **Verdict: do it, as a stepping stone and fallback.** It delivers "installable on Windows" cheaply and exercises the signing, onedir freezing and winget pipeline that every GUI route also needs, so the work is reused. It is not a GUI and does not meet the stated goal on its own.
+
+---
+
+## Unverified items in this file
+- Windows Firewall "no prompt for loopback" rests on weak sources; test on a clean Windows 11 install.
+- Whether Edge installs a PWA from a plain-http `127.0.0.1` origin on current builds (MDN says localhost/127.0.0.1 qualify; not tested). The one-app-per-origin consequence of a changing port is supported by web.dev but untested here.
+- OpenHands' use of WebSockets/Socket.io (implied, not confirmed).
+- Textual: current state of the inline-mode input lag, and Windows-Terminal-only support (weak source). Inline mode unsupported on Windows is stated in Textual's own guide; I did not check whether that changed after 8.2.8's release notes.
+- `%LOCALAPPDATA%` expansion in fragment `commandline`, and `%V` in an Explorer verb.
+- All effort estimates (sections 1-3) are mine.

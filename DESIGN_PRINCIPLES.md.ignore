@@ -1,0 +1,683 @@
+# TMT design principles
+
+Colour and text rules for everything TMT draws in the terminal. Git-ignored: this is a
+working reference for whoever is building the interface, not shipped documentation.
+
+The values below are not aspirational. They are the ones in `agent_ui.py`, and that
+module is the only place they are defined. If a rule here and the code disagree, the
+code is right and this file is stale.
+
+## The gradient
+
+TMT has one visual idea: a gradient running **red → orange → green**. It is the
+progress bar, the frames, the logo, the spinner. Nothing else needs inventing.
+
+Six stops, interpolated (`agent_ui._gradient`):
+
+| Position | RGB | Hex | Reads as |
+|---|---|---|---|
+| 10 | `220, 38, 38` | `#DC2626` | red |
+| 40 | `249, 115, 22` | `#F97316` | orange |
+| 60 | `234, 179, 8` | `#EAB308` | amber |
+| 80 | `132, 204, 22` | `#84CC16` | lime |
+| 95 | `34, 197, 94` | `#22C55E` | green |
+| 100 | `74, 222, 128` | `#4ADE80` | light green |
+
+One neutral, and only one: `DIM = 88, 88, 88` (`#585858`), for the unfilled part of a
+bar and for detail that must recede.
+
+There is no other colour. No blue, no magenta, no per-feature palette. A second colour
+system would make two things look unrelated that are the same thing.
+
+## What the gradient means
+
+Position in the gradient carries meaning, so do not pick a colour for looks:
+
+- **Red is early, green is done.** `_gradient(progress)` maps 0–100 directly, so a
+  progress bar's colour and its number always agree.
+- **Ambient surfaces cycle** rather than sit still: `gradient_at(phase)` walks
+  red→green over the first half of `GRADIENT_CYCLE` (2.4s) and back over the second, so
+  it can loop forever without snapping from green to red. Use it for anything that is
+  alive but not measuring progress — the THINKING word, the logo, a menu that is
+  waiting to be driven.
+- **`spread`** in `cycle_text` decides how much of the gradient one string covers. `1.0`
+  spans the whole range across the text; smaller values keep a string closer to one hue.
+  Paired elements (a left and right frame edge) use the same phase offset by `0.5` so
+  they differ without looking unrelated.
+- **A fixed phase for anything printed once.** `agent_menu.BRAND_PHASE` /
+  `BRAND_SPREAD` are where the non-animating gradient starts and how far it
+  travels. A line printed into scrollback is read, not watched, and a wordmark
+  that is a different colour every launch is not a wordmark. The span starts
+  past red on purpose: red is the error end of the scale.
+
+## What does not carry the gradient
+
+The gradient marks what is alive or measuring. Three surfaces are deliberately
+plain — the terminal's own colour, no cycle, no phase:
+
+| Surface | Why |
+|---|---|
+| the prompt box: rules, marker, typed text | it is being typed into. Colouring it says "this is progressing", which it is not, and an animated box repaints under the caret |
+| the streaming reply box | it holds the answer as it arrives, and a reader is reading it |
+| the finished answer from `render_response` | the one thing on screen the user came for. A coloured border made it look like another instrument |
+
+Plain is not only a matter of taste here: two frames of an undecorated box are
+byte-identical, so `LiveRegion` skips the repaint, and a repaint skipped is a
+caret that does not move. The flicker fix and this rule are the same fix.
+
+### The one exception: capability commands in the field
+
+`/plan`, `/review` and `/verify` in the input field carry the gradient
+(`agent_menu.paint_capabilities`). It is the only coloured thing on the typed
+surface and it is worth being precise about why it does not break the rule
+above.
+
+**It is not the typed text, it is an instrument that happens to sit in it.** A
+capability command is a switch the user is throwing: it decides whether TMT may
+plan, whether a second agent will audit the work, and whether the final answer
+will be gated. Everything else in the field is prose the model will read. The
+gradient marks the two apart, and marking them apart is exactly what the
+gradient is for.
+
+**It is a FIXED phase — `CAPABILITY_PHASE = 0.0`, `CAPABILITY_SPREAD = 0.5` —
+so the mechanical half of the rule is untouched.** The clock is never
+consulted, the token is the same colour in every frame, two frames of an
+untouched box are still byte-identical, `LiveRegion` still skips the repaint
+and the caret still does not move. This is the "fixed phase for anything
+printed once" rule above, applied to something drawn repeatedly but never
+changing. An ANIMATED highlight here would put the flicker straight back, on
+the one surface where it is least tolerable, and is the thing not to do.
+
+**It starts at red on purpose**, which is the other departure: `BRAND_PHASE`
+begins past red because a header is not an error. Here the full red → orange →
+green run is the point — it is what was asked for, and a switch being thrown
+reads as a scale rather than as a hue.
+
+Colour is still never the message. Strip the escapes and the row says
+`/plan`, which is the command spelled out; on a terminal with ANSI but no
+colour the token takes `BOLD + UNDERLINE` instead, and in a piped run it takes
+nothing at all.
+
+## The neutral ramp, and the one strip that uses it
+
+There is one neutral for detail that recedes — `DIM` — and there is one other
+grey, which is a **ramp** rather than a colour: `agent_panel.NEUTRAL_STEPS`,
+black through grey to white, and it belongs to the bars of background agents
+and to nothing else.
+
+It is not a second palette. The gradient means *"the main agent is working and
+this is how far along it is"*, and painting a worker's bar with it says the
+same sentence about a different thing on the row below — at a glance five
+gradient bars read as one process reported five times. So the delegated work
+gets **the absence of a colour** rather than a colour of its own, which is
+"one gradient, one neutral" spent on its most useful distinction. The rows
+still read with the escapes stripped: each one says which agent it is and what
+state it is in, in words.
+
+### A delegation's contract on the row and on the card
+
+A background agent spawned with constraints — read-only, a deadline, a report
+it owes — says so on its own row and on its own card, and it says it in **the
+absence of a colour like everything else in that strip**. Nothing here took a
+position on the gradient: `READ ONLY` is a word, the countdown is a pair of
+numbers, and both read exactly the same with the escapes stripped, which is
+what the rule requires of a fact that changes what the user should expect from
+a process they can see.
+
+Three sizes of the same fact, and each is the size its surface has room for:
+
+    ██░░░░░░ #3  RO  8:32/10:00  +0 -0  ~4k out  1m28s  running   <- the strip
+    > #3: ~4k T +180                                              <- the card
+       RO  8:32/10:00  F D S
+    #3: ~4k T running                                             <- /agents
+       READ ONLY  TIMEOUT 10:00  (8:30 left)
+       REPORTS FILES  DIFF  SUMMARY
+
+The strip and the card abbreviate because they are twenty to thirty columns
+wide; `/agents` prints to the permanent surface with the width of the
+terminal, so it is where the contract is actually *read*, and shrinking it
+there to match the card would be abbreviating the one readout with room.
+
+**The countdown is real, and that is the whole reason it is allowed.** A card
+draws no elapsed time — the rule two sections down, and it stands — because a
+duration that the repaint could not keep current would be a stale number
+presented as a live one. What is drawn here is `remaining/limit`, read off the
+same deadline arithmetic the runtime will actually stop the work with, so the
+number on screen cannot drift from the number that matters; and it stops being
+a countdown the moment the delegation does, showing the limit alone. A fake
+countdown would be worse than none.
+
+**A delegation that timed out is not painted as one that failed.** It takes
+the `KILLED_POSITION` a stopped agent takes, and the word `timeout` rather
+than `failed`. The two are separate states because a worker that ran out of
+time has not crashed, and giving them one colour would undo on screen the
+distinction the whole feature exists to draw.
+
+**The counter says `4/10`, not `4`.** A count on its own answers "how much is
+running" and not "how much more can". The maximum is asked of the register
+rather than written into the interface, so the number promised on screen is
+the number the capacity check enforces.
+
+**An unconstrained delegation draws exactly what it drew before.** No chip
+row, no countdown, two rows on the card. The contract is the only thing that
+adds anything, which is the same rule the plan column and the capabilities row
+follow: a session that does not use a feature must not be able to tell it
+exists.
+
+### The reviewbot strip
+
+The independent reviewer draws in that same strip, under the main progress
+bar, because it *is* one of those agents — same loop, same record, same
+background thread. It is drawn `reviewbot` rather than `#4` because it is not
+a numbered member of the fleet: there is one of it, it lives in its own slot,
+and a number would send the reader looking for it in the AGENTS panel, where
+it is not.
+
+    ███░░░░░ reviewbot  2/6  ~12k T +840  47s   <- the instrument
+      Read Lines agent_review.py                <- the current task, dim
+      A1 ✓ Understand what the user asked for   ┐
+      A2 ✓ Read the diff end to end             │ the reviewer's own agenda,
+      A3 ● Check the tests cover the new paths  │ windowed on the item in hand
+      A4 ○ Check every requirement              ┘
+
+- **The bar is the neutral ramp, and turns red at exactly one moment**: when
+  the review has come back blocking, or has not come back at all — the two
+  states the runtime will not release a final answer from. Red is position 10,
+  which is where `error` already sits, so nothing here added a colour. A stale
+  pass is deliberately *not* red: the work moved under a review that really
+  did pass, which is news about the code rather than news from the reviewer.
+- **It is the one completion figure in TMT that is not a guess.** Every other
+  bar shows budget spent, because nothing can know how close a process is to
+  finishing. Here the reviewer itself declared how many things it would check
+  and has itself reported which are done, so `2/6` is a fact it stated. An
+  agenda with nothing in it is 0 and never 100.
+- **The list is the reviewer's, and the runtime never supplies one.** A
+  reviewer that declares nothing gets the bar and the activity row and no
+  list at all. A default agenda would be a description of what a review is
+  supposed to do, drawn beside a review that might be doing something else,
+  and nothing on screen would tell the two apart. That is "never fabricate"
+  on the one display whose whole job is to say what is actually happening.
+- **`skipped` is its own state, with its reason on the row.** Collapsing it
+  into `done` would let the strip claim coverage the review did not have, and
+  a reviewer that could not check something must be able to say so rather than
+  choose between a tick and a stuck list.
+- **Four marks, distinct with the escapes stripped**, and the ASCII table is
+  asked for whenever the stream cannot carry them — `✓ ● ○ –` becoming
+  `+ > . -`. A terminal that draws a box rule but not a tick would otherwise
+  put a replacement character on the one column being scanned.
+- **Nothing on it animates.** Two frames of an unchanged strip are identical,
+  which is what lets `LiveRegion` skip the repaint — the same bargain the
+  prompt box strikes, and for the same reason.
+
+## Text rules
+
+- **Never colour alone.** Selection, state and errors must be legible with ANSI
+  stripped. A `>` marker, a word, or a position — colour is confirmation, not the
+  message. `_supports_color()` returns False more often than you would think: pipes,
+  redirects, `NO_COLOR`.
+- **Measure, never count.** Width is `display_width()`, not `len()`. Full-width and
+  combining characters break every layout that counts characters, and have already
+  done so twice in this project.
+- **Leave a spare column.** Draw to `columns - 1`. Terminals disagree about what a row
+  filled to the last column does, and the ones that auto-wrap silently cost a line the
+  repaint arithmetic does not know about.
+- **Degrade on purpose.** When `plain_output()` is True the stream cannot encode the
+  decorative glyphs: use the ASCII set (`#`/`-` for bars, `+`/`|` for frames, `*` for
+  the spinner) rather than emitting replacement marks. A deliberate ASCII interface
+  reads as a choice; a row of `?` reads as a bug.
+- **Write through `safe_write()`.** Decoration must never end the run.
+- **Wrap prose on words, never at the column.** `wrap_words()` for anything a person
+  reads as a sentence; `wrap_lines()` only where the columns mean something — a table
+  laid out by hand, a line of code, a path. A word sawn in half at the edge of the
+  terminal is the reader doing the renderer's job. The one exception is a word wider
+  than a whole row, which is cut because moving it cannot help.
+- **Generated text is markdown, and it is rendered.** Models write markdown whether or
+  not anything reads it, so `agent_markdown` turns it into something meant for a
+  person: the answer box, the streaming reply box and every progress line. The subset
+  is GitHub's — headings, lists, task lists, quotes, rules, fenced code, pipe tables
+  and every inline mark. The block grammar is for the two boxes; a line of the event
+  stream gets the inline marks only, because it is drawn inside a row that already has
+  a marker and an indent in front of it.
+- **Markdown carries WEIGHT, and two marks are lit — in the reply, and only there.**
+  Italic, strike and the one neutral are weights and nothing more. Bold is `BOLD + LIME`
+  — the gradient's own lime stop at 80, `(132, 204, 22)`, muted a fifth of the way toward
+  `DIM` — so the word a model chose to stress is the word the eye lands on. It is a
+  **position on the existing ramp**, not a hue of its own.
+- **The event stream takes the weights and none of the colour.** `render` draws a reply,
+  which is a surface with nothing else on it, so the two lit marks are the only colour in
+  the row. `render_message` draws one line of the event stream — a progress line, a
+  milestone, a file edit — and that row already carries a gradient position on its
+  **marker**, saying what kind of thing happened. A lime word and a cyan path inside it
+  are a second colour system in the same row, one talking about the sentence while the
+  other talks about the event; and on a progress line, the quietest thing TMT draws, they
+  are a lit word inside something whose whole job is to recede. Neither mark loses
+  anything by it: bold keeps its weight, code keeps its backticks.
+- **A span inside a coloured row gives the row back.** `RESET` ends the caller's styling
+  as well as the span's own, so a dim progress line carrying one `` `path` `` was dim as
+  far as the first backtick and full brightness for the rest of the sentence — half quiet
+  and half loud, and the loud half whatever the model happened to write after its first
+  inline mark. Every span closes with `RESET` and then re-opens the base it interrupted.
+  A row that opened nothing has nothing to put back and emits nothing.
+- **Inline code is `CYAN` `(79, 209, 197)`, and it is the one colour in TMT that is off
+  the ramp.** That is deliberate and it is the reason it is allowed. The ramp colours a
+  **quantity** — how far along, how urgent, how done — and a path, a flag or a symbol in
+  the middle of a sentence is not a quantity and has no position to take. It is a
+  different **kind** of text, which is the whole reason to mark it, and a ramp position
+  would say something false about it. Warm rather than blue, so it reads as a neighbour
+  of the palette rather than as a second one.
+- **Each lit mark keeps something that survives the colour being taken away.** Bold
+  keeps its weight; inline code keeps its backticks. That is what lets both obey the
+  rule every rendered row obeys — it still reads with the escapes stripped — and it is
+  why the backticks stay even now that the span is coloured.
+- **The lime never animates, and is never the colour alone.** No clock is consulted, so
+  two frames of an unchanged reply are still byte-identical, `LiveRegion` still skips
+  the repaint and the caret still does not move — the same fixed-value answer the
+  capability commands in the input field give, for the same mechanical reason. And it
+  is always emitted with `BOLD`, so a terminal that refuses colour still shows the
+  emphasis as weight. Colour marks the emphasis; it is never what the emphasis *is*.
+- **Only a level-1 heading is ruled.** A document has one title, and a rule under every
+  `###` in a long reply draws more lines than text.
+
+## Voice
+
+- Plain, factual, lower-case-ish. No exclamation marks, no emoji, no marketing.
+- Say what happened, not how it felt. "Nothing was committed" beats "Oops".
+- An error names the thing to do next. If there is nothing to do next, say that too.
+- Short lines. The terminal is narrow and the text is read once.
+
+## Layout
+
+- One idea per screen. The startup screen is a logo, a few facts, a divider, a menu.
+- Dividers are a single rule, full width minus one. On a menu it is in the gradient;
+  on the prompt box it is plain, for the reason in the table above.
+- **One rule per boundary.** Two rules a blank line apart are not a boundary, they
+  are a box with nothing in it. The session header used to end in a rule and the
+  prompt box below it drew its own, and the screen opened with an empty frame
+  between them. A rule belongs to the thing it encloses; the header has none.
+- **Fill the window.** `_content_width` is `columns - 1` with a floor and no ceiling.
+  It used to stop at 72, which on a wide terminal left the session in a strip down
+  the left and made the box read as a panel dropped onto the terminal rather than
+  as the interface of the thing running in it.
+- **A screen opens at the top and reads downward.** `clear_screen` erases the viewport
+  and homes the cursor as the startup menu opens and again as the session behind it
+  does, so each begins where a reader begins. The header is the first thing on the
+  window; the question, the work and the answer follow it down in the order they
+  happened. No alternate screen buffer, which would pin a region at the cost of the
+  terminal's own scrollback, and that scrollback is TMT's permanent surface. `\033[3J`
+  is never sent either: the scrollback above TMT is somebody's shell session and not
+  TMT's to throw away.
+- **And the prompt box is at the foot of it from the first frame.** Those two look
+  like they contradict, and what reconciles them is that the gap between them is
+  *inside* the live region, as blank rows above the box — `BottomPad`. `write_above`
+  erases the region, prints where it stood, and paints it again below; painting it one
+  row shorter puts it back on exactly the rows it already occupied, so the box does not
+  move and the printed line lands in the space the pad gave up. The window fills from
+  the top while the box holds still, and once the pad is gone the box is at the bottom
+  and the terminal's own scrolling keeps it there.
+
+  `opening_pad` is answerable only at the start, because the screen has just been
+  cleared and the cursor is on a row we know. After that the count never has to be
+  exact: it only ever decreases, it is part of the region's own line list so no repaint
+  arithmetic depends on it, and a row out means the box sits a row off the bottom until
+  the next line of output corrects it. The last row of the window is never drawn on —
+  a region is painted by writing each row and a newline, so the cursor ends one below.
+- Repaint in place; never print a second copy of a frame. `LiveRegion` exists for this.
+- Blank lines are structure. Two elements with nothing between them are one element.
+
+## Two surfaces, and which one a thing belongs to
+
+This is the most important rule in the file, because getting it wrong is what
+produced the defect the response history was built to fix.
+
+Everything TMT draws is either **permanent** or **temporary**, and the two are
+rendered by different code that must never be mixed:
+
+| | Permanent | Temporary |
+|---|---|---|
+| What | progress messages, tool activity, file edits, command and test results, warnings, errors, milestones, the next-step hint, the final answer | the progress bar, the THINKING word, the token count, the elapsed readout, the streaming reply box |
+| Written by | `agent_ui.Transcript` | `agent_ui.LiveUI` and `agent_live_renderer.LiveRelay` |
+| How | printed once into the terminal's own scrollback | repainted in place through `LiveRegion` |
+| Lifetime | the rest of the session | until the next repaint |
+| Recorded in | `agent_ui.ResponseHistory`, append-only | nothing |
+
+A temporary row is written with `\r\033[2K` — a carriage return and an erase.
+Anything sent there is gone the moment the next thing arrives. That is correct
+for a bar measuring progress and wrong for everything else, and for a long
+time it was the only surface there was, so every intermediate message erased
+the one before it.
+
+The seam between them is `LiveRegion.write_above()`: it erases the live
+region, prints the permanent text where the region stood, and paints the
+region again below. Paint again rather than shift — how far the terminal
+scrolled is something only the terminal knows, and arithmetic that assumed a
+fixed offset is what used to march the frame down the screen.
+
+**Never print past a live region.** Either the terminal is yours or it is the
+region's; `write_above` is how you borrow it.
+
+## The prominence ladder
+
+Terminals cannot size type independently, so weight is carried by what a
+terminal does have: dimness, indentation, the blank line at the edge of a
+block, and how loud the marker is. Four levels, in `agent_ui.PROMINENCE`:
+
+| Level | Kinds | Treatment |
+|---|---|---|
+| 3 | `final` | the boxed reply from `render_response`. One answer per turn, drawn one way. |
+| 2 | `file_edit`, `file_create`, `file_delete`, `command`, `test` | indented three columns, gradient marker, measured facts on a dim second row, blank line at the edge of the block |
+| 1 | `milestone`, `success`, `warning`, `error`, `tool`, `file_read`, `background_agent` | one row, gradient marker, normal weight |
+| 0 | `progress`, `next_step_suggestion` | dim throughout, one column of indent, no blank line |
+
+Level 0 must read as something said in passing and level 2 as a result worth
+scrolling back to. Check it with ANSI stripped: the indent still separates
+them, because colour is confirmation and never the message.
+
+## Where an event sits in the gradient
+
+Position carries the meaning here exactly as it does on the progress bar, and
+these are fixed positions rather than the ambient cycle — a line printed once
+into scrollback is being read, and nothing the user is reading may animate.
+
+| Position | Kinds |
+|---|---|
+| 10 (red) | `error` |
+| 40 (orange) | `milestone`, `tool`, `file_read`, `command`, `background_agent` |
+| 60 (amber) | `warning` |
+| 80 (lime) | `file_edit`, `file_create`, `file_delete`, `test` |
+| 95 (green) | `success` |
+| the one neutral | `progress`, `next_step_suggestion` |
+
+No event gets a colour of its own. A new kind takes a position on this scale.
+
+## Facts on an event
+
+Only measured ones. `+18 -4` means eighteen lines arrived and four left, and
+it is written only where both halves are actually known — a `patch_file` knows
+both, an `append_file` knows both, a `write_file` knows only what it wrote
+because the content it replaced is gone by the time the event is made. An
+event with nothing certain to report gets no second row rather than a
+plausible-looking zero.
+
+The same rule governs whether an action succeeded. A result is read for
+success or failure only when it is the action's own report; a program's output
+and a file's contents are data. Scanning those for words like "failed" once
+labelled a fully green test run a failure, which is a lie told confidently.
+
+## The running session, top to bottom
+
+Idle, the moment a session opens:
+
+    ████████ ███    ███ ████████           <- drawn once, when the session opens
+       ██    ████  ████    ██
+       ██    ██ ████ ██    ██
+       ██    ██  ██  ██    ██
+       ██    ██      ██    ██
+      date
+      workspace
+
+                          clock · provider · model    <- the caption, dim
+    ──────────────────────────────────────────────    <- the prompt box
+    > the hint in dim, or the line being typed
+    ──────────────────────────────────────────────
+
+Working, after a question has been asked:
+
+                          clock · provider · model    <- permanent: the question,
+    > the question as it was typed                       written when it is answered
+
+    · progress                             <- permanent, into scrollback
+      ▸ Patched file: config.py
+        +3 -2
+    · progress
+    ┌──────────────────────────┐           <- the reply as it arrives   ┐
+    │ ...                      │                                        │ one live
+    └──────────────────────────┘                                        │ region,
+    ──────────────────────────────────────────────  <- the box, inert   │ at the
+    > Working. Ctrl-C to stop.                                          │ foot of
+    ──────────────────────────────────────────────                      │ the
+    ███████░░░ 72%  ✳ thinking…  (18s · ↓ 142 tokens)                   ┘ window
+
+**Settled facts in the header, moving ones on the box.** The date and the
+workspace were decided before the first request and cannot change while the
+loop runs, so they are printed once — repeating them per turn only pushed the
+conversation up the screen. The clock, the provider and the model can all be
+different from one question to the next, so they are stated on the box, which
+is drawn again for every question anyway. Each fact appears once.
+
+### One wordmark, three sizes, descending in the order you meet them
+
+`agent_menu.LOGO` is the canonical letterform and there is exactly one of it.
+Everything that signs the screen derives from it rather than restating it, so
+there is no way for TMT to end up with two wordmarks that are nearly the same:
+
+| Where | Size | Phase |
+|---|---|---|
+| the launch screen (`agent_splash`) | the block, scaled ×2 | the ambient cycle while waiting or working; fixed `LOGO_PHASE` once settled |
+| the startup menu banner | the block | the ambient cycle |
+| the session header | the block | fixed, `BRAND_PHASE` |
+| any window too narrow or too short for the block | the plain word | fixed |
+
+**What is printed once takes a fixed phase; what is repainted and watched
+animates.** The session header is written into scrollback and never redrawn, so
+it cannot animate at all and takes `BRAND_PHASE`. The menu's banner and the
+launch screen both live in a live region somebody is looking at, and both ride
+the cycle — the launch screen is an attract screen, nothing on it is being read
+yet, and the wordmark is the natural thing to say the program is alive with.
+
+**The launch screen stops once a state has settled**, wordmark and subtitle
+together. That half is mechanical as well as tasteful: "Up to date." is a fact
+and a fact that pulses looks like it is still deciding, and a frame that stops
+changing is a frame `LiveRegion` skips repainting. The cost usually argued
+against an animating logo — that every repaint rewrites every row — is not paid
+on this screen, because the subtitle was already oscillating and a region
+repaints every row whenever any row differs.
+
+The session header spends five rows on the block only when the window has
+room: `HEADER_LOGO_MIN_ROWS` (18) as well as the width. Below either it falls
+back to `TMT · date` on one row — on a window that size the rows are worth
+more than the size of the letters.
+
+**The bottom of the screen is one region.** The reply, the box and the status
+row are painted together by `LiveRelay`, so they keep their order and their
+distance from the foot of the window however much permanent output scrolls
+past above them. The status row is last because it is the instrument, and an
+instrument belongs under the thing it is measuring. It stops when the turn
+does: a bar that is not measuring anything and a clock that is not counting
+are decoration pretending to be instruments.
+
+**The box is a live region, not a record.** It is taken down the moment it is
+answered, and the question is written into scrollback by `render_task` — the
+caption, and the line under the same marker it was typed under, with no rules.
+Left behind instead, every question of the session would sit on screen inside
+a frame that no longer accepts anything, and an empty prompt would stack an
+empty box each time it was answered.
+
+## The meter
+
+`+1231 lines, -123 lines, ~15k tokens in, 30k out` — what the session has changed and
+what it has cost. It rides on the **left end of the prompt box's caption**, opposite the
+clock, and on the running box it has that row to itself.
+
+**Nothing is drawn outside the flow of the screen.** The meter was briefly pinned to row
+one, held there by narrowing the terminal's scrolling region to rows two and below. That
+worked, and the cost was the whole session: lines scrolled out of a narrowed region are
+discarded rather than pushed into the terminal's scrollback, so the history stopped
+accumulating, scrolling up no longer reached it, and the box jumped about when it was
+scrolled back. TMT's permanent surface **is** that scrollback — it is the only record a
+finished session leaves — and nothing may be bought with it, least of all a readout.
+Neither DECSTBM nor the alternate screen buffer has any business here, and a test says so.
+
+- **Only the two counts are coloured**, and each takes the position it already holds:
+  green (95) for lines that arrived, red (10) for lines that left. Everything else is
+  the one neutral, and the whole row reads with the escapes stripped.
+- **A guessed number is marked guessed.** Tokens sent carry `~` always — no provider
+  will count a request before it is sent. Tokens generated carry it while the reply is
+  still arriving, and when the provider reported no figure of its own. Lines are
+  counted, from the events the actions themselves reported, and only where both halves
+  are known — which is why a `write_file` says `Created file:` for a path that did not
+  exist and `Wrote file:` for one that did.
+- **It moves as the work happens**, not when the turn ends: `note_output` feeds it the
+  characters as they stream, and `count_event` counts each action as it completes. A
+  readout that only settles at the end of a turn is a readout nobody watches.
+- **Nothing to report means nothing drawn**, not a row of zeroes.
+- It gives up its words before its figures as the terminal narrows, gives up the whole
+  meter before any fact on the right end, and says nothing at all before it would show
+  a fragment of a number.
+
+## The prompt box
+
+- A dim caption, a rule, a `>` marker and the line, a rule. `-` and `>` when the
+  stream cannot encode the rule. Plain, not gradient: see the table above.
+- It is the primary surface of the screen — the only bordered thing below the
+  answer, and the only one with a live caret in it. That is prominence enough
+  without decoration.
+- A blank line above it, always. It arrives under the header or under the
+  answer's border, and butted against either it reads as part of that rather
+  than as the next question.
+- The line scrolls sideways rather than wrapping, and both the offset and the
+  caret are measured in columns. An offset counted in characters puts a wide
+  one half off the edge.
+- **The caret stays in the input row.** It is the terminal's own, and it is
+  taken out of the row only for a repaint that has something new to show —
+  never on a timer. `LiveRegion` writes the repaint with the caret suppressed
+  and hands it back once it is in the row again, so it is never drawn on a row
+  it is only passing through. Getting either half of this wrong is what put a
+  caret at the foot of the terminal flickering twelve times a second while
+  nobody was typing.
+- Movement is by grapheme. A cursor that steps one code point lands inside a
+  combining sequence and everything drawn from there is cut through a
+  character.
+- The terminal is measured per paint, never remembered: a window resized
+  between two keystrokes is drawn at its new width.
+- **While a turn runs the box is inert**, drawn by the relay with
+  `running_lines`: no caret, no caption, and shadow text saying what is
+  happening and how to stop it. Nothing typed into it would be read, so a box
+  that looked ready for input would be a lie about what the program is doing.
+- **Any doubt about raw keys means no.** A wrong "yes" hangs the process on a
+  read that will never be answered; a wrong "no" only degrades to reading a
+  whole line. Every scripted, piped and tested run takes the degraded path, and
+  that is why they work at all. That path prints the box rather than painting
+  it, and does not take it down: there is no repaint, so the box is the record.
+
+## The system prompt
+
+The model never speaks to the user. It emits one JSON object, and what the user
+reads is inside `"message"`. The prompt's whole job is to make that unmissable,
+and it used to open by undermining it — "You chat naturally with the user" — which
+is exactly what a capable model then did. Three things carry it now:
+
+- **The header states the contract first**, before any rule: the reply goes to a
+  parser, prose outside the object reaches nobody, and being conversational
+  happens *inside* `message`. A greeting, a refusal and a question back are all
+  named as respond actions, because those are the three cases a model reaches for
+  prose in.
+- **`ANSWERING_EXAMPLES` shows it**, for every situation the model will really be
+  in — small talk, a question it can answer, a question needing a read first, a
+  change, a failure, a refusal, nothing to do, needing the user, and a follow-up
+  that depends on an earlier turn. Each is "they said / you emit", with the exact
+  object. A model that reads nothing else copies the nearest example, so every
+  example is valid JSON, a valid action, and obeys every rule stated elsewhere —
+  there is a test that says so.
+- **A `WHAT NEVER WORKS` list**, because the failures are specific and repeated:
+  a fence, a preamble, prose after the object, thinking-out-loud before it.
+
+Every task ends with a respond whose message summarises what was made. Stated in
+the header, in the output rules, and again in BEHAVIOUR with a right and a wrong
+example — the message is the only thing the user ever sees, so work not described
+there did not reach them.
+
+## The next-step hint
+
+**Four words is the ask; six is the ceiling.** `TARGET_SUGGESTION_WORDS` is what
+the prompt demands and what every example in it obeys; `MAX_SUGGESTION_WORDS` is
+what `validate_suggestion` lets through. The gap is deliberate. A single limit
+that was also the truncation point meant every overshoot came out cut mid-phrase,
+and "Run the integration tests for" reads worse than the five-word line it was.
+So the ask is strict and the ceiling above it is slack: aim at four, let a five or
+a six arrive whole, and cut only at seven, where it has stopped being a hint.
+
+Counted the way a reader counts them: punctuation is not a word, a hyphenated
+form is one. It is a bare imperative, never a sentence, an offer or a question —
+there is one line of shadow text beside a cursor and no room for one.
+
+**It is shadow text in the next prompt box and nothing else.** It is recorded
+in the history — a hint that was offered was offered — and `Transcript` draws
+no line for it, exactly as it draws none for the final answer, and for the same
+reason: something else on screen already is it. It used to be printed as a
+lead-in above the answer as well, which put the same five words on screen twice
+a few rows apart in two different styles, and announced inside the reply a line
+the reader was about to see under their own cursor.
+
+The input buffer is empty; the hint is drawn, never assigned. The first
+character typed replaces it in the same keystroke, so it can never be submitted
+by accident and can never end up joined to what the user typed.
+
+When the model offers none, the substitute is read off the turn's own history
+rather than invented. A turn that ran no tests is never told to go and look at
+test results. The first question of a session has no turn to read, and gets
+`agent_ui.OPENING_SUGGESTION` — measured by the same five-word rule, so the
+opening line and every line after it read as the same kind of thing.
+
+## The session, and what one question carries from the last
+
+`agent_session.Session` is the one record of a running session: the provider,
+the model, the workspace and the conversation. The first three are properties
+that answer from the modules that own them, so nothing here can be a stale copy
+of a model Settings has since moved. The fourth is the only thing it holds.
+
+- **TMT's own shape, never a provider's.** The conversation is a list of
+  `{"role", "content"}`, and `Provider.convert_messages` turns it into whatever
+  the active adapter needs. That is what lets the model or the provider change
+  mid-session without the history having to be rebuilt or thrown away.
+- **The turn, not the transcript.** What is carried forward is each question,
+  its answer, and what the turn measurably did — the files it changed and the
+  milestones it reached, read off the events. "Now add percentage support" is a
+  sentence about a file and the file is the part the answer most often leaves
+  out; a turn that only committed and pushed says so nowhere else at all. The
+  tool calls in between are not carried; they belong to the turn that made them.
+- **Every turn is recorded, however it ended.** It used to take an answer to be
+  recorded at all, so a stream failure, a circuit break, an unreadable reply or a
+  turn that ran out of steps dropped the user's *question* with it — and the next
+  question arrived with no sign the exchange had happened. That is exactly what
+  "it has no context between prompts" looked like from outside. A turn with no
+  answer carries its `outcome` instead, said by TMT on the question rather than
+  as words the model never wrote.
+- **A machine's error is never recorded as the model's answer.** Every failure in
+  `agent_model` has to come back as a valid action, because the loop has no other
+  shape to receive one in — so they carry `SYNTHETIC_KEY`, and `is_synthetic` is
+  how the loop tells "the model said this" from "TMT is reporting a failure".
+  Without it the next turn was told the model had said "no JSON object found in
+  response". Prose where JSON was asked for is the opposite case: those are the
+  model's own words, and they are passed through as the answer rather than
+  thrown away for an error string that tells the user nothing.
+- **The carried answer is the JSON action the model speaks in.** Every other
+  assistant message in a request is a JSON object; dropping the last turn's
+  answer in as loose prose put an example of the forbidden shape in front of the
+  model, in its own voice, immediately before asking it not to use that shape.
+  The words are the model's own either way — only the wrapper is restored.
+- **Bounded by the model's real window.** `context_window()` reads the
+  catalogue entry for the model actually selected; `CONTEXT_SHARE` is how much
+  of it the history may take, because the system prompt goes in front of the
+  history and the turn's own results pile up behind it. A model with no entry
+  gets a small fallback: an unknown limit is a reason to send less.
+- **Dropped, never summarised.** A summary of a turn is a claim about what
+  happened in it, and nothing here can make one that is true. Oldest first, and
+  the newest turn always survives.
+- **It dies with the process.** Nothing in `agent_session.py` opens a file. A
+  task abandoned on Tuesday must not turn up as context on Wednesday.
+- `trim_messages(messages, pinned)` may never trim into the pinned head — the
+  system prompt, the carried turns, and the task. Trimming the question out of
+  a request leaves the model answering something nobody asked.
+
+## Things not to do
+
+- Do not add a colour to distinguish a new feature. Use position in the existing
+  gradient.
+- Do not centre body text. Centre the logo, left-align everything readable.
+- Do not draw a box around something that is already obviously grouped.
+- Do not draw a second rule where one already marks the boundary.
+- Do not animate anything the user is trying to read — and a surface with a
+  caret in it is being read.
+- Do not fix a caret problem with extra newlines, a permanently hidden cursor,
+  or a full redraw. The cause is always a cursor move that was drawn; suppress
+  the drawing, not the symptom.

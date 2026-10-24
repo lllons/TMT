@@ -12,7 +12,7 @@
 </p>
 
 
-## "Too Many Tools" — a CLI coding agent. It edits files in a workspace it cannot leave, runs shell commands through one guarded tool, and commits and pushes automatically on any repo.
+## "Too Many Tools" — a CLI coding agent. It edits files in a controlled workspace, runs commands through a safe shell, runs your own code in many languages, and commits and pushes automatically on any repository.
 
 >**Needs Python 3.8+.** Install it with `npm install -g tmtcode` (Node 14+ and git),
 >or from a clone with pip.
