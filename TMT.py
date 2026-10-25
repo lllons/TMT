@@ -68,6 +68,7 @@ import agent_context
 import agent_manager
 import agent_panel
 import agent_tips
+import agent_tsui
 from agent_session import Session
 from agent_live_renderer import LiveRelay
 from agent_setup import ensure_api_key, ensure_git_identity
@@ -1051,6 +1052,22 @@ def parse_args(argv=None):
              "should fix and check without pushing, and a push from an "
              "unattended run is the one action nobody can take back.",
     )
+    # The front end for THIS run only. Nothing is written: the saved choice is
+    # the Settings row, and this flag (like TMT_UI) is the way back to Python
+    # when the saved one cannot start. No default, so "not given" is None and
+    # the environment and the saved setting get their turn.
+    parser.add_argument(
+        "--ui", dest="ui", choices=agent_config.UIS, default=None,
+        help="the front end for this run: python (the default) or typescript. "
+             "Overrides the saved Settings choice and the TMT_UI environment "
+             "variable for one run.",
+    )
+    # Not for people. Set by the TypeScript front end when it starts this same
+    # program as its backend: JSON lines over stdin and stdout, no terminal.
+    parser.add_argument(
+        "--backend-stdio", dest="backend_stdio", action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args(argv)
     words = list(args.words or [])
     if args.ci:
@@ -1183,6 +1200,30 @@ def main(argv=None):
         # Before everything below, because everything below is for somebody
         # sitting in front of it.
         return run_ci(args)
+    if getattr(args, "backend_stdio", False):
+        # The TypeScript front end's backend. Before the workspace is resolved
+        # and before any screen, because this process must never draw or ask
+        # on the terminal: it speaks JSON lines and the front end owns the
+        # screen. Imported here rather than at the top so a checkout without
+        # the module still starts every other way.
+        try:
+            import agent_backend
+        except ImportError as error:
+            print("tmtcode: --backend-stdio is unavailable (%s)." % error,
+                  file=sys.stderr)
+            return 2
+        return agent_backend.run(args)
+    # The front end. `chosen_ui` is the flag, then TMT_UI, then the saved
+    # setting, and anything unreadable is Python. A TypeScript front end that
+    # cannot start (no Node, not built, not a terminal) answers None and the
+    # Python one runs exactly as it always has, so no setting can stop TMT
+    # starting. It sits before `resolve_workspace` because the front end
+    # resolves the workspace itself, through its backend. Never reached by CI:
+    # that returned above, whatever is chosen.
+    if agent_tsui.chosen_ui(getattr(args, "ui", None)) == "typescript":
+        code = agent_tsui.launch(sys.argv[1:] if argv is None else list(argv))
+        if code is not None:
+            return code
     root = resolve_workspace(args.directory)
     if root is None:
         return

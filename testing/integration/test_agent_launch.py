@@ -595,7 +595,11 @@ def test_the_frame_draws_the_state_of_every_other_row_unchanged():
         agent_config.set_auto_update(False)
         rows = [visible(row) for row in agent_menu.render_settings_menu_frame(
             3, io.StringIO(), size=(90, 30))]
-        carrying = [row for row in rows if "OFF" in row]
+        # Click To Place Caret is a second on/off switch that reads OFF on a
+        # fresh install, and it is a different setting's row, so it is left out
+        # of the count of rows that carry THIS toggle's state.
+        carrying = [row for row in rows
+                    if "OFF" in row and "Click To Place Caret" not in row]
         assert len(carrying) == 1, carrying
         assert "Auto Update on Launch" in carrying[0], carrying[0]
     finally:

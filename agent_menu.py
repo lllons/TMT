@@ -187,6 +187,19 @@ SETTINGS_ITEMS = (
     # the row has to say what it is flipping between.
     ("protocol", "Model Reply Format",
      "The shape the model writes its actions in"),
+    # The fourth and fifth switches, drawn the same way, and both about the
+    # optional TypeScript front end. The UI row's detail says "next start"
+    # because that is the one thing a user cannot guess: flipping it changes
+    # nothing on screen, and a session cannot swap its own front end under
+    # itself. It leads with that and keeps the sentence short, so the words
+    # survive an 80-column terminal even beside the longer value, TYPESCRIPT --
+    # the row's state is protected from trimming and its description is not.
+    # The caret row's detail says who it is for, since the Python UI never
+    # reads it.
+    ("ui", "UI",
+     "Takes effect next start. Python or TypeScript"),
+    ("mouse", "Click To Place Caret",
+     "TypeScript UI only. Off keeps normal text selection"),
     # Last before Back, and it is the position that does the work: everything
     # above it changes what TMT does next, and this ends TMT. A row that can
     # remove the program does not sit between two rows that set a preference,
@@ -239,6 +252,15 @@ PROJECT_CONTEXT_LABELS = ("OFF", "ON")
 # off: keyed by what `agent_config` stores, upper case for the reason ON and OFF
 # are, so the state reads as a state next to the sentence that describes it.
 PROTOCOL_LABELS = {"tags": "TAGS", "json": "JSON"}
+
+# The fourth switch, keyed by what `agent_config` stores like the third and for
+# the same reason. "TYPESCRIPT" is the longer word, ten columns against six, so
+# the row's state is the thing a narrow terminal has to protect.
+UI_LABELS = {"python": "PYTHON", "typescript": "TYPESCRIPT"}
+
+# The fifth, and a plain on/off like the first two. A separate name so any of
+# the three can change its wording without silently changing another's.
+MOUSE_LABELS = {"off": "OFF", "on": "ON"}
 
 # One per keystroke, and the only thing the key screen ever echoes. ASCII on
 # purpose: it is drawn on every terminal, including the ones that cannot carry
@@ -2184,6 +2206,58 @@ def toggle_protocol():
     return protocol_text()
 
 
+def ui_text():
+    """"PYTHON" or "TYPESCRIPT" for the front end, read from disk each time.
+
+    The same shape as `protocol_text` and for the same two reasons: read rather
+    than cached so the row is right immediately after a toggle, and guarded to
+    the default so a settings file that cannot be read draws a menu rather than
+    stopping one. It shows what the NEXT start will use, which is the whole
+    meaning of the setting; the running session is already on one of them.
+    """
+    try:
+        return UI_LABELS[agent_config.read_saved_ui()]
+    except Exception:
+        return UI_LABELS[agent_config.DEFAULT_UI]
+
+
+def toggle_ui():
+    """Flip the front end and return what it now says. Never raises.
+
+    Exactly `toggle_protocol`'s contract: a failed write leaves the row where
+    it was, and the flip is made from what is on DISK because the row draws
+    from disk.
+    """
+    try:
+        current = agent_config.read_saved_ui()
+        agent_config.set_ui("typescript" if current == "python" else "python")
+    except Exception:
+        pass
+    return ui_text()
+
+
+def mouse_text():
+    """"ON" or "OFF" for click-to-place-caret, read from disk each time."""
+    try:
+        return MOUSE_LABELS[agent_config.read_saved_mouse()]
+    except Exception:
+        return MOUSE_LABELS[agent_config.DEFAULT_MOUSE]
+
+
+def toggle_mouse():
+    """Flip click-to-place-caret and return what it now says. Never raises.
+
+    The same contract as `toggle_ui`, and flipped from disk for the same
+    reason.
+    """
+    try:
+        current = agent_config.read_saved_mouse()
+        agent_config.set_mouse("on" if current == "off" else "off")
+    except Exception:
+        pass
+    return mouse_text()
+
+
 def _settings_suffix(entry):
     """The value drawn on the right of a Settings row, or "" for a screen.
 
@@ -2199,6 +2273,10 @@ def _settings_suffix(entry):
         return "  " + project_context_text()
     if entry == "protocol":
         return "  " + protocol_text()
+    if entry == "ui":
+        return "  " + ui_text()
+    if entry == "mouse":
+        return "  " + mouse_text()
     return ""
 
 
@@ -5146,6 +5224,12 @@ def settings_screen(stream=None, key_reader=None, region=None, active_id=None,
                 # the other two: there is no screen behind it, and the row
                 # re-reads the file on the next pass of `_drive`.
                 toggle_protocol()
+            elif entry == "ui":
+                # The fourth switch, toggled in place. Nothing on screen
+                # changes but the row: the front end is read at launch.
+                toggle_ui()
+            elif entry == "mouse":
+                toggle_mouse()
             elif entry == "provider":
                 provider_setup(stream=stream, key_reader=key_reader, region=region,
                                text_reader=text_reader)

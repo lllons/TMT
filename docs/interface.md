@@ -39,6 +39,27 @@ box is inert, which is what every scripted run and the test suite get.
 Set `TMT_STREAM=0` to disable streaming. Streaming also needs `requests`; without it
 TMT runs unstreamed.
 
+## The TypeScript UI (optional)
+
+Settings has a **UI** row, `PYTHON` or `TYPESCRIPT`, and Enter flips it. It takes effect
+on the next start, never live: a running session cannot change which program owns the
+terminal. The Python UI described above is the default and is not changed by any of
+this. The TypeScript one is a Node front end in `tui/` (Node 22 or newer, built once with
+`cd tui && npm install && npm run build`) that runs the same agent as a backend.
+
+If it cannot start — no suitable Node, `tui/dist/` not built, or stdin or stdout is not a
+terminal — TMT runs the Python UI and, when stderr is a terminal, prints one line saying
+why. `--ci`, piped and scripted runs never use it, whichever UI is saved.
+
+To pick a UI for one run without touching the saved setting, pass `--ui python` or
+`--ui typescript`, or set `TMT_UI` to the same words; the flag wins over the variable, and
+the variable over the setting. That is the way back to Python if the saved choice ever
+misbehaves.
+
+**Click To Place Caret** (also in Settings, `OFF` by default) lets the TypeScript UI move
+the input caret to where you click. It is off because asking a terminal to report the
+mouse takes plain text selection away from it. The Python UI ignores it.
+
 ---
 
 [← Back to the README](../README.md)

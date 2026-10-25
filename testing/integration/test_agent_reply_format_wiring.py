@@ -97,15 +97,18 @@ def _drive(box_keys=None, region=None):
 def test_settings_offers_the_row_above_the_danger_zone_with_back_still_last():
     """The way in. The Danger Zone's own comment says nothing that changes a
     preference may sit below it and the existing tests pin the last two ids, so
-    the new row has to be the third from the end -- not the second, which would
-    put a switch between a preference and the program's removal."""
+    the new row has to be above it, never between it and `Back`, which would
+    put a switch between a preference and the program's removal. It was third
+    from the end until the UI and Click To Place Caret rows were added below it
+    (and still above the Danger Zone), so it is fifth now."""
     ids = [item[0] for item in agent_menu.SETTINGS_ITEMS]
     labels = {item[0]: item[1] for item in agent_menu.SETTINGS_ITEMS}
     details = {item[0]: item[2] for item in agent_menu.SETTINGS_ITEMS}
     assert "protocol" in ids, ids
     assert labels["protocol"] == ROW, labels["protocol"]
     assert ids[-2:] == ["danger", "back"], ids
-    assert ids.index("protocol") == len(ids) - 3, ids
+    assert ids[-4:-2] == ["ui", "mouse"], ids
+    assert ids.index("protocol") == len(ids) - 5, ids
     assert ids.index("protocol") > ids.index("autoupdate"), ids
     assert details["protocol"].strip(), details["protocol"]
     # The existing tests count rows containing the word OFF to find the one

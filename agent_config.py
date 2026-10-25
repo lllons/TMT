@@ -685,6 +685,134 @@ def set_protocol(name):
     return name
 
 
+# --- the front end ----------------------------------------------------------
+#
+# Which user interface TMT draws: "python", the hand-written renderer that has
+# always been here, or "typescript", an optional front end run by Node
+# (`tui/`, started by `agent_tsui`). Both talk to the same agent; this section
+# only knows where the choice lives and which values are allowed.
+#
+# **It is read once, at launch, and never acted on live.** A session cannot
+# change its own front end halfway through -- the terminal belongs to exactly
+# one of them -- so Settings says "takes effect next start" and the value
+# below is what the NEXT process will read. `--ui` and `TMT_UI` override it for
+# one run without writing anything, which is the way back to Python when the
+# saved choice cannot start.
+#
+# Every read failure is "python", the rule the reply format follows and for the
+# stronger reason: the default is the UI that is always installed, so an
+# unreadable file must land somewhere that works.
+#
+# Kept in INSTALL_DIR beside the other per-installation choices.
+UI_FILE = INSTALL_DIR / ".tmt_ui"
+
+DEFAULT_UI = "python"
+
+# The two values, in the order Settings offers them.
+UIS = ("python", "typescript")
+
+# The live value, re-read by `refresh_ui`.
+UI = DEFAULT_UI
+
+
+def ui_names():
+    """The front ends, in the order they are offered."""
+    return list(UIS)
+
+
+def read_saved_ui():
+    """The front end stored on disk, or the default. Never raises.
+
+    The same forgiving read as `read_saved_protocol`: a missing file is a fresh
+    installation, an unreadable one is somebody's permissions, a file that is
+    not text raises ValueError when decoded, and one edited into nonsense is a
+    typo. None of them is a reason to stop TMT starting, and none is a request
+    for the TypeScript front end.
+    """
+    try:
+        stored = UI_FILE.read_text(encoding="utf-8").strip().lower()
+    except (OSError, ValueError):
+        return DEFAULT_UI
+    return stored if stored in UIS else DEFAULT_UI
+
+
+def refresh_ui():
+    """Re-read the stored front end. Called at startup, beside refresh_protocol."""
+    global UI
+    UI = read_saved_ui()
+    return UI
+
+
+def set_ui(name):
+    """Persist a front end and make it live. Returns what was stored.
+
+    Raises ValueError for anything not offered, and lets a failed write raise,
+    for the reasons `set_protocol` gives: a typo must not become the setting,
+    and a toggle that silently did not persist would show one value in
+    Settings and be the other on the next launch.
+    """
+    global UI
+    name = str(name or "").strip().lower()
+    if name not in UIS:
+        raise ValueError("UI is one of %s; got %r."
+                         % (", ".join(ui_names()), name))
+    UI_FILE.write_text(name + "\n", encoding="utf-8")
+    UI = name
+    return name
+
+
+# --- clicking to place the caret --------------------------------------------
+#
+# "on" lets the TypeScript front end move the input caret to where the mouse is
+# clicked; "off" leaves the terminal's own text selection alone. It is off by
+# default because asking a terminal to report the mouse is exactly what takes
+# selecting and copying text away from it -- a cost the user should choose.
+#
+# Only the TypeScript front end reads it; the Python UI never turns mouse
+# reporting on. Stored beside `.tmt_ui` and read the same forgiving way.
+MOUSE_FILE = INSTALL_DIR / ".tmt_mouse"
+
+DEFAULT_MOUSE = "off"
+
+# The two values, in the order Settings offers them.
+MOUSES = ("off", "on")
+
+# The live value, re-read by `refresh_mouse`.
+MOUSE = DEFAULT_MOUSE
+
+
+def read_saved_mouse():
+    """The click-to-place-caret setting stored on disk, or "off". Never raises."""
+    try:
+        stored = MOUSE_FILE.read_text(encoding="utf-8").strip().lower()
+    except (OSError, ValueError):
+        return DEFAULT_MOUSE
+    return stored if stored in MOUSES else DEFAULT_MOUSE
+
+
+def refresh_mouse():
+    """Re-read the stored setting. Called at startup, beside refresh_ui."""
+    global MOUSE
+    MOUSE = read_saved_mouse()
+    return MOUSE
+
+
+def set_mouse(name):
+    """Persist the setting and make it live. Returns what was stored.
+
+    Raises ValueError for anything but "on" or "off" and lets a failed write
+    raise, exactly as `set_ui` does and for the same reasons.
+    """
+    global MOUSE
+    name = str(name or "").strip().lower()
+    if name not in MOUSES:
+        raise ValueError("Click to place caret is one of %s; got %r."
+                         % (", ".join(MOUSES), name))
+    MOUSE_FILE.write_text(name + "\n", encoding="utf-8")
+    MOUSE = name
+    return name
+
+
 # --- the tip cursor ---------------------------------------------------------
 #
 # Which tip the session header shows next. One integer, stored beside the

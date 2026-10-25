@@ -1449,6 +1449,12 @@ _MAY_CREATE_A_PROCESS = {
     # model name checked not to start with a dash), never a shell, and nothing a
     # model wrote reaches the command line. It is a model call, not an action.
     "agent_providers",
+    # The optional TypeScript front end: `node tui/dist/main.js`, started with
+    # the process's own arguments and an inherited terminal, plus a `node
+    # --version` probe. Both argv lists are built by TMT, never a shell, and
+    # nothing a model wrote can reach them -- this runs before any session
+    # exists, on the user's saved setting.
+    "agent_tsui",
 }
 
 

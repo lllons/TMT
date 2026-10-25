@@ -31,6 +31,10 @@ DESIGN_PRINCIPLES.md
 # How the model is asked to write its actions: tags or json. A per-install
 # choice beside the model and the effort level.
 .tmt_protocol
+# Which front end to start (python or typescript) and whether the TypeScript one
+# places the caret on a click. Per-install choices, like the line above.
+.tmt_ui
+.tmt_mouse
 # The commands the user has allowed or denied the bash tool, per workspace and
 # globally. TMT's own state, and per-machine: a rule one person approved on
 # their checkout is not a rule anyone else agreed to.

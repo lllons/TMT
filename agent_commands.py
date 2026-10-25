@@ -357,6 +357,12 @@ def _config(argument, session):
             ("JSON mode", "off (tags)"
              if getattr(agent_config, "PROTOCOL", "json") == "tags"
              else ("on" if agent_config.USE_JSON_MODE else "off")),
+            # The saved front end and click-to-caret choice, read from the file
+            # and not from a live value: a front end is chosen at launch and
+            # never swapped under a running session, so the file is the one
+            # thing that says what the NEXT start will do.
+            ("UI", "%s  (takes effect next start)" % agent_config.read_saved_ui()),
+            ("Click to place caret", agent_config.read_saved_mouse()),
             ("Workspace", str(workspace)),
             ("Install", str(agent_config.INSTALL_DIR))]
     # Whether a key exists. Not the key, and not a masked form of it either:
