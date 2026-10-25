@@ -60,6 +60,16 @@ misbehaves.
 the input caret to where you click. It is off because asking a terminal to report the
 mouse takes plain text selection away from it. The Python UI ignores it.
 
+### How the two halves talk
+
+The TypeScript UI starts `python TMT.py --backend-stdio` and speaks to it in JSON lines:
+it sends what the user typed, approvals, answers and Ctrl-C on the backend's stdin, and
+reads an event for everything the Python UI would have drawn (the streamed reply, each
+tool and its result, approvals, questions, the plan, review and verify panels, the
+status row and the meter) from its stdout. Logs go to stderr. The backend runs the same
+session loop, gates, policy and sandbox as the Python UI; only the screens differ. The
+wire format, every message and every event is in [tui-protocol.md](tui-protocol.md).
+
 ---
 
 [← Back to the README](../README.md)
