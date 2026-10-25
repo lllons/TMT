@@ -1444,6 +1444,11 @@ _MAY_CREATE_A_PROCESS = {
     # never an executable. The verbs that used to run code from this module --
     # `run_file` and `run_python` -- are gone.
     "agent_execution",
+    # The Claude subscription route: the owner's own `claude -p`, started as a
+    # plain-text model backend. The argv is built by TMT (a fixed flag set and a
+    # model name checked not to start with a dash), never a shell, and nothing a
+    # model wrote reaches the command line. It is a model call, not an action.
+    "agent_providers",
 }
 
 

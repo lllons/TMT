@@ -1,6 +1,7 @@
 """OpenRouter model communication, streaming and response normalization."""
 
 import json
+import os
 import re
 import agent_config
 import agent_protocol
@@ -100,7 +101,7 @@ def selected_provider():
     except Exception:
         provider = agent_providers.get_provider(agent_providers.DEFAULT_PROVIDER)
     key = agent_credentials.credential(provider.id)
-    if not key:
+    if not key and not agent_providers.uses_cli(provider):
         return None, "", (
             f"No API key is set for {provider.label}. Open Settings, choose "
             "API Key, and add one."
@@ -747,6 +748,18 @@ def _error_reply(message):
     label = getattr(provider, "label", "") or "The provider"
     return _made_up(f"{label} error — {message}", reason=PROVIDER_FAILURE)
 
+def _cli_streams():
+    """Whether the selected provider runs through the local `claude` CLI and may stream.
+
+    STREAM_ENABLED is False in a stdlib-only runtime (no `requests`), but the CLI
+    runner reads a pipe and needs no HTTP transport.
+    """
+    import agent_providers
+    provider = selected_provider()[0]
+    return (provider is not None and agent_providers.uses_cli(provider)
+            and os.environ.get("TMT_STREAM", "1").lower() not in {"0", "false", "no", "off"})
+
+
 def _open_stream(payload, on_usage, on_input_usage):
     """Start stream_chat, tolerating a stand-in that predates on_input_usage.
 
@@ -870,7 +883,7 @@ def ask_model(messages, on_event=None, model=None, max_tokens=None, quiet=False,
     """
     global _json_mode_ok
     plain_text = bool(plain_text) and _protocol() == agent_protocol.TAGS
-    streaming = on_event is not None and STREAM_ENABLED
+    streaming = on_event is not None and (STREAM_ENABLED or _cli_streams())
     if streaming:
         raw, fall_back = _ask_model_streaming(messages, on_event, model=model,
                                               max_tokens=max_tokens, quiet=quiet,

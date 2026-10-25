@@ -4660,6 +4660,64 @@ def provider_screen(stream=None, key_reader=None, region=None, active_id=None):
     return _drive(render, key_reader, region, on_key) or None
 
 
+ROUTE_ROWS = (("api", "API key", "pay per use, with a key"),
+              ("subscription", "Claude subscription", "your signed-in Claude Code"))
+
+
+def route_status():
+    """One sentence on whether Claude Code is installed and signed in here."""
+    try:
+        return _adapter("claude_cli").status()[2]
+    except Exception:
+        return "Claude Code could not be checked."
+
+
+def render_route_frame(selected=0, stream=None, size=None, phase=None):
+    """How Anthropic is reached: with a key, or through Claude Code's own sign-in."""
+    stream = sys.stdout if stream is None else stream
+    columns, rows = _terminal(size)
+    phase = gradient_phase() if phase is None else phase
+    width = _content_width(columns)
+    store = _credentials()
+    active = getattr(store, "anthropic_route", lambda: "api")()
+    label_width = max(display_width(row[1]) for row in ROUTE_ROWS)
+    head = ["", " " + _paint("Anthropic", stream, phase), "",
+            _dim(fit_to_width(" How TMT reaches Claude models.", width), stream),
+            _rule(stream, phase, width)]
+    options = [_option_row(index == selected, label, detail, stream, phase, width,
+                           label_width, suffix="  (active)" if name == active else "")
+               for index, (name, label, detail) in enumerate(ROUTE_ROWS)]
+    tail = ["", _dim(fit_to_width(" " + route_status(), width), stream), "",
+            _footer(stream, ("{up}/{down} Navigate", "Enter Select", "Esc Back"), width)]
+    return _fit_menu(head, options, tail, rows, selected, stream, width)
+
+
+def route_screen(stream=None, key_reader=None, region=None):
+    """Choose the Anthropic route. Saves it and returns it, or None when backed out of."""
+    stream = sys.stdout if stream is None else stream
+    if key_reader is None:
+        if not is_interactive(stream):
+            return None
+        key_reader = _default_reader()
+    region = LiveRegion(stream) if region is None else region
+    state = {"selected": 0}
+
+    def on_key(key):
+        if key in (None, "esc", "quit", "interrupt"):
+            return ""
+        if key in ("up", "down"):
+            state["selected"] = (state["selected"] + (1 if key == "down" else -1)) % len(ROUTE_ROWS)
+        elif key == "enter":
+            return ROUTE_ROWS[state["selected"]][0]
+        return None
+
+    route = _drive(lambda: render_route_frame(state["selected"], stream), key_reader, region, on_key)
+    try:
+        return _credentials().set_anthropic_route(route) if route else None
+    except Exception:
+        return None
+
+
 def api_key_screen(provider_id=None, stream=None, key_reader=None, region=None,
                    opening="", identify=False):
     """Take an API key for one provider. Returns its id when one was saved.
@@ -4773,6 +4831,13 @@ def provider_setup(stream=None, key_reader=None, region=None, text_reader=None):
         chosen = provider_screen(stream=stream, key_reader=key_reader, region=region)
         if not chosen:
             return None
+        if chosen == "anthropic" and hasattr(_credentials(), "set_anthropic_route"):
+            route = route_screen(stream=stream, key_reader=key_reader, region=region)
+            if not route:
+                continue
+            if route == "subscription":
+                _select_provider(chosen)
+                return chosen
         if provider_has_key(chosen):
             _select_provider(chosen)
             return chosen

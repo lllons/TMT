@@ -63,7 +63,11 @@ STORE_FILE = agent_config.INSTALL_DIR / ".tmt_providers.json"
 _ENCODING_TAG = "obf1:"
 _ENCODING_PAD = b"tmt-provider-store"
 
-_EMPTY_STORE = {"provider": "", "credentials": {}, "legacy_key_dismissed": False}
+# "anthropic_route" is how calls to the anthropic provider are made: "api" (the
+# key, over HTTP) or "subscription" (the signed-in Claude Code on this PC).
+ROUTES = ("api", "subscription")
+_EMPTY_STORE = {"provider": "", "credentials": {}, "legacy_key_dismissed": False,
+                "anthropic_route": "api"}
 
 
 def _encode(key):
@@ -140,6 +144,8 @@ def _read_store():
             if isinstance(name, str) and name.strip().lower() in PROVIDERS:
                 store["credentials"][name.strip().lower()] = value
     store["legacy_key_dismissed"] = bool(loaded.get("legacy_key_dismissed", False))
+    if loaded.get("anthropic_route") in ROUTES:
+        store["anthropic_route"] = loaded["anthropic_route"]
     return store
 
 
@@ -211,6 +217,21 @@ def _resolve(provider_id):
     return "", SOURCE_NONE
 
 
+def anthropic_route():
+    """"api" or "subscription", read from the store at call time (a swap applies to the next call)."""
+    return _read_store()["anthropic_route"]
+
+
+def set_anthropic_route(route):
+    """Persist the route for the anthropic provider and return it."""
+    if route not in ROUTES:
+        raise ValueError("The route must be one of: %s." % ", ".join(ROUTES))
+    store = _read_store()
+    store["anthropic_route"] = route
+    _write_store(store)
+    return route
+
+
 def selected_provider():
     """The provider TMT should use, read at call time.
 
@@ -263,7 +284,12 @@ def source(provider_id=None):
 
 
 def has_credential(provider_id=None):
-    """Whether a key is available for a provider from any source."""
+    """Whether a key is available for a provider from any source.
+
+    Anthropic on the subscription route needs no key: the local sign-in is used.
+    """
+    if _known(provider_id) == "anthropic" and anthropic_route() == "subscription":
+        return True
     return bool(_resolve(provider_id)[0])
 
 

@@ -30,7 +30,14 @@ to fetch a URL the key appears in.
 """
 
 import json
+import os
+import queue
 import re
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -452,6 +459,10 @@ class Provider:
     key_min_length = 20
 
     supports_json_mode = False
+
+    # True for a provider that runs a program on this PC instead of calling an
+    # HTTP API: stream_completion / complete take the runner path for it.
+    local_cli = False
 
     # Used only when list_models() cannot reach the provider. Kept short and
     # marked stale in each entry's note, because a hardcoded catalogue rots.
@@ -1261,9 +1272,450 @@ class GeminiProvider(Provider):
                            "note": ""})
         return models
 
+# --- Claude subscription (the locally installed, signed-in `claude` CLI) ------
+
+# Variables that would make the child bill an API key or talk to another
+# endpoint, or make it believe it is running inside another Claude Code
+# session. CLAUDE_CODE_OAUTH_TOKEN and CLAUDE_CONFIG_DIR are kept: they are how
+# the subscription sign-in is found.
+_CLI_DROPPED_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+                    "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
+_CLI_STDERR_LIMIT = 500
+_CLI_INSTALL_URL = "https://code.claude.com/docs/en/quickstart"
+_CLI_NOT_INSTALLED = ("Claude Code isn't installed on this PC (no `claude` command found). "
+                      "Install it from " + _CLI_INSTALL_URL + ", then run `claude` once and log in.")
+_CLI_NOT_SIGNED_IN = "Claude Code is installed but not signed in. Run `claude` once and log in."
+_CLI_USAGE_LIMIT = re.compile(r"usage limit|limit reached|hit your limit|out of extra usage",
+                              re.IGNORECASE)
+_CLI_LOGIN = re.compile(r"not logged in|please run /login|\blog ?in\b|oauth|invalid api key|"
+                        r"authentication", re.IGNORECASE)
+_cli_version_cache = {}
+
+
+def uses_cli(provider):
+    """Whether calls to this adapter run through Claude Code rather than HTTP.
+
+    True for the claude_cli adapter, and for anthropic while its route is
+    "subscription" (read at call time).
+    """
+    if provider.local_cli:
+        return True
+    if provider.id != "anthropic":
+        return False
+    try:
+        import agent_credentials
+        return agent_credentials.anthropic_route() == "subscription"
+    except Exception:
+        return False
+
+
+def _cli_executable():
+    """The `claude` program: on PATH, else the installer's default folder. None if absent."""
+    found = shutil.which("claude")
+    if found:
+        return found
+    home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    fallback = os.path.join(home, ".local", "bin", "claude.exe")
+    return fallback if os.path.isfile(fallback) else None
+
+
+def _cli_env():
+    """The child's environment: ours without the API-key and nested-session variables.
+
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 stops Claude Code creating a memory folder for the cwd.
+    """
+    env = {name: value for name, value in os.environ.items()
+           if name.upper() not in _CLI_DROPPED_ENV}
+    env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+    return env
+
+
+def _cli_popen_flags():
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
+
+
+def _cli_signin_file():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
+        os.environ.get("USERPROFILE") or os.path.expanduser("~"), ".claude")
+    return os.path.join(base, ".credentials.json")
+
+
+class ClaudeCliProvider(Provider):
+    """The owner's own Claude Code, run in print mode as a plain text backend.
+
+    No key and no HTTP: the subscription sign-in lives in Claude Code itself.
+    The engine speaks a JSON-text action protocol, so text in and text out is
+    all that is needed; Claude Code's own tools, settings, plugins and MCP
+    servers are switched off (--tools "", --setting-sources "",
+    --strict-mcp-config), which is also what keeps a call at about 3 seconds
+    and a few hundred context tokens. --bare is never passed: it would disable
+    the subscription sign-in.
+    """
+
+    id = "claude_cli"
+    label = "Claude subscription"
+    key_env = ""
+    key_url = _CLI_INSTALL_URL
+    default_model = "sonnet"
+    local_cli = True
+
+    FALLBACK_MODELS = (
+        {"id": "sonnet", "label": "Claude Sonnet", "context": 200000, "note": "balanced, the default"},
+        {"id": "opus", "label": "Claude Opus", "context": 200000, "note": "most capable"},
+        {"id": "haiku", "label": "Claude Haiku", "context": 200000, "note": "fastest"},
+        {"id": "fable", "label": "Claude Fable", "context": 200000, "note": "writing focused"},
+    )
+
+    def supports_images(self, model_id):
+        return False
+
+    def list_models(self, key):
+        return list(self.FALLBACK_MODELS)
+
+    def looks_like_key(self, key):
+        return False, "Claude subscription uses your Claude Code sign-in; there is no key."
+
+    def validate_credentials(self, key):
+        return False, "Claude subscription has no key to check; use the connection test."
+
+    def transcript(self, messages):
+        """(system_text, stdin_text): the non-system turns flattened with role markers."""
+        system_text, converted = self.convert_messages(messages)
+        parts = []
+        for message in converted:
+            content = message["content"]
+            if isinstance(content, list):
+                content = "\n".join(block.get("text", "") for block in content)
+            speaker = "Assistant" if message["role"] == "assistant" else "User"
+            parts.append("[%s]\n%s" % (speaker, content))
+        parts.append("[Instruction]\nWrite only the next Assistant reply. Do not write a role "
+                     "marker and do not continue the User's turn.")
+        return system_text, "\n\n".join(parts)
+
+    def version(self, executable):
+        """`claude --version` as a bare number, cached per executable. "" when unreadable."""
+        try:
+            stamp = (executable, os.path.getmtime(executable))
+        except OSError:
+            return ""
+        if stamp not in _cli_version_cache:
+            text = ""
+            try:
+                done = subprocess.run([executable, "--version"], stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                      env=_cli_env(), timeout=20,
+                                      creationflags=_cli_popen_flags())
+                text = done.stdout.decode("utf-8", "replace").strip().split(" ")[0]
+            except Exception:
+                text = ""
+            _cli_version_cache[stamp] = text
+        return _cli_version_cache[stamp]
+
+    def status(self):
+        """(configured, version, detail) with no model call; the sign-in file is only checked to exist."""
+        executable = _cli_executable()
+        if not executable:
+            return False, "", "Claude Code isn't installed on this PC (no `claude` command found)."
+        version = self.version(executable)
+        if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.path.isfile(_cli_signin_file()):
+            return True, version, ("Found Claude Code %s and a Claude sign-in." % version
+                                   if version else "Found Claude Code and a Claude sign-in.")
+        return False, version, _CLI_NOT_SIGNED_IN
+
+
+def _cli_args(executable, model, system_file):
+    args = [executable, "-p", "--output-format", "stream-json", "--verbose",
+            "--include-partial-messages", "--tools", "", "--setting-sources", "",
+            "--strict-mcp-config", "--no-session-persistence", "--model", model,
+            # Always passed: without it Claude Code adds its own ~6,000-token default prompt.
+            "--system-prompt-file", system_file]
+    return args
+
+
+_cli_children = {}
+_cli_children_lock = threading.Lock()
+
+
+def _cli_workdir():
+    """One stable, empty cwd for every call, beside the provider store.
+
+    Claude Code makes one projects folder per distinct cwd, so a fresh folder per
+    call would leave thousands behind. Nothing is ever written into it.
+    """
+    import agent_credentials
+    from pathlib import Path
+    folder = Path(agent_credentials.STORE_FILE).parent
+    if folder.resolve() == Path(__file__).resolve().parent:     # never the shipped engine folder
+        folder = Path(tempfile.gettempdir())
+    folder = folder / "claude-cli-workdir"
+    folder.mkdir(parents=True, exist_ok=True)
+    return str(folder)
+
+
+def _kill_process_tree(process):
+    """Kill a child and anything it started (taskkill /T on Windows, else process.kill())."""
+    pid = getattr(process, "pid", None)
+    if os.name == "nt" and isinstance(pid, int):
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                           creationflags=_cli_popen_flags())
+        except Exception:
+            pass
+    try:
+        if process.poll() is None:
+            process.kill()
+    except Exception:
+        pass
+
+
+def kill_cli_children():
+    """Kill every live `claude -p` child of this process and remove its temp folder.
+
+    Called when a run is cancelled and right before the host exits, since the
+    generator's own `finally` never runs once the process is torn down.
+    """
+    with _cli_children_lock:
+        entries = list(_cli_children.values())
+        for entry in entries:
+            entry["killed"] = True
+    for entry in entries:
+        if entry["process"] is not None:
+            _kill_process_tree(entry["process"])
+        shutil.rmtree(entry["tmp"], ignore_errors=True)
+
+
+def _cli_error(result, limit_info):
+    """The ProviderError for a `result` event that reports a failure.
+
+    The usage-limit message avoids the words retry.is_transient looks for, and
+    carries kind "unknown", so the retry loops give up on it at once.
+    """
+    text = str(result.get("result") or "").strip()
+    status = result.get("api_error_status")
+    status = status if isinstance(status, int) and not isinstance(status, bool) else None
+    if (limit_info and limit_info.get("status") == "rejected") or _CLI_USAGE_LIMIT.search(text):
+        when = ""
+        resets = (limit_info or {}).get("resetsAt")
+        if isinstance(resets, (int, float)) and resets > 0:
+            when = " It resets around %s." % time.strftime("%H:%M on %d %b", time.localtime(resets))
+        return ProviderError("Claude usage limit reached on your plan." + when
+                             + " Wait for it to reset or switch provider.")
+    if status in (401, 403) or _CLI_LOGIN.search(text):
+        return ProviderError(_CLI_NOT_SIGNED_IN, kind="auth", status=status)
+    return ProviderError("Claude Code reported an error: %s"
+                         % (redact(text[:_CLI_STDERR_LIMIT]) or "no details"),
+                         kind=classify_status(status), status=status)
+
+
+PLAN_USAGE_FILE = "claude_plan_usage.json"
+
+
+def _usage_window(window):
+    """One meter of the plan usage: {utilization, resetsAt}, each only when it is a number."""
+    out = {}
+    if isinstance(window, dict):
+        for name in ("utilization", "resetsAt"):
+            value = window.get(name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                out[name] = value
+    return out
+
+
+def _plan_usage_snapshot(info, now_ms):
+    """The small snapshot kept for the app's usage bar, from a rate_limit_info dict."""
+    windows = info.get("unifiedWindows")
+    windows = windows if isinstance(windows, dict) else {}
+    snapshot = {"fiveHour": _usage_window(windows.get("five_hour")),
+                "sevenDay": _usage_window(windows.get("seven_day"))}
+    # An event for one window names it at the top level; use that when unifiedWindows is absent.
+    kind = info.get("rateLimitType")
+    top = _usage_window(info)
+    for key, name in (("fiveHour", "five_hour"), ("sevenDay", "seven_day")):
+        if not snapshot[key] and kind == name and top:
+            snapshot[key] = top
+    for name in ("status", "rateLimitType"):
+        if isinstance(info.get(name), str):
+            snapshot[name] = info[name]
+    snapshot["updatedAt"] = now_ms
+    return snapshot
+
+
+def _save_plan_usage(info):
+    """Keep the latest rate_limit_event beside the provider store (shared by the core and run hosts).
+
+    Written atomically (temp file, then replace). It must never break a model call, so every
+    failure is swallowed; nothing is written into the shipped engine folder.
+    """
+    try:
+        import agent_credentials
+        from pathlib import Path
+        folder = Path(agent_credentials.STORE_FILE).parent
+        if folder.resolve() == Path(__file__).resolve().parent:
+            return
+        target = folder / PLAN_USAGE_FILE
+        temp = folder / (PLAN_USAGE_FILE + ".%d.tmp" % os.getpid())
+        temp.write_text(json.dumps(_plan_usage_snapshot(info, int(time.time() * 1000))),
+                        encoding="utf-8")
+        os.replace(str(temp), str(target))
+    except Exception:
+        pass
+
+
+def _cli_run(provider, messages, model, on_usage=None, on_input_usage=None):
+    """Run `claude -p` once and yield the generated text fragments.
+
+    One runner for streaming and blocking calls. The child is killed on a
+    timeout, an exception, or the generator being closed early. REQUEST_TIMEOUT
+    is how long the child may stay silent, as it is for an HTTP read.
+    """
+    executable = _cli_executable()
+    if not executable:
+        raise ProviderError(_CLI_NOT_INSTALLED, kind="not_found")
+    model = str(model or "").strip() or provider.default_model
+    if model.startswith("-"):
+        raise ProviderError("Not a Claude model name: %r" % model, kind="bad_request")
+    # The flattening is the claude_cli adapter's, whichever adapter asked: anthropic on
+    # the subscription route is not a ClaudeCliProvider.
+    system_text, prompt = _REGISTRY["claude_cli"].transcript(messages)
+    # The cwd is one stable empty folder (no project files load, one Claude projects folder
+    # in all). The system prompt file (a command line is capped near 32,000 characters)
+    # goes in a per-call temp folder OUTSIDE it; it is written even when empty.
+    work = _cli_workdir()
+    tmp = tempfile.mkdtemp(prefix="tmt-claude-")
+    process = None
+    entry = {"process": None, "tmp": tmp, "killed": False}
+    with _cli_children_lock:      # registered before the child exists, so an early kill still cleans up
+        _cli_children[id(entry)] = entry
+    try:
+        system_file = os.path.join(tmp, "system.txt")
+        with open(system_file, "w", encoding="utf-8", newline="") as handle:
+            handle.write(system_text)
+        try:
+            process = subprocess.Popen(
+                _cli_args(executable, model, system_file), cwd=work, env=_cli_env(),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=_cli_popen_flags())
+        except OSError as error:
+            raise ProviderError("Claude Code could not be started: %s" % redact(error),
+                                kind="not_found")
+        entry["process"] = process
+        if entry["killed"]:       # a kill landed while the child was starting
+            _kill_process_tree(process)
+        lines = queue.Queue()
+        stderr_chunks = []
+
+        def read_stdout():
+            try:
+                for raw in iter(process.stdout.readline, b""):
+                    lines.put(raw)
+            except Exception:
+                pass
+            lines.put(None)
+
+        def drain_stderr():
+            try:
+                for raw in iter(process.stderr.readline, b""):
+                    if sum(map(len, stderr_chunks)) < 20000:
+                        stderr_chunks.append(raw)
+            except Exception:
+                pass
+
+        threading.Thread(target=read_stdout, daemon=True).start()
+        threading.Thread(target=drain_stderr, daemon=True).start()
+        try:
+            process.stdin.write(prompt.encode("utf-8"))
+            process.stdin.close()
+        except OSError:
+            pass  # the child already quit; its exit status and stderr say why
+
+        limit_info, result, got_text = None, None, False
+        last_heard = time.monotonic()
+        while True:
+            try:
+                raw = lines.get(timeout=0.25)
+            except queue.Empty:
+                if entry["killed"]:
+                    raise ProviderError("The Claude Code call was stopped.", kind="network")
+                if time.monotonic() - last_heard >= REQUEST_TIMEOUT:
+                    raise ProviderError("Claude Code timed out after %d seconds without a reply."
+                                        % REQUEST_TIMEOUT, kind="network")
+                continue
+            last_heard = time.monotonic()
+            if raw is None:
+                if entry["killed"]:
+                    raise ProviderError("The Claude Code call was stopped.", kind="network")
+                break
+            try:
+                event = json.loads(raw.decode("utf-8", errors="replace"))
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            kind = event.get("type")
+            if kind == "stream_event":
+                delta = (event.get("event") or {}).get("delta") or {}
+                if delta.get("type") == "text_delta" and delta.get("text"):
+                    got_text = True
+                    yield delta["text"]
+            elif kind == "rate_limit_event":
+                limit_info = event.get("rate_limit_info") or limit_info
+                if isinstance(event.get("rate_limit_info"), dict):
+                    _save_plan_usage(event["rate_limit_info"])
+            elif kind == "result":
+                result = event
+                break
+        if result is None:
+            try:
+                code = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                code = None
+            raw = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
+            detail = redact(raw[:_CLI_STDERR_LIMIT])
+            if _CLI_LOGIN.search(detail):
+                raise ProviderError(_CLI_NOT_SIGNED_IN, kind="auth")
+            raise ProviderError("Claude Code stopped without a reply%s.%s"
+                                % ("" if code is None else " (exit code %s)" % code,
+                                   " " + detail if detail else ""), kind="malformed")
+        if result.get("is_error") or result.get("api_error_status"):
+            raise _cli_error(result, limit_info)
+        usage = result.get("usage")
+        if isinstance(usage, dict):
+            counts = [usage.get(name) for name in
+                      ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")]
+            counts = [value for value in counts if isinstance(value, int)]
+            if on_input_usage is not None and counts:
+                on_input_usage(sum(counts))
+            if on_usage is not None and isinstance(usage.get("output_tokens"), int):
+                on_usage(usage["output_tokens"])
+        if not got_text and isinstance(result.get("result"), str) and result["result"]:
+            yield result["result"]
+    except ProviderError:
+        raise
+    except Exception as error:
+        raise ProviderError(redact("%s: %s" % (type(error).__name__, error)), kind="network")
+    finally:
+        with _cli_children_lock:
+            _cli_children.pop(id(entry), None)
+        if process is not None:
+            if process.poll() is None:
+                _kill_process_tree(process)
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+            try:
+                process.wait(timeout=5)
+            except Exception:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 
 _REGISTRY = {}
-for _adapter in (OpenRouterProvider, OpenAIProvider, AnthropicProvider, GeminiProvider):
+for _adapter in (OpenRouterProvider, OpenAIProvider, AnthropicProvider, GeminiProvider,
+                 ClaudeCliProvider):
     _REGISTRY[_adapter.id] = _adapter()
 
 
@@ -1296,6 +1748,10 @@ def stream_completion(provider, key, messages, model=None,
     request that has already been sent. Merging them would make the caller
     guess which it had just been handed.
     """
+    if uses_cli(provider):
+        for fragment in _cli_run(provider, messages, model, on_usage, on_input_usage):
+            yield fragment
+        return
     url, payload = provider.chat_payload(messages, model, stream=True,
                                          max_tokens=max_tokens, json_mode=json_mode)
     response = _send(url, provider.headers(key, stream=True), payload, key, stream=True)
@@ -1339,6 +1795,12 @@ def complete(provider, key, messages, model=None,
     what keeps replies parseable, so it is worth asking for and worth giving up
     rather than failing on.
     """
+    if uses_cli(provider):
+        counts = {}
+        text = "".join(_cli_run(provider, messages, model,
+                                on_usage=lambda n: counts.__setitem__("out", n),
+                                on_input_usage=lambda n: counts.__setitem__("in", n)))
+        return text, counts.get("out"), counts.get("in")
     for attempt in (0, 1):
         url, payload = provider.chat_payload(messages, model, stream=False,
                                              max_tokens=max_tokens, json_mode=json_mode)
