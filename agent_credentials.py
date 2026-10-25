@@ -63,6 +63,10 @@ STORE_FILE = agent_config.INSTALL_DIR / ".tmt_providers.json"
 _ENCODING_TAG = "obf1:"
 _ENCODING_PAD = b"tmt-provider-store"
 
+# What every model call answers while nothing is configured.
+NO_PROVIDER = ("No model provider is set up yet. Choose one in Settings (any provider, "
+               "an API key, or a Claude subscription) before TMT can do anything.")
+
 # "anthropic_route" is how calls to the anthropic provider are made: "api" (the
 # key, over HTTP) or "subscription" (the signed-in Claude Code on this PC).
 ROUTES = ("api", "subscription")
@@ -203,10 +207,14 @@ def _resolve(provider_id):
     existed, so nobody is asked again for a key they have already given.
     """
     name = _known(provider_id)
+    store = _read_store()
+    if name == "anthropic" and store["anthropic_route"] == "subscription":
+        # The subscription route makes the API key invisible, the environment's
+        # included, so no API credit can be spent while it is chosen.
+        return "", SOURCE_NONE
     from_env = os.environ.get(KEY_ENV[name], "").strip()
     if from_env:
         return from_env, SOURCE_ENV
-    store = _read_store()
     stored = _decode(store["credentials"].get(name, ""))
     if stored:
         return stored, SOURCE_STORE
@@ -230,6 +238,11 @@ def set_anthropic_route(route):
     store["anthropic_route"] = route
     _write_store(store)
     return route
+
+
+def has_stored_key(provider_id):
+    """Whether the store itself holds a key, whatever the route makes visible."""
+    return bool(_decode(_read_store()["credentials"].get(_known(provider_id), "")))
 
 
 def selected_provider():

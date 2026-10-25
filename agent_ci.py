@@ -68,11 +68,11 @@ MAX_CHANGED_FILES = 200
 NO_TASK = ("--ci needs a task. Give it as an argument, or pipe it in:\n"
            '    tmtcode --ci "run the test suite and fix failures"\n'
            '    echo "fix the lint errors" | tmtcode --ci')
-NO_KEY = ("No API key is configured, and CI mode will not open the setup "
-          "screen -- there is nobody to fill it in. Set the provider's key in "
-          "the environment (OPENROUTER_API_KEY, OPENAI_API_KEY, "
-          "ANTHROPIC_API_KEY or GEMINI_API_KEY), or run tmtcode once "
-          "interactively to store one.")
+NO_KEY = ("No model provider is set up yet. Choose one in Settings (any provider, "
+          "an API key, or a Claude subscription) before TMT can do anything. CI mode "
+          "will not open the setup screen -- there is nobody to fill it in. Set a "
+          "provider's key in the environment (OPENROUTER_API_KEY, OPENAI_API_KEY, "
+          "ANTHROPIC_API_KEY or GEMINI_API_KEY), or run tmtcode once interactively.")
 
 # What a refused approval is recorded as. The question itself is composed by
 # `agent_bash`, which knows what is being asked; this is only the note that the

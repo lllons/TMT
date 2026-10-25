@@ -538,6 +538,18 @@ def provider_has_key(provider_id):
     return provider_id == "openrouter" and bool(agent_config.OPENROUTER_API_KEY)
 
 
+SUBSCRIPTION_KEY_HINT = "Using your Claude subscription - API key not used"
+
+
+def _uses_subscription(provider_id):
+    """Whether Anthropic is on the subscription route, which makes its API key unused."""
+    store = _credentials()
+    try:
+        return provider_id == "anthropic" and store.anthropic_route() == "subscription"
+    except Exception:
+        return False
+
+
 def provider_key_hint(provider_id):
     """A safe description of the key in force: masked, and where it came from.
 
@@ -547,6 +559,8 @@ def provider_key_hint(provider_id):
     """
     store = _credentials()
     mask, origin = "", ""
+    if _uses_subscription(provider_id):
+        return SUBSCRIPTION_KEY_HINT
     if store is not None:
         try:
             mask, origin = store.masked(provider_id), store.source(provider_id)
@@ -4718,6 +4732,46 @@ def route_screen(stream=None, key_reader=None, region=None):
         return None
 
 
+FORGET_ROWS = (("keep", "Keep the key", "stored, but not used on this route"),
+               ("forget", "Forget the key", "remove the stored Anthropic API key"))
+
+
+def forget_key_screen(stream=None, key_reader=None, region=None):
+    """Offer to forget the stored Anthropic key. True only when the user chose to."""
+    stream = sys.stdout if stream is None else stream
+    if key_reader is None:
+        if not is_interactive(stream):
+            return False
+        key_reader = _default_reader()
+    region = LiveRegion(stream) if region is None else region
+    state = {"selected": 0}
+
+    def render():
+        columns, rows = _terminal(None)
+        phase = gradient_phase()
+        width = _content_width(columns)
+        label_width = max(display_width(row[1]) for row in FORGET_ROWS)
+        head = ["", " " + _paint("Stored API key", stream, phase), "",
+                _dim(fit_to_width(" The subscription does not use your Anthropic API key.", width), stream),
+                _rule(stream, phase, width)]
+        options = [_option_row(index == state["selected"], label, detail, stream, phase,
+                               width, label_width)
+                   for index, (_name, label, detail) in enumerate(FORGET_ROWS)]
+        tail = ["", _footer(stream, ("{up}/{down} Navigate", "Enter Select", "Esc Keep"), width)]
+        return _fit_menu(head, options, tail, rows, state["selected"], stream, width)
+
+    def on_key(key):
+        if key in (None, "esc", "quit", "interrupt"):
+            return "keep"
+        if key in ("up", "down"):
+            state["selected"] = (state["selected"] + (1 if key == "down" else -1)) % len(FORGET_ROWS)
+        elif key == "enter":
+            return FORGET_ROWS[state["selected"]][0]
+        return None
+
+    return _drive(render, key_reader, region, on_key) == "forget"
+
+
 def api_key_screen(provider_id=None, stream=None, key_reader=None, region=None,
                    opening="", identify=False):
     """Take an API key for one provider. Returns its id when one was saved.
@@ -4836,6 +4890,10 @@ def provider_setup(stream=None, key_reader=None, region=None, text_reader=None):
             if not route:
                 continue
             if route == "subscription":
+                store = _credentials()
+                if store.has_stored_key("anthropic") and forget_key_screen(
+                        stream=stream, key_reader=key_reader, region=region):
+                    store.clear_credential("anthropic")
                 _select_provider(chosen)
                 return chosen
         if provider_has_key(chosen):
@@ -5068,8 +5126,9 @@ def settings_screen(stream=None, key_reader=None, region=None, active_id=None,
                 # here". A provider's default is not a choice made here.
                 state["model"] = agent_models.current_model()
             elif entry == "key":
-                api_key_screen(current_provider(), stream=stream,
-                               key_reader=text_reader, region=region)
+                if not _uses_subscription(current_provider()):
+                    api_key_screen(current_provider(), stream=stream,
+                                   key_reader=text_reader, region=region)
             elif entry == "websearch":
                 # Chained exactly as `provider` is: choose the backend, then
                 # paste its key. Nothing is returned to Settings because

@@ -173,6 +173,25 @@ def _guard_url(url, key):
         raise ProviderError("refusing to send the API key in a URL", kind="bad_request")
 
 
+def _guard_route(url):
+    """Refuse any HTTP call to Anthropic while the subscription route is chosen.
+
+    The route keeps usage on the owner's Claude session, never on API credits, so
+    this holds even for a key that got here some other way, and a failed CLI call
+    never falls back to the API.
+    """
+    if "api.anthropic.com" not in str(url):
+        return
+    try:
+        import agent_credentials
+        subscription = agent_credentials.anthropic_route() == "subscription"
+    except Exception:
+        subscription = False
+    if subscription:
+        raise ProviderError("The Claude subscription route is on, so the Anthropic API is not used. "
+                            "Switch the route to API key in Settings to use a key.", kind="auth")
+
+
 def _guard_key(key):
     """Refuse to send a key that is empty or cannot go in a header.
 
@@ -190,6 +209,7 @@ def _guard_key(key):
 
 def _send(url, headers, payload, key, stream=False):
     """POST JSON through the shared session and return the response object."""
+    _guard_route(url)
     _guard_key(key)
     _guard_url(url, key)
     session = _session()
@@ -225,6 +245,7 @@ def _get(url, headers, key):
     only post(), and the model listings are GETs; urllib is already a
     dependency of that shim, so this adds nothing new.
     """
+    _guard_route(url)
     _guard_key(key)
     _guard_url(url, key)
     getter = getattr(_session(), "get", None)

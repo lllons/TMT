@@ -160,7 +160,8 @@ def test_a_missing_credential_is_a_usage_error_and_never_opens_the_form():
     try:
         assert code == agent_ci.EXIT_USAGE, code
         assert opened == [], "the setup form must never be reached"
-        assert "No API key" in err, err
+        assert "No model provider is set up yet." in err, err
+        assert "Settings" in err, err
         for name in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY"):
             assert name in err, "the fix has to name the variable"
     finally:

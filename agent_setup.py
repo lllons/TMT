@@ -1,7 +1,7 @@
-"""First-launch setup: ask for the OpenRouter API key and remember it.
+"""First-launch setup: offer to take an API key, and let the user skip it.
 
-Shown only when no key is found in the environment or in the saved key file,
-and styled to match the THINKING animation and the progress bar: the same
+Shown only when no provider is configured, and styled to match the THINKING
+animation and the progress bar: the same
 repeating red -> orange -> green cycle, the same block characters, and icons
 drawn from the live relay's symbol pool.
 """
@@ -17,9 +17,7 @@ from agent_ui import (
     GRADIENT_TICK, _supports_color, cycle_bar, cycle_text, gradient_phase, safe_write,
 )
 
-KEY_URL = "https://openrouter.ai/keys"
 KEY_PREFIX = "sk-or-"
-MAX_ATTEMPTS = 3
 TITLE_MARGIN = "   "
 SAVE_CURSOR = "\0337"
 RESTORE_CURSOR = "\0338"
@@ -152,7 +150,7 @@ class TitleLoop:
 
 
 def run_setup(stream=None, ask=None, animate=True):
-    """Draw the setup screen and return the key the user typed, or ""."""
+    """Draw the setup screen; the key typed, None when skipped, "" when cancelled."""
     stream = sys.stdout if stream is None else stream
     ask = input if ask is None else ask
     plain = ascii_only(stream)
@@ -195,11 +193,11 @@ def run_setup(stream=None, ask=None, animate=True):
     say(cycle_text(box["tl"] + box["h"] * (width - 2) + box["tr"], stream))
     for icon, text in (
         (icons[0], "W E L C O M E   T O   T M T"),
-        (icons[1], "No OpenRouter API key found on this machine."),
-        (icons[2], f"Get one free at  {KEY_URL}"),
-        (icons[3], f"It is saved to {agent_config.KEY_FILE.name} beside the code,"),
+        (icons[1], "No model provider is set up yet."),
+        (icons[2], "Paste an API key to set one up now, or press Enter"),
+        (" ", "to skip and choose one later in Settings."),
+        (icons[3], "A pasted key is saved beside the code,"),
         (" ", f"which is git-ignored {dash} it never travels with a push."),
-        (icons[4], "Or set OPENROUTER_API_KEY in your environment instead."),
     ):
         body = f"{icon}  {text}".ljust(width - 4)
         say(cycle_text(box["v"], stream) + " " + body + " " + cycle_text(box["v"], stream))
@@ -208,36 +206,41 @@ def run_setup(stream=None, ask=None, animate=True):
 
     title = TitleLoop(stream, art)
     try:
-        for attempt in range(MAX_ATTEMPTS):
-            progress = 40 + attempt * 15
-            say(f"  {cycle_bar(progress, stream, plain=plain)} {progress:>3}% Waiting for your key...")
-            safe_write(stream, f"  {cycle_text(f'{arrow} paste key {caret}', stream)} ")
-            if animate:
-                title.start(below[0])
-            try:
-                key = clean_key(ask(""))
-            except (EOFError, KeyboardInterrupt):
-                title.stop()
-                say()
-                say(f"  {cross} Setup cancelled {dash} no key saved.")
-                return ""
+        say(f"  {cycle_bar(40, stream, plain=plain)}  40% Waiting for your key...")
+        safe_write(stream, f"  {cycle_text(f'{arrow} paste key, or Enter to skip {caret}', stream)} ")
+        if animate:
+            title.start(below[0])
+        try:
+            key = clean_key(ask(""))
+        except (EOFError, KeyboardInterrupt):
             title.stop()
-            below[0] += 1              # the line the user just submitted
-            if not key:
-                say(f"  {cross} That was empty. Paste the key from {KEY_URL}.")
-                continue
-            if not key.startswith(KEY_PREFIX):
-                say(f"  {cross} Heads up: OpenRouter keys usually start with {KEY_PREFIX}. Using it anyway.")
             say()
-            say(f"  {cycle_bar(100, stream, plain=plain)} 100% Key saved!  {tick}")
-            say(f"  {sparkles(3, stream, plain)}  {mask_key(key, plain)} "
-                f"stored in {agent_config.KEY_FILE.name}  {sparkles(3, stream, plain, gradient_phase() + 0.5)}")
-            say()
-            return key
-        say(f"  {cross} No key entered after {MAX_ATTEMPTS} tries {dash} stopping here.")
-        return ""
+            say(f"  {cross} Setup cancelled {dash} no key saved.")
+            return ""
+        title.stop()
+        below[0] += 1              # the line the user just submitted
+        if not key:
+            say(f"  {tick} Skipped {dash} choose a model provider in Settings when you are ready.")
+            return None
+        if not key.startswith(KEY_PREFIX) and not _identified(key):
+            say(f"  {cross} Heads up: that does not look like a key TMT recognises. Using it anyway.")
+        say()
+        say(f"  {cycle_bar(100, stream, plain=plain)} 100% Key saved!  {tick}")
+        say(f"  {sparkles(3, stream, plain)}  {mask_key(key, plain)} "
+            f"stored beside the code  {sparkles(3, stream, plain, gradient_phase() + 0.5)}")
+        say()
+        return key
     finally:
         title.stop()
+
+
+def _identified(key):
+    """The provider a pasted key belongs to, or "" (OpenRouter's own prefix counts as none)."""
+    try:
+        import agent_menu
+        return agent_menu.identify_provider(key)
+    except Exception:
+        return ""
 
 
 GIT_SETUP_TITLE = "TMT Git Contributor Setup"
@@ -299,11 +302,31 @@ def ensure_git_identity(stream=None, ask=None):
 
 
 def ensure_api_key(stream=None, ask=None, animate=True):
-    """True when a key is available, running first-launch setup if it is not."""
+    """True when TMT can start: a provider is configured, or the user skipped setup.
+
+    False only when setup was cancelled. A pasted key is filed under the
+    provider it identifies as; anything else goes where it always went, the
+    OpenRouter key file. Skipping leaves nothing configured, and every call to a
+    model then answers NO_PROVIDER.
+    """
     if agent_config.OPENROUTER_API_KEY:
         return True
+    try:
+        import agent_credentials
+        if agent_credentials.is_configured(agent_credentials.selected_provider()):
+            return True
+    except Exception:
+        pass
     key = run_setup(stream=stream, ask=ask, animate=animate)
+    if key is None:
+        return True
     if not key:
         return False
-    agent_config.save_api_key(key)
+    provider = _identified(key)
+    if provider and provider != "openrouter":
+        import agent_credentials
+        agent_credentials.set_credential(provider, key)
+        agent_credentials.set_provider(provider)
+    else:
+        agent_config.save_api_key(key)
     return True

@@ -1147,7 +1147,7 @@ def run_ci(args):
         # this is a statement of intent rather than a guard -- a pipeline that
         # rewrote its own agent mid-job would be a pipeline nobody could
         # reproduce.
-        if not agent_config.OPENROUTER_API_KEY:
+        if not agent_config.OPENROUTER_API_KEY and not agent_menu.provider_is_configured():
             print(agent_ci.NO_KEY, file=sys.stderr)
             return agent_ci.EXIT_USAGE
         run = agent_ci.Run(task=task, workspace=str(root), max_turns=turns,

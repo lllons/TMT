@@ -11,6 +11,7 @@ import agent_config
 import agent_setup
 from agent_setup import TitleLoop, clean_key, ensure_api_key, mask_key, run_setup
 from agent_ui import cycle_text
+from test_agent_credentials import Credentials
 
 
 class FakeTTY(io.StringIO):
@@ -46,11 +47,12 @@ def temp_key_file():
 def sandbox(function):
     """Run a test with the key file and in-memory key isolated."""
     saved_path, saved_key = agent_config.KEY_FILE, agent_config.OPENROUTER_API_KEY
-    agent_config.KEY_FILE, agent_config.OPENROUTER_API_KEY = temp_key_file(), ""
-    try:
-        return function()
-    finally:
-        agent_config.KEY_FILE, agent_config.OPENROUTER_API_KEY = saved_path, saved_key
+    with Credentials(key=None):         # the machine's own provider store must not answer
+        agent_config.KEY_FILE, agent_config.OPENROUTER_API_KEY = temp_key_file(), ""
+        try:
+            return function()
+        finally:
+            agent_config.KEY_FILE, agent_config.OPENROUTER_API_KEY = saved_path, saved_key
 
 
 SAVE_CURSOR = "\0337"
@@ -105,22 +107,38 @@ def test_saved_key_is_never_echoed_in_full():
     sandbox(check)
 
 
-def test_empty_answers_are_retried_then_give_up_without_writing():
+def test_an_empty_answer_skips_setup_and_starts_with_nothing_configured():
     def check():
         output = FakeTTY()
-        answers = iter(["", "  ", ""])
-        assert not ensure_api_key(stream=output, ask=lambda prompt: next(answers), animate=False)
+        assert ensure_api_key(stream=output, ask=lambda prompt: "  ", animate=False)
         assert agent_config.OPENROUTER_API_KEY == ""
         assert not agent_config.KEY_FILE.exists()
-        assert strip_ansi(output.getvalue()).count("That was empty") == 3
+        text = strip_ansi(output.getvalue())
+        assert "Skipped" in text and "That was empty" not in text
+        assert "No model provider is set up yet." in text
+        assert "OpenRouter" not in text and "openrouter" not in text
     sandbox(check)
 
 
-def test_a_key_entered_after_a_slip_is_accepted():
+def test_a_pasted_key_is_filed_under_the_provider_it_identifies():
     def check():
-        answers = iter(["", "sk-or-v1-second-try"])
-        assert ensure_api_key(stream=FakeTTY(), ask=lambda prompt: next(answers), animate=False)
-        assert agent_config.OPENROUTER_API_KEY == "sk-or-v1-second-try"
+        import agent_credentials
+        key = "sk-ant-api03-" + "a" * 40
+        assert ensure_api_key(stream=FakeTTY(), ask=lambda prompt: key, animate=False)
+        assert agent_credentials.selected_provider() == "anthropic"
+        assert agent_credentials.credential("anthropic") == key
+        assert agent_config.OPENROUTER_API_KEY == ""
+    sandbox(check)
+
+
+def test_a_configured_provider_other_than_openrouter_needs_no_setup():
+    def check():
+        import agent_credentials
+        agent_credentials.set_credential("gemini", "g" * 30)
+        agent_credentials.set_provider("gemini")
+        output = FakeTTY()
+        assert ensure_api_key(stream=output, ask=lambda prompt: "", animate=False)
+        assert output.getvalue() == ""
     sandbox(check)
 
 
@@ -162,7 +180,7 @@ def test_screen_shows_the_title_the_panel_and_a_progress_bar():
     text = strip_ansi(output.getvalue())
     assert "████████╗" in text
     assert "W E L C O M E   T O   T M T" in text
-    assert agent_setup.KEY_URL in text
+    assert "No model provider is set up yet." in text
     assert "100% Key saved!" in text
     assert "░" in text and "█" in text
 
@@ -222,7 +240,7 @@ def test_a_console_that_cannot_encode_the_screen_still_gets_the_key_prompt():
 def test_both_ways_setup_gives_up_are_readable_on_an_ascii_console():
     """The other two em dashes are on paths the happy case never touches.
 
-    Cancelling and running out of tries each write their own sentence, so a fix
+    Cancelling and skipping each write their own sentence, so a fix
     proved only against a successful run would leave both crashing -- and both
     are the moment the user most needs to be told what happened.
     """
@@ -234,10 +252,10 @@ def test_both_ways_setup_gives_up_are_readable_on_an_ascii_console():
     cancelled.getvalue().encode("ascii")
     assert "Setup cancelled - no key saved." in strip_ansi(cancelled.getvalue())
 
-    exhausted = StrictTTY()
-    assert run_setup(stream=exhausted, ask=lambda prompt: "", animate=False) == ""
-    exhausted.getvalue().encode("ascii")
-    assert "tries - stopping here." in strip_ansi(exhausted.getvalue())
+    skipped = StrictTTY()
+    assert run_setup(stream=skipped, ask=lambda prompt: "", animate=False) is None
+    skipped.getvalue().encode("ascii")
+    assert "Skipped - choose a model provider in Settings" in strip_ansi(skipped.getvalue())
 
 
 def test_a_terminal_that_can_carry_the_em_dash_still_gets_it():

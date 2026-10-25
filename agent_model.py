@@ -102,10 +102,7 @@ def selected_provider():
         provider = agent_providers.get_provider(agent_providers.DEFAULT_PROVIDER)
     key = agent_credentials.credential(provider.id)
     if not key and not agent_providers.uses_cli(provider):
-        return None, "", (
-            f"No API key is set for {provider.label}. Open Settings, choose "
-            "API Key, and add one."
-        )
+        return None, "", agent_credentials.NO_PROVIDER
     return provider, key, ""
 
 
