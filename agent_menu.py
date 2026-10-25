@@ -4799,6 +4799,9 @@ def forget_key_screen(stream=None, key_reader=None, region=None):
     return _drive(render, key_reader, region, on_key) == "forget"
 
 
+MAX_KEY_LENGTH = 200
+
+
 def api_key_screen(provider_id=None, stream=None, key_reader=None, region=None,
                    opening="", identify=False):
     """Take an API key for one provider. Returns its id when one was saved.
@@ -4862,6 +4865,13 @@ def api_key_screen(provider_id=None, stream=None, key_reader=None, region=None,
             key = "".join(typed).strip()
             if not key:
                 message = "Nothing was typed. Paste the key, or press Esc to go back."
+                continue
+            if len(key) > MAX_KEY_LENGTH:
+                # A paste of a whole page or the wrong clipboard is not a key,
+                # and storing it only to have the provider refuse it leaves junk.
+                typed, message = [], ("That is %d characters; a key is shorter than %d. "
+                                      "Paste just the key, or press Esc to go back."
+                                      % (len(key), MAX_KEY_LENGTH))
                 continue
             if identify:
                 # The first-run path. What was pasted has to BE a key before
@@ -5223,9 +5233,13 @@ def run_startup(stream=None, key_reader=None, model_id=None, workspace=None,
     text_reader = key_reader
     if key_reader is None:
         key_reader = _default_reader()
+        # Named here, not left None: Settings reads "a reader was given" as
+        # "scripted" and would hand the key screens the menu reader, which
+        # turns every typed character into a tick.
+        text_reader = _default_text_reader()
 
     region = LiveRegion(stream)
-    workspace = agent_config.ROOT_DIR if workspace is None else workspace
+    workspace =agent_config.ROOT_DIR if workspace is None else workspace
     selected = 0
     cursor = None
     try:

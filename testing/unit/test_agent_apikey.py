@@ -401,3 +401,48 @@ def test_a_short_key_is_refused_with_the_right_article():
     for provider, article in (("openrouter", "an"), ("openai", "an"), ("anthropic", "an"), ("gemini", "a")):
         ok, reason = agent_providers._REGISTRY[provider].looks_like_key("x")
         assert not ok and reason.startswith("That is too short for %s " % article), (provider, reason)
+
+
+def test_a_paste_longer_than_any_key_is_refused_and_not_stored():
+    calls = []
+    result, frames = drive_reader(
+        "openrouter", ["x" * 360, "enter", "esc"],
+        store=lambda p, k: calls.append(k) or ("Saved.", True))
+    assert not calls and result is None
+    assert "360 characters" in frames
+
+
+def test_the_main_menu_hands_settings_a_raw_text_reader_on_a_real_terminal():
+    # Settings read "a reader was given" as "scripted" and gave the key screens
+    # the menu reader, so every typed character became a tick (N01).
+    m = menu()
+    seen = {}
+    real = (m.settings_screen, m.is_interactive, m.LiveRegion, m._hide_cursor,
+            m._show_cursor if hasattr(m, "_show_cursor") else None)
+
+    class Region:
+        def __init__(self, *a, **k): pass
+        def paint(self, *a, **k): pass
+        def clear(self, *a, **k): pass
+
+    def fake_settings(**kw):
+        seen["text"] = kw.get("text_reader")
+        seen["key"] = kw.get("key_reader")
+        return None
+
+    m.settings_screen, m.is_interactive, m.LiveRegion = fake_settings, (lambda s: True), Region
+    m._hide_cursor = lambda s: None
+    try:
+        keys = iter(["down", "down", "enter", "interrupt", "interrupt"])
+        orig = m._default_reader
+        m._default_reader = lambda: (lambda: next(keys, "interrupt"))
+        try:
+            m.main_menu(stream=Terminal())
+        except Exception:
+            pass
+        finally:
+            m._default_reader = orig
+    finally:
+        m.settings_screen, m.is_interactive, m.LiveRegion, m._hide_cursor = real[:4]
+    if "text" in seen:
+        assert seen["text"] is not None and seen["text"] is not seen["key"]
