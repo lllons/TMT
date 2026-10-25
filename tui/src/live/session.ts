@@ -29,6 +29,11 @@ export interface SessionScreenOptions {
 
 export type InterruptKey = 'ctrl-c' | 'ctrl-d';
 
+export interface AskOptions {
+  /** Shadow text in the empty box while the question is open, drawn like the placeholder. */
+  hint?: string;
+}
+
 export interface SessionScreen {
   /** Write text into the scrollback above the frame. Never redrawn. */
   commit(text: string): void;
@@ -46,6 +51,14 @@ export interface SessionScreen {
   onSubmit(handler: (line: string) => void): () => void;
   /** Ctrl-C (box empty, or a turn running) and Ctrl-D on an empty box. */
   onInterrupt(handler: (key: InterruptKey) => void): () => void;
+  /**
+   * Ask the user one question in the box. The next Enter resolves it with the
+   * line (an empty one included) and never reaches `onSubmit`, busy or not;
+   * Esc, Ctrl-C, Ctrl-D and `stop()` resolve `null`. A draft typed before it
+   * is kept and comes back after, and queued lines stay queued meanwhile.
+   * A second ask replaces the first, which resolves `null`.
+   */
+  ask(options?: AskOptions): Promise<string | null>;
   /** Lines waiting for the turn to end, oldest first. */
   queued(): string[];
   /** Hand the terminal to someone else (a delegated Python screen), and take it back. */
@@ -89,11 +102,29 @@ export function createSessionScreen(options: SessionScreenOptions): SessionScree
   let scheduled = false;
   let draining = false;
   let escapeTimer: ReturnType<typeof setTimeout> | undefined;
+  // The open question, if any, with the draft it displaced.
+  let asking: {
+    hint: string;
+    draft: { value: string; cursor: number; pastes: string[]; placeholderVisible: boolean };
+    resolve: (line: string | null) => void;
+  } | null = null;
 
   const state = () => ({
     editor, reply, status, caption, busy, color,
+    ask: asking ? asking.hint : null,
     pending: queue.map((entry) => entry.shown),
   });
+
+  /** Close the open question with `line` and give the box its draft back. */
+  function closeAsk(line: string | null): void {
+    const open = asking;
+    if (!open) return;
+    asking = null;
+    Object.assign(editor, open.draft);
+    open.resolve(line);
+    drain();
+    schedule();
+  }
 
   function schedule(): void {
     if (scheduled || !live) return;
@@ -112,6 +143,8 @@ export function createSessionScreen(options: SessionScreenOptions): SessionScree
     const line = editor.expanded();
     const shown = editor.value;
     editor.reset();
+    // The answer to an open question, even an empty one, and not a task.
+    if (asking) return closeAsk(line);
     if (!line.trim()) return;
     // Typed during a turn: queued, drawn above the box, and sent when the
     // turn ends. Sending it now would interleave two turns against one
@@ -127,7 +160,7 @@ export function createSessionScreen(options: SessionScreenOptions): SessionScree
       // One line per turn: a handler that starts a turn calls setBusy(true)
       // before returning, which stops this; one that does not (a local
       // command) lets the next queued line go straight after it.
-      while (!busy && queue.length > 0) emitSubmit(queue.shift()!.line);
+      while (!busy && !asking && queue.length > 0) emitSubmit(queue.shift()!.line);
     } finally {
       draining = false;
     }
@@ -152,14 +185,18 @@ export function createSessionScreen(options: SessionScreenOptions): SessionScree
     }
     const { key } = event;
     if (key === 'enter') return submit();
+    if (key === 'escape' && asking) return closeAsk(null);
     if (key === 'ctrl-c') {
       // Between turns, Ctrl-C on a written line abandons the line. Otherwise
       // it is the caller's: the stop for a running turn, the way out between.
-      if (!busy && editor.value) return editor.reset();
+      // An open question is cancelled first, so the caller finds it closed.
+      if (!asking && !busy && editor.value) return editor.reset();
+      closeAsk(null);
       for (const handler of [...interruptHandlers]) handler('ctrl-c');
       return;
     }
     if (key === 'eof' && !editor.value) {
+      closeAsk(null);
       for (const handler of [...interruptHandlers]) handler('ctrl-d');
       return;
     }
@@ -248,11 +285,14 @@ export function createSessionScreen(options: SessionScreenOptions): SessionScree
     live = false;
     clearTimeout(escapeTimer);
     stdin.off('data', onData);
+    // Reading stops while the console is still raw. A read left pending when
+    // the mode switches back is a line read, and it would take the next line
+    // typed away from whatever runs next (a Python menu on this terminal).
+    stdin.pause?.();
     stdout.off('resize', onResize);
     terminal.close();
     restoreModes();
     removeHooks();
-    stdin.pause?.();
   }
 
   take();
@@ -292,6 +332,19 @@ export function createSessionScreen(options: SessionScreenOptions): SessionScree
       interruptHandlers.add(handler);
       return () => interruptHandlers.delete(handler);
     },
+    ask(askOptions = {}) {
+      if (stopped) return Promise.resolve(null);
+      const previous = asking;
+      // A replaced question keeps the draft it found, not the answer typed to it.
+      const draft = previous ? previous.draft
+        : { value: editor.value, cursor: editor.cursor, pastes: editor.pastes, placeholderVisible: editor.placeholderVisible };
+      editor.reset();
+      return new Promise((resolve) => {
+        asking = { hint: plain(askOptions.hint ?? ''), draft, resolve };
+        previous?.resolve(null);
+        schedule();
+      });
+    },
     queued() {
       return queue.map((entry) => entry.line);
     },
@@ -305,6 +358,11 @@ export function createSessionScreen(options: SessionScreenOptions): SessionScree
     },
     stop() {
       if (stopped) return;
+      // Closed without giving the draft back or sending the queue: nothing
+      // is left to type into.
+      const open = asking;
+      asking = null;
+      open?.resolve(null);
       if (live) release();
       stopped = true;
     },

@@ -27,6 +27,8 @@ export interface FrameState {
   /** Queued lines, as they were shown in the field. */
   pending: string[];
   busy: boolean;
+  /** The hint of the open question, or null when none is open. */
+  ask: string | null;
   color: boolean;
 }
 
@@ -136,7 +138,8 @@ function fieldRows(state: FrameState, inner: number, maxRows: number,
   const { editor } = state;
   const lead = ' > ';
   const indent = ' '.repeat(PROMPT_PREFIX);
-  const hint = state.busy && editor.value === '' ? TYPING_HINT
+  const hint = state.ask !== null && editor.value === '' ? state.ask
+    : state.busy && editor.value === '' ? TYPING_HINT
     : editor.placeholderVisible ? editor.placeholder : '';
   if (editor.value === '') {
     // The placeholder never wraps. It is shadow text standing in for an empty

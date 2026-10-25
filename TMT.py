@@ -1068,7 +1068,18 @@ def parse_args(argv=None):
         "--backend-stdio", dest="backend_stdio", action="store_true",
         help=argparse.SUPPRESS,
     )
+    # Not for people either. Set by the TypeScript front end to run the Python
+    # startup screens (splash, menu, API key, git identity) on the real
+    # terminal, once at launch and again after `/back`. See `run_prelude`.
+    parser.add_argument(
+        "--tui-prelude", dest="tui_prelude", action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args(argv)
+    if args.tui_prelude and args.ci:
+        # Screens are exactly what a CI run must never draw, so the two do not
+        # combine: refused rather than one of them quietly winning.
+        parser.error("--tui-prelude cannot be combined with --ci.")
     words = list(args.words or [])
     if args.ci:
         # Every word is the task; the workspace comes from --dir or from where
@@ -1194,6 +1205,62 @@ def run_ci(args):
     return result.exit_code()
 
 
+def run_prelude(args):
+    """The Python startup screens on the real terminal, for the TypeScript UI.
+
+    `main` from the splash to just before `_session_loop`, run as a process of
+    its own so the front end can reuse these screens instead of porting them.
+    This process draws and reads the terminal itself (the front end has handed
+    it over), exactly as the Python UI does, and returns an exit code:
+
+        0   start the session: every screen was passed and the screen is clear.
+        10  the user chose Exit (the splash, the menu or the API key form, or
+            Ctrl-C on any of them). Nothing is started.
+        2   the workspace was refused (missing, a file, a filesystem root, the
+            home directory). The reason has been printed.
+        1   an unexpected error. The traceback is on stderr.
+
+    The workspace is settled but never asked about: the directory that already
+    holds files and has no git is the backend's question, put to the front end
+    as an `approval` event once the session starts, and this process has no
+    business asking it on a terminal the front end is about to take back.
+
+    It runs again on `/back`, in a new process each time. A successful update
+    inside `run_splash` restarts the process with the same argument list, which
+    carries `--tui-prelude` and so lands back here (see `agent_update.restart`).
+    """
+    try:
+        candidate = args.directory or default_workspace()
+        refusal = workspace_refusal(candidate)
+        if refusal:
+            console.print(f"[red]Not a usable workspace:[/red] {refusal}")
+            console.print("Run TMT from inside a project, or name one with --dir.")
+            return 2
+        root = set_workspace_root(candidate)
+        if run_splash() == "exit":
+            return 10
+        agent_config.refresh_model()
+        agent_config.refresh_effort()
+        agent_config.refresh_protocol()
+        agent_config.refresh_auto_update()
+        agent_config.refresh_project_context()
+        if run_startup(workspace=root) == "exit":
+            return 10
+        if not ensure_api_key():
+            return 10
+        ensure_git_identity()
+        clear_screen()
+        return 0
+    except KeyboardInterrupt:
+        # Ctrl-C on a startup screen means the user did not want to start, which
+        # is how `run_splash` already reads it.
+        return 10
+    except Exception:                   # noqa: BLE001 - reported, never raised
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return 1
+
+
 def main(argv=None):
     args = parse_args(argv)
     if getattr(args, "ci", False):
@@ -1213,6 +1280,11 @@ def main(argv=None):
                   file=sys.stderr)
             return 2
         return agent_backend.run(args)
+    if getattr(args, "tui_prelude", False):
+        # The TypeScript front end borrowing the Python startup screens. Before
+        # the UI dispatch for the same reason `--backend-stdio` is: it must not
+        # be sent back to the front end that started it.
+        return run_prelude(args)
     # The front end. `chosen_ui` is the flag, then TMT_UI, then the saved
     # setting, and anything unreadable is Python. A TypeScript front end that
     # cannot start (no Node, not built, not a terminal) answers None and the

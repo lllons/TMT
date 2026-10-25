@@ -325,6 +325,104 @@ describe('typing during a turn', () => {
   });
 });
 
+describe('asking a question', () => {
+  it('answers with the next line, an empty one too, and keeps it from onSubmit even while busy', async () => {
+    const term = new FakeTerminal(80, 24);
+    const screen = open(term);
+    const sent: string[] = [];
+    screen.onSubmit((line) => sent.push(line));
+    screen.setBusy(true);
+    const first = screen.ask({ hint: 'Type y to run it' });
+    await term.settle();
+    expect(term.viewport().some((row) => row.startsWith(' > ') && row.includes('Type y to run it'))).toBe(true);
+    term.type('y');
+    term.type('\r');
+    expect(await first).toBe('y');
+    const second = screen.ask({ hint: 'again' });
+    term.type('\r');
+    expect(await second).toBe('');
+    expect(sent).toEqual([]);
+    expect(screen.queued()).toEqual([]);
+  });
+
+  it('draws the hint only in the empty box, and the typing hint comes back after', async () => {
+    const term = new FakeTerminal(80, 24);
+    const screen = open(term);
+    screen.setBusy(true);
+    const answer = screen.ask({ hint: 'Pick one' });
+    await term.settle();
+    expect(term.viewport().some((row) => row.includes('Pick one'))).toBe(true);
+    expect(term.viewport().some((row) => row.includes('Type to queue the next task'))).toBe(false);
+    term.type('2');
+    await term.settle();
+    expect(term.viewport().some((row) => row.includes('Pick one'))).toBe(false);
+    term.type('\r');
+    expect(await answer).toBe('2');
+    await term.settle();
+    expect(term.viewport().some((row) => row.includes('Type to queue the next task'))).toBe(true);
+  });
+
+  it('resolves null on Esc, Ctrl-C and Ctrl-D, and Ctrl-C still reaches onInterrupt', async () => {
+    const term = new FakeTerminal(80, 24);
+    const screen = open(term);
+    const keys: string[] = [];
+    screen.onInterrupt((key) => keys.push(key));
+    screen.setBusy(true);
+    const esc = screen.ask();
+    term.type('\x1b');
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(await esc).toBeNull();
+    expect(keys).toEqual([]);
+    const ctrlC = screen.ask();
+    term.type('typed');
+    term.type('\x03');
+    expect(await ctrlC).toBeNull();
+    expect(keys).toEqual(['ctrl-c']);
+    const ctrlD = screen.ask();
+    term.type('\x04');
+    expect(await ctrlD).toBeNull();
+    expect(keys).toEqual(['ctrl-c', 'ctrl-d']);
+  });
+
+  it('gives the draft back after the answer and leaves the queue untouched meanwhile', async () => {
+    const term = new FakeTerminal(80, 24);
+    const screen = open(term);
+    const sent: string[] = [];
+    screen.onSubmit((line) => sent.push(line));
+    screen.setBusy(true);
+    term.type('later');
+    term.type('\r');
+    term.type('half a draft');
+    const answer = screen.ask({ hint: 'Pick one' });
+    await term.settle();
+    expect(term.viewport().some((row) => row.includes('half a draft'))).toBe(false);
+    expect(term.viewport().some((row) => row.includes('queued  later'))).toBe(true);
+    // The turn ending while the question is open must not send the queue.
+    screen.setBusy(false);
+    expect(sent).toEqual([]);
+    term.type('n');
+    term.type('\r');
+    expect(await answer).toBe('n');
+    expect(sent).toEqual(['later']);
+    await term.settle();
+    expect(term.viewport().some((row) => row.startsWith(' > half a draft'))).toBe(true);
+    term.type('\r');
+    expect(sent).toEqual(['later', 'half a draft']);
+  });
+
+  it('resolves null when stopped or replaced, and at once after a stop', async () => {
+    const term = new FakeTerminal(80, 24);
+    const screen = open(term);
+    const first = screen.ask({ hint: 'one' });
+    const second = screen.ask({ hint: 'two' });
+    expect(await first).toBeNull();
+    screen.stop();
+    expect(await second).toBeNull();
+    expect(await screen.ask()).toBeNull();
+    expect(forbiddenIn(term.raw)).toEqual([]);
+  });
+});
+
 describe('terminal modes', () => {
   it('turns on bracketed paste and raw mode, and restores both, the cursor and the screen on stop', async () => {
     const term = new FakeTerminal(80, 24);
