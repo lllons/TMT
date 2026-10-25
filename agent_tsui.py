@@ -69,7 +69,7 @@ def _node_major(node):
     """The major version of a Node executable, or None if it will not say."""
     try:
         done = subprocess.run([node, "--version"], capture_output=True,
-                              text=True, timeout=15)
+                              text=True, timeout=15, stdin=subprocess.DEVNULL)
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     match = re.match(r"v?(\d+)", (done.stdout or "").strip())

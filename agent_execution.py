@@ -61,7 +61,7 @@ def open_app(app_name, file_path=None, url=None):
             return f"'{key}' does not accept URLs."
         cmd.append(url)
     try:
-        subprocess.Popen(cmd)
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
         target = file_path or url or ""
         return f"Opened {target} in {key}" if target else f"Launched {key}"
     except FileNotFoundError:

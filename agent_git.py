@@ -204,11 +204,15 @@ def _git(args, cwd, env=None, timeout=GIT_TIMEOUT, check=True, stdin=None):
     cmd = ["git"] + [str(a) for a in args]
     log("run", " ".join(cmd) + f"   (in {cwd})")
     started = time.monotonic()
+    # Without text to feed it git must not inherit this process's stdin: under
+    # the headless backend that is the protocol pipe, and on Windows a child
+    # that shares a pipe another thread is blocked reading can hang.
+    feed = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
     try:
         result = subprocess.run(
             cmd, cwd=str(cwd), env=env, shell=False, capture_output=True,
-            input=stdin, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, **feed,
         )
     except FileNotFoundError:
         log("error", "git was not found on PATH")

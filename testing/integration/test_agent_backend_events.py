@@ -607,6 +607,137 @@ def test_the_real_process_ends_cleanly_when_stdin_closes():
     assert code == 0, (code, stderr[-2000:])
 
 
+# The real process with only the model replaced. The stand-in model starts a
+# child that reads stdin, as a `bash` command or a test run would, and reports
+# what that child saw; nothing here reaches a network.
+_CHILD_PROGRAM = """
+import json, subprocess, sys
+sys.path.insert(0, {repo!r})
+import TMT
+
+def model(messages, on_event=None, **kwargs):
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", "import sys; print(repr(sys.stdin.read()))"],
+            capture_output=True, text=True, timeout=20)
+        seen = done.stdout.strip()
+    except subprocess.TimeoutExpired:
+        seen = "TIMEOUT"
+    return json.dumps({{"action": "end_conversation", "message": seen}})
+
+TMT.ask_model = model
+sys.exit(TMT.main(["--backend-stdio", "--dir", {work!r}]))
+"""
+
+
+def test_a_task_starts_at_once_and_a_child_of_the_backend_sees_an_empty_stdin():
+    """The front end's stdin is a live pipe. A child that inherited it hung for
+    git's whole 30 second timeout (the first git call of a turn comes before
+    `turn_start`), and one that read it would swallow the front end's messages.
+    So `task` -> `turn_start` must be quick, and a child started with no stdin of
+    its own must see the end of an empty one while the pipe stays open."""
+    box = Workspace(git=True)
+    proc = None
+    try:
+        env = dict(os.environ)
+        env.pop("TMT_UI", None)
+        program = _CHILD_PROGRAM.format(repo=str(REPO), work=str(box.path))
+        proc = subprocess.Popen(
+            [sys.executable, "-c", program],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=str(box.path), env=env)
+        watchdog = threading.Timer(120, proc.kill)
+        watchdog.start()
+        try:
+            def send(message):
+                proc.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
+                proc.stdin.flush()
+
+            def read_until(kind):
+                for raw in proc.stdout:
+                    event = json.loads(raw.decode("utf-8"))
+                    if event["type"] == kind:
+                        return event
+                raise AssertionError("stdout ended before %r: %r"
+                                     % (kind, proc.stderr.read()[-2000:]))
+
+            send(HELLO)
+            read_until("prompt")
+            send({"v": 1, "type": "submit", "text": "go"})
+            asked = time.monotonic()
+            read_until("turn_start")
+            waited = time.monotonic() - asked
+            final = read_until("final")
+            read_until("prompt")
+            send({"v": 1, "type": "quit"})
+            read_until("exit")
+            proc.wait(timeout=60)
+        finally:
+            watchdog.cancel()
+    finally:
+        if proc is not None:
+            proc.kill()
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        box.close()
+    assert waited < 15, "task -> turn_start took %.1fs" % waited
+    assert final["text"] == "''", final
+
+
+def test_the_backend_points_descriptor_0_at_the_null_device_and_gives_it_back():
+    """In-process, with a real descriptor 0 swapped for a pipe: the channel is
+    moved to a private copy, a child with no stdin of its own reads an empty
+    one, and descriptor 0 is the pipe again afterwards -- even while the reader
+    thread is blocked in a read, which on Windows made a `dup2` from the
+    reader's own descriptor wait for the front end and the process never end."""
+    try:
+        saved = os.dup(0)
+    except OSError:
+        return                             # no descriptor 0 here to swap
+    in_r, in_w = os.pipe()
+    os.dup2(in_r, 0)
+    os.close(in_r)
+    try:
+        class Stdin:                       # what `sys.stdin` is, as far as the channel can tell
+            def fileno(self):
+                return 0
+
+        channel = agent_backend.Channel(Stdin(), io.BytesIO())
+        spare = agent_backend._private_stdin(channel)
+        assert spare is not None and channel._fd not in (0, spare)
+        assert not os.get_inheritable(channel._fd)
+        lines = []
+        reader = threading.Thread(target=lambda: lines.append(channel._readline()),
+                                  daemon=True)
+        reader.start()
+        time.sleep(0.3)                    # blocked in its read now
+        done = subprocess.run(
+            [sys.executable, "-c", "import sys; print(repr(sys.stdin.read()))"],
+            capture_output=True, text=True, timeout=20)
+        assert done.stdout.strip() == "''", (done.stdout, done.stderr)
+        giver = threading.Thread(target=agent_backend._restore_stdin, args=(spare,),
+                                 daemon=True)
+        giver.start()
+        giver.join(10)
+        assert not giver.is_alive(), "restoring descriptor 0 waited for the reader"
+        os.write(in_w, b'{"v":1,"type":"quit"}\n')
+        reader.join(10)
+        assert lines == [b'{"v":1,"type":"quit"}\n'], lines      # the channel kept the pipe
+        os.write(in_w, b"back\n")
+        assert os.read(0, 16) == b"back\n"                       # descriptor 0 is the pipe again
+        os.close(channel._fd)
+    finally:
+        os.close(in_w)
+        os.dup2(saved, 0)
+        os.close(saved)
+    # A channel that does not read descriptor 0 is left alone.
+    other = agent_backend.Channel(io.BytesIO(b""), io.BytesIO())
+    assert agent_backend._private_stdin(other) is None and other._fd is None
+
+
 # --- the terminal UI is not changed by any of this ------------------------------
 
 # What the terminal UI drew for `_python_ui_session` when the backend was

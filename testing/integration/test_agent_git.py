@@ -563,6 +563,31 @@ def test_a_diverged_remote_rejects_the_push_and_is_never_force_updated():
         sandbox.close()
 
 
+def test_git_gets_an_empty_stdin_of_its_own_unless_it_is_fed_text():
+    """Under the headless backend this process's stdin is the front end's
+    protocol pipe, and a git child that inherits it can hang for the whole
+    timeout. So a git command with no text to feed always gets the null device."""
+    if not ready("agent_git", "agent_config"):
+        return
+    seen = []
+    real_run = subprocess.run
+
+    def recording_run(args, **kwargs):
+        seen.append(kwargs)
+        return real_run(args, **kwargs)
+
+    cwd = tempfile.gettempdir()
+    agent_git.subprocess.run = recording_run
+    try:
+        agent_git._git(["--version"], cwd)
+        fed = agent_git._git(["hash-object", "--stdin"], cwd, stdin="hello\n")
+    finally:
+        agent_git.subprocess.run = real_run
+    assert seen[0]["stdin"] is subprocess.DEVNULL and "input" not in seen[0], seen[0]
+    assert seen[1]["input"] == "hello\n" and "stdin" not in seen[1], seen[1]
+    assert len(fed.stdout.strip()) in (40, 64), fed.stdout
+
+
 # Case 11
 def test_authorizes_push_matches_a_push_request_and_nothing_else():
     require(agent_actions, "agent_actions")

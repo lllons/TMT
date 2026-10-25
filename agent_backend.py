@@ -1075,13 +1075,62 @@ def _reconfigure(stream, errors):
     return old
 
 
+def _private_stdin(channel):
+    """Take the protocol pipe off descriptor 0 so no child can inherit it.
+
+    A child started without its own `stdin` gets this process's descriptor 0.
+    Under the front end that is the protocol pipe the reader thread sits
+    blocked in. On Windows such a child can hang until its timeout (git did,
+    for exactly 30 seconds), and any child that reads stdin swallows the front
+    end's messages. So the channel is moved to a private, non-inheritable
+    duplicate and descriptor 0 itself becomes the null device: from here on
+    every child inherits an empty stdin.
+
+    Returns a spare duplicate for `_restore_stdin`, or None when the channel
+    does not read descriptor 0 (a test's pipe or an in-memory stream). The
+    spare is a second copy because the first is never safe to copy from: on
+    Windows the C runtime holds a descriptor's lock for the whole of a read, so
+    a `dup2` from the one the reader thread is blocked in waits for the front
+    end to send something, and the process would never end.
+    """
+    if channel._fd != 0:
+        return None
+    held = []
+    try:
+        held.append(os.dup(0))
+        held.append(os.dup(0))
+        null = os.open(os.devnull, os.O_RDONLY)
+        try:
+            os.dup2(null, 0)
+        finally:
+            os.close(null)
+    except OSError:
+        for descriptor in held:
+            os.close(descriptor)
+        return None
+    channel._fd, spare = held
+    return spare
+
+
+def _restore_stdin(spare):
+    """Point descriptor 0 at the pipe again, from the spare nobody reads."""
+    if spare is None:
+        return
+    try:
+        os.dup2(spare, 0)
+        os.close(spare)
+    except OSError:
+        pass
+
+
 def run(args, stdin=None, stdout=None):
     """Serve one session over JSON lines. Returns the process exit code.
 
     `stdin` and `stdout` default to the process's own; a test passes pipes.
     For the length of the run `sys.stdout` IS `sys.stderr` and `sys.stdin` is
     empty, so nothing but events can reach the front end's stdout and nothing
-    can read the front end's messages out from under the channel.
+    can read the front end's messages out from under the channel. Descriptor 0
+    is the null device too, so no child inherits the protocol pipe.
     """
     loop = _loop_module()
     channel = Channel(sys.stdin if stdin is None else stdin,
@@ -1093,6 +1142,7 @@ def run(args, stdin=None, stdout=None):
     # What lands on stderr is a log; a character it cannot encode must not be
     # the thing that ends the session.
     errors = _reconfigure(sys.stderr, "backslashreplace")
+    spare = _private_stdin(channel)
     code, message = EXIT_OK, ""
     try:
         channel.start()
@@ -1124,6 +1174,7 @@ def run(args, stdin=None, stdout=None):
         if channel.ready:
             channel.send("exit", code=code, reason=port.ended, message=message)
         sys.stdout, sys.stdin = saved[0], saved[1]
+        _restore_stdin(spare)
         for name, value in (("COLUMNS", saved[2]), ("LINES", saved[3])):
             if value is None:
                 os.environ.pop(name, None)
