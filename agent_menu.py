@@ -2571,6 +2571,9 @@ _HISTORY_KEYS = {
 }
 
 
+_PASTE_NOISE = re.compile("\x1b\\[20[01]~|[﻿​‌‍⁠ ]")
+
+
 def normalize_text_key(key, allow_multiline=False, allow_history=False):
     """One keystroke for a text field, as (kind, value).
 
@@ -2610,6 +2613,13 @@ def normalize_text_key(key, allow_multiline=False, allow_history=False):
         return ("end", None)
     if key in _TEXT_KEYS:
         return ("key", _TEXT_KEYS[key])
+    if len(key) > 1:
+        # A paste can carry bracketed-paste markers and invisible characters
+        # (a byte-order mark, zero-width spaces) that browsers and password
+        # managers add; any one of them made the whole paste unprintable.
+        key = _PASTE_NOISE.sub("", key)
+        if not key:
+            return ("", "")
     if allow_history and key in _HISTORY_KEYS:
         return ("key", _HISTORY_KEYS[key])
     if key in _TEXT_IGNORED:

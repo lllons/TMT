@@ -371,3 +371,12 @@ def test_a_single_character_is_still_a_character_and_a_break_is_still_enter():
     assert m.normalize_text_key("\x1b") == ("key", "esc")
     assert m.normalize_text_key(None) == ("end", None)
     assert m.normalize_text_key("") == ("", "")
+
+
+def test_a_pasted_key_with_invisible_noise_still_lands():
+    import agent_menu
+    want = ("char", "sk-or-v1-abc")
+    for pasted in ("\x1b[200~sk-or-v1-abc\x1b[201~", "﻿sk-or-v1-abc",
+                   "sk-or-v1-abc​", "sk-or-v1-abc\xa0\r\n"):
+        assert agent_menu.normalize_text_key(pasted) == want, repr(pasted)
+    assert agent_menu.normalize_text_key("﻿​") == ("", "")
