@@ -329,6 +329,8 @@ def _known_actions():
 
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _TAG = re.compile(r"/(/?)([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z0-9_-]+))?/")
+# A tag with blanks inside its slashes, such as "/ git_push/" or "/git_push /".
+_SPACED_TAG = re.compile(r"/(/?)(?:[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*|([A-Za-z_][A-Za-z0-9_]*)[ \t]+)/")
 # Text that could still become a tag once more of it arrives.
 _PARTIAL_TAG = re.compile(r"//?(?:[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z0-9_-]*)?)?\Z")
 _BLOCK_START = re.compile(r"[ \t]*\n")
@@ -803,12 +805,14 @@ class _Reader(object):
             except _Incomplete:
                 say(slash)
                 raise
+            if found is None and not live:
+                self.spaced(slash)
             if found is None or found.group(1):
                 p = slash + 1 if found is None else found.end()
                 continue
             name, suffix = found.group(2).lower(), found.group(3)
             closer_after = low.find(_fold(_close(name, suffix)), found.end()) >= 0
-            glued = slash > 0 and slash != after and text[slash - 1] not in _SPACE
+            glued =slash > 0 and slash != after and text[slash - 1] not in _SPACE
             top = name in self.known or name in PLAIN_REPLY_KEYS or name == "actions"
             if not top or (glued and not closer_after):
                 if live and (top or self.mistaken(found, name, closer_after)):
@@ -864,6 +868,19 @@ class _Reader(object):
         if sentence:
             raise ProtocolError(sentence)
 
+    def spaced(self, slash):
+        """Rule G: a taught name with blanks inside its slashes, closer following."""
+        found = _SPACED_TAG.match(self.text, slash)
+        if found is None:
+            return
+        name = (found.group(2) or found.group(3)).lower()
+        if name not in _known_actions() and name not in PLAIN_REPLY_KEYS:
+            return
+        closer = re.compile(r"/[ \t]*" + re.escape(name) + r"[ \t]*/", re.I)
+        if closer.search(self.text, found.end()) is None:
+            return
+        raise ProtocolError(_SPACED % (found.group(0), _open(name)))
+
     def mistaken(self, found, name, closer_after):
         """The rule-G refusal for this tag, or None when it is prose."""
         if not (closer_after or self.text.strip(_SPACE) == found.group(0)):
@@ -892,6 +909,7 @@ _PLAIN_MESSAGE = ("A message to the user is written as plain text outside any "
                   "block, and a reply with no action blocks is the final answer.")
 _NEAR_MISS = "%s is not an action TMT knows; did you mean %s?"
 _UNTAUGHT_NEAR = "%s is not a tag TMT reads. " + _PLAIN_MESSAGE
+_SPACED = "%s has blanks inside its slashes. Write it without them: %s."
 _KEY_MESSAGE = ("/message/ is not needed at the top of a reply. " + _PLAIN_MESSAGE)
 _KEY_AT_TOP = ("%s is a key, not an action: write %s inside the action block it "
                "belongs to, as /read_file/ /path/ src/a.py //path/ //read_file/.")

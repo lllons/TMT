@@ -1268,6 +1268,17 @@ def test_plain_the_end_conversations_typo_is_refused_with_the_plain_rule():
     plain_refused("/raed_file/ a.py //raed_file/", "did you mean /read_file/")
 
 
+def test_plain_blanks_inside_a_tags_slashes_are_refused_not_read_as_prose():
+    # The real reply that ended a push turn silently (HANDOFF 7 step 5a).
+    plain_refused("/ git_push/ //git_push/", "blanks inside its slashes", "/git_push/")
+    plain_refused("/git_push / //git_push/", "blanks inside its slashes")
+    plain_refused("/ git_push/ // git_push /", "blanks inside its slashes")
+    # Slashes in ordinary prose, and an unclosed spaced name, stay prose.
+    assert plain("Use a / b / c for the path")["message"] == "Use a / b / c for the path"
+    assert plain("see / git_push/ for details")["message"] == "see / git_push/ for details"
+    assert plain("/git_push/ //git_push/") == {"action": "git_push"}
+
+
 def test_plain_text_before_a_block_is_its_progress():
     assert plain("ok, I'll look at the repo first /list_files/ //list_files/") == {
         "action": "list_files", "progress": "ok, I'll look at the repo first"}
