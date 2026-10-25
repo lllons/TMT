@@ -22,6 +22,8 @@ dist/
 # ignored for the same reason: there is nothing to lock.
 node_modules/
 package-lock.json
+# ...except the TypeScript front end in tui/, which has real dependencies to lock.
+!tui/package-lock.json
 *.tgz
 
 # Working references and per-install choices, not source.

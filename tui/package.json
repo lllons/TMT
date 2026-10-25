@@ -1,0 +1,27 @@
+{
+  "name": "tmt-tui",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Optional TypeScript front end for the TMT CLI. The Python UI stays the default.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "ink": "^8.0.0",
+    "react": "^19.3.1",
+    "string-width": "^8.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/react": "^19.3.0",
+    "@xterm/headless": "^6.0.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}
