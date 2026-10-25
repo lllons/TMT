@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runApp, type PreludeRequest, type PreludeRunner } from '../src/app.js';
+import { displayWidth } from '../src/input/width.js';
 import { FakeTerminal, forbiddenIn, isField } from './harness.js';
 
 // Every test starts a real process, and two wait out the 2 s a backend that
@@ -36,6 +37,7 @@ interface Options {
   runPrelude?: PreludeRunner;
   quitWaitMs?: number;
   python?: string;
+  color?: boolean;
 }
 
 class Run {
@@ -60,7 +62,7 @@ class Run {
       args: [scriptFile, this.receivedFile],
       logPath: this.logFile,
       runPrelude: options.runPrelude ?? (async () => 0),
-      color: false,
+      color: options.color ?? false,
       quitWaitMs: options.quitWaitMs,
     }).then((code) => { this.code = code; return code; });
   }
@@ -345,11 +347,12 @@ describe('approvals and questions', () => {
     await run.showing('Describe your first task');
     await run.enter('delete it');
     await run.showing('rm notes1.txt');
-    // The question and the choices are in the record; the hint is in the box.
+    // The question, the choices and the backend's sentence are in the record; the keys are in the box.
     expect(run.shows('  y  Run it once')).toBe(true);
     expect(run.shows('  a  Allow `rm` from now on')).toBe(true);
     expect(run.shows('  n  Refuse')).toBe(true);
-    expect(run.term.viewport().some((row) => row.startsWith(' > Type y, a or n and Enter'))).toBe(true);
+    expect(run.rows().filter((row) => row === 'Type y, a or n and Enter')).toHaveLength(1);
+    expect(run.term.viewport().some((row) => row === ' > y / a / n  then Enter')).toBe(true);
     // Each line is the answer to the open question: none is queued or submitted.
     await run.enter(' A ');
     await run.showing('rm notes2.txt');
@@ -667,6 +670,298 @@ describe('the Python screens', () => {
     await run.showing('The menu closed with an error (exit code 1).');
     await run.showing('after the menu');
     expect(run.sent('reload')).toEqual([]);
+    run.term.type('\x03');
+    expect(await run.finished()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The polish lane: committed rows wrap at a word boundary, an ask's hint fits
+// the box, the live reply stays out of the way of an ask, the answer's markdown.
+
+const TASK_TEXT = 'Please refactor the authentication module so that the login handler, the token refresh logic and the session cleanup all live in separate files, keep the public API unchanged, add unit tests for each new file, update the README section on authentication, and finally run the whole test suite twice to make sure nothing flaky slipped in.';
+const wordsOf = (rows: string[]): string[] => rows.flatMap((row) => row.split(/\s+/).filter(Boolean));
+const widestRow = (rows: string[]): number => Math.max(...rows.map((row) => displayWidth(row)));
+
+describe('committed rows wrap at a word boundary, at the content width', () => {
+  /** The rows from the one starting with `first` to the one ending with `last`. */
+  const block = (run: Run, first: string, last: string): string[] => {
+    const rows = run.rows();
+    const start = rows.findIndex((row) => row.startsWith(first));
+    expect(start, `a row starting ${first}\n${rows.join('\n')}`).toBeGreaterThanOrEqual(0);
+    const end = rows.findIndex((row, index) => index >= start && row.endsWith(last));
+    expect(end, `a row ending ${last}\n${rows.join('\n')}`).toBeGreaterThanOrEqual(start);
+    return rows.slice(start, end + 1);
+  };
+
+  it.each([[120, 100], [100, 99], [80, 79], [60, 59]])('wraps the task row and an event row at min(100, columns - 1): %i columns', async (columns, width) => {
+    const message = 'Ran the whole test suite for the authentication module twice and nothing flaky slipped in';
+    const long = 'a-very-long-directory-name/'.repeat(5) + 'file.ts';
+    const run = start([
+      START,
+      { on: { type: 'submit', text: TASK_TEXT }, send: [
+        TASK(TASK_TEXT), { type: 'turn_start', task: TASK_TEXT },
+        { type: 'event', kind: 'success', message, stage: '', level: 1, detail: {} },
+        { type: 'event', kind: 'file_edit', message: 'Edited file: ' + long, stage: '', level: 2, detail: {} },
+        { type: 'notice', level: 'info', text: 'done' },
+        { type: 'turn_end', task: TASK_TEXT, answer: '', outcome: '', suggestion: '' }, prompt('next'),
+      ] },
+      QUIT,
+    ], { columns, rows: 36 });
+    await run.showing('Describe your first task');
+    await run.enter(TASK_TEXT);
+    await run.showing('done');
+
+    const task = block(run, '> Please', ' in.');
+    expect(task.length).toBeGreaterThan(1);
+    expect(widestRow(task)).toBeLessThanOrEqual(width);
+    // Cut at a space: every word is whole, and a continuation lines up under the text.
+    expect(wordsOf(task)).toEqual(['>', ...TASK_TEXT.split(' ')]);
+    for (const row of task.slice(1)) expect(row).toMatch(/^ {2}\S/);
+    // Filled to the edge, as far as a whole word allows.
+    expect(displayWidth(task[0]!)).toBeGreaterThan(width - 16);
+
+    const event = block(run, '  ✓ ', ' in');
+    expect(wordsOf(event)).toEqual(['✓', ...message.split(' ')]);
+    for (const row of event.slice(1)) expect(row).toMatch(/^ {4}\S/);
+    if (width < 90) expect(event.length).toBeGreaterThan(1);
+
+    // A word longer than the row is cut where the row ends, not dropped.
+    const path = block(run, '  • Edited file:', 'file.ts');
+    expect(widestRow(path)).toBeLessThanOrEqual(width);
+    expect(path.map((row) => row.trim()).join('').replace(/\s/g, '')).toBe('•Editedfile:' + long);
+    run.term.type('\x03');
+    expect(await run.finished()).toBe(0);
+  });
+
+  it('measures colour as no width: a painted task row wraps where a plain one does', async () => {
+    const run = start([
+      START,
+      { on: { type: 'submit', text: TASK_TEXT }, send: [
+        TASK(TASK_TEXT), { type: 'notice', level: 'info', text: 'done' },
+        { type: 'turn_end', task: TASK_TEXT, answer: '', outcome: '', suggestion: '' }, prompt('next'),
+      ] },
+      QUIT,
+    ], { columns: 120, rows: 36, color: true });
+    await run.showing('Describe your first task');
+    await run.enter(TASK_TEXT);
+    await run.showing('done');
+    const task = block(run, '> Please', ' in.');
+    expect(widestRow(task)).toBeLessThanOrEqual(100);
+    expect(wordsOf(task)).toEqual(['>', ...TASK_TEXT.split(' ')]);
+    // Bold on every row of it: the colour is carried across each break.
+    expect(run.term.raw).toContain('\x1b[1m> Please refactor');
+    expect(run.term.raw.match(/\x1b\[1m {0,2}\S/g)!.length).toBeGreaterThanOrEqual(task.length);
+    run.term.type('\x03');
+    expect(await run.finished()).toBe(0);
+  });
+
+  it('follows the window as it is at the time of the commit', async () => {
+    const notice = Array.from({ length: 30 }, (_, index) => `change${index}`).join(' ');
+    const run = start([
+      START,
+      { on: { type: 'resize' }, send: [{ type: 'notice', level: 'warning', text: notice }] },
+      { on: { type: 'resize' }, send: [{ type: 'notice', level: 'warning', text: notice.replace(/change/g, 'second') }] },
+      QUIT,
+    ], { columns: 100, rows: 30 });
+    await run.showing('Describe your first task');
+    run.term.resize(70, 30);
+    await run.showing('change29');
+    const narrow = block(run, 'change0 ', 'change29');
+    expect(narrow.length).toBeGreaterThan(2);
+    expect(widestRow(narrow)).toBeLessThanOrEqual(69);
+    expect(wordsOf(narrow)).toEqual(notice.split(' '));
+
+    run.term.resize(140, 30);
+    await run.showing('second29');
+    const wide = block(run, 'second0 ', 'second29');
+    // Wider than before, but never past 100 columns, however wide the window.
+    expect(widestRow(wide)).toBeLessThanOrEqual(100);
+    expect(wide.length).toBeLessThan(narrow.length);
+    expect(wordsOf(wide)).toEqual(notice.replace(/change/g, 'second').split(' '));
+    run.term.type('\x03');
+    expect(await run.finished()).toBe(0);
+  });
+});
+
+describe('an approval or a question in the box', () => {
+  const SENTENCE = 'Type y and Enter to run it once, a to allow `rm` in this project from now on, or anything else to refuse:';
+  const approval = (id: number, hint = SENTENCE) => ({
+    type: 'approval', id, question: 'TMT wants to run a command that needs your approval.\n\n    rm notes.txt\n    in .', pattern: 'rm',
+    hint, action: 'bash',
+    choices: [{ key: 'y', label: 'Run it once' }, { key: 'a', label: 'Allow `rm` in this project from now on' }, { key: 'n', label: 'Refuse' }],
+  });
+  const question = (id: number, keys: string[]) => ({
+    type: 'question', id, text: `Which one ${id}?\n\n${keys.map((key) => `  ${key}. Option ${key}`).join('\n')}\n\nPress a key, or Esc to skip the question.`,
+    keys, question: `Which one ${id}?`, options: keys.map((key) => `Option ${key}`),
+  });
+
+  it('says in the box which keys answer, and commits the whole sentence, wrapped, under the choices', async () => {
+    const run = start([
+      START,
+      { on: { type: 'submit', text: 'rm it' }, send: [TASK('rm it'), { type: 'turn_start', task: 'rm it' }, approval(1)] },
+      { on: { type: 'approval_reply', id: 1, answer: 'n' }, send: [question(2, ['1', '2', '3'])] },
+      { on: { type: 'answer', id: 2, key: '2' }, send: [question(3, ['1'])] },
+      { on: { type: 'answer', id: 3, key: '' }, send: [question(4, ['y', 'n'])] },
+      { on: { type: 'answer', id: 4, key: 'n' }, send: [approval(5, '')] },
+      { on: { type: 'approval_reply', id: 5, answer: 'y' }, send: [
+        { type: 'final', text: 'ok' }, { type: 'turn_end', task: 'rm it', answer: 'ok', outcome: '', suggestion: '' }, prompt('go'),
+      ] },
+      QUIT,
+    ], { columns: 80, rows: 30 });
+    await run.showing('Describe your first task');
+    await run.enter('rm it');
+    await run.showing('y / a / n  then Enter');
+    // The box row is short and whole: no ellipsis, and the refusal is not lost, because
+    // the sentence that says it is in the record, under the choices, in full.
+    const box = run.term.viewport().find(isField)!;
+    expect(box).toBe(' > y / a / n  then Enter');
+    expect(box).not.toContain('…');
+    const rows = run.rows();
+    const refuse = rows.findIndex((row) => row === '  n  Refuse');
+    const sentence = rows.slice(refuse + 1, refuse + 3);
+    expect(sentence[0]).toMatch(/^Type y and Enter/);
+    expect(wordsOf(sentence).join(' ')).toBe(SENTENCE);
+    expect(widestRow(sentence)).toBeLessThanOrEqual(79);
+
+    await run.enter('n');
+    await run.showing('Which one 2?');
+    expect(run.term.viewport().find(isField)).toBe(' > 1-3, then Enter, Esc to skip');
+    await run.enter('2');
+    await run.showing('Which one 3?');
+    expect(run.term.viewport().find(isField)).toBe(' > 1, then Enter, Esc to skip');
+    await run.enter('');
+    await run.showing('Which one 4?');
+    expect(run.term.viewport().find(isField)).toBe(' > y / n, then Enter, Esc to skip');
+    await run.enter('n');
+    await run.until(() => run.count('rm notes.txt') === 2, 'the last approval');
+    // The backend sent no sentence for it, so no row is committed under its choices.
+    expect(run.term.viewport().find(isField)).toBe(' > y / a / n  then Enter');
+    expect(run.rows().filter((row) => row.startsWith('Type y and Enter'))).toHaveLength(1);
+    await run.enter('y');
+    await run.showing('ok');
+    expect(run.sent('approval_reply').map((message) => message.answer)).toEqual(['n', 'y']);
+    expect(run.sent('answer').map((message) => message.key)).toEqual(['2', '', 'n']);
+    run.term.type('\x03');
+    expect(await run.finished()).toBe(0);
+  });
+
+  it('keeps the live reply out of the window while it is open, and puts it back after the answer', async () => {
+    const run = start([
+      START,
+      { on: { type: 'submit', text: 'go' }, send: [
+        TASK('go'), { type: 'turn_start', task: 'go' },
+        { type: 'delta', text: 'I read the project layout first' }, { type: 'delta', text: ', then wrote the notes file.' },
+        approval(1),
+      ] },
+      { on: { type: 'approval_reply', id: 1, answer: 'y' }, send: [] },
+      { on: { type: 'resize' }, send: [
+        { type: 'final', text: 'the end' }, { type: 'turn_end', task: 'go', answer: 'the end', outcome: '', suggestion: '' }, prompt('next'),
+      ] },
+      QUIT,
+    ]);
+    await run.showing('Describe your first task');
+    await run.enter('go');
+    await run.showing('y / a / n  then Enter');
+    // Nothing of the reply is on the screen, above or below the question.
+    expect(run.shows('I read the project layout')).toBe(false);
+    expect(run.shows('then wrote the notes file')).toBe(false);
+    const rows = run.rows();
+    expect(rows.findIndex((row) => row === '  n  Refuse')).toBeGreaterThan(rows.findIndex((row) => row.startsWith('TMT wants')));
+    await run.enter('y');
+    await run.showing('I read the project layout first, then wrote the notes file.');
+    expect(run.sent('approval_reply')).toMatchObject([{ id: 1, answer: 'y' }]);
+    // The question is above the reply now: the order they came in.
+    const after = run.rows();
+    expect(after.findIndex((row) => row.startsWith('I read the project'))).toBeGreaterThan(after.findIndex((row) => row === '  n  Refuse'));
+    run.term.resize(101, 30);
+    await run.until(() => run.shows('the end') && run.shows('next'), 'the answer');
+    expect(run.shows('I read the project layout')).toBe(false);
+    run.term.type('\x03');
+    expect(await run.finished()).toBe(0);
+  });
+
+  it('draws nothing of a reply that was taken back, or answered, while a question was open', async () => {
+    const run = start([
+      START,
+      { on: { type: 'submit', text: 'go' }, send: [
+        TASK('go'), { type: 'turn_start', task: 'go' }, { type: 'delta', text: 'streamed words' }, question(1, ['1', '2']),
+      ] },
+      { delay: 150, send: [{ type: 'reply_reset' }] },
+      { on: { type: 'answer', id: 1, key: '1' }, send: [{ type: 'delta', text: 'fresh words' }, question(2, ['1', '2'])] },
+      { delay: 150, send: [{ type: 'final', text: 'all done' }] },
+      { on: { type: 'answer', id: 2, key: '2' }, send: [
+        { type: 'notice', level: 'info', text: 'after the answer' },
+        { type: 'turn_end', task: 'go', answer: '', outcome: '', suggestion: '' }, prompt('next'),
+      ] },
+      QUIT,
+    ]);
+    await run.showing('Describe your first task');
+    await run.enter('go');
+    await run.showing('Which one 1?');
+    expect(run.shows('streamed words')).toBe(false);
+    // The reset arrives with the question open; answering it must not bring the old reply back.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    await run.enter('1');
+    await run.showing('Which one 2?');
+    await run.until(() => run.shows('all done'), 'the final answer');
+    await run.enter('2');
+    await run.showing('after the answer');
+    // 'fresh words' came while the question was open, and `final` took it back before it was shown.
+    expect(run.shows('streamed words')).toBe(false);
+    expect(run.shows('fresh words')).toBe(false);
+    expect(run.count('all done')).toBe(1);
+    run.term.type('\x03');
+    expect(await run.finished()).toBe(0);
+  });
+});
+
+describe('the answer is read as markdown', () => {
+  const ANSWER = [
+    '# Summary', '', 'I wrote **notes.txt** and *briefly* changed `README.md`, see [the docs](https://example.com/docs).', '',
+    '- notes.txt is **new** (12 lines) and it goes on for long enough to need a second row once it is wrapped to the width of the window',
+    '1. the test suite still passes', '', '```', 'const raw = **not bold**;', '```', 'Done.',
+  ].join('\n');
+  const script = (): Step[] => [
+    START,
+    { on: { type: 'submit', text: 'go' }, send: [
+      TASK('go'), { type: 'final', text: ANSWER }, { type: 'turn_end', task: 'go', answer: ANSWER, outcome: '', suggestion: '' }, prompt('next'),
+    ] },
+    QUIT,
+  ];
+
+  it('shows the formatted text, with no markers, when colour is off', async () => {
+    const run = start(script(), { columns: 100, rows: 40 });
+    await run.showing('Describe your first task');
+    await run.enter('go');
+    await run.showing('Done.');
+    const rows = run.rows();
+    expect(run.shows('**notes.txt**')).toBe(false);
+    expect(rows).toContain('Summary');
+    expect(rows).toContain('I wrote notes.txt and briefly changed README.md, see the docs (https://example.com/docs).');
+    const item = rows.findIndex((row) => row.startsWith('- notes.txt is new (12 lines)'));
+    expect(item).toBeGreaterThanOrEqual(0);
+    // The item keeps its marker, and wraps under its text.
+    expect(rows[item + 1]).toMatch(/^ {2}\S/);
+    expect(rows).toContain('1. the test suite still passes');
+    // The fenced block is as written, fences and all.
+    expect(rows).toContain('```');
+    expect(rows).toContain('const raw = **not bold**;');
+    expect(run.term.raw).not.toMatch(/\x1b\[(?:1|2|3|22|23|36|39)m/);
+    run.term.type('\x03');
+    expect(await run.finished()).toBe(0);
+  });
+
+  it('paints bold, italic, code, headings and the dimmed block when colour is on', async () => {
+    const run = start(script(), { columns: 100, rows: 40, color: true });
+    await run.showing('Describe your first task');
+    await run.enter('go');
+    await run.showing('Done.');
+    const raw = run.term.raw;
+    expect(raw).toContain('I wrote \x1b[1mnotes.txt\x1b[22m and \x1b[3mbriefly\x1b[23m changed \x1b[36mREADME.md\x1b[39m');
+    expect(raw).toContain('\x1b[1mSummary\x1b[22m');
+    expect(raw).toContain('\x1b[2mconst raw = **not bold**;\x1b[0m');
+    expect(run.rows()).toContain('const raw = **not bold**;');
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });

@@ -6,12 +6,14 @@
 import { spawn } from 'node:child_process';
 import { Backend, type BackendOptions } from './backend.js';
 import {
-  agentsBlock, captionText, commandLines, eventLines, finalLines, makeStyle, noticeLines, planBlock,
-  reviewBlock, sessionLines, statusText, taskLine, verifyBlock, type Style,
+  agentsBlock, approvalHint, captionText, commandLines, eventLines, finalLines, makeStyle, noticeLines, planBlock,
+  questionHint, reviewBlock, sessionLines, statusText, taskLine, verifyBlock, type Style,
 } from './format.js';
+import { MAX_CONTENT_WIDTH } from './live/frame.js';
 import { createSessionScreen, type Input, type InterruptKey, type SessionScreen } from './live/session.js';
 import type { Output } from './live/terminal.js';
 import type { BackendEvent, Caption, Choice, Meter } from './protocol.js';
+import { wrapRows } from './wrap.js';
 
 export interface PreludeRequest {
   python: string;
@@ -98,6 +100,8 @@ class App {
   private version = '';
   private readonly blocks = new Map<string, string>();
   private openAsk: { abandoned: boolean } | null = null;
+  // Approvals and questions in progress: while one is open the live reply is hidden.
+  private asks = 0;
   private readonly inbox: Item[] = [];
   private pumping = false;
 
@@ -143,8 +147,14 @@ class App {
     }
   }
 
+  /**
+   * Committed rows, wrapped at a word boundary to the width the frame is drawn
+   * at, as it is now: a row left to the terminal would be cut mid-word at the
+   * window's edge, and run past the 100-column block in a wide window.
+   */
   private commit(...lines: string[]): void {
-    for (const line of lines) this.screen?.commit(line);
+    const width = Math.min(MAX_CONTENT_WIDTH, Math.max(1, (this.options.stdout.columns || 80) - 1));
+    for (const line of lines) for (const row of wrapRows(line, width)) this.screen?.commit(row);
   }
 
   /** Errors go above the box, or to stderr while there is no box. */
@@ -214,7 +224,7 @@ class App {
         const cut = text.length > REPLY_KEPT ? text.indexOf('\n', text.length - REPLY_KEPT) : -1;
         if (cut >= 0) text = text.slice(cut + 1);
         this.replyText = text;
-        screen.setReply(text);
+        if (this.asks === 0) screen.setReply(text);
         return;
       }
       case 'reply_reset':
@@ -240,7 +250,7 @@ class App {
         this.noted = true;
         this.replyText = '';
         screen.setReply('');
-        this.commit(...finalLines(item.text ?? ''));
+        this.commit(...finalLines(item.text ?? '', this.color));
         return;
       case 'turn_end':
         this.turn = false;
@@ -354,26 +364,49 @@ class App {
 
   private approval(event: Of<'approval'>): void {
     const choices = event.choices ?? [];
-    this.commit('', ...(event.question ?? '').split('\n'), '', ...choices.map((choice) => `  ${choice.key}  ${choice.label}`));
-    void this.ask(event.hint).then((answer) => {
+    // The box says which keys answer it; the backend's whole sentence, which
+    // is too long for a row that never wraps, is committed under the choices.
+    const sentence = (event.hint ?? '').trim();
+    this.commit('', ...(event.question ?? '').split('\n'), '', ...choices.map((choice) => `  ${choice.key}  ${choice.label}`),
+      ...(sentence ? [this.style.dim(sentence)] : []));
+    void this.whileAsking(() => this.ask(approvalHint(choices, sentence))).then((answer) => {
       if (answer) this.backend.approvalReply(event.id, approvalAnswer(answer.line, choices));
     });
   }
 
-  private async question(event: Of<'question'>): Promise<void> {
+  private question(event: Of<'question'>): Promise<void> {
     const keys = (event.keys ?? []).map(String);
     this.commit('', ...(event.text ?? '').split('\n'));
-    const hint = `Type ${keys.join(', ')} and Enter, or Esc to skip`;
-    for (;;) {
-      const answer = await this.ask(hint);
-      if (!answer) return;
-      const typed = (answer.line ?? '').trim();
-      const key = keys.find((candidate) => candidate.toLowerCase() === typed.toLowerCase());
-      // Esc and an empty line dismiss it. Anything else is asked again here:
-      // the backend would answer a key it did not offer with an error.
-      if (answer.line === null || typed === '') return this.backend.answer(event.id, '');
-      if (key !== undefined) return this.backend.answer(event.id, key);
-      this.commit(this.style.yellow(`"${typed}" is not one of ${keys.join(', ')}. Type one of them, or press Esc to skip.`));
+    const hint = questionHint(keys);
+    return this.whileAsking(async () => {
+      for (;;) {
+        const answer = await this.ask(hint);
+        if (!answer) return;
+        const typed = (answer.line ?? '').trim();
+        const key = keys.find((candidate) => candidate.toLowerCase() === typed.toLowerCase());
+        // Esc and an empty line dismiss it. Anything else is asked again here:
+        // the backend would answer a key it did not offer with an error.
+        if (answer.line === null || typed === '') return this.backend.answer(event.id, '');
+        if (key !== undefined) return this.backend.answer(event.id, key);
+        this.commit(this.style.yellow(`"${typed}" is not one of ${keys.join(', ')}. Type one of them, or press Esc to skip.`));
+      }
+    });
+  }
+
+  /**
+   * Run an approval or a question with the live reply hidden. The reply came
+   * before it, and drawn under the question that was just committed it reads as
+   * coming after. It is drawn again when the last one closes, if the turn is
+   * still streaming (a `final` or `reply_reset` meanwhile has emptied it).
+   */
+  private async whileAsking<T>(run: () => Promise<T>): Promise<T> {
+    this.asks += 1;
+    this.screen?.setReply('');
+    try {
+      return await run();
+    } finally {
+      this.asks -= 1;
+      if (this.asks === 0 && this.turn && this.replyText && !this.finished) this.screen?.setReply(this.replyText);
     }
   }
 

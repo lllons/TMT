@@ -1,7 +1,8 @@
 // What the backend's events look like as committed text. Pure: an event goes
 // in, rows come out, so the app only decides when to write them.
 
-import type { AgentCard, BackendEvent, Caption, Check, Meter, PlanStep } from './protocol.js';
+import { markdownLines } from './markdown.js';
+import type { AgentCard, BackendEvent, Caption, Check, Choice, Meter, PlanStep } from './protocol.js';
 
 type Of<T extends BackendEvent['type']> = Extract<BackendEvent, { type: T }>;
 
@@ -117,9 +118,27 @@ export function commandLines(event: Of<'command'>, style: Style): string[] {
   return lines;
 }
 
-/** The answer, set apart by a blank line on each side. */
-export function finalLines(text: string): string[] {
-  return ['', text.replace(/\n+$/, ''), ''];
+/** The answer, its markdown read (see markdown.ts), set apart by a blank line on each side. */
+export function finalLines(text: string, color: boolean): string[] {
+  return ['', ...markdownLines(text.replace(/\n+$/, ''), color), ''];
+}
+
+/**
+ * What the box says while an approval is open: the keys it takes, short enough
+ * that it is never cut. The backend's full sentence is committed as a row
+ * instead (the app does that), so nothing of it is lost.
+ */
+export function approvalHint(choices: Choice[], fallback = ''): string {
+  const keys = choices.map((choice) => choice.key).filter(Boolean);
+  return keys.length > 0 ? `${keys.join(' / ')}  then Enter` : fallback || 'Type your answer, then Enter';
+}
+
+/** The same for a question: `1-2, then Enter, Esc to skip`. */
+export function questionHint(keys: string[]): string {
+  const numbers = keys.map(Number);
+  const range = keys.length > 1 && numbers.every((number, index) => Number.isInteger(number) && (index === 0 || number === numbers[index - 1]! + 1));
+  const offered = keys.length === 0 ? '' : range ? `${keys[0]}-${keys[keys.length - 1]}, then Enter, ` : `${keys.join(' / ')}, then Enter, `;
+  return `${offered || 'Enter or '}Esc to skip`;
 }
 
 const STEP_MARKS: Record<string, string> = { pending: '[ ]', in_progress: '[>]', completed: '[x]', blocked: '[!]' };
