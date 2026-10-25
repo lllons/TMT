@@ -192,6 +192,32 @@ def test_the_input_ending_answers_every_waiting_request_with_nobody():
     assert ch.request("question", "answer", text="?") is None
 
 
+def test_lines_are_split_the_same_whatever_the_reads_cut_them_into():
+    """A real stdin is read in raw chunks (see `Channel._readline`): a line may
+    arrive in pieces, several lines in one piece, and a last line with no
+    newline; a multi-byte character cut by a chunk edge must survive."""
+    read_fd, write_fd = os.pipe()
+    ch = agent_backend.Channel(os.fdopen(read_fd, "rb"), io.BytesIO())
+    big = "é" * 70000                      # 140 KB: past one 64 KB read
+    lines = [json.dumps({"type": "submit", "text": big}).encode("utf-8") + b"\n",
+             b'{"type":"submit","text":"a"}\n{"type":"submit","text":"b"}\n',
+             b'{"type":"submit","text":"c"}']      # the last one has no newline
+
+    def feed():
+        with os.fdopen(write_fd, "wb") as write:
+            for chunk in lines:
+                write.write(chunk)
+                write.flush()
+
+    threading.Thread(target=feed, daemon=True).start()
+    ch._read()
+    texts = []
+    while not ch.inbox.empty():
+        item = ch.inbox.get_nowait()
+        texts.append(item[1] if item[0] == "submit" else item[0])
+    assert texts == [big, "a", "b", "c", "eof"], [text[:10] for text in texts]
+
+
 # --- the stand-ins -----------------------------------------------------------
 
 def test_the_stand_ins_cover_names_the_loop_really_draws_through():

@@ -543,6 +543,70 @@ def test_the_real_process_speaks_only_json_lines():
     assert events[-1]["reason"] == "quit", events[-1]
 
 
+def _real_backend_that_ends(how):
+    """The real process, ended by a `quit` message or by closing its stdin.
+
+    Its stdin stays OPEN until the process has gone, as a live front end's
+    does when it sends `quit`: the stdin reader thread is then still blocked in
+    a read when the main thread finishes, and that is what interpreter shutdown
+    used to die on. (`subprocess.run(input=...)` closes stdin first, so the
+    thread has already ended and the bug cannot show.)
+    """
+    box = Workspace()
+    try:
+        env = dict(os.environ)
+        env.pop("TMT_UI", None)
+        proc = subprocess.Popen(
+            [sys.executable, str(REPO / "TMT.py"), "--backend-stdio", "--dir",
+             str(box.path)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=str(box.path), env=env)
+        watchdog = threading.Timer(120, proc.kill)
+        watchdog.start()
+        try:
+            proc.stdin.write((json.dumps(HELLO) + "\n").encode("utf-8"))
+            proc.stdin.flush()
+            events = []
+            for raw in proc.stdout:
+                event = json.loads(raw.decode("utf-8"))
+                events.append(event)
+                if event["type"] == "prompt":
+                    if how == "quit":
+                        proc.stdin.write(b'{"v":1,"type":"quit"}\n')
+                        proc.stdin.flush()
+                    else:
+                        proc.stdin.close()
+                if event["type"] == "exit":
+                    break
+            code = proc.wait(timeout=60)
+            stderr = proc.stderr.read()
+        finally:
+            watchdog.cancel()
+            proc.kill()
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+    finally:
+        box.close()
+    return events, code, stderr
+
+
+def test_the_real_process_ends_cleanly_after_quit_with_stdin_still_open():
+    events, code, stderr = _real_backend_that_ends("quit")
+    assert events[-1]["type"] == "exit" and events[-1]["reason"] == "quit", events[-1]
+    assert b"Fatal Python error" not in stderr, stderr[-2000:]
+    assert code == 0, (code, stderr[-2000:])
+
+
+def test_the_real_process_ends_cleanly_when_stdin_closes():
+    events, code, stderr = _real_backend_that_ends("eof")
+    assert events[-1]["type"] == "exit" and events[-1]["reason"] == "eof", events[-1]
+    assert b"Fatal Python error" not in stderr, stderr[-2000:]
+    assert code == 0, (code, stderr[-2000:])
+
+
 # --- the terminal UI is not changed by any of this ------------------------------
 
 # What the terminal UI drew for `_python_ui_session` when the backend was

@@ -106,6 +106,13 @@ class Channel:
         self._in = getattr(instream, "buffer", instream)
         self._out = getattr(outstream, "buffer", outstream)
         self._binary = not isinstance(self._out, io.TextIOBase)
+        # A stream with no file descriptor (an in-memory one) is read through
+        # its own `readline`; see `_readline` for why a real one is not.
+        try:
+            self._fd = self._in.fileno()
+        except (AttributeError, OSError, ValueError):
+            self._fd = None
+        self._pending = b""
         self._write_lock = threading.Lock()
         self._state = threading.Lock()
         self._ids = itertools.count(1)
@@ -173,10 +180,32 @@ class Channel:
                                         name="tmt-backend-stdin")
         self._thread.start()
 
+    def _readline(self):
+        """The next line of input as bytes, or b"" at the end.
+
+        A real stdin is read with `os.read` on its descriptor, not through the
+        BufferedReader. This thread is a daemon blocked in a read for the whole
+        run, and `BufferedReader.readline` holds the reader's lock while it
+        waits. When the main thread finishes first, interpreter shutdown tries
+        to close `sys.stdin`, cannot take that lock, and dies with "Fatal
+        Python error: _enter_buffered_busy" (exit code 0xC0000005 on Windows).
+        `os.read` holds no Python lock, so there is nothing to contend for.
+        """
+        if self._fd is None:
+            return self._in.readline()
+        while b"\n" not in self._pending:
+            chunk = os.read(self._fd, 65536)
+            if not chunk:
+                line, self._pending = self._pending, b""
+                return line
+            self._pending += chunk
+        line, _, self._pending = self._pending.partition(b"\n")
+        return line + b"\n"
+
     def _read(self):
         try:
             while True:
-                raw = self._in.readline()
+                raw = self._readline()
                 if not raw:
                     break
                 if isinstance(raw, bytes):
