@@ -394,3 +394,10 @@ def test_esc_on_the_first_run_screen_goes_back_without_saving():
                                   identify=True)
     assert result is None
     assert "A key is wanted." in frames
+
+
+def test_a_short_key_is_refused_with_the_right_article():
+    import agent_providers
+    for provider, article in (("openrouter", "an"), ("openai", "an"), ("anthropic", "an"), ("gemini", "a")):
+        ok, reason = agent_providers._REGISTRY[provider].looks_like_key("x")
+        assert not ok and reason.startswith("That is too short for %s " % article), (provider, reason)

@@ -2,7 +2,6 @@
 
 import argparse
 import inspect
-import shutil
 import sys
 from pathlib import Path
 
@@ -62,6 +61,7 @@ from agent_ui import (
     wrap_lines,
 )
 import agent_checkpoint
+import agent_ui
 import agent_ci
 import agent_commands
 import agent_context
@@ -1558,6 +1558,7 @@ def _session_loop(root, ci=None):
 
     manager.subscribe(_panel_changed)
     placeholder = OPENING_SUGGESTION
+    notice = ""
     if ci is not None:
         # The one task, put where a typed one would have gone. The loop takes
         # a queued line before it draws a box, and `render_task` echoes it into
@@ -1574,6 +1575,7 @@ def _session_loop(root, ci=None):
             # a typed one is -- the record must not be able to tell them
             # apart, because the user cannot either.
             answer = pending.pop()
+            asked_at = None          # it runs now; the box stamped the earlier question
         elif ci is not None:
             # One task, and it has been answered. A CI run must never reach
             # `ask`: there is nothing on the other end of it, and a read that
@@ -1584,14 +1586,18 @@ def _session_loop(root, ci=None):
             # question and the last turn's hint after that: `ask` returns what
             # was typed, and an untouched box returns the empty line it
             # actually holds, never the line drawn in it.
-            answer = prompt_box.ask(placeholder)
+            answer = prompt_box.ask(notice or placeholder)
+            asked_at = prompt_box.asked_at
+            notice = ""
             if answer is None:
                 break
             if prompt_box.cancelled:
-                console.print("[yellow]Use 'quit' or 'exit' to close.[/yellow]")
+                # Said inside the box, as shadow text for the next question
+                # only: a line printed above it scrolled the header and stayed.
+                notice = "Use 'quit' or 'exit' to close."
                 continue
         task = answer.strip()
-        if task.lower() in {"quit", "exit"}:
+        if task.lower() in {"quit", "exit", "/quit", "/exit"}:
             break
         if not task:
             continue
@@ -1614,7 +1620,7 @@ def _session_loop(root, ci=None):
                                              agent_rows=agent_rows)
         answered = _dispatch_command(task, session, manager, slow=slow)
         if answered is not None:
-            render_task(task, moment=prompt_box.asked_at)
+            render_task(task, moment=asked_at)
             # The rows just printed take blank rows from the pad, the same
             # as any other permanent output, so the box does not move. The
             # placeholder is left alone: asking what the model is does not
@@ -1630,7 +1636,7 @@ def _session_loop(root, ci=None):
             if answered.prompt_for == "note":
                 asked = prompt_box.ask(NOTE_PLACEHOLDER)
                 if asked is not None and asked.strip() and not prompt_box.cancelled:
-                    render_task(asked.strip(), moment=prompt_box.asked_at)
+                    render_task(asked.strip(), moment=asked_at)
                     answer = slow(lambda: agent_commands.run_note(
                         asked.strip(), session, manager))
                     pad.take(2 + (render_command(answer) or 0))
@@ -1649,7 +1655,7 @@ def _session_loop(root, ci=None):
         # region and has already been taken down, so this is the only record
         # of what was asked -- and it belongs above the work the answer came
         # out of, which is why it is written here rather than at the end.
-        render_task(task, moment=prompt_box.asked_at)
+        render_task(task, moment=asked_at)
         pad.take(2)              # the caption and the marker row it just wrote
         # Authority to push comes from this task's wording alone, decided once
         # here so nothing the model later writes can widen it.
@@ -2442,8 +2448,7 @@ def finish_response(live_ui, relay, result, transcript=None, state=None, pad=Non
         # The answer's own box: two borders and however many rows the reply
         # wrapped to. Measured from the reply rather than assumed, so a long
         # answer takes the room it actually used.
-        pad.take(2 + len(wrap_lines(str(result),
-                                    max(10, shutil.get_terminal_size((80, 24)).columns - 5))))
+        pad.take(2 + len(wrap_lines(str(result), agent_ui.response_inner_width())))
     if transcript is not None:
         # Recorded, not drawn: render_response has already drawn it, and the
         # history is what the turn is answerable from afterwards.

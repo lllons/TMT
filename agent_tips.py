@@ -143,6 +143,12 @@ def next_tip():
     """
     try:
         position = following(agent_config.read_saved_tip_cursor())
+        # Not the tip for the effort level already in force: it would advise
+        # what /config says is done.
+        for _ in range(len(TIPS)):
+            if tip_at(position)[0] != "/effort " + str(agent_config.EFFORT):
+                break
+            position = following(position)
         agent_config.set_tip_cursor(position)
     except Exception:
         position = 0

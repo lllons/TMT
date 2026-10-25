@@ -338,3 +338,17 @@ def test_with_no_provider_a_model_call_fails_with_one_clean_sentence():
             raise AssertionError("a stream was opened with nothing configured")
         reply = agent_model.ask_model([{"role": "user", "content": "hi"}], quiet=True)
         assert agent_credentials.NO_PROVIDER in reply, reply
+
+
+def test_the_model_is_told_the_real_workspace_not_the_scratch_folder():
+    """The child runs in an empty scratch folder, which Claude Code reports to
+    the model as its working directory; the model then called that folder the
+    workspace and refused paths inside the real one."""
+    import agent_config
+    system, _ = agent_providers._REGISTRY["claude_cli"].transcript(
+        [{"role": "system", "content": "You are TMT."}, {"role": "user", "content": "hi"}])
+    assert system.startswith("You are TMT.")
+    assert "scratch folder, not the workspace" in system
+    assert "The workspace is %s." % agent_config.ROOT_DIR in system
+    bare, _ = agent_providers._REGISTRY["claude_cli"].transcript([{"role": "user", "content": "hi"}])
+    assert bare.startswith("The working directory") and str(agent_config.ROOT_DIR) in bare

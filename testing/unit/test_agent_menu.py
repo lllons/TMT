@@ -769,9 +769,11 @@ def test_the_header_is_one_component_and_draws_no_rule_of_its_own():
     # window's business and not this test's -- what is asserted is the
     # GROUPING, which is the indent and nothing else.
     assert has_wordmark("\n".join(body)), body
-    assert body[-2].startswith("   ") and body[-2].strip(), body
-    assert body[-1].startswith("   ") and body[-1].strip() == str(probe), body
-    assert not body[0].startswith("   "), body
+    # Every row shares the one margin: the wordmark, the date and the directory
+    # all start in column 1, as the menus and the prompt box do.
+    assert body[-2].startswith(" ") and not body[-2].startswith("  "), body
+    assert body[-1].startswith(" ") and body[-1].strip() == str(probe), body
+    assert not body[-1].startswith("  ") and not body[0].startswith("  "), body
     # No rule anywhere in it, in either character set.
     joined = "\n".join(lines)
     assert "─" not in joined and "---" not in joined, joined
@@ -798,7 +800,7 @@ def test_the_header_carries_one_tip_hanging_at_the_same_indent():
     nothing in front of it reads as another fact about this session rather
     than as advice about the program."""
     body = [line for line in tipped() if line.strip()]
-    assert body[-1].startswith("   "), body
+    assert body[-1].startswith(" ") and not body[-1].startswith("  "), body
     assert body[-1].strip().startswith("Tip"), body
     assert "/note asks a question" in body[-1], body
     # Under the workspace, not above it: the directory TMT may write to is the
@@ -1384,19 +1386,19 @@ def test_the_running_status_fits_a_narrow_terminal_and_degrades_to_ascii():
     assert "..." in drawn and "---" in drawn, drawn
 
 
-def test_the_interface_fills_the_window_it_was_given():
-    """It used to stop growing at 72 columns, which on a wide terminal left
-    the whole session in a strip down the left with the rest of the window
-    unused -- and made the prompt box read as a panel dropped onto the
-    terminal rather than as the interface of the thing running in it.
+def test_the_interface_fills_the_window_up_to_the_content_cap():
+    """It fills the window it was given (one spare column at the right) up to
+    MAX_CONTENT_WIDTH. Past that the rules ran edge to edge on a wide terminal
+    while the text stayed in a strip at the left, so the block is capped and
+    left-aligned instead (UI review F20).
 
     The rule is the measure, because it is the one row that is drawn to the
-    full width by construction. One spare column at the right, and nothing
-    given up on the left."""
+    full width by construction."""
+    cap = menu().MAX_CONTENT_WIDTH
     for columns in (60, 100, 160, 240):
         rows = prompt_rows(editor(SUGGESTION), columns=columns)
         rule = rows[1]
-        assert menu().display_width(rule) == columns - 1, (columns, len(rule))
+        assert menu().display_width(rule) == min(columns - 1, cap), (columns, len(rule))
         # And the header agrees with it, so the two read as one interface.
         header = status(columns=columns, workspace="C:\\Coding\\TMT",
                         provider_id="openrouter", model_id=SAMPLE_ID)
@@ -2740,3 +2742,72 @@ def test_the_cursor_reads_the_same_catalogue_the_screen_draws_by_default():
         else:
             os.environ["TMT_PROVIDER"] = previous
         box.close()
+
+
+# --- the 2026-10-25 UI review fixes -------------------------------------------
+
+def test_content_is_capped_so_a_wide_window_does_not_stretch_the_rules():
+    """160 columns used to draw rules from edge to edge with the text stuck at
+    the left. The width is the window less the spare column, up to a cap."""
+    assert menu()._content_width(80) == 79
+    assert menu()._content_width(160) == menu().MAX_CONTENT_WIDTH == 100
+    wide = [visible(line) for line in menu().render_startup_frame(size=(160, 50), stream=Console())]
+    assert max(len(line) for line in wide) <= menu().MAX_CONTENT_WIDTH, wide
+
+
+def test_a_region_taller_than_the_pad_is_held_at_the_foot_when_it_shrinks_again():
+    """The slash palette on a short window outgrows the pad and scrolls the
+    screen. Closing it left the box where its top row had been, with the rest
+    of the window blank under it (60x20)."""
+    pad = menu().BottomPad(5)
+    height = menu().PROMPT_HEIGHT
+    assert pad.above(height + 1, size=(60, 20)) == 4          # the box alone: held at the foot
+    assert pad.above(height + 13, size=(60, 20)) == 0         # the palette: no room, the screen scrolls
+    assert pad.above(height + 1, size=(60, 20)) == 12         # closed: padded back down to the foot
+
+
+def test_the_meter_says_one_line_in_the_singular():
+    session = type("S", (), dict(lines_added=1, lines_removed=0, tokens_in=0, tokens_out=0,
+                                 tokens_out_exact=True, streaming=False))()
+    text = visible(menu().meter_text(session, Console(), columns=100))
+    assert text.startswith("+1 line, -0 lines"), text
+    session.lines_added = 2
+    assert visible(menu().meter_text(session, Console(), columns=100)).startswith("+2 lines, -0 lines")
+
+
+def test_the_summary_labels_keep_two_spaces_before_the_value():
+    """A label such as Workspace or Web Search had a single space before its value."""
+    with Credentials(key=None):
+        rows = [visible(line) for line in menu().render_startup_frame(size=(100, 36), stream=Console())]
+        assert any(line.startswith(" Workspace  ") for line in rows), rows
+        settings = [visible(line) for line in menu().render_settings_menu_frame(size=(100, 36), stream=Console())]
+        assert any(line.startswith(" Web Search  ") for line in settings), settings
+
+
+def test_the_route_screen_marks_active_only_when_anthropic_is_the_provider():
+    import agent_credentials
+    with Credentials(key=None, provider="openrouter"):
+        agent_credentials.set_anthropic_route("subscription")
+        frame = "\n".join(visible(line) for line in menu().render_route_frame(size=(100, 30), stream=Console()))
+        assert "(active)" not in frame, frame
+        agent_credentials.set_provider("anthropic")
+        frame = "\n".join(visible(line) for line in menu().render_route_frame(size=(100, 30), stream=Console()))
+        assert frame.count("(active)") == 1 and "your signed-in Claude Code  (active)" in frame, frame
+
+
+def test_the_subscription_route_is_named_not_called_a_key():
+    import agent_credentials
+    with Credentials(key=None, provider="anthropic"):
+        agent_credentials.set_anthropic_route("subscription")
+        assert menu().provider_display("anthropic") == "Anthropic (Claude subscription)"
+        provider_list = "\n".join(visible(line) for line in menu().render_provider_frame(size=(100, 30), stream=Console()))
+        assert "subscription" in provider_list and "key set" not in provider_list.split("Anthropic")[1].split("\n")[0], provider_list
+        agent_credentials.set_anthropic_route("api")
+        assert menu().provider_display("anthropic") == "Anthropic"
+
+
+def test_the_model_screen_has_its_own_title_and_search_wording_is_plain():
+    model = "\n".join(visible(line) for line in menu().render_settings_frame(size=(100, 30), stream=Console()))
+    assert model.split("\n")[1].strip() == "Model", model
+    search = "\n".join(visible(line) for line in menu().render_search_frame(size=(100, 30), stream=Console()))
+    assert "search stays off until a key is set" in search and "until one has one" not in search

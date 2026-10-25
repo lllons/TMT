@@ -268,6 +268,17 @@ def _unknown(name):
 
 # --- the commands ----------------------------------------------------------
 
+def _provider_text(provider):
+    """The provider as the menus name it, with the Claude route when that is how it is reached."""
+    if not provider:
+        return "not set"
+    try:
+        import agent_menu
+        return agent_menu.provider_display(provider)
+    except Exception:
+        return provider
+
+
 def _facts(session):
     """Provider, model and workspace, from the modules that own them."""
     provider = model = ""
@@ -298,7 +309,7 @@ def _context(argument, session):
     """What the conversation looks like right now."""
     provider, model, workspace = _facts(session)
     rows = [("Model", _model_label(model, provider)),
-            ("Provider", provider or "not set"),
+            ("Provider", _provider_text(provider)),
             ("Workspace", str(workspace))]
     if session is None:
         rows.append("No session is running, so there is no conversation yet.")
@@ -336,7 +347,7 @@ def _config(argument, session):
     """The settings a request runs under. No secrets, by construction."""
     provider, model, workspace = _facts(session)
     rows = [("Model", _model_label(model, provider)),
-            ("Provider", provider or "not set"),
+            ("Provider", _provider_text(provider)),
             ("Effort", "%s  (%d max tokens, %d rounds per task)"
              % (agent_config.EFFORT,
                 agent_config.max_tokens_for_effort(),
@@ -355,13 +366,32 @@ def _config(argument, session):
     # it deliberately.
     try:
         import agent_credentials
-        rows.append(("API key", "set" if agent_credentials.credential(provider or None)
-                     else "not set"))
+        if agent_credentials.anthropic_route() == "subscription" and provider == "anthropic":
+            rows.append(("API key", "not needed (Claude subscription)"))
+        else:
+            rows.append(("API key", "set" if agent_credentials.credential(provider or None)
+                         else "not set"))
     except Exception:
         rows.append(("API key", "unavailable"))
     if agent_models.is_overridden():
         rows.append("OPENROUTER_MODEL is set, so it overrides the saved model.")
     return Result("Configuration", rows)
+
+
+def _help(argument, session):
+    """Every command, and the keys that are not commands."""
+    del argument, session
+    rows = [(PREFIX + name, SUMMARY[name]) for name in _HANDLERS if name != "exit"]
+    rows.append("")
+    rows.append("Enter sends the line, Esc clears it, Tab completes a command,")
+    rows.append("Up recalls what you typed, and Ctrl-C stops a running turn.")
+    return Result("Commands", rows)
+
+
+def _quit(argument, session):
+    """Close TMT. The session loop acts on the word itself; this is the answer when asked directly."""
+    del argument, session
+    return Result("Closing TMT")
 
 
 def _clear(argument, session):
@@ -441,7 +471,7 @@ def _model(argument, session):
         catalogue = []
     if not argument:
         rows = [("Model", _model_label(current, provider)),
-                ("Provider", provider or "not set")]
+                ("Provider", _provider_text(provider))]
         if catalogue:
             rows.append("")
             rows.append("Offered by this provider:")
@@ -465,7 +495,7 @@ def _model(argument, session):
     # it in step for the selected provider, and this covers the rest.
     agent_config.refresh_model()
     return Result("Model set", [("Model", _model_label(chosen, provider)),
-                                ("Provider", provider or "not set")],
+                                ("Provider", _provider_text(provider))],
                   note="It applies from the next request.")
 
 
@@ -1009,6 +1039,7 @@ def _still_running_phrase(manager):
 # reach the background agents, which are the newest and the least often
 # wanted. `/agents` sits beside `/note` because they are the same subject.
 _HANDLERS = {
+    "help": _help,
     "context": _context,
     "config": _config,
     "clear": _clear,
@@ -1035,9 +1066,17 @@ _HANDLERS = {
     # `/notes` sits beside `/note`.
     "undo": _undo,
     "checkpoints": _checkpoints,
+    # Last: they end the session rather than ask about it. The loop answers
+    # them itself, before a command is looked up, so these handlers only run
+    # when something else dispatches the line.
+    "quit": _quit,
+    "exit": _quit,
 }
 
 SUMMARY = {
+    "help": "the commands and keys",
+    "quit": "close TMT",
+    "exit": "close TMT",
     "agents": "what the background agents are doing",
     "back": "step out to the menu, keeping the session",
     "context": "what the conversation looks like now",
@@ -1055,6 +1094,9 @@ SUMMARY = {
 }
 
 USAGE = {
+    "help": "/help",
+    "quit": "/quit",
+    "exit": "/exit",
     "agents": "/agents",
     "back": "/back",
     "context": "/context",

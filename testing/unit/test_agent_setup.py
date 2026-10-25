@@ -174,15 +174,15 @@ def test_unexpected_key_shape_is_flagged_but_still_accepted():
     sandbox(check)
 
 
-def test_screen_shows_the_title_the_panel_and_a_progress_bar():
+def test_screen_is_the_menus_wordmark_and_plain_sentences():
     output = FakeTTY()
     run_setup(stream=output, ask=lambda prompt: "sk-or-v1-abcdefghijkl", animate=False)
     text = strip_ansi(output.getvalue())
-    assert "████████╗" in text
-    assert "W E L C O M E   T O   T M T" in text
+    assert "████████ ███    ███ ████████" in text      # the logo every other screen draws
+    assert "Welcome to TMT" in text
     assert "No model provider is set up yet." in text
-    assert "100% Key saved!" in text
-    assert "░" in text and "█" in text
+    assert "Key saved:" in text
+    assert not any(mark in text for mark in ("░", "%", "╔", "═", "◈", "➤"))   # no box, bar or symbols
 
 
 def test_title_is_painted_with_the_progress_gradient():
@@ -212,8 +212,8 @@ def test_terminals_without_unicode_get_a_plain_screen():
     run_setup(stream=output, ask=lambda prompt: "sk-or-v1-abcdefghijkl", animate=False)
     text = strip_ansi(output.getvalue())
     text.encode("cp1252")                  # would raise if a symbol slipped through
-    assert "|_    _|" in text
-    assert "100% Key saved!" in text
+    assert "######## ###    ### ########" in text
+    assert "Key saved:" in text
 
 
 def test_a_console_that_cannot_encode_the_screen_still_gets_the_key_prompt():
@@ -234,7 +234,7 @@ def test_a_console_that_cannot_encode_the_screen_still_gets_the_key_prompt():
     plain = strip_ansi(text)
     assert "which is git-ignored - it never travels with a push." in plain
     assert "?" not in plain                # the words degraded, not a replacement mark
-    assert "100% Key saved!" in plain
+    assert "Key saved:" in plain
 
 
 def test_both_ways_setup_gives_up_are_readable_on_an_ascii_console():

@@ -753,11 +753,8 @@ class Provider:
         if any(character.isspace() for character in key):
             return False, "That contains a space, so part of the key is probably missing."
         if len(key) < self.key_min_length:
-            # "for a X key" rather than "to be a X key": every label that
-            # starts with a vowel made the old wording read "a OpenAI key",
-            # and this sentence is now the commonest refusal on the first-run
-            # screen rather than a rare aside in Settings.
-            return False, f"That is too short for a {self.label} key."
+            article = "an" if self.label[:1].lower() in "aeiou" else "a"
+            return False, f"That is too short for {article} {self.label} key."
         if self.key_prefix and not key.startswith(self.key_prefix):
             return False, f"{self.label} keys normally start with {self.key_prefix}."
         return True, ""
@@ -1402,6 +1399,11 @@ class ClaudeCliProvider(Provider):
     def transcript(self, messages):
         """(system_text, stdin_text): the non-system turns flattened with role markers."""
         system_text, converted = self.convert_messages(messages)
+        # The child runs in an empty scratch folder (see _cli_workdir), which Claude Code reports
+        # to the model as its working directory. The workspace is the real one.
+        system_text = (system_text + "\n\n" if system_text else "") + (
+            "The working directory you may be told about is an empty scratch folder, not the "
+            "workspace. The workspace is %s." % agent_config.ROOT_DIR)
         parts = []
         for message in converted:
             content = message["content"]

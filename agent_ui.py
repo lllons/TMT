@@ -91,6 +91,9 @@ ACTIVITY_TICK = 0.4      # seconds each glyph is held
 ACTIVITY_GAP = 2         # minimum blank columns kept between the two halves
 CHARS_PER_TOKEN = 4      # token size assumed until the provider reports its own
 
+# The widest block of content TMT draws, however wide the window is: rules, menus, the answer box.
+MAX_CONTENT_WIDTH = 100
+
 _ZWJ = "‍"
 _VARIATION_SELECTOR_16 = "️"
 
@@ -657,16 +660,16 @@ def render_response(response: str, stream=None):
     border is structure the reader does not need drawn to.
     """
     stream = stream or sys.stdout
-    width = max(20, shutil.get_terminal_size((80, 24)).columns)
     plain = plain_output(stream)
     edge, rule = ("|", "-") if plain else ("│", "─")
-    inner = max(10, width - 5)
+    inner = response_inner_width()
     lines = _rendered(str(response), inner, stream)
     fill = rule * (inner + 2)
     if plain:
         border = bottom = "+" + fill + "+"
     else:
         border, bottom = "┌" + fill + "┐", "└" + fill + "┘"
+    margin = " "          # the one column every other row of the screen starts in
     out = [border]
     # Padded by what the row SHOWS. A rendered line carries escapes, and
     # `pad_to_width` measures the string it is given -- so padding the styled
@@ -677,7 +680,13 @@ def render_response(response: str, stream=None):
                                edge)
                for line in lines)
     out.append(bottom)
-    safe_write(stream, "\n".join(out) + "\n")
+    safe_write(stream, "\n".join(margin + row for row in out) + "\n")
+
+
+def response_inner_width():
+    """Columns of text inside the answer box, so the box ends where the rules above and below it do."""
+    width = min(MAX_CONTENT_WIDTH, max(20, shutil.get_terminal_size((80, 24)).columns - 1))
+    return max(10, width - 5)
 
 
 def _message_rows(message, columns, stream, base=""):

@@ -630,3 +630,20 @@ def test_a_row_of_the_transcript_never_reaches_the_last_column():
                 assert display_width(visible(line)) < 40, (kind, visible(line))
     finally:
         agent_ui.shutil.get_terminal_size = original
+
+
+def test_the_response_box_has_the_screens_margin_and_stops_at_the_content_cap():
+    """The box touched both screen edges and ran past the rules on a wide
+    window. It starts in column 1 like every other row and ends where the
+    rules do, which is at most MAX_CONTENT_WIDTH."""
+    for columns, edge in ((60, 59), (100, 99), (160, agent_ui.MAX_CONTENT_WIDTH)):
+        original = with_columns(columns)
+        try:
+            buffer = io.StringIO()
+            render_response("An answer. " * 30, buffer)
+            rows = [row for row in buffer.getvalue().split("\n") if row]
+            assert all(row.startswith(" ") and not row.startswith("  ") for row in rows), rows
+            assert {display_width(row) for row in rows} == {edge}, (columns, [display_width(r) for r in rows])
+            assert agent_ui.response_inner_width() == edge - 5
+        finally:
+            agent_ui.shutil.get_terminal_size = original

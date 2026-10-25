@@ -29,8 +29,8 @@ import agent_history
 import agent_models
 from agent_live_renderer import LiveRegion
 from agent_ui import (
-    BOLD, DIM, GRADIENT_TICK, RESET, UNDERLINE, _color, _supports_color,
-    clip_to_width, cycle_text, display_width, fit_to_width, gradient_phase,
+    BOLD, DIM, GRADIENT_TICK, MAX_CONTENT_WIDTH, RESET, UNDERLINE, _color,
+    _supports_color, clip_to_width, cycle_text, display_width, fit_to_width, gradient_phase,
     iter_graphemes, pad_to_width, plain_output, safe_write, visible_width,
     wrap_lines,
 )
@@ -245,12 +245,9 @@ PROTOCOL_LABELS = {"tags": "TAGS", "json": "JSON"}
 # the decorative glyphs.
 MASK_CHAR = "*"
 
-# The narrowest the screen is drawn for. There is deliberately no widest: the
-# interface fills the window it was given. It used to stop growing at 72
-# columns, which on a wide terminal left the rules, the box and the whole
-# session sitting in a strip down the left with the rest of the window unused
-# -- and made the box look like a panel dropped onto the terminal rather than
-# the interface of the thing running in it.
+# The narrowest the screen is drawn for, and (agent_ui.MAX_CONTENT_WIDTH) the
+# widest: past about 100 columns the rules ran edge to edge while the text
+# stayed in a strip at the left, so the content is capped and left-aligned.
 _MIN_CONTENT = 24
 _LOGO_ROW_SPREAD = 0.05  # gradient offset per logo row, so colour flows down
 
@@ -294,11 +291,10 @@ def _content_width(columns):
     drawn to the last column wraps on the terminals that auto-wrap, and costs
     a screen line the repaint arithmetic does not know about.
 
-    Floored rather than capped. A terminal narrower than the floor overflows
-    it, which is a known and accepted limit; a terminal wider than the window
-    does not exist.
+    Floored, and capped at MAX_CONTENT_WIDTH. A terminal narrower than the
+    floor overflows it, which is a known and accepted limit.
     """
-    return max(_MIN_CONTENT, columns - 1)
+    return min(MAX_CONTENT_WIDTH, max(_MIN_CONTENT, columns - 1))
 
 
 def _paint(text, stream, phase, spread=0.8):
@@ -499,6 +495,14 @@ def provider_ids():
 
 def provider_label(provider_id):
     return PROVIDER_LABELS.get(provider_id, (provider_id or "not set", ""))[0]
+
+
+def provider_display(provider_id):
+    """The provider as a summary row names it: its label, and the route when it is not an API key."""
+    if not provider_id:
+        return "not set"
+    text = provider_label(provider_id)
+    return text + " (Claude subscription)" if _uses_subscription(provider_id) else text
 
 
 def provider_note(provider_id):
@@ -844,7 +848,7 @@ def render_banner(stream=None, phase=None, columns=None):
             for index, row in enumerate(rows)]
 
 
-def _field(name, value, stream, width, name_width=10, middle=False):
+def _field(name, value, stream, width, name_width=11, middle=False):
     """One `name  value` row of a summary block.
 
     `middle` shortens the VALUE through its middle instead of cutting its
@@ -987,9 +991,9 @@ def render_startup_frame(selected=0, stream=None, model_id=None, workspace=None,
     # which model will, and a provider with no key has to say so here rather
     # than at the first request.
     provider_id = current_provider()
-    provider_text = provider_label(provider_id) if provider_id else "not set"
+    provider_text = provider_display(provider_id)
     if provider_id and not provider_has_key(provider_id):
-        provider_text += "  (no key yet)"
+        provider_text += "  (no key stored)"
 
     head = [
         "",
@@ -1053,9 +1057,9 @@ TASK_PROMPT = "Task> "
 BRAND_PHASE = 0.15
 BRAND_SPREAD = 0.35
 
-# The header's second row hangs under the first, at the indent the prominence
-# ladder already uses for detail belonging to the row above it.
-_HEADER_INDENT = 3
+# The header's detail rows start in the same column as the wordmark and the
+# prompt box (every row of the screen has the one margin).
+_HEADER_INDENT = 1
 
 # What the tip row is labelled with. It needs one, because a sentence hanging
 # under the workspace with no label reads as a fact about this session rather
@@ -1532,8 +1536,10 @@ def meter_text(session, stream=None, columns=None, manager=None):
         # agents rather than as what they cost.
         spend = "agents %s%s" % ("" if agents["exact"] else "~",
                                  _short_count(agents["tokens"]))
-    full = "%s lines, %s lines, ~%s context, %s%s out" % (
-        added, removed, sent, out_mark, back)
+    full = "%s %s, %s %s, ~%s context, %s%s out" % (
+        added, "line" if lines_added == 1 else "lines",
+        removed, "line" if lines_removed == 1 else "lines",
+        sent, out_mark, back)
     short = "%s %s  ~%s ctx  %s%s out" % (added, removed, sent, out_mark, back)
     tiny = "%s %s" % (added, removed)
     if spend:
@@ -1609,6 +1615,13 @@ class BottomPad:
             self.height = rows
         room = max(0, rows - 1 - int(height))
         slack = self.rows + PROMPT_HEIGHT + (rows - self.height)
+        if slack < int(height):
+            # The region outgrew the pad (the slash palette on a short window),
+            # so the terminal scrolled and the region now ends at the foot with
+            # nothing above it to hold. Remembered as that, so a shorter frame
+            # afterwards is padded back down to the foot instead of being left
+            # stranded where its top row happened to be.
+            self.rows = max(0, int(height) - PROMPT_HEIGHT - (rows - self.height))
         return max(0, min(slack - int(height), room))
 
     def reset(self, rows=0, height=None):
@@ -1832,7 +1845,7 @@ def render_settings_frame(selected=0, active_id=None, stream=None, size=None,
 
     head = [
         "",
-        " " + _paint("Settings", stream, phase),
+        " " + _paint("Model", stream, phase),
         "",
         _dim(fit_to_width(" The model TMT sends every request to.", width), stream),
     ]
@@ -1910,10 +1923,11 @@ def render_provider_frame(selected=0, active_id=None, stream=None, size=None, ph
     head.append(_rule(stream, phase, width))
     options = []
     for index, name in enumerate(ids):
-        state = "key set" if provider_has_key(name) else "no key"
+        state = ("subscription" if _uses_subscription(name)
+                 else "key set" if provider_has_key(name) else "no key")
         options.append(_option_row(
             index == selected, provider_label(name),
-            pad_to_width(state, 8) + " " + provider_note(name),
+            pad_to_width(state, 13) + " " + provider_note(name),
             stream, phase, width, label_width,
             suffix="  (active)" if name == active_id else ""))
     # The id and the state of the key belong to the row the cursor is on, the
@@ -1991,7 +2005,7 @@ def render_search_frame(selected=0, active_id=None, stream=None, size=None, phas
         " " + _paint("Web Search", stream, phase),
         "",
         _dim(fit_to_width(" The service TMT searches the web with. One key", width), stream),
-        _dim(fit_to_width(" is enough; search is off until one has one.", width), stream),
+        _dim(fit_to_width(" is enough; search stays off until a key is set.", width), stream),
     ]
     if not ids:
         head.append(_rule(stream, phase, width))
@@ -2192,7 +2206,7 @@ def _settings_suffix(entry):
 # label in it, plus one, so there is always a gap between a name and its value.
 _SETTINGS_FIELD_NAMES = ("Provider", "API Key", "Model", "Web Search")
 _SETTINGS_FIELD_WIDTH = max(display_width(name)
-                            for name in _SETTINGS_FIELD_NAMES) + 1
+                            for name in _SETTINGS_FIELD_NAMES) + 2
 
 
 def render_settings_menu_frame(selected=0, stream=None, model_id=None, size=None, phase=None):
@@ -2209,12 +2223,12 @@ def render_settings_menu_frame(selected=0, stream=None, model_id=None, size=None
         "",
         " " + _paint("Settings", stream, phase),
         "",
-        # All four share a name column one wider than the longest label. The
+        # All four share a name column two wider than the longest label. The
         # default of 10 was exactly the width of "Web Search", which drew it
         # as `Web Searchnot set` -- a label and its value with no gap at all.
         # The number is derived here rather than written out again, so the
         # next label added to this block cannot reintroduce that.
-        _field("Provider", provider_label(provider_id) if provider_id else "not set",
+        _field("Provider", provider_display(provider_id),
                stream, width, name_width=_SETTINGS_FIELD_WIDTH),
         _field("API Key", provider_key_hint(provider_id), stream, width,
                name_width=_SETTINGS_FIELD_WIDTH),
@@ -4704,7 +4718,9 @@ def render_route_frame(selected=0, stream=None, size=None, phase=None):
     phase = gradient_phase() if phase is None else phase
     width = _content_width(columns)
     store = _credentials()
-    active = getattr(store, "anthropic_route", lambda: "api")()
+    # Only the route in use is "active": with another provider selected neither is.
+    active = (getattr(store, "anthropic_route", lambda: "api")()
+              if current_provider() == "anthropic" else "")
     label_width = max(display_width(row[1]) for row in ROUTE_ROWS)
     head = ["", " " + _paint("Anthropic", stream, phase), "",
             _dim(fit_to_width(" How TMT reaches Claude models.", width), stream),

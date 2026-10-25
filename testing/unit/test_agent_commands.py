@@ -107,7 +107,7 @@ def test_command_names_are_case_insensitive_and_arguments_are_not():
 def test_every_command_in_the_table_has_a_summary_and_a_usage_line():
     """The completion list and the error messages read from these, so a
     command added without them would offer a blank row or crash a refusal."""
-    assert set(agent_commands.names()) == {"context", "config", "clear",
+    assert set(agent_commands.names()) == {"help", "quit", "exit", "context", "config", "clear",
                                            "effort", "model", "note", "notes",
                                            "agents", "back", "plan", "verify",
                                            "review", "undo", "checkpoints"}
@@ -120,11 +120,13 @@ def test_every_command_in_the_table_has_a_summary_and_a_usage_line():
 
 def test_typing_a_slash_offers_the_commands_and_narrows_as_you_type():
     assert [name for name, _ in agent_commands.completions("/")] == [
-        "/context", "/config", "/clear", "/effort", "/model", "/note",
+        "/help", "/context", "/config", "/clear", "/effort", "/model", "/note",
         "/notes", "/agents", "/back", "/plan", "/verify", "/review",
         # Last, and together, because they are the only two here that can
         # change anything -- everything above reads.
-        "/undo", "/checkpoints"]
+        "/undo", "/checkpoints",
+        # Then the two that end the session, which change nothing.
+        "/quit", "/exit"]
     assert [name for name, _ in agent_commands.completions("/mo")] == ["/model"]
     # `/note` and `/notes` share a prefix, and both are offered until the
     # trailing "s" settles it. They are two different questions -- one asks
@@ -493,3 +495,25 @@ def test_the_effort_stored_on_disk_is_read_back_at_startup():
 
 
 TMT_SOURCE = Path(agent_commands.__file__).resolve().parent / "TMT.py"
+
+
+def test_help_lists_every_command_and_quit_is_a_command_that_ends_nothing_itself():
+    result = agent_commands.dispatch("/help")
+    text = result.text()
+    for name in agent_commands.names():
+        if name != "exit":
+            assert "/" + name in text, name
+    assert result.ok and "Esc clears it" in text
+    assert agent_commands.dispatch("/quit").ok and agent_commands.dispatch("/exit").ok
+    assert agent_commands.dispatch("/quit now").ok is False       # takes no argument
+
+
+def test_config_names_the_claude_subscription_instead_of_saying_the_key_is_not_set():
+    import agent_credentials
+    from test_agent_credentials import Credentials
+    with Credentials(key=None, provider="anthropic"):
+        agent_credentials.set_anthropic_route("subscription")
+        text = agent_commands.dispatch("/config").text()
+        assert "Provider  Anthropic (Claude subscription)" in text, text
+        assert "API key  not needed (Claude subscription)" in text, text
+        assert "not set" not in text.split("API key")[1], text

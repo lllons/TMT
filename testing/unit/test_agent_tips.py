@@ -199,12 +199,17 @@ def test_a_run_of_launches_walks_the_whole_catalogue_and_wraps():
     what is being asked is whether the number that survives a launch is the
     one that comes back."""
     cursor = Cursor(0)
+    previous = agent_config.EFFORT
     try:
+        # Medium has no tip of its own; the effort tip in force is skipped, so
+        # a walk under high or low is one short by design (tested below).
+        agent_config.EFFORT = "medium"
         seen = [agent_tips.next_tip() for _ in range(agent_tips.count())]
         assert len(set(seen)) == agent_tips.count(), len(set(seen))
         assert cursor.stored() == "0", cursor.stored()
         assert agent_tips.next_tip() == seen[0]
     finally:
+        agent_config.EFFORT = previous
         cursor.close()
 
 
@@ -273,3 +278,17 @@ def test_the_cursor_belongs_to_the_installation_and_not_to_a_project():
     that no installation state follows the workspace covers it there."""
     assert Path(agent_config.TIP_FILE).resolve().parent == INSTALL_DIR
     assert Path(agent_config.TIP_FILE).name == ".tmt_tip"
+
+
+def test_the_tip_for_the_effort_level_already_in_force_is_skipped():
+    """"/effort high lets one task take up to 60 steps" under a /config that
+    already says high is advice for something that is done."""
+    previous = agent_config.EFFORT
+    cursor = Cursor()
+    try:
+        agent_config.EFFORT = "high"
+        gestures = [agent_tips.next_tip()[0] for _ in range(agent_tips.count())]
+        assert "/effort high" not in gestures and "/effort low" in gestures, gestures
+    finally:
+        agent_config.EFFORT = previous
+        cursor.close()

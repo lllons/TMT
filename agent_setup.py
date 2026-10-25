@@ -1,62 +1,32 @@
 """First-launch setup: offer to take an API key, and let the user skip it.
 
-Shown only when no provider is configured, and styled to match the THINKING
-animation and the progress bar: the same
-repeating red -> orange -> green cycle, the same block characters, and icons
-drawn from the live relay's symbol pool.
+Shown only when no provider is configured. It is drawn like the rest of TMT:
+the menu's wordmark (same size, same colour cycle), the same one-column margin
+and plain sentences, with no boxes, symbols or progress bar of its own.
 """
 
-import random
 import shutil
 import sys
 import threading
 
 import agent_config
-from agent_live_renderer import SYMBOL_POOL, encodable
+import agent_menu
+from agent_live_renderer import encodable
 from agent_ui import (
-    GRADIENT_TICK, _supports_color, cycle_bar, cycle_text, gradient_phase, safe_write,
+    GRADIENT_TICK, _supports_color, cycle_text, gradient_phase, safe_write,
 )
 
 KEY_PREFIX = "sk-or-"
-TITLE_MARGIN = "   "
+TITLE_MARGIN = " "
 SAVE_CURSOR = "\0337"
 RESTORE_CURSOR = "\0338"
 
-TITLE_ART = (
-    "████████╗ ███╗   ███╗ ████████╗",
-    "╚══██╔══╝ ████╗ ████║ ╚══██╔══╝",
-    "   ██║    ██╔████╔██║    ██║   ",
-    "   ██║    ██║╚██╔╝██║    ██║   ",
-    "   ██║    ██║ ╚═╝ ██║    ██║   ",
-    "   ╚═╝    ╚═╝     ╚═╝    ╚═╝   ",
-)
-
-ASCII_TITLE_ART = (
-    " ______  __       __  ______ ",
-    "|_    _||  \\     /  ||_    _|",
-    "  |  |  |   \\   /   |  |  |  ",
-    "  |  |  | |\\ \\_/ /| |  |  |  ",
-    "  |  |  | | \\___/ | |  |  |  ",
-    "  |__|  |_|       |_|  |__|  ",
-)
-
-# Icons for the panel gutter, in both a decorated and a plain flavour.
-PANEL_ICONS = ("◈", "◆", "◇", "✎", "⚑", "➤")
-ASCII_PANEL_ICONS = ("*", "+", "-", ">", "!", ">")
-BOX = {"tl": "╔", "tr": "╗", "bl": "╚", "br": "╝", "h": "═", "v": "║"}
-ASCII_BOX = {"tl": "+", "tr": "+", "bl": "+", "br": "+", "h": "-", "v": "|"}
-ASCII_SPARKLES = ("*", "+", ".", "o", "x", "^", "~", "=")
+ASCII_LOGO = tuple(row.replace("█", "#") for row in agent_menu.LOGO)
 
 
 def ascii_only(stream):
     """True when the terminal cannot render the decorated characters."""
-    sample = "".join(TITLE_ART) + "".join(PANEL_ICONS) + "".join(BOX.values())
-    return not encodable(stream, sample)
-
-
-def sparkles(count, stream, plain=False, phase=None):
-    pool = ASCII_SPARKLES if plain else SYMBOL_POOL
-    return cycle_text(" ".join(random.choice(pool) for _ in range(count)), stream, phase)
+    return not encodable(stream, "".join(agent_menu.LOGO) + "—")
 
 
 def clean_key(raw):
@@ -154,16 +124,10 @@ def run_setup(stream=None, ask=None, animate=True):
     stream = sys.stdout if stream is None else stream
     ask = input if ask is None else ask
     plain = ascii_only(stream)
-    art = ASCII_TITLE_ART if plain else TITLE_ART
-    width = max(46, min(66, shutil.get_terminal_size((80, 24)).columns - 2))
-    box = ASCII_BOX if plain else BOX
-    icons = ASCII_PANEL_ICONS if plain else PANEL_ICONS
-    arrow, caret = (">", ">") if plain else ("➤", "▸")
-    tick, cross = ("OK", "x") if plain else ("✓", "✗")
-    # The em dash in the three sentences below is the only punctuation here a
-    # cp437 or ascii console cannot encode, so it takes a plain form like every
-    # other decorated character on this screen. A deliberate hyphen reads as a
-    # choice; a replacement mark reads as a bug.
+    art = ASCII_LOGO if plain else agent_menu.LOGO
+    # The em dash is the only punctuation here a cp437 or ascii console cannot
+    # encode, so it takes a plain form like every other decorated character. A
+    # deliberate hyphen reads as a choice; a replacement mark reads as a bug.
     dash = "-" if plain else "—"
     below = [0]
 
@@ -174,11 +138,9 @@ def run_setup(stream=None, ask=None, animate=True):
         thing between a fresh install and a usable TMT and nothing above it
         catches anything -- ensure_api_key has no try, TMT.main calls it bare,
         and the entry point is sys.exit(main()). A character the console could
-        not encode used to raise UnicodeEncodeError on the sixth row of the
-        welcome box, so the user got a traceback instead of the key prompt with
-        no way to enter a key and no way past it. Decoration must never end the
-        run; the ASCII vocabulary above is what keeps the words readable when
-        it degrades.
+        not encode used to raise UnicodeEncodeError, so the user got a
+        traceback instead of the key prompt with no way past it. Decoration
+        must never end the run.
         """
         safe_write(stream, text + "\n")
         below[0] += 1
@@ -188,26 +150,18 @@ def run_setup(stream=None, ask=None, animate=True):
         safe_write(stream, cycle_text(TITLE_MARGIN + line, stream) + "\n")
     below[0] = 0                       # count lines below the title from here
 
-    say(TITLE_MARGIN + sparkles(12, stream, plain))
     say()
-    say(cycle_text(box["tl"] + box["h"] * (width - 2) + box["tr"], stream))
-    for icon, text in (
-        (icons[0], "W E L C O M E   T O   T M T"),
-        (icons[1], "No model provider is set up yet."),
-        (icons[2], "Paste an API key to set one up now, or press Esc or Enter"),
-        (" ", "to skip and choose one later in Settings."),
-        (icons[3], "A pasted key is saved beside the code,"),
-        (" ", f"which is git-ignored {dash} it never travels with a push."),
-    ):
-        body = f"{icon}  {text}".ljust(width - 4)
-        say(cycle_text(box["v"], stream) + " " + body + " " + cycle_text(box["v"], stream))
-    say(cycle_text(box["bl"] + box["h"] * (width - 2) + box["br"], stream, gradient_phase() + 0.5))
+    say(" " + cycle_text("Welcome to TMT", stream))
+    say(" No model provider is set up yet.")
+    say(" Paste an API key to set one up now, or press Esc or Enter")
+    say(" to skip and choose one later in Settings.")
+    say(" A pasted key is saved beside the code,")
+    say(f" which is git-ignored {dash} it never travels with a push.")
     say()
 
     title = TitleLoop(stream, art)
     try:
-        say(f"  {cycle_bar(40, stream, plain=plain)}  40% Waiting for your key...")
-        safe_write(stream, f"  {cycle_text(f'{arrow} paste key, or Esc/Enter to skip {caret}', stream)} ")
+        safe_write(stream, " > ")
         if animate:
             title.start(below[0])
         try:
@@ -215,19 +169,17 @@ def run_setup(stream=None, ask=None, animate=True):
         except (EOFError, KeyboardInterrupt):
             title.stop()
             say()
-            say(f"  {cross} Setup cancelled {dash} no key saved.")
+            say(f" Setup cancelled {dash} no key saved.")
             return ""
         title.stop()
         below[0] += 1              # the line the user just submitted
         if not key:
-            say(f"  {tick} Skipped {dash} choose a model provider in Settings when you are ready.")
+            say(f" Skipped {dash} choose a model provider in Settings when you are ready.")
             return None
         if not key.startswith(KEY_PREFIX) and not _identified(key):
-            say(f"  {cross} Heads up: that does not look like a key TMT recognises. Using it anyway.")
+            say(" Heads up: that does not look like a key TMT recognises. Using it anyway.")
         say()
-        say(f"  {cycle_bar(100, stream, plain=plain)} 100% Key saved!  {tick}")
-        say(f"  {sparkles(3, stream, plain)}  {mask_key(key, plain)} "
-            f"stored beside the code  {sparkles(3, stream, plain, gradient_phase() + 0.5)}")
+        say(f" Key saved: {mask_key(key, plain)}, stored beside the code.")
         say()
         return key
     finally:
