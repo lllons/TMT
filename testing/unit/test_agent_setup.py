@@ -301,3 +301,13 @@ def test_the_title_does_not_animate_where_it_would_mangle_the_screen():
     loop.start(lines_below=1)
     assert not loop.running
     assert plain.getvalue() == ""
+
+
+def test_esc_then_enter_skips_setup_like_an_empty_answer():
+    def check():
+        output = FakeTTY()
+        assert ensure_api_key(stream=output, ask=lambda prompt: chr(27), animate=False)
+        assert not agent_config.KEY_FILE.exists()
+        text = strip_ansi(output.getvalue())
+        assert "Skipped" in text and "Esc" in text
+    sandbox(check)

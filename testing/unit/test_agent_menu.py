@@ -458,7 +458,7 @@ def test_settings_enter_changes_the_current_model():
         # the first row; one move down reaches the second. Esc leaves the
         # submenu, which is why the run ends back on the menu.
         choice, keys = start(box, "down", "enter", "down", "down", "enter",
-                             "down", "enter", "esc", "quit")
+                             "down", "enter", "esc", "quit", "enter")
         assert agent_models.current_model() == chosen, agent_models.current_model()
         assert agent_models.read_saved_model() == chosen
         assert agent_config.MODEL == chosen
@@ -473,7 +473,7 @@ def test_settings_esc_leaves_the_model_alone():
     who only looked keeps the model they arrived with."""
     box = Sandbox()
     try:
-        choice, keys = start(box, "down", "enter", "down", "esc", "quit")
+        choice, keys = start(box, "down", "enter", "down", "esc", "quit", "enter")
         assert agent_models.read_saved_model() == ""
         assert not agent_models.MODEL_FILE.exists()
         assert agent_models.current_model() == agent_models.DEFAULT_MODEL
@@ -495,7 +495,7 @@ def test_help_returns_to_the_menu_rather_than_exiting():
         assert plain_keys.remaining == 0
 
         box.stream = Terminal()
-        choice, keys = start(box, "down", "down", "enter", "esc", "quit")
+        choice, keys = start(box, "down", "down", "enter", "esc", "quit", "enter")
         assert choice == "exit", choice
         assert keys.remaining == 0, "Esc left Help without returning to the menu"
 
@@ -547,7 +547,7 @@ def test_the_selected_item_is_marked_without_relying_on_colour():
             assert resting, "the menu never drew a Start row"
 
             box.stream = Terminal()
-            start(box, "down", "quit")
+            start(box, "down", "quit", "enter")
             rows = [line for line in box.stream.text().splitlines()
                     if "Start" in line]
             assert len(rows) >= 2, "the menu did not repaint after moving"

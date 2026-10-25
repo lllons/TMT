@@ -194,7 +194,7 @@ def run_setup(stream=None, ask=None, animate=True):
     for icon, text in (
         (icons[0], "W E L C O M E   T O   T M T"),
         (icons[1], "No model provider is set up yet."),
-        (icons[2], "Paste an API key to set one up now, or press Enter"),
+        (icons[2], "Paste an API key to set one up now, or press Esc or Enter"),
         (" ", "to skip and choose one later in Settings."),
         (icons[3], "A pasted key is saved beside the code,"),
         (" ", f"which is git-ignored {dash} it never travels with a push."),
@@ -207,11 +207,11 @@ def run_setup(stream=None, ask=None, animate=True):
     title = TitleLoop(stream, art)
     try:
         say(f"  {cycle_bar(40, stream, plain=plain)}  40% Waiting for your key...")
-        safe_write(stream, f"  {cycle_text(f'{arrow} paste key, or Enter to skip {caret}', stream)} ")
+        safe_write(stream, f"  {cycle_text(f'{arrow} paste key, or Esc/Enter to skip {caret}', stream)} ")
         if animate:
             title.start(below[0])
         try:
-            key = clean_key(ask(""))
+            key = clean_key((ask("") or "").replace(chr(27), ""))   # Esc, then Enter, skips
         except (EOFError, KeyboardInterrupt):
             title.stop()
             say()

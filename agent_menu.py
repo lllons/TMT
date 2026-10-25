@@ -953,13 +953,15 @@ def _rule(stream, phase, width):
 
 
 def render_startup_frame(selected=0, stream=None, model_id=None, workspace=None,
-                         size=None, phase=None, resuming=False, busy=""):
+                         size=None, phase=None, resuming=False, busy="",
+                         confirm=False):
     """The whole startup screen as a list of ready-to-paint lines.
 
     `resuming` is whether a session is waiting behind this menu, which turns
     Start into Resume. `busy` is what is still running, as a phrase for the
     note -- an empty string means nothing is, and is what removes the note and
-    puts the Settings row back.
+    puts the Settings row back. `confirm` is the state after Esc: the footer
+    asks whether to quit rather than leaving the key to quit silently.
     """
     stream = sys.stdout if stream is None else stream
     columns, rows = _terminal(size)
@@ -1014,7 +1016,9 @@ def render_startup_frame(selected=0, stream=None, model_id=None, workspace=None,
                     label_width, live=(resuming and item[0] == "start"))
         for index, item in enumerate(items)
     ]
-    tail = ["", _footer(stream, ("{up}/{down} Navigate", "Enter Select"), width)]
+    hints = (("Quit TMT?", "Enter Quit", "Esc Stay") if confirm else
+             ("{up}/{down} Navigate", "Enter Select", "Esc Quit"))
+    tail = ["", _footer(stream, hints, width)]
 
     banner = render_banner(stream, phase, columns)
     if len(banner) + len(head) + len(options) + len(tail) <= max(1, rows - 1):
@@ -4513,8 +4517,9 @@ def main_menu(stream=None, key_reader=None, region=None, model_id=None,
               cursor=None):
     """Run the startup menu and return the chosen action.
 
-    One of "start", "settings", "help" or "exit". Exhausted input, Esc, q and
-    Ctrl-C all answer "exit", so no path leaves the caller waiting.
+    One of "start", "settings", "help" or "exit". Exhausted input and Ctrl-C
+    answer "exit" at once; Esc and q ask "Quit TMT?" first and Enter confirms,
+    so no path leaves the caller waiting and none quits by accident.
 
     `busy` is a CALLABLE answering what is still running, re-asked on every
     frame, because a background agent can finish while the menu is open and
@@ -4554,7 +4559,8 @@ def main_menu(stream=None, key_reader=None, region=None, model_id=None,
 
     opening = menu_items(resuming=resuming, busy=bool(running()))
     keys = [item[0] for item in opening]
-    state = {"key": cursor if cursor in keys else opening[selected % len(opening)][0]}
+    state = {"key": cursor if cursor in keys else opening[selected % len(opening)][0],
+             "confirm": False}
 
     def place(items):
         """Where the cursor sits in `items`, and never off the end of them."""
@@ -4568,11 +4574,16 @@ def main_menu(stream=None, key_reader=None, region=None, model_id=None,
         note = running()
         items = menu_items(resuming=resuming, busy=bool(note))
         return render_startup_frame(place(items), stream, model_id, workspace,
-                                    resuming=resuming, busy=note)
+                                    resuming=resuming, busy=note,
+                                    confirm=state["confirm"])
 
     def on_key(key):
-        if key in (None, "esc", "quit", "interrupt"):
+        if key in (None, "interrupt") or (state["confirm"] and key == "enter"):
             return "exit"
+        if key in ("esc", "quit") and not state["confirm"]:
+            state["confirm"] = True       # Esc is Back everywhere else: ask first
+            return None
+        state["confirm"] = False
         items = menu_items(resuming=resuming, busy=bool(running()))
         index = place(items)
         if key == "up":

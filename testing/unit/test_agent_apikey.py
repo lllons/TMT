@@ -380,3 +380,17 @@ def test_a_pasted_key_with_invisible_noise_still_lands():
                    "sk-or-v1-abc​", "sk-or-v1-abc\xa0\r\n"):
         assert agent_menu.normalize_text_key(pasted) == want, repr(pasted)
     assert agent_menu.normalize_text_key("﻿​") == ("", "")
+
+
+def test_the_first_character_on_a_fresh_key_screen_is_echoed_at_once():
+    """Typed straight after the screen opens, with no message on it yet."""
+    result, frames = drive_reader("openrouter", ["k", "x", "y", "esc"])
+    assert result is None
+    assert masked(frames) == 3, masked(frames)
+
+
+def test_esc_on_the_first_run_screen_goes_back_without_saving():
+    result, frames = drive_reader("openrouter", ["esc"], opening="A key is wanted.",
+                                  identify=True)
+    assert result is None
+    assert "A key is wanted." in frames

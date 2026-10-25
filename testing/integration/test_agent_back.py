@@ -814,12 +814,12 @@ def test_a_busy_register_that_answers_nonsense_is_read_as_a_phrase():
 
 
 def test_every_way_out_of_the_menu_still_exits():
-    """Esc, q, exhausted input and Ctrl-C all answer "exit", so no path
+    """Esc and q (after Enter confirms), exhausted input and Ctrl-C all answer "exit", so no path
     leaves the caller waiting on a menu that has nothing left to read. This
     is what stops a scripted or broken terminal hanging the process, and
     `/back` adds two new ways to reach this screen without changing it."""
     for name in ("esc", "quit", "q"):
-        choice, _ = menu(name, resuming=True)
+        choice, _ = menu(name, "enter", resuming=True)
         assert choice == "exit", name
     exhausted = agent_menu.main_menu(stream=Plain(), key_reader=lambda: None,
                                      region=nowhere(), model_id=MODEL,
@@ -995,3 +995,14 @@ def test_reset_is_in_place_because_the_prompt_box_holds_the_object():
     # And the object goes on working: the new count is what is spent from.
     holder["pad"].take(1)
     assert pad.rows == 3
+
+
+def test_esc_on_the_menu_asks_first_and_a_second_esc_stays():
+    """Esc is Back on every other screen, so on the menu it must not quit at
+    once: it asks in the footer, Esc stays and Enter quits."""
+    choice, keys = menu("esc", "esc", "down", "enter", resuming=True)
+    assert choice == "settings" and keys.remaining == 0
+    text = lambda **kw: chr(10).join(frame(**kw))
+    shown = text(confirm=True)
+    assert "Quit TMT?" in shown and "Esc Stay" in shown
+    assert "Esc Quit" in text() and "Quit TMT?" not in text()
