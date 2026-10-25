@@ -569,7 +569,8 @@ def _review(context, obj):
     if not answer:
         return "FAILED: %s" % review.fail("the reviewer produced no result")
     try:
-        result = agent_review.parse_result(answer, number=review.cycles + 1)
+        result = agent_review.parse_result(answer, number=review.cycles + 1,
+                                           **_plain_review_kwargs())
     except agent_review.ReviewError as error:
         # THE line that keeps section 15 honest. Text that does not validate
         # is not a review, whatever it claims about itself, and it leaves the
@@ -744,6 +745,13 @@ def _agent_id(obj):
     if isinstance(value, bool) or value is None:
         return ""
     return str(value).strip()
+
+
+def _plain_review_kwargs():
+    """`{"plain_text": True}` for `parse_result` when the reviewer speaks plain-text tags."""
+    if getattr(agent_config, "PROTOCOL", None) == "tags":
+        return {"plain_text": True}
+    return {}
 
 
 def _timeout(obj):

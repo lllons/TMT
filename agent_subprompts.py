@@ -604,21 +604,303 @@ SUBPROMPT_REMINDER_TAGS = ("Reminder: reply with tag blocks only. Every block "
                            "exactly one internal_response.")
 
 
+# --- the third variant: plain-text replies under tags -------------------------
+#
+# The background agents under tags are taught what the main agent is taught
+# (agent_prompt's `*_TAGS_PLAIN` constants, see the comment above them): a reply
+# with NO action blocks is the final answer and ends the run, and text beside
+# an action block reaches nobody. The `*_TAGS` constants above stay as they are
+# -- their digests are pinned -- but no prompt is built from them any more:
+# `_section` and `_common` pick the `_TAGS_PLAIN` twin below under tags.
+#
+# The reviewer's verdict has a plain shape too (see REVIEW_RESULT_REFERENCE_
+# TAGS_PLAIN and agent_review.parse_result): `VERDICT: approve` or
+# `VERDICT: revise` on the first line and the notes after it. The structured
+# object is still accepted from a reviewer that writes one.
+_PARSER_PARAGRAPH_PLAIN = (
+    'Your reply does not go to a person. It goes to a tag parser. The parser '
+    'reads your tag blocks: the outer tag of each block names an action, and '
+    'the parser runs it. Text outside the blocks is thrown away without being '
+    'shown to anyone, with one exception: a reply with no action blocks at all '
+    'is your final answer, and it ends your run.')
+
+WORKER_HEADER_TAGS_PLAIN = agent_prompt.rewrite("WORKER_HEADER", WORKER_HEADER, (
+    (_PARSER_PARAGRAPH, _PARSER_PARAGRAPH_PLAIN),
+    ('the "response" of the single internal_response you finish with. The main agent reads it.',
+     'your final answer, the reply with no action blocks that you finish with. The main agent reads it.'),
+))
+NOTE_HEADER_TAGS_PLAIN = agent_prompt.rewrite("NOTE_HEADER", NOTE_HEADER, (
+    (_PARSER_PARAGRAPH, _PARSER_PARAGRAPH_PLAIN),
+    ('the "response" of the single internal_response you finish with. That one IS printed',
+     'your final answer, the reply with no action blocks that you finish with. That one IS printed'),
+))
+REVIEWER_HEADER_TAGS_PLAIN = agent_prompt.rewrite("REVIEWER_HEADER", REVIEWER_HEADER, (
+    (_PARSER_PARAGRAPH, _PARSER_PARAGRAPH_PLAIN),
+    ('the "response" of the single internal_response you finish with, and it MUST be the review result object described below. The runtime parses it. A response that is not that object is not a review at all',
+     'your final answer, the reply with no action blocks that you finish with, and it MUST be the review verdict described below. The runtime reads it. An answer that is not that verdict is not a review at all'),
+))
+
+_OVERRIDE_SWAPS_PLAIN = (
+    ('- OUTPUT FORMAT rule 5 says everything the user reads goes in the "message" of a send_message or an end_conversation action. Neither of those reaches anybody from here. What you have to say goes in the "response" of internal_response.',
+     '- OUTPUT FORMAT rule 5 says everything the user reads is plain text outside the blocks. Nobody reads that from here. What you have to say goes in your final answer, the reply with no action blocks, which is handed to the main agent.'),
+    ('- OUTPUT FORMAT rules 10 and 11 require every task to end with an end_conversation action. Yours ends with exactly one internal_response instead. That is the only ending you have.',
+     '- OUTPUT FORMAT rules 10 and 11 require every task to end with a final answer, a reply with no action blocks. Yours does too: that reply is the only ending you have, and the main agent reads it rather than a user.'),
+    ('- The ACTIONS reference lists end_conversation. It is refused to you, and so is git_push. Emitting one costs you a step and hands you back a refusal.\n'
+     '- The ACTIONS reference lists send_message, and that one is not refused - it runs, and it reaches nobody, which is worse. There is no screen showing your words. It costs you a step and hands back a note telling you the same thing this line does. Say it in your internal_response instead.',
+     '- The ACTIONS reference lists git_push. It is refused to you. Emitting it costs you a step and hands you back a refusal.\n'
+     '- Text before an action block or after the last one reaches nobody: there is no screen showing your words. Say it in your final answer instead.'),
+    ('- The PROGRESS section requires a "progress" sentence on every action that does work. It does not apply to you: nobody reads it. See below.',
+     '- The PROGRESS section asks for a sentence before every action that does work. It does not apply to you: nobody reads it. See below.'),
+)
+
+WORKER_OVERRIDES_TAGS_PLAIN = agent_prompt.rewrite(
+    "WORKER_OVERRIDES", WORKER_OVERRIDES, _OVERRIDE_SWAPS_PLAIN)
+NOTE_OVERRIDES_TAGS_PLAIN = agent_prompt.rewrite(
+    "NOTE_OVERRIDES", NOTE_OVERRIDES, _OVERRIDE_SWAPS_PLAIN)
+REVIEWER_OVERRIDES_TAGS_PLAIN = agent_prompt.rewrite(
+    "REVIEWER_OVERRIDES", REVIEWER_OVERRIDES, _OVERRIDE_SWAPS_PLAIN + (
+        ("- Your internal_response is not prose. It is the review result object, and its shape is given below. That is the one place your ending differs from every other background agent's.",
+         "- Your final answer is not free prose. It is the review verdict, and its shape is given below. That is the one place your ending differs from every other background agent's."),
+    ))
+
+WORKER_RULES_TAGS_PLAIN = agent_prompt.rewrite("WORKER_RULES", WORKER_RULES, (
+    ('2. Emit no progress and no commentary. Leave "progress", "events" and "next_step" off your actions entirely; the interface shows your activity from the actions themselves, not from your prose. send_message is the same mistake in a more expensive form: it is not refused to you, it simply addresses a party that does not exist, so it spends one of your steps and delivers nothing.',
+     '2. Write no progress line and no commentary. Put no text before or after your action blocks and leave events and next_step out; the interface shows your activity from the actions themselves, not from your prose. Text beside an action addresses a party that does not exist, so it delivers nothing.'),
+    ('Say in your response that you could not verify them', 'Say in your answer that you could not verify them'),
+    ('6. Finish with exactly one internal_response, and finish with one whatever happened: work done, work half done, work refused, nothing to do, or a task you could not carry out at all. It is the only way your task ends.',
+     '6. Finish with a final answer, a reply with no action blocks, and finish with one whatever happened: work done, work half done, work refused, nothing to do, or a task you could not carry out at all. It is the only way your task ends. A reply with no action block ends your run, so if you say you will do something, put its action in the same reply.'),
+    ('7. Write that response for the main agent', '7. Write that answer for the main agent'),
+    ('Every count, timing and result in your response must be', 'Every count, timing and result in your answer must be'),
+))
+
+_NOTE_VERBS_JSON = ", ".join(verb for verb in NOTE_VERBS if verb != "internal_response")
+_NOTE_VERBS_PLAIN = ", ".join(verb for verb in NOTE_VERBS
+                              if verb not in ("internal_response", "send_message"))
+NOTE_RULES_TAGS_PLAIN = agent_prompt.rewrite("NOTE_RULES", NOTE_RULES, (
+    (": %s. Anything else is refused" % _NOTE_VERBS_JSON,
+     ": %s. Anything else is refused" % _NOTE_VERBS_PLAIN),
+    ('5. Finish with exactly one internal_response containing the answer.',
+     '5. Finish with a final answer, a reply with no action blocks, containing the answer. It ends your run, so write it only once you have what you need.'),
+    ('6. That response IS shown to the person who asked.', '6. That answer IS shown to the person who asked.'),
+))
+
+REVIEWER_RULES_TAGS_PLAIN = agent_prompt.rewrite("REVIEWER_RULES", REVIEWER_RULES, (
+    ('I. DECIDE. PASS, PASS_WITH_WARNINGS or FAIL, with the findings that justify it.',
+     'I. DECIDE. Approve or revise, with the findings that justify it.'),
+    ('7. Finish with exactly one internal_response carrying the result object, whatever happened - including when you found nothing at all, which is a PASS with an empty issues list and is a perfectly good review.',
+     '7. Finish with a final answer carrying the verdict, whatever happened - including when you found nothing at all, which is an approve with nothing to revise and is a perfectly good review. It is a reply with no action blocks, so write it only when the review is done.'),
+))
+
+INTERNAL_RESPONSE_REFERENCE_TAGS_PLAIN = r"""=== YOUR FINAL ANSWER ===
+Your run ends with a reply that has NO action blocks: plain text, handed back to the main agent. It is the only ending you have, and the main agent reads it rather than a user. Write it only when the task is finished, because it ends your run.
+  Added percent(a, b) to Calc.py, returning a * b / 100, and a case for it in tests/test_calc.py. I did not run the suite.
+  There was nothing to change: src/net.py already uses a 30 second timeout, set on line 41."""
+
+REVIEW_RESULT_REFERENCE_TAGS_PLAIN = r"""=== THE REVIEW VERDICT YOU MUST RETURN ===
+Your final answer, the reply with no action blocks, IS the review. The runtime reads it and refuses anything it cannot read - a malformed answer is recorded as a review that did not happen, which blocks the task exactly as a failure does. So get the shape right.
+
+The first line is the verdict, and it is exactly one of these two:
+VERDICT: approve
+VERDICT: revise
+Every line after it is your notes, in plain text. The notes are required.
+
+approve: the change does what the request asked and you found nothing that must be fixed. The notes say what you reviewed and what you concluded, and may list smaller things worth knowing, one per line.
+revise: something MUST be fixed before this ships. The notes are what the implementing agent reads: one finding per line, the most serious first, as "path:line - what is wrong, what the code does, what it should do, and the fix you want". Close with a line on what the tests do and do not cover.
+
+Rules for the notes:
+- Every finding is supported by something you actually read. "path" is a file you looked at. LEAVE OUT the line number rather than estimate one: a fabricated line number sends somebody to the wrong place.
+- Go through each thing the user asked for and say whether it is there: satisfied, partial or not satisfied, and where you checked.
+- Your verdict and your notes must agree. An approve whose notes describe something that must be fixed is a contradiction that misleads the implementing agent: write revise.
+- A revise is recorded as one blocking finding carrying your notes, so each finding you want fixed must be in them."""
+
+WORKER_EXAMPLES_TAGS_PLAIN = r"""=== HOW YOU WORK THROUGH A TASK - WORKED EXAMPLES ===
+Each of these is a task you might really be given. The first line is what reached you; the rest is what you write. A reply with no action blocks is your final answer and ends your run.
+
+A change you can make once you have looked. Look, then change, then report.
+  You were given: add a percent operator to Calc.py
+  You write:
+/read_lines/ /path/ Calc.py //path/ /start/ 1 //start/ /end/ 80 //end/ //read_lines/
+  The lines come back. Then:
+  You write:
+/append_file/
+/path/ Calc.py //path/
+/content/
+
+def percent(a, b):
+    return a * b / 100
+//content/
+//append_file/
+  The result comes back. Then, and only then:
+  You write:  Added percent(a, b) to Calc.py, returning a * b / 100. It is callable but not wired into main(), so the command line does not reach it yet. I did not run any tests.
+
+Independent steps go in one reply, and that does not end the run.
+  You were given: create the reports folder and a stub for the Q3 summary
+  You write:
+/create_folder/ /path/ reports //path/ //create_folder/
+/write_file/
+/path/ reports/q3.md //path/
+/content/
+# Q3
+//content/
+//write_file/
+  Both results come back together. Then:
+  You write:  Created the reports/ folder and reports/q3.md, which currently holds only the heading "# Q3".
+
+You were asked to verify tests. You cannot, and you say so rather than guessing.
+  You were given: add the percent case to the calculator tests and confirm the suite passes
+  You write:
+/append_file/
+/path/ tests/test_calc.py //path/
+/content/
+
+def test_percent():
+    assert percent(50, 10) == 5
+//content/
+//append_file/
+  Then:
+  You write:  Added test_percent to tests/test_calc.py, asserting percent(50, 10) == 5. I could not confirm the suite passes: I have no way to run anything, so I did not run it. The new case follows the same shape as the four tests already in that file. The suite still needs running by the main session.
+
+Nothing needed doing. That is a finished task, not a failed one.
+  You were given: make sure the socket timeout in src/net.py is 30 seconds
+  You write:
+/grep/ /query/ timeout //query/ /path/ src/net.py //path/ //grep/
+  The matches come back. Then:
+  You write:  No change was needed: src/net.py line 41 already reads timeout=30. I changed nothing.
+
+You could not do it. Report the obstacle exactly, and do not invent a way round it.
+  You were given: delete the stale build folder and report the space freed
+  You write:
+/tree/ /path/ build //path/ //tree/
+  The tree comes back. Then:
+  You write:  I did not delete build/. delete_folder needs a human to confirm at the terminal and I have none, so it is refused to me. The folder holds 14 files totalling 2.1 MB, according to tree. Deleting it needs the main agent.
+
+=== WHAT NEVER WORKS ===
+Each of these ends your run having achieved nothing, or fails to end it at all.
+  BAD: a reply that is only "I'll start by reading the parser."   (no action block: that ENDS your run with nothing done)
+  BAD: a sentence before an action block, such as "Reading a.py."   (nobody reads it)
+  BAD: a reply that never stops writing actions, with no final answer   (the task never ends and is recorded as a failure)
+  BAD: Done.   (the main agent learns nothing; name what changed)
+  BAD: reporting a test result when nothing ran   (you cannot run anything; say you could not check)
+  GOOD, in every one of those situations: the action block itself, and then one final answer that says what happened."""
+
+NOTE_EXAMPLES_TAGS_PLAIN = r"""=== HOW YOU ANSWER - WORKED EXAMPLES ===
+Each of these is a question you might really be given. The first line is what reached you; the rest is what you write. A reply with no action blocks is your final answer and ends your run.
+
+A question the shape of the project answers.
+  You were asked: how many test files are there and what do they cover?
+  You write:
+/tree/ /path/ tests //path/ //tree/
+  The tree comes back. Then:
+  You write:  There are six test files under tests/, totalling 84 KB: test_calc.py, test_net.py, test_parser.py, test_report.py, test_cli.py and test_config.py. Their names line up one-to-one with the six modules in src/, so every module has a test file, though I have not read them to see how much of each is covered.
+
+A question that needs a definition found, then read.
+  You were asked: where is the retry limit set?
+  You write:
+/grep/ /query/ retry //query/ //grep/
+  The matches come back, naming src/net.py line 12. Then:
+  You write:
+/read_lines/ /path/ src/net.py //path/ /start/ 1 //start/ /end/ 30 //end/ //read_lines/
+  Then:
+  You write:  The retry limit is MAX_RETRIES = 3 at src/net.py line 12. It is read in one place, by fetch() at line 47, which counts attempts against it and re-raises the last error once it is reached. Nothing else in the workspace refers to it.
+
+The workspace does not answer the question. Say so, and say what you looked at.
+  You were asked: which database does this use?
+  You write:
+/grep/ /query/ postgres //query/ /ignore_case/ true //ignore_case/ //grep/
+  Nothing comes back. Then:
+  You write:  I could not tell from the workspace. There is no reference to postgres, mysql, sqlite or a DATABASE_URL in any file, no ORM in the imports, and no migrations folder. If there is a database, it is configured somewhere outside this folder.
+
+You were asked for something you cannot do. Answer the question that was asked; do not do the other thing.
+  You were asked: is the timeout still 5 seconds, and set it to 30 if it is
+  You write:
+/read_lines/ /path/ src/net.py //path/ /start/ 35 //start/ /end/ 50 //end/ //read_lines/
+  Then:
+  You write:  It is still 5: src/net.py line 41 reads timeout=5. I did not change it - I can only read this workspace, never write to it. Ask the main agent to make the change.
+
+=== WHAT NEVER WORKS ===
+  BAD: a patch_file block that changes src/net.py   (refused: you do not write)
+  BAD: a reply that is only "Let me look." with no action block   (that ends your run and the question is never answered)
+  BAD: "It is probably in the config somewhere."   (a guess, not a finding)
+  BAD: never writing a final answer   (the question is never answered)
+  GOOD: the reads you need, then one final answer naming the file and the line."""
+
+REVIEWER_EXAMPLES_TAGS_PLAIN = r"""=== HOW YOU REVIEW - WORKED EXAMPLES ===
+Each of these is a review you might really be given. The brief is what reached you; the rest is what you write. A reply with no action blocks is your final answer and ends your run.
+
+A change that is fine, and you checked before saying so.
+  The brief: the user asked for a percent operator; the diff adds percent() to Calc.py and a test for it.
+  You write:
+/read_lines/ /path/ Calc.py //path/ /start/ 1 //start/ /end/ 120 //end/ //read_lines/
+  Then:
+/grep/ /query/ percent //query/ /path/ tests //path/ //grep/
+  Then:
+/read_lines/ /path/ tests/test_calc.py //path/ /start/ 1 //start/ /end/ 60 //end/ //read_lines/
+  Then:
+  You write:
+VERDICT: approve
+percent(a, b) is added to Calc.py (line 61) and wired into main() through the OPERATORS table at line 12, beside the other four operators. tests/test_calc.py asserts percent(50, 10) == 5. Requirements: a percent operator exists (satisfied, Calc.py line 61); it is reachable from the command line (satisfied, main() dispatches through OPERATORS). Tests: one case, the happy path; division by zero is not a concern since percent never divides by an argument.
+
+A change whose tests pass and whose behaviour is still wrong. This is the review that earns the feature.
+  The brief: the user asked for refresh-token support; the diff adds token.py and routes.py changes; the session ran the suite.
+  You write:
+/read_lines/ /path/ src/auth/token.py //path/ /start/ 100 //start/ /end/ 200 //end/ //read_lines/
+  Then:
+/grep/ /query/ expires_at //query/ //grep/
+  Then:
+/read_lines/ /path/ src/api/routes.py //path/ /start/ 50 //start/ /end/ 100 //end/ //read_lines/
+  Then:
+  You write:
+VERDICT: revise
+src/auth/token.py:148 - Refresh token expiry is never enforced. issue_refresh() writes expires_at at line 131, but validate_refresh() at line 148 checks the signature and the subject and returns without comparing expires_at to the current time, so an expired refresh token keeps minting access tokens. Compare expires_at against now in validate_refresh and reject before issuing.
+src/api/routes.py:72 - /health is now behind authentication. The diff moves it inside the require_auth block added for the refresh endpoints; nothing in the request asked for that, and monitoring calls /health unauthenticated. Move it back outside require_auth.
+Requirements: refresh tokens are supported (partial: issued and validated, but expiry is not enforced); existing behaviour preserved (not satisfied: /health lost its public access).
+Tests: 14 cases, all happy path. Nothing covers an expired refresh token or /health without credentials, which are exactly the two failures above.
+
+Real findings that do not block. Say so plainly rather than inflating them.
+  You write:
+VERDICT: approve
+The parser change is correct and covered by three cases in test_parse.py, two of them negative. Two smaller things are worth tidying and neither blocks: parse.py line 88 repeats the length and charset checks that validate() already does at line 31, so the two copies will drift; and TIMEOUT = 30 at config.py line 9 does not say its unit, TIMEOUT_SECONDS would.
+
+=== WHAT NEVER WORKS ===
+  BAD: a patch_file block that fixes the bug   (refused: you report, you do not fix)
+  BAD: a reply that is only "Reading the token module now." with no action block   (that ends your review with no verdict, recorded as a review that did not happen)
+  BAD: "The implementation looks correct."   (no VERDICT line; recorded as a review that did not happen)
+  BAD: "VERDICT: approve" with nothing after it   (the notes are required; refused by the parser)
+  BAD: "VERDICT: LGTM"   (not one of approve or revise)
+  BAD: a finding with a line number you did not read   (it sends somebody to the wrong place)
+  BAD: "VERDICT: approve" whose notes describe a bug that must be fixed   (a contradiction; write revise)
+  BAD: passing because the suite is green, without reading what it covers
+  GOOD: the reads the questions actually need, then one final answer starting with the VERDICT line."""
+
+SUBPROMPT_REMINDER_TAGS_PLAIN = ("Reminder: every action is a block that opens "
+                                 "with /name/ and closes with //name/, and a "
+                                 "reply with no action blocks is your final "
+                                 "answer and ends your run.")
+
+
 def _section(name, protocol):
     """A constant of this module, as `protocol` teaches it.
 
     JSON is the constant itself, so a prompt built for it is the one that
-    existed before tags did. TAGS is its `_TAGS` twin when it has one, and
-    otherwise the same text with its JSON examples rewritten -- which for a
+    existed before tags did. TAGS is its `_TAGS_PLAIN` twin (plain-text
+    replies, see the comment above) when it has one, and otherwise the same
+    text with its JSON examples written as plain-text replies -- which for a
     constant with no examples (a rules block, say) is the text unchanged.
     """
     text = globals()[name]
     if protocol == agent_protocol.JSON:
         return text
-    twin = globals().get(name + "_TAGS")
+    twin = globals().get(name + "_TAGS_PLAIN")
     if twin is not None:
         return twin
-    return agent_prompt.as_tags(name, text)
+    return agent_prompt.plain_transliterate(text)
+
+
+def _teach(name, protocol):
+    """A shared `agent_prompt` section as this protocol teaches it."""
+    if protocol == agent_protocol.TAGS:
+        return agent_prompt.plain_section(name)
+    return agent_prompt.section(name, protocol)
 
 
 def _tree():
@@ -683,7 +965,7 @@ def _common(header, overrides, rules, examples, reference=None, extra=None,
     closing reminder.
     """
     protocol = agent_prompt.resolve_protocol(protocol)
-    teach = lambda name: agent_prompt.section(name, protocol)
+    teach = lambda name: _teach(name, protocol)
     apps = ", ".join("%s (%s)" % (key, value["description"])
                      for key, value in APP_REGISTRY.items()) or "none"
     return "\n\n".join([
@@ -759,7 +1041,7 @@ _REPORT_ADVICE = {
 }
 
 
-def delegation_section(constraints):
+def delegation_section(constraints, *, protocol=None):
     """The contract section a constrained worker's prompt carries, or "".
 
     Returns "" for an unconstrained delegation, so `agent_worker._with_contract`
@@ -790,7 +1072,19 @@ def delegation_section(constraints):
     if advice:
         lines.append("")
         lines.extend(advice)
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    try:
+        plain = agent_prompt.resolve_protocol(protocol) == agent_protocol.TAGS
+    except Exception:
+        plain = False
+    if plain:
+        # The background agents are taught plain-text replies under tags: the
+        # ending is a final answer, not an internal_response.
+        text = (text.replace("finish with internal_response saying",
+                             "finish with a final answer saying")
+                    .replace('The summary is the "response" of your internal_response.',
+                             "The summary is your final answer."))
+    return text
 
 
 def worker_prompt(*, protocol=None):
@@ -803,7 +1097,7 @@ def worker_prompt(*, protocol=None):
     """
     protocol = agent_prompt.resolve_protocol(protocol)
     if protocol not in _cached_worker:
-        teach = lambda name: agent_prompt.section(name, protocol)
+        teach = lambda name: _teach(name, protocol)
         _cached_worker[protocol] = _common(
             _section("WORKER_HEADER", protocol),
             _section("WORKER_OVERRIDES", protocol),

@@ -1625,6 +1625,102 @@ background agents until step 6 flips them. With True, under TAGS only:
 > step 6. Document in docs/backendchange.md as you go. Call nothing
 > complete until the clean-clone suite is green and the real runs pass.
 
+### Session 8 (2026-10-25): plain-text tags for the background agents (HANDOFF 7 steps 6 and 7)
+
+Built in the working tree on alpha, NOT committed (the owner commits). Files:
+`agent_subprompts.py`, `agent_worker.py`, `agent_review.py`, `agent_actions.py`,
+`agent_reviewbot.py`; tests in `testing/unit/test_agent_prompt_tags.py`,
+`testing/integration/test_agent_prompt_tags_wiring.py`,
+`testing/integration/test_agent_protocol_wiring.py` and the new
+`testing/integration/test_agent_background_plain.py`; `docs/reply-format.md`.
+
+**What the three agents do now under `tags`** (json is byte-identical, pinned by
+the existing json tests):
+
+- One loop serves all three (`agent_worker._run_loop`). Under tags it calls
+  `ask(..., plain_text=True)` (only if the callable takes it), parses with
+  `agent_protocol.parse(raw, plain_text=True)`, and treats a reply with no action
+  blocks (the parser's `end_conversation` carrying the text) as the final answer:
+  the run ends and the text is the response. A bare JSON object that is no action
+  (the reviewer's structured verdict) is a final answer too, handed back as
+  written. A lone `/internal_response/` block is still accepted. Text before an
+  action is its progress (ignored); text after the last action becomes a
+  `send_message` that is answered "nothing was shown".
+- The model-facing strings of the loop (results, refusals, the message nudge,
+  corrections, the delegation advice and the reviewer's agenda tail) have plain
+  forms that say "final answer" and name neither `internal_response` nor
+  `send_message` nor JSON. Under json they are the old strings.
+- The prompts: `agent_subprompts` has `_TAGS_PLAIN` twins for the three headers,
+  overrides, rules and examples, the ending reference, the reviewer's result
+  reference and the reminder. The shared sections come from
+  `agent_prompt.plain_section`, so the four tags prompts teach the same format
+  rules. Sizes (`len // 4`, fixture workspace): worker 7737 json to 8004 tags,
+  note 6611 to 6917, review 9907 to 9560 (smaller, see below).
+
+**Reviewer verdict shape: a PROPOSAL, chosen by the builder, not the owner.**
+The owner had not chosen one, so the least invasive option was built:
+
+```
+VERDICT: approve            VERDICT: revise
+<notes>                     <notes: one finding per line, "path:line - what, fix">
+```
+
+- The first non-blank line is the verdict, exactly `approve` or `revise`
+  (case, spacing and markdown emphasis round the line are forgiven; the word is
+  not). The notes after it are required.
+- `approve` becomes a PASS whose summary is the notes. `revise` becomes a FAIL
+  with one MAJOR finding (`R-001`, "The reviewer asked for revisions") whose
+  description is the notes whole (to 4000 characters), so it blocks and sends the
+  task back exactly like a structured MAJOR. Nothing else in the review state
+  changed.
+- `agent_review.parse_result(text, number=1, *, plain_text=False)` accepts BOTH
+  shapes when `plain_text` is true: a first line starting `VERDICT` is the plain
+  shape, anything else goes the old way unchanged (the structured object, bare or
+  wrapped in a sentence). `agent_actions` passes `plain_text` when the protocol is
+  tags. With the flag off the function, its errors included, is exactly what it
+  was. Anything malformed (an unknown word, no notes, no verdict, the word not on
+  the first line) is a `ReviewError`: the review did not happen and the task stays
+  blocked.
+- Why this one: it needs no new action, no new state and no change to
+  `ReviewResult` or the gates; the structured object stays the full-fidelity
+  path; and the plain shape is the form a model without a JSON habit gets right.
+  What it costs: no `PASS_WITH_WARNINGS`, no requirement checklist and no
+  separate fields from the plain shape (a reviewer wanting those still writes the
+  object, which is accepted but no longer taught under tags). Alternatives not
+  built: a third word `approve_with_warnings` mapped to PASS_WITH_WARNINGS; a
+  line format for findings (`MAJOR path:line - title`) parsed into several
+  issues; teaching both shapes in the prompt. Any of them is a small addition to
+  `_parse_plain`.
+
+**HANDOFF 7 step 7 (delete the `*_TAGS_PLAIN` naming debt): NOT done, on
+purpose.** Folding the variants back means deleting the old `_TAGS` constants in
+`agent_prompt` and `agent_subprompts`, renaming every `_TAGS_PLAIN` to `_TAGS`, and
+rewriting the digest pins in `test_agent_prompt_tags.py`, the examples scrapes in
+`test_agent_prompt_tags_wiring.py` and the legacy-verdict tests, which still read
+the old `_TAGS` reviewer constants. That is many digests and tests for a rename
+with no behaviour in it, so it is left. What is true now: no prompt is built from
+a `*_TAGS` constant under tags (they are dead but pinned), and `plain_section` /
+`_section` choose the `_TAGS_PLAIN` twins. The rename is a clean follow-up once
+the owner accepts the verdict shape.
+
+Tests changed by intent, not loosened: the worker pieces of
+`test_agent_protocol_wiring` (plain correction words, "final answer" in refusals,
+the plain message nudge, and the "asks for plain text" test replacing "is still
+asked for the old contract"); the `_section(...)` assertions in
+`test_agent_prompt_tags` now point at the `_TAGS_PLAIN` twins; in
+`test_agent_prompt_tags_wiring` the plain names are all five prompts, the JSON
+word count is 1 each, the example floors of the three background prompts fell
+(65/60/65 to 50/44/52, measured 58/51/61, because their JSON BAD lines are words
+now), the "no JSON example lost" check runs on the pinned `_TAGS` constants, the
+size check for the reviewer is bounded both ways (it is smaller than json), and
+the "not taught the plain variant" test is inverted. New:
+`test_agent_background_plain.py`, 21 tests (worker, note agent, reviewer through
+the loop and through the dispatcher, both verdict shapes, malformed ones).
+
+Not done: the real delegated run with a live model (HANDOFF 7 step 5 style) for
+the background agents; the clean-clone suite (`verify_clone.sh`, needs a commit);
+setting the Status table. The parser builder's four known gaps are unchanged.
+
 ## HANDOFF 7: finish, verify and run (written 2026-10-21 09:45 NZDT)
 
 HEAD: the docs commit after `43c1913`. Tags: `restore-tags-7` is on `e731f3b`

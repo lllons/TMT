@@ -558,7 +558,15 @@ def test_the_three_background_headers_say_tag_parser_under_tags():
         assert tags_text.replace(agent_subprompts._PARSER_PARAGRAPH_TAGS,
                                  agent_subprompts._PARSER_PARAGRAPH) == json_text, name
         assert agent_subprompts._section(name, "json") is json_text
-        assert agent_subprompts._section(name, "tags") is tags_text
+        # Under tags the prompt is taught plain-text replies (Session 8); the
+        # `_TAGS` constant stays, digest-pinned, but no prompt reads it.
+        plain_text = getattr(agent_subprompts, name + "_TAGS_PLAIN")
+        assert agent_subprompts._section(name, "tags") is plain_text
+        assert "It goes to a tag parser" in plain_text, name
+        assert "JSON" not in plain_text and "internal_response" not in plain_text, name
+        assert "a reply with no action blocks at all is your final answer" in plain_text, name
+        assert plain_text.replace(agent_subprompts._PARSER_PARAGRAPH_PLAIN,
+                                  agent_subprompts._PARSER_PARAGRAPH) != json_text, name
 
 
 def test_the_reviewers_verdict_is_still_json_but_is_written_raw_under_tags():
@@ -596,17 +604,23 @@ def test_the_background_reminder_is_switched_with_the_protocol():
     assert tags.startswith("Reminder: reply with tag blocks only.")
     assert tags.endswith("Finish with exactly one internal_response.")
     assert "{" not in tags and "JSON" not in tags
-    assert agent_subprompts._section("SUBPROMPT_REMINDER", "tags") is tags
+    # Under tags the background agents read the plain-text reminder.
+    plain = agent_subprompts.SUBPROMPT_REMINDER_TAGS_PLAIN
+    assert agent_subprompts._section("SUBPROMPT_REMINDER", "tags") is plain
+    assert "final answer" in plain and "{" not in plain and "JSON" not in plain
+    assert "internal_response" not in plain
     assert agent_subprompts._section("SUBPROMPT_REMINDER", "json") \
         is agent_subprompts.SUBPROMPT_REMINDER
 
 
-def test_a_background_constant_with_no_twin_is_derived_from_its_examples():
+def test_a_background_constant_with_no_plain_twin_is_derived_from_its_examples():
+    # The ending reference has a hand-written plain twin now ...
     text = agent_subprompts._section("INTERNAL_RESPONSE_REFERENCE", "tags")
-    assert not JSON_EXAMPLE_LINE.search(text)
-    assert len(tag_examples(text)) == 2
+    assert text is agent_subprompts.INTERNAL_RESPONSE_REFERENCE_TAGS_PLAIN
+    assert "NO action blocks" in text and "internal_response" not in text
     assert agent_subprompts._section("INTERNAL_RESPONSE_REFERENCE", "json") \
         is agent_subprompts.INTERNAL_RESPONSE_REFERENCE
+    # ... and one with no twin is its JSON examples written as plain replies.
     agenda = agent_subprompts._section("REVIEW_AGENDA_REFERENCE", "tags")
     assert not JSON_EXAMPLE_LINE.search(agenda)
     assert len(tag_examples(agenda)) >= 6

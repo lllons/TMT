@@ -61,14 +61,20 @@ EVERYTHING = "Build it /plan /review /verify"
 
 PROMPT_NAMES = ("main", "main (all three)", "worker", "note", "review")
 
-# The main agent under tags is taught the plain-text variant (the temporary
-# third variant in agent_prompt); its own checks are the plain-text tests at the end of this file.
-PLAIN_NAMES = ("main", "main (all three)")
+# Every agent under tags is taught the plain-text variant (the temporary third
+# variant in agent_prompt, and its `_TAGS_PLAIN` twins in agent_subprompts); the
+# plain-text checks are the tests at the end of this file.
+PLAIN_NAMES = PROMPT_NAMES
 
 # A floor per prompt, below what each measured when this was written (111, 124,
 # 75, 67 and 76 blocks). They are not the point; a scrape that came back empty
 # passing every assertion below is, and these are what stop it.
-FLOORS = {"main": 80, "main (all three)": 95, "worker": 65, "note": 60, "review": 65}
+#
+# The three background floors were lowered (65, 60 and 65 to 50, 44 and 52) when
+# the background agents moved to plain text: their old JSON "BAD" lines, each
+# counted as a block, are described in words now, and the plain examples are
+# fewer. They measure 58, 51 and 61.
+FLOORS = {"main": 80, "main (all three)": 95, "worker": 50, "note": 44, "review": 52}
 
 
 def build(protocol):
@@ -174,7 +180,7 @@ def test_an_explicit_protocol_beats_the_setting_in_both_directions():
             assert agent_prompt.get_system_prompt(protocol="tags") \
                 .endswith(agent_prompt.REMINDER_TAGS_PLAIN)
             assert agent_subprompts.worker_prompt(protocol="tags") \
-                .endswith(agent_subprompts.SUBPROMPT_REMINDER_TAGS)
+                .endswith(agent_subprompts.SUBPROMPT_REMINDER_TAGS_PLAIN)
         with ReplyFormat("tags"):
             assert agent_prompt.get_system_prompt(protocol="json") \
                 .endswith(agent_prompt.REMINDER)
@@ -228,19 +234,18 @@ def test_every_tag_example_in_every_tags_prompt_is_parsed_validated_and_exact():
 
 
 def test_no_json_example_was_lost_in_the_translation():
-    """Each JSON example line becomes at least one tag block, so a tags prompt
-    with FEWER blocks than the JSON prompt has example lines dropped one."""
-    def check(box):
-        json_prompts, tags_prompts = build("json"), build("tags")
-        for name in PROMPT_NAMES:
-            if name in PLAIN_NAMES:
-                continue  # taught as plain-text replies; the plain-text tests at the end of this file cover them
-            lines = len(JSON_EXAMPLE_LINE.findall(json_prompts[name]))
-            blocks = len(tag_examples(tags_prompts[name]))
-            assert lines > 0, name
-            assert blocks >= lines, \
-                "%s: %d JSON example lines but only %d tag blocks" % (name, lines, blocks)
-    with_project(check)
+    """Each JSON example line becomes at least one tag block, so a tags
+    constant with FEWER blocks than the JSON one has example lines dropped one.
+    No prompt is built from the old `_TAGS` constants any more (every agent is
+    taught plain text under tags), but they stay, digest-pinned, so the check
+    is made on them; the plain prompts' examples are covered by the plain-text
+    tests at the end of this file."""
+    for name in ("WORKER_EXAMPLES", "NOTE_EXAMPLES", "REVIEWER_EXAMPLES"):
+        lines = len(JSON_EXAMPLE_LINE.findall(getattr(agent_subprompts, name)))
+        blocks = len(tag_examples(getattr(agent_subprompts, name + "_TAGS")))
+        assert lines > 0, name
+        assert blocks >= lines, \
+            "%s: %d JSON example lines but only %d tag blocks" % (name, lines, blocks)
 
 
 def test_no_tags_prompt_still_quotes_the_json_syntax_the_swaps_replaced():
@@ -276,8 +281,10 @@ ALLOWED_JSON_LINES = (
 
 def test_the_word_json_appears_in_a_tags_prompt_only_where_it_is_allowed():
     def check(box):
+        # Only the file format read_document converts: the plain-text reviewer's
+        # verdict is not JSON either.
         expected = {
-            "main": 1, "main (all three)": 1, "worker": 2, "note": 2, "review": 3}
+            "main": 1, "main (all three)": 1, "worker": 1, "note": 1, "review": 1}
         for name, prompt in build("tags").items():
             lines = [line for line in prompt.split("\n") if re.search(r"\bJSON\b", line)]
             for line in lines:
@@ -293,9 +300,8 @@ def test_the_word_json_appears_in_a_tags_prompt_only_where_it_is_allowed():
             assert not others, "%s prompt: %r" % (name, others[:3])
         # And the verdict sentence is in the review prompt and nowhere else.
         prompts = build("tags")
-        for name in ("main", "main (all three)", "worker", "note"):
+        for name in PROMPT_NAMES:
             assert "ONE JSON object" not in prompts[name], name
-        assert "ONE JSON object" in prompts["review"]
     with_project(check)
 
 
@@ -316,6 +322,9 @@ def test_the_strict_sentences_are_in_every_tags_prompt():
     def check(box):
         for name, prompt in build("tags").items():
             if name in PLAIN_NAMES:
+                assert agent_prompt.OUTPUT_RULES_TAGS_PLAIN in prompt, name
+                assert agent_prompt.OUTPUT_RULES_TAGS not in prompt, name
+                assert agent_prompt.OUTPUT_RULES not in prompt, name
                 continue
             for needle in ("Reply in TAG BLOCKS and nothing else.",
                            "NO JSON, NO code fences, NO language label",
@@ -369,19 +378,22 @@ def test_the_overrides_cite_rules_that_still_say_what_they_are_cited_for_under_t
             assert "=== WHERE THE SHARED RULES DIFFER FOR YOU ===" in prompt, name
             assert "OUTPUT FORMAT rules 10 and 11" in prompt, name
             assert "OUTPUT FORMAT rule 5" in prompt, name
-            assert agent_subprompts._SHARED_OVERRIDES in prompt, name
+            # The overrides are the plain-text ones: same rule numbers cited,
+            # the ending is a final answer, and neither old verb is named.
+            assert agent_subprompts._SHARED_OVERRIDES not in prompt, name
+            assert "a reply with no action blocks" in prompt, name
             for heading in ("=== OUTPUT FORMAT - ABSOLUTE RULES ===",
                             "=== EDITING PREFERENCES - FOLLOW IN THIS ORDER ===",
                             "=== CHOOSING A TOOL - ALWAYS TAKE THE NARROWEST ONE ==="):
                 assert heading in prompt, (name, heading)
             # What the overrides name by number, read off the tags text.
-            editing = numbered_rules(agent_prompt.section("PREFERENCE_RULES", "tags"))
-            choosing = numbered_rules(agent_prompt.section("TOOL_CHOICE_RULES", "tags"))
+            editing = numbered_rules(agent_prompt.plain_section("PREFERENCE_RULES"))
+            choosing = numbered_rules(agent_prompt.plain_section("TOOL_CHOICE_RULES"))
             assert "8 KB" in editing[8] and "already pasted" in editing[8], editing[8]
             assert "8 KB" in choosing[7] and "already pasted" in choosing[7], choosing[7]
         worker = prompts["worker"]
-        assert "send_message" in worker and "internal_response" in worker
-        assert "Emitting one costs you a step" in worker
+        assert "send_message" not in worker and "internal_response" not in worker
+        assert "Emitting it costs you a step" in worker
     with_project(check)
 
 
@@ -394,7 +406,8 @@ def test_the_three_background_prompts_say_tag_parser_and_never_a_json_parser():
             assert "JSON parser" not in prompt, name
             assert "one JSON object only" not in prompt, name
             assert "the whole contract, and everything else follows from it" in prompt, name
-        assert "an internal_response" in prompts["worker"]
+        assert "your final answer, the reply with no action blocks" in prompts["worker"]
+        assert "internal_response" not in prompts["worker"]
     with_project(check)
 
 
@@ -407,7 +420,8 @@ def test_the_closing_reminder_is_the_protocols_own_in_all_five_prompts():
             assert agent_prompt.REMINDER not in tags[name], name
             assert agent_prompt.REMINDER_TAGS not in json_[name], name
         for name in ("worker", "note", "review"):
-            assert tags[name].endswith(agent_subprompts.SUBPROMPT_REMINDER_TAGS), name
+            assert tags[name].endswith(agent_subprompts.SUBPROMPT_REMINDER_TAGS_PLAIN), name
+            assert agent_subprompts.SUBPROMPT_REMINDER_TAGS not in tags[name], name
             assert json_[name].endswith(agent_subprompts.SUBPROMPT_REMINDER), name
             assert "one JSON object only" not in tags[name], name
         for name, prompt in tags.items():
@@ -436,10 +450,13 @@ def _tag_verdicts(prompt):
     return found
 
 
+# The two tests below pin the old `_TAGS` reviewer constants (no prompt is built
+# from them any more, but the structured object is still what the parser reads
+# beside the plain-text verdict), so they read the constants and not the prompt.
 def test_the_reviewers_verdict_is_the_same_json_object_written_raw_in_the_response():
     def check(box):
         original = _json_verdicts(build("json")["review"])
-        raw = _tag_verdicts(build("tags")["review"])
+        raw = _tag_verdicts(agent_subprompts.REVIEWER_EXAMPLES_TAGS)
         assert len(original) >= 3, len(original)
         # A verdict under tags is character for character the one under JSON:
         # carrying it changed, what it is did not. The tags prompt also holds
@@ -466,15 +483,20 @@ def test_the_reviewers_verdict_is_the_same_json_object_written_raw_in_the_respon
 
 def test_the_reviewer_is_told_the_verdict_needs_no_escaping_and_is_still_json():
     def check(box):
-        review = build("tags")["review"]
-        reference = agent_subprompts.REVIEW_RESULT_REFERENCE_TAGS
-        assert reference in review
+        review = (agent_subprompts.REVIEW_RESULT_REFERENCE_TAGS + "\n"
+                  + agent_subprompts.REVIEWER_EXAMPLES_TAGS)
         assert agent_subprompts.REVIEW_RESULT_REFERENCE not in review
         assert "ONE JSON object as its response" in review
         assert "no escaping" in review and "Write that object raw" in review
         assert "internal_response" in review
         # The bad examples teach what a tags verdict must not be.
         assert "/internal_response/ {\"status\":\"PASS\"} //internal_response/" in review
+        # And the prompt the reviewer actually reads under tags teaches the
+        # plain-text verdict instead, with no JSON in it.
+        prompt = build("tags")["review"]
+        assert agent_subprompts.REVIEW_RESULT_REFERENCE_TAGS_PLAIN in prompt
+        assert agent_subprompts.REVIEW_RESULT_REFERENCE_TAGS not in prompt
+        assert "VERDICT: approve" in prompt and "VERDICT: revise" in prompt
     with_project(check)
 
 
@@ -558,7 +580,13 @@ def test_the_tags_prompts_are_longer_and_by_how_much_is_in_the_message():
         message = "prompt sizes in estimated tokens, fixture workspace:\n  " + "\n  ".join(report)
         for name in PROMPT_NAMES:
             a, b = tokens(json_[name]), tokens(tags[name])
-            assert a < b < a * 1.35, "%s\n(%s)" % (message, name)
+            if name in ("main", "main (all three)", "worker", "note"):
+                assert a < b < a * 1.35, "%s\n(%s)" % (message, name)
+            else:
+                # The reviewer's plain-text verdict is much shorter to teach
+                # than the structured object, so it is smaller than the JSON
+                # prompt, not larger. Bounded both ways all the same.
+                assert a * 0.65 < b < a * 1.35, "%s\n(%s)" % (message, name)
         print(message)
     with_project(check)
 
@@ -712,16 +740,84 @@ def test_the_json_main_prompt_is_unchanged_by_the_plain_variant():
     with_empty_project(check)
 
 
-def test_the_three_background_tags_prompts_are_not_taught_the_plain_variant():
+BACKGROUND = ("worker", "note", "review")
+
+
+def background_plain_prompts():
+    return {
+        "worker": agent_subprompts.worker_prompt(protocol="tags"),
+        "note": agent_subprompts.note_prompt(protocol="tags"),
+        "review": agent_subprompts.review_prompt(protocol="tags"),
+    }
+
+
+def test_the_three_background_tags_prompts_are_taught_the_plain_variant():
     def check(box):
-        for name, prompt in (("worker", agent_subprompts.worker_prompt(protocol="tags")),
-                             ("note", agent_subprompts.note_prompt(protocol="tags")),
-                             ("review", agent_subprompts.review_prompt(protocol="tags"))):
-            for constant in ("HEADER_TAGS_PLAIN", "SPEAKING_RULES_TAGS_PLAIN",
-                             "OUTPUT_RULES_TAGS_PLAIN", "REMINDER_TAGS_PLAIN"):
-                assert getattr(agent_prompt, constant) not in prompt, (name, constant)
-            assert agent_prompt.OUTPUT_RULES_TAGS in prompt, name
+        for name, prompt in background_plain_prompts().items():
+            # The main agent's plain rules, shared; its header and speaking
+            # rules are the main agent's own and are not.
+            assert agent_prompt.OUTPUT_RULES_TAGS_PLAIN in prompt, name
+            assert agent_prompt.OUTPUT_RULES_TAGS not in prompt, name
+            assert agent_prompt.HEADER_TAGS_PLAIN not in prompt, name
+            assert agent_prompt.SPEAKING_RULES_TAGS_PLAIN not in prompt, name
+            assert agent_prompt.REMINDER_TAGS_PLAIN not in prompt, name
+            assert prompt.endswith(agent_subprompts.SUBPROMPT_REMINDER_TAGS_PLAIN), name
+            assert "a reply with no action blocks" in prompt.lower(), name
     with_empty_project(check)
+
+
+def test_the_background_plain_prompts_never_mention_json_braces_or_the_old_tags():
+    def check(box):
+        for name, prompt in background_plain_prompts().items():
+            assert not forbidden_in_plain(prompt), (name, forbidden_in_plain(prompt))
+            for tag in ("/progress/", "/send_message/", "/end_conversation/",
+                        "/internal_response/"):
+                assert tag not in prompt, (name, tag)
+            assert "internal_response" not in prompt, name
+            assert '{"action"' not in prompt, name
+            said = [line for line in prompt.split("\n")
+                    if "json" in line.replace("package.json", "").lower()]
+            assert len(said) == 1 and said[0].startswith("read_document - keys:"), (name, said)
+    with_empty_project(check)
+
+
+def test_every_block_in_the_background_plain_prompts_is_read_by_the_plain_parser():
+    def check(box):
+        for name, prompt in background_plain_prompts().items():
+            blocks = tag_examples(prompt)
+            assert len(blocks) >= BACKGROUND_FLOORS[name], (name, len(blocks))
+            for block in blocks:
+                check_example(block)
+                try:
+                    got = agent_protocol.parse(block, plain_text=True)
+                except agent_protocol.ProtocolError as error:
+                    raise AssertionError("%s: plain parse refuses (%s):\n%s" % (name, error, block))
+                assert got is not None and got.get("action"), (name, block)
+    with_empty_project(check)
+
+
+BACKGROUND_FLOORS = dict((name, FLOORS[name]) for name in BACKGROUND)
+
+FINAL_ANSWER = re.compile(r"^  You write:  (\S.*)$", re.M)
+
+
+def test_every_final_answer_in_the_background_examples_is_a_final_answer():
+    for name, text in (("worker", agent_subprompts.WORKER_EXAMPLES_TAGS_PLAIN),
+                       ("note", agent_subprompts.NOTE_EXAMPLES_TAGS_PLAIN)):
+        answers = FINAL_ANSWER.findall(text)
+        assert len(answers) >= 3, (name, len(answers))
+        for answer in answers:
+            got = agent_protocol.parse(answer, plain_text=True)
+            assert got["action"] == "end_conversation" and got["message"] == answer, answer
+
+
+def test_every_verdict_in_the_reviewer_plain_examples_is_read_by_parse_result():
+    text = agent_subprompts.REVIEWER_EXAMPLES_TAGS_PLAIN
+    verdicts = [chunk.split("\n\n")[0] for chunk in re.split(r"(?m)^(?=VERDICT:)", text)
+                if chunk.startswith("VERDICT:")]
+    assert len(verdicts) == 3, len(verdicts)
+    states = [agent_review.parse_result(chunk, plain_text=True).verdict for chunk in verdicts]
+    assert states == ["PASS", "FAIL", "PASS"], states
 
 
 def test_the_plain_main_prompt_size_is_reported_and_close_to_the_old_tags_prompt():

@@ -601,8 +601,12 @@ class Agenda:
         if active is not None:
             rows.append("Now on %s: %s" % (active.id, active.title))
         elif total and settled == total:
-            rows.append("Every item is reported. Finish with your "
-                        "internal_response carrying the review result.")
+            if _protocol() == "tags":
+                rows.append("Every item is reported. Finish with your final "
+                            "answer: the VERDICT line and your notes.")
+            else:
+                rows.append("Every item is reported. Finish with your "
+                            "internal_response carrying the review result.")
         return "\n".join(rows)
 
     @staticmethod

@@ -605,8 +605,61 @@ def _requirement_from(raw, index):
                              _text(raw.get("note")))
 
 
-def parse_result(text, number=1):
+# The plain-text verdict (proposed in docs/backendchange.md, "Session 8"): the
+# first line is `VERDICT: approve` or `VERDICT: revise` and every line after it
+# is the reviewer's notes. Read only under plain-text tags, beside the
+# structured object, which stays accepted unchanged.
+APPROVE = "approve"
+REVISE = "revise"
+PLAIN_VERDICTS = (APPROVE, REVISE)
+MAX_NOTES_CHARS = 4000
+_VERDICT_LINE = re.compile(r"^[\s*_`#>]*VERDICT\s*:\s*(.*?)[\s*_`]*$", re.IGNORECASE)
+
+
+def _plain_verdict(text):
+    """(word, notes) when the text opens with a VERDICT line, else None.
+
+    The line is found only as the first non-blank line, so a reviewer that
+    mentions the word in the middle of a sentence is not misread. Markdown
+    emphasis round the line is forgiven; the word itself is not.
+    """
+    lines = str(text or "").strip().splitlines()
+    if not lines:
+        return None
+    found = _VERDICT_LINE.match(lines[0])
+    if not found:
+        return None
+    return found.group(1).strip().lower(), "\n".join(lines[1:]).strip()
+
+
+def _parse_plain(word, notes, number):
+    """A ReviewResult from a plain-text verdict, or a ReviewError."""
+    if word not in PLAIN_VERDICTS:
+        raise ReviewError("'%s' is not a verdict. The first line must be "
+                          "\"VERDICT: approve\" or \"VERDICT: revise\"." % word)
+    if not notes:
+        raise ReviewError("The reviewer's verdict has no notes. Say after the "
+                          "VERDICT line what was reviewed and what was "
+                          "concluded.")
+    summary = _text(notes, MAX_SUMMARY_CHARS)
+    if word == APPROVE:
+        return ReviewResult(PASS, summary=summary, number=number)
+    # A revise is one blocking finding carrying the notes whole, so that it
+    # sends the task back exactly as a structured MAJOR does.
+    issue = ReviewIssue("R-001", MAJOR, "The reviewer asked for revisions",
+                        _text(notes, MAX_NOTES_CHARS))
+    return ReviewResult(FAIL, summary=_text(notes.splitlines()[0], MAX_SUMMARY_CHARS),
+                        issues=[issue], number=number)
+
+
+def parse_result(text, number=1, *, plain_text=False):
     """A ReviewResult from what a reviewer agent returned, or a ReviewError.
+
+    With `plain_text` (the reviewer under plain-text tags) a reply whose first
+    line is `VERDICT: approve` or `VERDICT: revise` is read as the plain
+    shape; anything else, including a structured object, goes the old way, so
+    the object stays accepted unchanged. Without it the function is exactly
+    what it was.
 
     THE gate on section 15 of the brief. Nothing else in this module builds a
     ReviewResult, and `ReviewState.settle` takes nothing else -- so the only
@@ -620,7 +673,15 @@ def parse_result(text, number=1):
     that could not be read is not a review that passed, and there is no shape
     of malformed output that this function will quietly wave through.
     """
+    if plain_text:
+        plain = _plain_verdict(text)
+        if plain is not None:
+            return _parse_plain(plain[0], plain[1], number)
     body = _first_object(text)
+    if not body and plain_text:
+        raise ReviewError("The reviewer's answer has no verdict. A review must "
+                          "start with \"VERDICT: approve\" or \"VERDICT: "
+                          "revise\" and carry its notes on the lines after it.")
     if not body:
         raise ReviewError("The reviewer returned no JSON object. A review must "
                           "end with one object carrying \"status\", \"summary\" "

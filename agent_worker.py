@@ -55,6 +55,8 @@ scope, so this module still imports cleanly when one of them is mid-edit or
 absent from a frozen install's module list.
 """
 
+import inspect
+
 import agent_delegation
 from agent_manager import WorkerCancelled, WorkerTimedOut, clip_activity
 
@@ -247,6 +249,51 @@ def _protocol():
         return "json"
 
 
+def _plain():
+    """Whether replies are read as plain text: tags only, like the main loop."""
+    try:
+        import agent_protocol
+        return agent_protocol.normal(_protocol()) == agent_protocol.TAGS
+    except Exception:
+        return False
+
+
+def _plain_ask_kwargs(ask, plain):
+    """`{"plain_text": True}` when asked for and `ask` can take it, else nothing.
+
+    Nothing under JSON, so that path calls `ask` exactly as it always did, and
+    a stand-in written against the older signature keeps working.
+    """
+    if not plain:
+        return {}
+    try:
+        params = inspect.signature(ask).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "plain_text" in params or any(p.kind == p.VAR_KEYWORD for p in params.values()):
+        return {"plain_text": True}
+    return {}
+
+
+# The few model-facing sentences below (and in agent_delegation) that name
+# internal_response, in the words a plain-text background agent is taught.
+_PLAIN_WORDS = (
+    ("or finish with internal_response.", "or give your final answer."),
+    ("your only terminal verb is internal_response.",
+     "the only way your run ends is a final answer, a reply with no action blocks."),
+    ("in your internal_response", "in your final answer"),
+)
+
+
+def _plain_words(text):
+    """`text` as a plain-text background agent should read it; unchanged under JSON."""
+    if not text or not _plain():
+        return text
+    for old, new in _PLAIN_WORDS:
+        text = text.replace(old, new)
+    return text
+
+
 def _correction(kind, **fields):
     """A sentence about the shape of a reply, in the reply format in force.
 
@@ -259,8 +306,15 @@ def _correction(kind, **fields):
     loop's: a background agent is not told "Emit the action you meant".
     """
     import agent_protocol
+    if _plain():
+        return agent_protocol.correction(kind, _protocol(), plain_text=True, **fields)
     return agent_protocol.correction(kind, _protocol(), **fields)
 
+
+_MESSAGE_SENT_PLAIN = ("Noted, and nothing was shown. Nothing you write "
+                       "reaches anybody -- you have no user -- so text beside "
+                       "an action tells nobody. The task is not finished: "
+                       "write the action you just described.")
 
 _MESSAGE_SENT = ("Noted, and nothing was shown. Nothing you write reaches "
                  "anybody -- you have no user -- so send_message costs a step "
@@ -600,7 +654,7 @@ def _activity_label(action, obj):
     return clip_activity(("%s %s" % (label, target)).strip())
 
 
-def _result_message(action, result):
+def _result_message(action, result, plain=False):
     """What the model is told after an action ran.
 
     Deliberately not `agent_actions.build_result_message`: that one ends a
@@ -615,6 +669,9 @@ def _result_message(action, result):
     if action == "patch_file" and "Search text not found" in text:
         return ("FAILED: %s\nThe search string did not match exactly. Use "
                 "grep or read_lines, then retry." % text)
+    if plain:
+        return ("Result: %s\nWrite your next action, or your final answer (a "
+                "reply with no action blocks) when the task is done." % text)
     return ("Result: %s\nOutput your next action, or internal_response when "
             "the task is done." % text)
 
@@ -791,7 +848,7 @@ def _constraint_refusal(manager, record, action, obj, constraints):
     the register cannot be written to. Refusing and forgetting is a smaller
     failure than remembering and allowing.
     """
-    said = agent_delegation.refusal(constraints, action)
+    said = _plain_words(agent_delegation.refusal(constraints, action))
     if not said:
         return ""
     try:
@@ -821,11 +878,12 @@ def _refusal(action, allowed, forbidden, read_only=_NOT_A_NOTE_VERB):
         # reason. Told it was "not a worker verb" the model would reasonably
         # try to reach the same effect another way; told the confirmation
         # cannot happen, it reports the path instead.
-        return _REFUSED % (action, _NEEDS_A_TERMINAL)
+        return _plain_words(_REFUSED % (action, _NEEDS_A_TERMINAL))
     if action in forbidden:
-        return _REFUSED % (action, _WHY_FORBIDDEN.get(action, _NOT_A_WORKER_VERB))
+        return _plain_words(
+            _REFUSED % (action, _WHY_FORBIDDEN.get(action, _NOT_A_WORKER_VERB)))
     if allowed is not None and action not in allowed:
-        return _REFUSED % (action, read_only)
+        return _plain_words(_REFUSED % (action, read_only))
     return ""
 
 
@@ -983,8 +1041,13 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
                            tokens_in=_tokens_for_chars(_message_chars(messages)),
                            input_exact=False)
         sink.begin(settled_out)
+        # Under tags a reply is read as plain text, like the main agent's: a
+        # reply with no action blocks is the final answer. Read per step,
+        # because Settings can change the format while an agent runs.
+        plain = _plain()
         raw = ask(messages, on_event=sink.handle, model=record.model or None,
-                  max_tokens=max_tokens, quiet=True)
+                  max_tokens=max_tokens, quiet=True,
+                  **_plain_ask_kwargs(ask, plain))
         # A kill that landed while the request was in flight arrives here. The
         # stream handler raises, but `ask_model` catches broadly on its way
         # out and can turn the exception into a fabricated reply, so the flag
@@ -1015,7 +1078,8 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
         # stays the model's own text for the history and the breaker.
         try:
             import agent_protocol
-            obj = agent_protocol.parse(raw)
+            obj = (agent_protocol.parse(raw, plain_text=True) if plain
+                   else agent_protocol.parse(raw))
             _adopt_verb(obj)
         except (ValueError, TypeError) as error:
             if hand_back(raw, _correction("worker_unreadable", error=error)):
@@ -1031,7 +1095,9 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
         # A reply in the format that is NOT in force is accepted and the
         # model is told so on the result it gets back, once per reply. There
         # is no user here to show a row to.
-        drifted = agent_protocol.drift(_protocol(), agent_protocol.detect(raw))
+        drifted = agent_protocol.drift(
+            _protocol(), agent_protocol.detect(raw, plain_text=True) if plain
+            else agent_protocol.detect(raw))
         drift_tail = "\n" + drifted if drifted else ""
 
         parse_failed, provider_failed, prose = _reply_flags(obj)
@@ -1061,10 +1127,21 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
                          "stopped: the model wrote prose instead of an action "
                          "%d times without doing any work" % retries)
 
+        if (plain and not obj.get("action") and not obj.get("actions")
+                and agent_protocol.detect(raw, plain_text=True) == agent_protocol.JSON):
+            # A bare JSON object that is no action: the reviewer's structured
+            # verdict, still accepted. It is text with no action blocks like any
+            # other, so it is the final answer, handed back as written.
+            return raw.strip()
+        if plain and obj.get("action") == "end_conversation":
+            # A reply with no action blocks (the parser reads it as an
+            # ending carrying the text) is the final answer: the response.
+            return str(obj.get("message", "")).strip()
+
         if isinstance(obj.get("actions"), list) and obj["actions"]:
             outcome, response, ran = _run_batch(
                 obj["actions"], record, manager, dispatch, allowed, forbidden,
-                read_only=read_only, constraints=constraints)
+                read_only=read_only, constraints=constraints, plain=plain)
             if ran:
                 acted = True
             if outcome == "response":
@@ -1079,8 +1156,11 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
             retries = 0
             messages.append({"role": "assistant", "content": raw})
             messages.append({"role": "user", "content": _with_images(
-                "Batch results:\n%s\nOutput your next action, or "
-                "internal_response when the task is done."
+                ("Batch results:\n%s\nWrite your next action, or your final "
+                 "answer (a reply with no action blocks) when the task is done."
+                 if plain else
+                 "Batch results:\n%s\nOutput your next action, or "
+                 "internal_response when the task is done.")
                 % "\n".join(response) + agenda_nudge() + drift_tail,
                 obj["actions"])})
             continue
@@ -1119,7 +1199,8 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
             steps += 1
             retries = 0
             messages.append({"role": "assistant", "content": raw})
-            messages.append({"role": "user", "content": _MESSAGE_SENT + drift_tail})
+            messages.append({"role": "user", "content": (
+                _MESSAGE_SENT_PLAIN if plain else _MESSAGE_SENT) + drift_tail})
             continue
         if action == AGENDA_ACTION:
             # The reviewbot's readout, applied here rather than dispatched.
@@ -1165,7 +1246,8 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
         messages.append({"role": "assistant", "content": raw})
         messages.append({"role": "user",
                          "content": _with_images(
-                             _result_message(action, result) + agenda_nudge()
+                             (_result_message(action, result, plain=True) if plain
+                              else _result_message(action, result)) + agenda_nudge()
                              + drift_tail,
                              [obj])})
 
@@ -1175,7 +1257,7 @@ def _run_loop(record, manager, ask, execute, system_prompt, allowed, forbidden,
 
 
 def _run_batch(batch, record, manager, dispatch, allowed, forbidden,
-               read_only=_NOT_A_NOTE_VERB, constraints=None):
+               read_only=_NOT_A_NOTE_VERB, constraints=None, plain=False):
     """Run a batch of actions. Returns (outcome, payload, ran_anything).
 
     `outcome` is "response" when an entry finished the agent, "invalid" when
@@ -1207,7 +1289,9 @@ def _run_batch(batch, record, manager, dispatch, allowed, forbidden,
         if refusal:
             return "invalid", _batch_complaint(refusal, results), ran
         if action == SEND_MESSAGE:
-            results.append("%s: nothing was shown; nobody sees your messages" % action)
+            results.append("text beside the actions: nothing was shown; nobody sees it"
+                           if plain else
+                           "%s: nothing was shown; nobody sees your messages" % action)
             continue
         if action == AGENDA_ACTION:
             # Answered here as well as on the single-action path, because a

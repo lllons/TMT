@@ -697,8 +697,11 @@ def test_a_worker_is_told_about_drift_on_a_batch_and_a_message_too():
         ask = ModelReplies([compact({"action": "send_message", "message": "hi"}),
                             finish])
         run_agent(record, manager, ask, Executor("x"))
+        # Background agents are taught plain text under tags, so the sentence is
+        # the plain one and names no send_message.
         assert ask.calls[1]["messages"][-1]["content"] == (
-            agent_worker._MESSAGE_SENT + line)
+            agent_worker._MESSAGE_SENT_PLAIN + line)
+        assert "send_message" not in agent_worker._MESSAGE_SENT_PLAIN
 
 
 def test_a_reply_in_the_format_in_force_carries_no_drift_line():
@@ -822,16 +825,19 @@ def test_a_worker_is_corrected_in_the_words_of_tags():
                             finish])
         run_agent(record, manager, ask, Executor())
         complaint = ask.calls[1]["messages"][-1]["content"]
-        assert complaint.startswith("INVALID: that reply could not be read as tags."), complaint
-        assert "JSON" not in complaint.split("The parser said:")[0], complaint
-        assert "/action_name/" in complaint, complaint
+        # The worker is taught plain text under tags, so it is corrected in
+        # plain words: no JSON, no "tags only", a final answer allowed.
+        assert complaint.startswith("INVALID: that reply could not be read."), complaint
+        assert "JSON" not in complaint, complaint
+        assert "/action_name/" in complaint and "final answer" in complaint, complaint
         # A refused verb: the sentence names the verb and the way out.
         record = manager.spawn("two")
         ask = ModelReplies([tags({"action": "git_push"}), finish])
         execute = Executor()
         run_agent(record, manager, ask, execute)
         refused = ask.calls[1]["messages"][-1]["content"]
-        assert "REFUSED" in refused and "internal_response" in refused, refused
+        assert "REFUSED" in refused and "final answer" in refused, refused
+        assert "internal_response" not in refused, refused
         assert execute.actions == [], execute.actions
 
         # An action that raised: the typing advice is the tag protocol's.
@@ -1123,8 +1129,8 @@ def test_the_json_correction_is_unchanged_by_plain_text():
             "INVALID: x. Output a corrected action JSON."
 
 
-def test_a_worker_is_still_asked_for_the_old_contract():
-    """The worker loop never passes plain_text, so its reader is the default."""
+def test_a_worker_asks_for_plain_text_under_tags_and_never_under_json():
+    """The worker loop passes plain_text under tags (only), so its reader is the plain one."""
     seen_kwargs = []
     finish = tags({"action": "internal_response", "response": "done"})
 
@@ -1136,8 +1142,15 @@ def test_a_worker_is_still_asked_for_the_old_contract():
     record = manager.spawn("do it")
     with ReplyFormat("tags"):
         assert run_agent(record, manager, ask, Executor("x")) == "done"
+    assert seen_kwargs and all(kwargs.get("plain_text") is True for kwargs in seen_kwargs)
+    seen_kwargs.clear()
+    record = manager.spawn("do it again")
+    with ReplyFormat("json"):
+        run_agent(record, manager, lambda messages, **kw: (seen_kwargs.append(kw)
+                  or compact({"action": "internal_response", "response": "done"})),
+                  Executor("x"))
     assert seen_kwargs and all("plain_text" not in kwargs for kwargs in seen_kwargs)
-    # And the reader it gets from `agent_model` is the default one.
+    # The default reader of `agent_model` is still the non-plain one.
     assert agent_model._LiveReader(TAGS).plain_text is False
     assert agent_model.ask_model.__defaults__ is not None
     import inspect
