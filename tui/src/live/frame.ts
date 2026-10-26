@@ -6,7 +6,8 @@
 
 import type { LineEditor } from '../input/editor.js';
 import { INPUT_MAX_ROWS, visibleField } from '../input/field.js';
-import { displayWidth, fieldText, fit, graphemes, wrapPlain } from '../input/width.js';
+import { displayWidth, fieldText, fit, graphemes } from '../input/width.js';
+import { wrapLine } from '../wrap.js';
 
 /** The widest block TMT draws, however wide the window is (MAX_CONTENT_WIDTH). */
 export const MAX_CONTENT_WIDTH = 100;
@@ -85,7 +86,8 @@ export function composeFrame(state: FrameState, columns: number, rows: number): 
   }
   const pending = pendingRows(state.pending, width).slice(0, Math.max(0, left)).map((text) => ({ plain: text, styled: dim(text) }));
   left -= pending.length;
-  const reply = state.reply ? wrapPlain(state.reply, width).slice(-LIVE_BODY_LINES) : [];
+  // Wrapped at word boundaries, like the committed rows the reply becomes.
+  const reply = state.reply ? state.reply.split('\n').flatMap((line) => wrapLine(line, width)).slice(-LIVE_BODY_LINES) : [];
   const replyRows = reply.slice(Math.max(0, reply.length - Math.max(0, left))).map(plainRow);
 
   const ruleRow = { plain: rule, styled: rule };
