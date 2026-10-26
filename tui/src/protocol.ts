@@ -21,6 +21,13 @@ export interface Meter {
   elapsed?: number;
 }
 
+/** A slash command's own row, as the backend sent them before it rendered them itself. */
+export interface CommandRow {
+  label?: string;
+  value?: string;
+  text?: string;
+}
+
 export interface Choice {
   key: string;
   label: string;
@@ -62,27 +69,28 @@ export interface Settings {
 export type BackendEvent =
   | ({ type: 'ready'; workspace?: string; columns?: number; rows?: number } & Settings)
   | ({ type: 'settings' } & Settings)
-  | { type: 'session'; workspace?: string; tip?: { gesture?: string; detail?: string } }
+  | { type: 'session'; workspace?: string; tip?: { gesture?: string; detail?: string }; rows?: string[] }
   | { type: 'prompt'; placeholder?: string; caption?: Caption; meter?: Meter }
-  | { type: 'task'; text?: string; caption?: Caption }
-  | { type: 'command'; title?: string; ok?: boolean; rows?: { label?: string; value?: string; text?: string }[];
+  | { type: 'task'; text?: string; caption?: Caption; rows?: string[] }
+  | { type: 'command'; title?: string; ok?: boolean; rows?: (string | CommandRow)[];
       note?: string; prompt_for?: string; to_menu?: boolean }
   | { type: 'turn_start'; task?: string }
   | { type: 'status'; state?: string; label?: string; progress?: number | null }
   | ({ type: 'meter' } & Meter)
   | { type: 'delta'; text?: string }
   | { type: 'reply_reset' }
-  | { type: 'event'; kind?: string; message?: string; stage?: string; level?: number; detail?: Record<string, unknown> }
+  | { type: 'event'; kind?: string; message?: string; stage?: string; level?: number; detail?: Record<string, unknown>; rows?: string[] }
   | { type: 'tool_start' | 'tool_end'; id?: number }
-  | { type: 'approval'; id: number; question?: string; hint?: string; choices?: Choice[]; pattern?: string; action?: string }
-  | { type: 'question'; id: number; text?: string; keys?: string[]; question?: string | null; options?: string[] | null }
+  | { type: 'approval'; id: number; question?: string; hint?: string; choices?: Choice[]; pattern?: string; action?: string; rows?: string[] }
+  | { type: 'question'; id: number; text?: string; keys?: string[]; question?: string | null; options?: string[] | null; rows?: string[] }
   | { type: 'plan'; steps?: PlanStep[] }
   | { type: 'review'; state?: string; headline?: string; cycles?: number; required?: boolean }
   | { type: 'verify'; state?: string; headline?: string; checks?: Check[]; cycles?: number; required?: boolean }
   | { type: 'agents'; agents?: AgentCard[] }
-  | { type: 'notice'; level?: string; text?: string }
+  | { type: 'panel'; rows?: string[]; width?: number }
+  | { type: 'notice'; level?: string; text?: string; rows?: string[] }
   | { type: 'text'; text?: string }
-  | { type: 'final'; text?: string }
+  | { type: 'final'; text?: string; rows?: string[] }
   | { type: 'turn_end'; task?: string; answer?: string; outcome?: string; suggestion?: string }
   | { type: 'protocol_error'; message?: string; id?: number; line?: string }
   | { type: 'exit'; code?: number; reason?: string; message?: string };

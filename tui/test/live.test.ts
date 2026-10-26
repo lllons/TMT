@@ -99,12 +99,12 @@ describe.each(SIZES)('live frame at %ix%i', (columns, rows) => {
     const view = term.viewport();
     expect(view[rows - 1]).toBe('');
     expect(box(term).status).toBe(rows - 2);
-    // The window less the cursor's row, the box and the status row; and never
-    // more than the ten rows the Python relay shows.
-    const shown = view.filter((row) => row.startsWith('reply row'));
-    expect(shown).toHaveLength(Math.min(LIVE_BODY_LINES, rows - 1 - 3 - 1));
-    expect(shown.at(-1)).toBe('reply row 79');
-    expect(term.scrollback().some((row) => row.startsWith('reply row'))).toBe(false);
+    // The window less the cursor's row, the box, the status row and the reply
+    // box's own two rules; and never more than the ten rows the Python relay shows.
+    const shown = view.filter((row) => row.includes('reply row'));
+    expect(shown).toHaveLength(Math.min(LIVE_BODY_LINES, rows - 1 - 3 - 1 - 2));
+    expect(shown.at(-1)).toContain('reply row 79');
+    expect(term.scrollback().some((row) => row.includes('reply row'))).toBe(false);
     expect(forbiddenIn(term.raw)).toEqual([]);
   });
 
@@ -322,7 +322,7 @@ describe.each([['xterm.js', false], ['conpty', true]] as const)('a young session
         // Until it fills the window, the conversation sits on the box, the
         // blank rows above it; a shrink then takes blank rows first.
         const last = view.indexOf(`line ${index}`);
-        expect(view.slice(last + 1, top - 1).every((row) => row.startsWith('a reply') || row.startsWith('of two'))).toBe(true);
+        expect(view.slice(last + 1, top - 1).every((row) => row.includes('a reply') || row.includes('of two') || /^[┌└]/.test(row))).toBe(true);
         expect(view.slice(0, view.indexOf('line 0')).every((row) => row === '')).toBe(true);
       }
     }
@@ -353,13 +353,13 @@ describe('a live reply resized (defect 2)', () => {
     await term.settle();
     term.resize(140, 40);
     await term.settle();
-    expect(term.viewport().filter((row) => row.startsWith('streamed line'))).toHaveLength(10);
-    expect(term.scrollback().some((row) => row.startsWith('streamed line'))).toBe(false);
+    expect(term.viewport().filter((row) => row.includes('streamed line'))).toHaveLength(10);
+    expect(term.scrollback().some((row) => row.includes('streamed line'))).toBe(false);
     screen.setReply('');
     screen.commit('\nStreaming finished.');
     await term.settle();
     const all = term.all();
-    expect(all.some((row) => row.startsWith('streamed line'))).toBe(false);
+    expect(all.some((row) => row.includes('streamed line'))).toBe(false);
     // The answer follows the record directly: no stranded or blank rows between.
     expect(all.indexOf('Streaming finished.')).toBe(all.indexOf('  · Streaming a long reply.') + 2);
     expectNoStaleRows(term);
@@ -375,13 +375,13 @@ describe('a live reply resized (defect 2)', () => {
     term.resize(140, 40);
     await term.settle();
     const view = term.viewport();
-    expect(view.filter((row) => row.startsWith('streamed line'))).toHaveLength(10);
-    expect(new Set(view.filter((row) => row.startsWith('streamed line'))).size).toBe(10);
+    expect(view.filter((row) => row.includes('streamed line'))).toHaveLength(10);
+    expect(new Set(view.filter((row) => row.includes('streamed line'))).size).toBe(10);
     expect(box(term).status).toBe(38);
     screen.setReply('');
     screen.commit('\nStreaming finished.');
     await term.settle();
-    expect(term.viewport().some((row) => row.startsWith('streamed line'))).toBe(false);
+    expect(term.viewport().some((row) => row.includes('streamed line'))).toBe(false);
     expect(box(term).status).toBe(38);
     expect(rowsWhere(term.all(), isRule)).toHaveLength(2);
     expect(forbiddenIn(term.raw)).toEqual([]);
@@ -396,14 +396,15 @@ describe('a live reply resized (defect 2)', () => {
     screen.commit('header\n> a task');
     screen.setReply(Array.from({ length: 12 }, (_, index) => `reply ${index}`).join('\n'));
     await term.settle();
-    const replies = (rows: string[]) => rows.filter((row) => row.startsWith('reply '));
+    const replies = (rows: string[]) => rows.flatMap((row) => row.match(/reply \d+/) ?? []);
     expect(replies(term.viewport())).toHaveLength(10);
     term.resize(80, 10);
     await term.settle();
     let view = term.viewport();
     expect(box(term).status).toBe(8);
     expect(view[9]).toBe('');
-    expect(replies(view)).toEqual(['reply 8', 'reply 9', 'reply 10', 'reply 11']);
+    // Nine rows less the cursor's, the box, its status row and the reply box's rules.
+    expect(replies(view)).toEqual(['reply 9', 'reply 10', 'reply 11']);
     expect(rowsWhere(term.all(), isRule)).toHaveLength(2);
     expect(rowsWhere(term.all(), isField)).toHaveLength(1);
     term.resize(80, 24);
@@ -424,7 +425,7 @@ describe('a live reply resized (defect 2)', () => {
 });
 
 describe('typing during a turn', () => {
-  it('queues a line, shows it above the box, and sends it when the turn ends', async () => {
+  it('queues a line, says so in the box instead of listing it, and sends it when the turn ends', async () => {
     const term = new FakeTerminal(80, 24);
     const screen = open(term);
     const sent: string[] = [];
@@ -437,12 +438,17 @@ describe('typing during a turn', () => {
     await term.settle();
     expect(sent).toEqual([]);
     expect(screen.queued()).toEqual(['run the tests']);
+    // The Python box's wording, less the key that is not wired here: the
+    // line itself is not drawn, and nothing is listed above the box.
     const view = term.viewport();
-    const queuedRow = view.findIndex((row) => row.includes('queued  run the tests'));
-    expect(queuedRow).toBeGreaterThanOrEqual(0);
-    expect(queuedRow).toBeLessThan(box(term).top);
+    expect(view[box(term).field]).toBe(' > 1 queued task - they run when this one finishes');
+    expect(view.some((row) => row.includes('run the tests') || row.includes('queued  '))).toBe(false);
+    term.type('and the linter');
+    term.type('\r');
+    await term.settle();
+    expect(term.viewport()[box(term).field]).toBe(' > 2 queued tasks - they run when this one finishes');
     screen.setBusy(false);
-    expect(sent).toEqual(['run the tests']);
+    expect(sent).toEqual(['run the tests', 'and the linter']);
     expect(screen.queued()).toEqual([]);
     await term.settle();
     expect(term.all().some((row) => row.includes('queued'))).toBe(false);
@@ -583,7 +589,8 @@ describe('asking a question', () => {
     const answer = screen.ask({ hint: 'Pick one' });
     await term.settle();
     expect(term.viewport().some((row) => row.includes('half a draft'))).toBe(false);
-    expect(term.viewport().some((row) => row.includes('queued  later'))).toBe(true);
+    // The question has the box, so the queue is not told; it is still there.
+    expect(screen.queued()).toEqual(['later']);
     // The turn ending while the question is open must not send the queue.
     screen.setBusy(false);
     expect(sent).toEqual([]);
@@ -607,6 +614,100 @@ describe('asking a question', () => {
     expect(await second).toBeNull();
     expect(await screen.ask()).toBeNull();
     expect(forbiddenIn(term.raw)).toEqual([]);
+  });
+});
+
+describe('asking for one key', () => {
+  it('resolves with the offered key the moment it is typed: no Enter, nothing in the box, nothing to onSubmit', async () => {
+    const term = new FakeTerminal(80, 24);
+    const screen = open(term);
+    const sent: string[] = [];
+    screen.onSubmit((line) => sent.push(line));
+    screen.setBusy(true);
+    const answer = screen.ask({ hint: '1-2, Esc to skip', keys: ['1', '2'] });
+    await term.settle();
+    expect(term.viewport().some((row) => row.startsWith(' > ') && row.includes('1-2, Esc to skip'))).toBe(true);
+    term.type('2');
+    expect(await answer).toBe('2');
+    await term.settle();
+    expect(term.viewport().some((row) => row.includes('1-2, Esc to skip'))).toBe(false);
+    expect(term.viewport().find(isField)).not.toContain('2');
+    expect(sent).toEqual([]);
+    expect(screen.queued()).toEqual([]);
+  });
+
+  it('ignores other characters, a paste and Enter, with the hint still in the empty box, until Esc skips it', async () => {
+    const term = new FakeTerminal(80, 24);
+    const screen = open(term);
+    const sent: string[] = [];
+    screen.onSubmit((line) => sent.push(line));
+    let settled = false;
+    const answer = screen.ask({ hint: 'Pick', keys: ['1', '2'] }).then((value) => { settled = true; return value; });
+    term.type('x');
+    term.type('9');
+    term.type('\x1b[200~12\x1b[201~');
+    term.type('\r');
+    term.type('\x7f');
+    await term.settle();
+    expect(settled).toBe(false);
+    expect(term.viewport().find(isField)).toBe(' > Pick');
+    term.type('\x1b');
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(await answer).toBeNull();
+    expect(sent).toEqual([]);
+  });
+
+  it('answers with the first offered key of a run typed in one read, and takes Ctrl-C and Ctrl-D as before', async () => {
+    const term = new FakeTerminal(80, 24);
+    const screen = open(term);
+    const keys: string[] = [];
+    screen.onInterrupt((key) => keys.push(key));
+    const run = screen.ask({ keys: ['1', '2', '3'] });
+    term.type('x32');
+    expect(await run).toBe('3');
+    const ctrlC = screen.ask({ keys: ['y', 'n'] });
+    term.type('\x03');
+    expect(await ctrlC).toBeNull();
+    const ctrlD = screen.ask({ keys: ['y', 'n'] });
+    term.type('\x04');
+    expect(await ctrlD).toBeNull();
+    expect(keys).toEqual(['ctrl-c', 'ctrl-d']);
+    // Keys match as typed: Y is not y.
+    let settled = false;
+    const exact = screen.ask({ keys: ['y'] }).then((value) => { settled = true; return value; });
+    term.type('Y');
+    await term.settle();
+    expect(settled).toBe(false);
+    term.type('y');
+    expect(await exact).toBe('y');
+  });
+
+  it('gives the draft back, leaves the queue alone, and an empty list of keys is a line question', async () => {
+    const term = new FakeTerminal(80, 24);
+    const screen = open(term);
+    const sent: string[] = [];
+    screen.onSubmit((line) => sent.push(line));
+    screen.setBusy(true);
+    term.type('later');
+    term.type('\r');
+    term.type('a draft');
+    const answer = screen.ask({ hint: 'Pick', keys: ['1', '2'] });
+    await term.settle();
+    expect(screen.queued()).toEqual(['later']);
+    expect(term.viewport().some((row) => row.includes('a draft'))).toBe(false);
+    screen.setBusy(false);
+    expect(sent).toEqual([]);
+    term.type('1');
+    expect(await answer).toBe('1');
+    expect(sent).toEqual(['later']);
+    await term.settle();
+    expect(term.viewport().some((row) => row.startsWith(' > a draft'))).toBe(true);
+    term.type('\r');
+    expect(sent).toEqual(['later', 'a draft']);
+    const line = screen.ask({ hint: 'Type', keys: [] });
+    term.type('go on');
+    term.type('\r');
+    expect(await line).toBe('go on');
   });
 });
 

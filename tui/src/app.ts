@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { Backend, type BackendOptions } from './backend.js';
 import {
   agentsBlock, approvalHint, captionText, commandLines, eventLines, finalLines, makeStyle, noticeLines, planBlock,
-  questionHint, reviewBlock, sessionLines, statusText, taskLine, verifyBlock, type Style,
+  questionHint, renderedRows, reviewBlock, sessionLines, taskLine, verifyBlock, type Style,
 } from './format.js';
 import { MAX_CONTENT_WIDTH } from './live/frame.js';
 import { createSessionScreen, type Input, type InterruptKey, type SessionScreen } from './live/session.js';
@@ -97,6 +97,10 @@ class App {
   private caption: Caption = {};
   private meter: Meter = {};
   private status: Of<'status'> | null = null;
+  // When the status row appeared, for its clock (ms).
+  private since = 0;
+  // A `panel` has arrived: the column is drawn by the screen, not committed as blocks.
+  private panelSeen = false;
   private version = '';
   private readonly blocks = new Map<string, string>();
   private openAsk: { abandoned: boolean } | null = null;
@@ -157,6 +161,19 @@ class App {
     for (const line of lines) for (const row of wrapRows(line, width)) this.screen?.commit(row);
   }
 
+  /**
+   * The backend's own rows for an event, laid out by the Python renderer for
+   * this width, blank rows and colour included: committed exactly as they
+   * are, never wrapped or reformatted. False when the event carries none
+   * (absent, empty or malformed), and the caller formats it itself.
+   */
+  private commitRendered(rows: unknown): boolean {
+    const own = renderedRows(rows);
+    if (!own) return false;
+    for (const row of own) this.screen?.commit(row);
+    return true;
+  }
+
   /** Errors go above the box, or to stderr while there is no box. */
   private complain(lines: string[]): void {
     if (this.screen) this.commit(...lines);
@@ -174,7 +191,9 @@ class App {
     }
     switch (item.type) {
       case 'session':
-        this.commit('', ...sessionLines(item, this.version, new Date().toLocaleDateString('en-CA'), this.style), '');
+        if (!this.commitRendered(item.rows)) {
+          this.commit('', ...sessionLines(item, this.version, new Date().toLocaleDateString('en-CA'), this.style), '');
+        }
         return;
       case 'prompt':
         this.turn = false;
@@ -183,8 +202,9 @@ class App {
         this.caption = item.caption ?? {};
         this.meter = item.meter ?? {};
         screen.setReply('');
-        screen.setStatus('');
-        screen.setCaption(captionText(this.meter, this.caption));
+        screen.setProgress(null);
+        screen.setCaption(this.caption);
+        screen.setMeter(this.meter);
         screen.setPlaceholder(item.placeholder ?? '');
         // The state first: setBusy(false) sends a queued line, and its handler
         // turns the screen busy again.
@@ -198,21 +218,31 @@ class App {
           this.caption = item.caption;
           screen.setCaption(captionText(this.meter, this.caption));
         }
-        this.commit('', taskLine(item.text ?? '', this.style));
+        if (!this.commitRendered(item.rows)) this.commit('', taskLine(item.text ?? '', this.style));
         return;
       case 'turn_start':
         this.turn = true;
         this.state = 'working';
+        this.since = Date.now();
         screen.setBusy(true);
         return;
       case 'status':
+        // The clock starts when the row appears; the backend's own `elapsed`
+        // (in `meter`) corrects it as soon as one arrives.
+        if (!this.status?.state || this.status.state === 'idle') this.since = Date.now();
         this.status = item;
-        screen.setStatus(statusText(this.status, this.meter));
+        this.showProgress(screen);
         return;
       case 'meter':
         this.meter = item;
-        screen.setCaption(captionText(this.meter, this.caption));
-        screen.setStatus(statusText(this.status, this.meter));
+        if (typeof item.elapsed === 'number' && Number.isFinite(item.elapsed)) {
+          // The backend's clock, once ours is off by more than its tenth of a
+          // second of rounding: re-anchored every time, the seconds would flicker.
+          const since = Date.now() - item.elapsed * 1000;
+          if (Math.abs(since - this.since) > 500) this.since = since;
+        }
+        screen.setMeter(item);
+        this.showProgress(screen);
         return;
       // The reply is only shown live, as the Python UI does: `final` carries
       // the same text, and `reply_reset` takes back what was streamed, so
@@ -233,15 +263,18 @@ class App {
         return;
       case 'event': {
         const level = item.level ?? 1;
-        // A blank row where the record crosses between prominent rows and the rest.
-        if (this.lastLevel !== null && (this.lastLevel === 2) !== (level === 2)) this.commit('');
+        const crossed = this.lastLevel !== null && (this.lastLevel === 2) !== (level === 2);
         this.lastLevel = level;
+        // The backend's rows already hold the blank row at a crossing.
+        if (this.commitRendered(item.rows)) return;
+        // A blank row where the record crosses between prominent rows and the rest.
+        if (crossed) this.commit('');
         this.commit(...eventLines(item, this.style));
         return;
       }
       case 'notice':
         this.noted = true;
-        this.commit(...noticeLines(item.level, item.text ?? '', this.style));
+        if (!this.commitRendered(item.rows)) this.commit(...noticeLines(item.level, item.text ?? '', this.style));
         return;
       case 'text':
         this.commit(item.text ?? '');
@@ -250,7 +283,7 @@ class App {
         this.noted = true;
         this.replyText = '';
         screen.setReply('');
-        this.commit(...finalLines(item.text ?? '', this.color));
+        if (!this.commitRendered(item.rows)) this.commit(...finalLines(item.text ?? '', this.color));
         return;
       case 'turn_end':
         this.turn = false;
@@ -259,7 +292,7 @@ class App {
         if (item.outcome && !this.noted) this.commit(this.style.dim(item.outcome));
         return;
       case 'command':
-        this.commit(...commandLines(item, this.style), '');
+        if (!this.commitRendered(item.rows)) this.commit(...commandLines(item, this.style), '');
         if (item.to_menu) return this.openMenu();
         return;
       case 'approval':
@@ -276,6 +309,14 @@ class App {
         return this.snapshot('verify', verifyBlock(item, this.style));
       case 'agents':
         return this.snapshot('agents', agentsBlock(item.agents ?? [], this.style));
+      case 'panel': {
+        // The right-hand column as Python drew it. Once the backend sends one,
+        // the plan, review and verify blocks are in it and not committed.
+        this.panelSeen = true;
+        const rows = Array.isArray(item.rows) ? item.rows : [];
+        screen.setPanel(rows.length > 0 ? { rows, width: item.width ?? 0 } : null);
+        return;
+      }
       case 'protocol_error':
         this.commit(this.style.red(`Protocol error: ${item.message ?? 'a message was not accepted'}`));
         return;
@@ -367,20 +408,30 @@ class App {
     // The box says which keys answer it; the backend's whole sentence, which
     // is too long for a row that never wraps, is committed under the choices.
     const sentence = (event.hint ?? '').trim();
-    this.commit('', ...(event.question ?? '').split('\n'), '', ...choices.map((choice) => `  ${choice.key}  ${choice.label}`),
-      ...(sentence ? [this.style.dim(sentence)] : []));
+    // With the backend's rows (the question and its hint line, as the Python
+    // UI prints them) there is no choice list and no dim hint row: the box
+    // says which keys answer, and what is typed is echoed under the prompt.
+    const rendered = this.commitRendered(event.rows);
+    if (!rendered) {
+      this.commit('', ...(event.question ?? '').split('\n'), '', ...choices.map((choice) => `  ${choice.key}  ${choice.label}`),
+        ...(sentence ? [this.style.dim(sentence)] : []));
+    }
     void this.whileAsking(() => this.ask(approvalHint(choices, sentence))).then((answer) => {
-      if (answer) this.backend.approvalReply(event.id, approvalAnswer(answer.line, choices));
+      if (!answer) return;
+      const typed = (answer.line ?? '').trim();
+      if (rendered && typed) this.screen?.commit(typed);
+      this.backend.approvalReply(event.id, approvalAnswer(answer.line, choices));
     });
   }
 
   private question(event: Of<'question'>): Promise<void> {
     const keys = (event.keys ?? []).map(String);
-    this.commit('', ...(event.text ?? '').split('\n'));
+    if (!this.commitRendered(event.rows)) this.commit('', ...(event.text ?? '').split('\n'));
     const hint = questionHint(keys);
     return this.whileAsking(async () => {
       for (;;) {
-        const answer = await this.ask(hint);
+        // One key answers it, as in the Python UI: no Enter, nothing echoed.
+        const answer = await this.ask(hint, keys);
         if (!answer) return;
         const typed = (answer.line ?? '').trim();
         const key = keys.find((candidate) => candidate.toLowerCase() === typed.toLowerCase());
@@ -411,19 +462,36 @@ class App {
   }
 
   /** One question in the box. null when an interrupt took it back or the session is over. */
-  private async ask(hint: string | undefined): Promise<{ line: string | null } | null> {
+  private async ask(hint: string | undefined, keys?: string[]): Promise<{ line: string | null } | null> {
     const slot = { abandoned: false };
     this.openAsk = slot;
-    const line = await this.screen!.ask({ hint });
+    const line = await this.screen!.ask({ hint, keys });
     if (this.openAsk === slot) this.openAsk = null;
     return slot.abandoned || this.finished ? null : { line };
   }
 
   /** The panels, as text, only when they changed. */
   private snapshot(kind: string, block: string): void {
+    if (this.panelSeen && kind !== 'agents') return;
     if (this.blocks.get(kind) === block) return;
     this.blocks.set(kind, block);
     if (block) this.commit('', ...block.split('\n'));
+  }
+
+  /** The progress row under the box: the `status` event, with the meter's tokens and the turn's clock. */
+  private showProgress(screen: SessionScreen): void {
+    const { state, label, progress } = this.status ?? {};
+    if (!state || state === 'idle') {
+      screen.setProgress(null);
+      return;
+    }
+    screen.setProgress({
+      state: state === 'thinking' ? 'thinking' : 'working',
+      label: label ?? '',
+      percent: typeof progress === 'number' && Number.isFinite(progress) ? progress : null,
+      since: this.since,
+      tokens: this.meter.turn_tokens ?? 0,
+    });
   }
 
   private exited(event: Of<'exit'>): void {

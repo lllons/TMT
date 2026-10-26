@@ -1,13 +1,18 @@
-// The live frame as rows of text: the reply in progress, the lines queued
-// behind the turn, the caption, the prompt box and the status row. Pure: the
-// terminal is measured by the caller and handed in, so a frame is a function
-// of the state and the window and nothing else. That is what makes two frames
-// of an untouched box equal, and an equal frame is never repainted.
+// The live frame as rows of text: the reply in progress in its box, the meter
+// or caption, the prompt box, the progress row under it, and the right-hand
+// column beside all of that but the progress row. Pure: the terminal is
+// measured by the caller and handed in, and so is the clock, so a frame is a
+// function of the state and the window and nothing else. That is what makes
+// two frames of an untouched box equal, and an equal frame is never repainted.
 
 import type { LineEditor } from '../input/editor.js';
 import { INPUT_MAX_ROWS, visibleField } from '../input/field.js';
-import { displayWidth, fieldText, fit, graphemes } from '../input/width.js';
-import { wrapLine } from '../wrap.js';
+import { displayWidth, fieldText, fit, graphemes, stripAnsi } from '../input/width.js';
+import type { Caption, Meter } from '../protocol.js';
+import {
+  captionLine, cutStyled, dimmed, meterLine, padStyled, progressLine, queuedHint, replyBox, visibleWidth,
+  type Look, type Progress,
+} from './rows.js';
 
 /** The widest block TMT draws, however wide the window is (MAX_CONTENT_WIDTH). */
 export const MAX_CONTENT_WIDTH = 100;
@@ -15,22 +20,40 @@ export const MAX_CONTENT_WIDTH = 100;
 export const PROMPT_PREFIX = 3;
 /** Visible rows of the reply in progress (LIVE_BODY_LINES). */
 export const LIVE_BODY_LINES = 10;
-/** Queued lines drawn above the box before the rest are counted instead. */
-export const MAX_PENDING_ROWS = 3;
 /** What an empty box says while a turn runs and it can be typed into. */
 export const TYPING_HINT = 'Working. Type to queue the next task. Ctrl-C to stop.';
+/** Blank columns between the live area and the right-hand column (agent_panel.GUTTER). */
+export const GUTTER = 2;
+/** The narrowest left column a right-hand column may leave (agent_menu._MIN_CONTENT). */
+export const MIN_LEFT = 24;
+
+/** The right-hand column as the backend rendered it: styled rows, and the width it was laid out for. */
+export interface Panel {
+  rows: string[];
+  width: number;
+}
+
+export type { Progress };
 
 export interface FrameState {
   editor: LineEditor;
   reply: string;
+  /** A plain row under the box, for a caller that has no `progress`. */
   status: string;
-  caption: string;
-  /** Queued lines, as they were shown in the field. */
+  /** The row above an idle box: the parts to lay out, or text to take as it is. */
+  caption: Caption | string;
+  meter: Meter | null;
+  progress: Progress | null;
+  panel: Panel | null;
+  /** Lines queued behind the turn, as they were shown in the field. */
   pending: string[];
   busy: boolean;
   /** The hint of the open question, or null when none is open. */
   ask: string | null;
   color: boolean;
+  truecolor: boolean;
+  /** The clock, in ms: the elapsed time and the colour cycle are read from it. */
+  now: number;
 }
 
 export interface Frame {
@@ -42,73 +65,84 @@ export interface Frame {
   field: { first: number; count: number; inner: number; maxRows: number };
 }
 
-const DIM = '\x1b[2m';
-const UNDIM = '\x1b[22m';
 const INVERSE = '\x1b[7m';
 const UNINVERSE = '\x1b[27m';
+const RESET = '\x1b[0m';
 
 /**
  * The frame for a window `columns` x `rows`. It is never taller than
  * `rows - 1`: the row under the frame is where the cursor waits, and a frame
  * as tall as the window cannot be redrawn in place -- its top has already
  * scrolled away from the cursor moves that would reach it.
+ *
+ * Top to bottom: [the reply box, the meter (turn) or caption (between turns),
+ * the box] as the left column, flush with the foot of the region, beside the
+ * right-hand column, flush with its top; then the progress row at full width.
  */
 export function composeFrame(state: FrameState, columns: number, rows: number): Frame {
   const room = rows - 1;
   // A spare column always: a row drawn to the last one wraps on terminals
   // that auto-wrap, and costs a screen line the repaint does not know about.
-  const width = Math.min(MAX_CONTENT_WIDTH, Math.max(1, columns - 1));
+  const spare = Math.max(1, columns - 1);
+  const look: Look = { color: state.color, truecolor: state.truecolor };
+  const panel = usablePanel(state.panel, spare);
+  // The left column is what the right-hand column leaves, when there is one.
+  const leftWidth = panel ? spare - GUTTER - panel.width : spare;
+  const width = Math.min(MAX_CONTENT_WIDTH, Math.max(1, leftWidth));
   const inner = Math.max(1, width - PROMPT_PREFIX);
   const maxRows = Math.max(1, Math.min(INPUT_MAX_ROWS, room - 2));
   const empty: Frame = { rows: [], plain: [], field: { first: 0, count: 0, inner, maxRows } };
   if (room < 1) return empty;
 
-  const dim = (text: string): string => (state.color && text ? DIM + text + UNDIM : text);
+  const dim = (text: string): string => dimmed(look, text);
   const field = fieldRows(state, inner, maxRows, dim);
   const rule = ' ' + '─'.repeat(Math.max(0, width - 1));
 
   // What is kept is the field and both rules; everything else gives up its
-  // rows to them when the window is short, the reply first.
+  // rows to them when the window is short: the progress row, then the meter or
+  // caption, then the reply.
   let topRule = true;
   let bottomRule = true;
   if (field.length + 2 > room) topRule = false;
   if (field.length + 1 > room) bottomRule = false;
   let left = room - field.length - (topRule ? 1 : 0) - (bottomRule ? 1 : 0);
 
-  const status: Row[] = state.status && left > 0 ? [plainRow(' ' + fit(state.status, width - 1))] : [];
-  left -= status.length;
-  const caption: Row[] = [];
-  if (state.caption && left > 0) {
-    const text = fit(state.caption, width);
-    caption.push({ plain: ' '.repeat(width - displayWidth(text)) + text, styled: '' });
-    caption[0]!.styled = dim(caption[0]!.plain);
-    left -= 1;
-  }
-  const pending = pendingRows(state.pending, width).slice(0, Math.max(0, left)).map((text) => ({ plain: text, styled: dim(text) }));
-  left -= pending.length;
-  // Wrapped at word boundaries, like the committed rows the reply becomes.
-  const reply = state.reply ? state.reply.split('\n').flatMap((line) => wrapLine(line, width)).slice(-LIVE_BODY_LINES) : [];
-  const replyRows = reply.slice(Math.max(0, reply.length - Math.max(0, left))).map(plainRow);
+  const underText = state.progress ? progressLine(state.progress, state.now, columns, look)
+    : state.status ? ' ' + fit(state.status, Math.min(MAX_CONTENT_WIDTH, spare) - 1) : '';
+  const under: Row[] = underText && left > 0 ? [styledRow(underText)] : [];
+  left -= under.length;
+  // Between turns the clock and the model, with the counts at the left end if
+  // they fit; while a turn runs the counts alone: the question already carries
+  // the clock, a few rows up (agent_menu.PromptBox.running_lines).
+  const counts = state.busy ? meterLine(state.meter, width, look) : '';
+  const leadText = state.busy ? (counts ? ' ' + counts : '') : captionLine(state.caption, state.meter, width, look);
+  const lead: Row[] = leadText && left > 0 ? [styledRow(leadText)] : [];
+  left -= lead.length;
+  // Three rows are the least a box can have: a rule, a row of the reply, a rule.
+  const box = state.reply && left >= 3 ? replyBox(state.reply, leftWidth, Math.min(LIVE_BODY_LINES, left - 2), look).map(styledRow) : [];
 
-  const ruleRow = { plain: rule, styled: rule };
-  const all: Row[] = [
-    ...replyRows, ...pending, ...caption,
+  const ruleRow = styledRow(rule);
+  const column: Row[] = [
+    ...box, ...lead,
     ...(topRule ? [ruleRow] : []), ...field, ...(bottomRule ? [ruleRow] : []),
-    ...status,
   ];
-  const first = replyRows.length + pending.length + caption.length + (topRule ? 1 : 0);
+  const first = box.length + lead.length + (topRule ? 1 : 0);
+
+  const region = panel ? beside(column, panel.rows.slice(0, Math.max(0, room - under.length)), spare - GUTTER - panel.widest) : column;
+  const pad = region.length - column.length;
+  const all = [...region, ...under];
   // A window narrower than the box itself: every row is cut to fit rather
   // than left to wrap, so one frame row is always one screen row.
   for (const row of all) {
-    if (displayWidth(row.plain) > columns - 1) {
-      row.plain = fit(row.plain, columns - 1);
-      row.styled = row.plain;
+    if (visibleWidth(row.styled) > columns - 1) {
+      row.styled = cutStyled(row.styled, columns - 1);
+      row.plain = stripAnsi(row.styled);
     }
   }
   return {
     rows: all.map((row) => row.styled),
     plain: all.map((row) => row.plain),
-    field: { first, count: field.length, inner, maxRows },
+    field: { first: first + pad, count: field.length, inner, maxRows },
   };
 }
 
@@ -117,14 +151,37 @@ interface Row {
   styled: string;
 }
 
-const plainRow = (text: string): Row => ({ plain: text, styled: text });
+const styledRow = (text: string): Row => ({ plain: stripAnsi(text), styled: text });
 
-function pendingRows(pending: string[], width: number): string[] {
-  const label = '  queued  ';
-  const shown = pending.length > MAX_PENDING_ROWS ? pending.slice(0, MAX_PENDING_ROWS - 1) : pending;
-  const rows = shown.map((line) => label + fit(line, Math.max(1, width - label.length)));
-  if (shown.length < pending.length) rows.push(`${label}+${pending.length - shown.length} more`);
-  return rows;
+/**
+ * The right-hand column, when there is one and the left column it leaves is
+ * wide enough (agent_panel.layout). `width` is the width its rows were laid
+ * out for and `widest` the widest of them: the column is drawn flush right.
+ */
+function usablePanel(panel: Panel | null, spare: number): { rows: string[]; width: number; widest: number } | null {
+  if (!panel || panel.rows.length === 0) return null;
+  const widest = Math.max(0, ...panel.rows.map(visibleWidth));
+  const width = Math.max(panel.width, widest);
+  return spare - GUTTER - width >= MIN_LEFT ? { rows: panel.rows, width, widest } : null;
+}
+
+/**
+ * The two columns side by side, one region row per row of the taller one
+ * (agent_panel.compose): the left column flush with the bottom, so the box
+ * stays at the foot, and the right one with the top. The left cell is
+ * `cell` columns, which the rows of the left column never exceed; one that
+ * did would be cut rather than allowed to push the right column along.
+ */
+function beside(column: Row[], right: string[], cell: number): Row[] {
+  const height = Math.max(column.length, right.length);
+  const lead = height - column.length;
+  return Array.from({ length: height }, (_, index) => {
+    const own = index < lead ? styledRow('') : column[index - lead]!;
+    const other = right[index] ?? '';
+    if (!other) return own;
+    const text = padStyled(cutStyled(own.styled, cell), cell) + ' '.repeat(GUTTER) + other + (other.includes('\x1b') ? RESET : '');
+    return styledRow(text);
+  });
 }
 
 /**
@@ -140,8 +197,9 @@ function fieldRows(state: FrameState, inner: number, maxRows: number,
   const { editor } = state;
   const lead = ' > ';
   const indent = ' '.repeat(PROMPT_PREFIX);
+  const waiting = state.pending.length;
   const hint = state.ask !== null && editor.value === '' ? state.ask
-    : state.busy && editor.value === '' ? TYPING_HINT
+    : state.busy && editor.value === '' ? (waiting > 0 ? queuedHint(waiting, inner - 1) : TYPING_HINT)
     : editor.placeholderVisible ? editor.placeholder : '';
   if (editor.value === '') {
     // The placeholder never wraps. It is shadow text standing in for an empty

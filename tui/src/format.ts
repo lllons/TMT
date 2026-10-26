@@ -2,7 +2,7 @@
 // in, rows come out, so the app only decides when to write them.
 
 import { markdownLines } from './markdown.js';
-import type { AgentCard, BackendEvent, Caption, Check, Choice, Meter, PlanStep } from './protocol.js';
+import type { AgentCard, BackendEvent, Caption, Check, Choice, CommandRow, Meter, PlanStep } from './protocol.js';
 
 type Of<T extends BackendEvent['type']> = Extract<BackendEvent, { type: T }>;
 
@@ -23,6 +23,16 @@ export function makeStyle(color: boolean): Style {
     ? text.split('\n').map((line) => (line ? `\x1b[${code}m${line}${RESET}` : line)).join('\n')
     : text);
   return { dim: paint(2), bold: paint(1), red: paint(31), yellow: paint(33), green: paint(32), cyan: paint(36) };
+}
+
+/**
+ * The rows the Python renderer laid out for an event (`rows`), or null when
+ * there are none to use: absent, not a list, empty, or not all strings. An
+ * empty list is no rows, so a backend that rendered nothing cannot make an
+ * answer vanish; and a `command`'s older `rows` (objects) never pass.
+ */
+export function renderedRows(value: unknown): string[] | null {
+  return Array.isArray(value) && value.length > 0 && value.every((row) => typeof row === 'string') ? (value as string[]) : null;
 }
 
 const tokens = (count: number): string => (count >= 1000 ? `${(count / 1000).toFixed(1)}k` : String(Math.round(count)));
@@ -46,20 +56,6 @@ export function meterText(meter: Meter): string {
 
 export function captionText(meter: Meter, caption: Caption): string {
   return [meterText(meter), caption.clock, caption.provider, caption.model].filter(Boolean).join('  ');
-}
-
-/** The status row under the box. '' when idle. */
-export function statusText(status: Of<'status'> | null, meter: Meter): string {
-  if (!status || status.state === 'idle' || !status.state) return '';
-  let text = status.state === 'thinking' ? 'Thinking...' : status.label || 'Working';
-  const progress = count(status.progress);
-  if (status.state === 'working' && progress !== null) {
-    const filled = Math.max(0, Math.min(10, Math.round(progress / 10)));
-    text += `  ${'█'.repeat(filled)}${'░'.repeat(10 - filled)} ${Math.round(progress)}%`;
-  }
-  if (meter.elapsed) text += `  ${Math.round(meter.elapsed)}s`;
-  if (meter.turn_tokens) text += `  ~${tokens(meter.turn_tokens)} tokens`;
-  return text;
 }
 
 /** The session header: wordmark and date, workspace, the tip. */
@@ -108,7 +104,8 @@ export function noticeLines(level: string | undefined, text: string, style: Styl
 /** A slash command's answer: title, rows, note. */
 export function commandLines(event: Of<'command'>, style: Style): string[] {
   const lines = [event.ok === false ? style.red(style.bold(event.title ?? '')) : style.bold(event.title ?? '')];
-  const rows = event.rows ?? [];
+  // A list of strings is the backend's own rendering, which never gets here.
+  const rows = (Array.isArray(event.rows) ? event.rows : []).filter((row): row is CommandRow => typeof row === 'object' && row !== null);
   const width = Math.min(24, Math.max(0, ...rows.map((row) => (row.label ?? '').length)));
   for (const row of rows) {
     if (row.label !== undefined) lines.push('  ' + style.dim((row.label ?? '').padEnd(width)) + '  ' + (row.value ?? ''));
@@ -133,11 +130,11 @@ export function approvalHint(choices: Choice[], fallback = ''): string {
   return keys.length > 0 ? `${keys.join(' / ')}  then Enter` : fallback || 'Type your answer, then Enter';
 }
 
-/** The same for a question: `1-2, then Enter, Esc to skip`. */
+/** The same for a question, which takes one key and no Enter: `1-2, Esc to skip`. */
 export function questionHint(keys: string[]): string {
   const numbers = keys.map(Number);
   const range = keys.length > 1 && numbers.every((number, index) => Number.isInteger(number) && (index === 0 || number === numbers[index - 1]! + 1));
-  const offered = keys.length === 0 ? '' : range ? `${keys[0]}-${keys[keys.length - 1]}, then Enter, ` : `${keys.join(' / ')}, then Enter, `;
+  const offered = keys.length === 0 ? '' : range ? `${keys[0]}-${keys[keys.length - 1]}, ` : `${keys.join(' / ')}, `;
   return `${offered || 'Enter or '}Esc to skip`;
 }
 

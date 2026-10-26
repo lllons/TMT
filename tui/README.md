@@ -28,8 +28,9 @@ result, so a test can call `runApp` with a headless terminal and a fake backend.
 | `src/main.ts` | The entry: real streams in, `process.exit(code)` out |
 | `src/app.ts` | `runApp`: the flow below, and every backend event's handler |
 | `src/backend.ts` | `Backend`: spawns `<python> <entry> --backend-stdio <args>`, JSON lines both ways, typed send helpers, stderr appended to `<install dir>/logs/tui-backend.log` (git-ignored) |
-| `src/format.ts` | Pure: an event in, committed rows out |
+| `src/format.ts` | Pure: an event in, committed rows out (the fallback for an event without `rows`) |
 | `src/protocol.ts` | The wire contract as types |
+| `src/theme.ts` | The Python UI's colours (`agent_ui.py`: the gradient, the dim grey): truecolor where `COLORTERM` says `truecolor`/`24bit` or `WT_SESSION` is set, the nearest of the 256 otherwise, none under `NO_COLOR` |
 | `test/fixtures/fake-backend.mjs` | A scripted stand-in for the backend, plain Node |
 
 1. **Prelude.** `<python> <entry> --tui-prelude <args>` runs the Python splash,
@@ -48,7 +49,11 @@ result, so a test can call `runApp` with a headless terminal and a fake backend.
    print them twice and cannot be taken back by `reply_reset`. `task`, `event`,
    `notice`, `command`, `final` and the panels (`plan`, `review`, `verify`,
    `agents`, only when they change) are committed; `status`, `meter` and
-   `prompt` set the status row, caption and placeholder.
+   `prompt` set the progress row, the counts, the caption and the placeholder.
+   Once a `panel` has arrived (the right-hand column, rendered by Python) it is
+   drawn beside the live area and `plan`, `review` and `verify` are no longer
+   committed as blocks (`agents` still is: the column does not hold it); a
+   backend that never sends `panel` keeps the blocks.
 4. **Keys.** A submit turns the screen busy at once and goes out as `submit`;
    lines typed meanwhile queue and go out after the next `prompt`. Ctrl-C
    during a turn or a command sends `interrupt`; between prompts it sends
@@ -56,12 +61,30 @@ result, so a test can call `runApp` with a headless terminal and a fake backend.
    Ctrl-D between prompts is the same as Ctrl-C; during a turn it does nothing.
 5. **Approvals and questions** use `screen.ask` (below). An approval's answer
    is the typed key (any case), the last choice (the refusal) for Esc or an
-   empty line, and anything else as typed. A question takes a key it offered,
-   `""` for Esc or an empty line, and asks again, with a notice, for any other
-   key. Ctrl-C during one sends only `interrupt`; the backend abandons it.
+   empty line, and anything else as typed. A question takes ONE key it offered,
+   at once and with no Enter, or `""` for Esc; any other key is ignored (the
+   Python UI reads a question the same way). Ctrl-C during either sends only
+   `interrupt`; the backend abandons it.
 6. **End.** `exit` stops the screen and ends with its `code`. A backend that
    ends without `exit` is an error row above the box with the last ten lines
    of the log, and exit 1. The terminal is restored on every path.
+
+### Rendered rows
+
+`session`, `task`, `event`, `command`, `final`, `notice`, `approval` and
+`question` may carry `rows: string[]`: what the Python UI would print for the
+event, laid out by its own renderer for the width the front end reported. One
+entry is one terminal row, SGR colour only (truecolor included), a blank row
+is `''`, and the blank-line rhythm is already in them. When `rows` is a
+non-empty list of strings the app commits them verbatim: no wrapping, no
+markdown, no `format.ts`, and no blank row added around them. Absent, empty,
+not a list, or holding anything but strings (a `command`'s older `rows` are
+objects), the event is formatted by the app as before. An approval with `rows`
+prints those and nothing else (no choice list, no dim hint row), keeps the
+short `y / a / n  then Enter` in the box, and echoes what was typed as one
+plain row under the prompt (nothing for Esc or an empty line), as the Python
+UI does. A question with `rows` is answered by one key (`ask({ keys })`), and
+nothing is echoed.
 
 ## The session screen
 
@@ -81,7 +104,7 @@ screen.onSubmit((line) => {           // folded pastes already expanded
 screen.onInterrupt((key) => {         // 'ctrl-c' | 'ctrl-d'
   if (working) backend.interrupt(); else backend.quit();
 });
-// on an event: screen.commit(row), screen.setReply(tail), screen.setStatus(text) ...
+// on an event: screen.commit(row), screen.setReply(tail), screen.setProgress(...) ...
 // on the next `prompt`: screen.setBusy(false)
 const key = await screen.ask({ hint: 'Type y and Enter' }); // an approval
 ```
@@ -89,12 +112,15 @@ const key = await screen.ask({ hint: 'Type y and Enter' }); // an approval
 | Call | What it does |
 |---|---|
 | `commit(text)` | Writes `text` into the terminal's scrollback above the frame, once, never redrawn. One row per line; a final newline adds none; `''` is one blank line. Colour (SGR) is kept; every other escape and control character is stripped, so output cannot erase or narrow the scrollback. |
-| `setReply(text)` | The reply in progress, plain text, drawn live above the box (its last 10 rows at most). Commit each finished line and keep only the unfinished tail here: the live frame should stay small, because a frame taller than a window that is then made shorter leaves rows in the scrollback. |
-| `setStatus(text)` | One plain row under the box (the instrument row). `''` removes it. |
-| `setCaption(text)` | One dim row above the box, right-aligned (clock, provider, model). `''` removes it. |
+| `setReply(text)` | The reply in progress, drawn live above the box in the Python relay's frame (`┌─┐`, `『 』`, `└─┘`; markdown read, its last 10 rows at most, none when fewer than 3 rows are free). Commit each finished line and keep only the unfinished tail here: the live frame should stay small, because a frame taller than a window that is then made shorter leaves rows in the scrollback. |
+| `setStatus(text)` | One plain row under the box. `''` removes it. Not drawn while a progress row is set. |
+| `setProgress(progress)` | The row under the box while a turn runs: `{ state: 'thinking' \| 'working', label, percent, since, tokens }`, `null` removes it. `working` is the cycling bar, `NN% label`, `Estimated finish: ~N seconds` and, at the right edge, `✻ thinking… (6s · ↓ 48 tokens)`; the finish is worked out like `LiveUI._render_progress` from `since` (ms on the screen's clock) and given up before the readout when the row is narrow. `thinking` is the word THINKING. While one is set the frame is recomposed every 100 ms for the clock and the colour cycle (an unchanged frame is not written); the timer is cleared with it, on `suspend()` and on `stop()`. |
+| `setMeter(meter)` | The counts (the `meter` event's fields). Between turns they are the left end of the caption row when they fit; while a turn runs they are a row of their own above the box, as `+0 lines, -0 lines, ~14k context, ~48 out` (shorter forms when narrow; nothing until something is counted). `+N` is green, `-N` red. |
+| `setCaption(caption)` | The row above the box between turns (not drawn while a turn runs, as in Python): `{ clock, provider, model }` right-aligned to the box as `09:30:00 · OpenRouter · Model` in dim grey, the narrowest of three forms that fits; or a string taken as it is. `''` removes it. |
+| `setPanel(panel)` | The right-hand column: `{ rows, width }`, rows styled (SGR kept, anything else stripped). Drawn beside everything above the progress row, flush with the top, `width` columns at the right edge, two columns from the live area; the live area is `columns - 1 - 2 - width` wide and flush with the foot. Not drawn while that leaves it under 24 columns (a column from before a resize), and cut to the rows the window has. `null` removes it. |
 | `setPlaceholder(text)` | Shadow text in an empty, untouched box between turns. Dismissed by the first character, back after each submit. |
-| `setBusy(bool)` | A turn is running. While busy, Enter queues the line; the queued lines are drawn above the box as `queued  <line>` and the empty box says `Working. Type to queue the next task. Ctrl-C to stop.` `setBusy(false)` sends the queue: one line per turn if each handler calls `setBusy(true)`, all of them if none does. |
-| `ask({ hint })` | Ask one question in the box; resolves with the line. The next Enter (an empty line included) answers it, bypasses the busy queue and never reaches `onSubmit`. Esc, Ctrl-C, Ctrl-D and `stop()` resolve `null` (Ctrl-C and Ctrl-D still reach `onInterrupt`, after the question is closed). `hint` is drawn like the placeholder, over the typing hint, in an empty box. A draft already typed is set aside and comes back afterwards; queued lines stay queued and are not sent while it is open. A second ask replaces the first (which resolves `null`). |
+| `setBusy(bool)` | A turn is running. While busy, Enter queues the line; the empty box says `Working. Type to queue the next task. Ctrl-C to stop.`, or `2 queued tasks - they run when this one finishes` once lines wait (the lines themselves are not drawn; the Python box adds `Up to edit`, which is not wired here). `setBusy(false)` sends the queue: one line per turn if each handler calls `setBusy(true)`, all of them if none does. |
+| `ask({ hint, keys })` | Ask one question in the box; resolves with the line. The next Enter (an empty line included) answers it, bypasses the busy queue and never reaches `onSubmit`. Esc, Ctrl-C, Ctrl-D and `stop()` resolve `null` (Ctrl-C and Ctrl-D still reach `onInterrupt`, after the question is closed). `hint` is drawn like the placeholder, over the typing hint, in an empty box. With `keys` (a non-empty list) it takes ONE key instead: a typed character that is one of them (exact match) resolves it at once with that character, no Enter, nothing put in the box; Esc resolves `null`; other characters, a paste and Enter are ignored. A draft already typed is set aside and comes back afterwards; queued lines stay queued and are not sent while it is open. A second ask replaces the first (which resolves `null`). |
 | `onSubmit(cb)` / `onInterrupt(cb)` | Subscribe; each returns an unsubscribe function. |
 | `queued()` | The waiting lines, oldest first, expanded. |
 | `suspend()` / `resume()` | Hand the terminal to something else (a delegated Python screen, an Ink screen) and take it back. Suspend writes pending commits, erases the frame, and turns raw mode, bracketed paste and mouse off; resume starts a fresh screen. |
@@ -117,7 +143,8 @@ Ctrl-W and Alt-Backspace (delete word). Up/Down and Tab do nothing yet
 
 Two regions, as in the Python UI (`LiveRegion`, `BottomPad`): committed
 lines go once into the terminal's own scrollback, and the live frame under
-them (reply tail, queued lines, caption, box, status) is the only thing
+them (reply box, counts or caption, box, progress row, and the right-hand
+column beside them) is the only thing
 repainted -- cursor up by its height, rewrite, erase down, all in one write
 inside synchronized-output markers. The frame is never taller than
 `rows - 1`. The box is on the last rows from the first frame. In a young
