@@ -120,8 +120,15 @@ lines go once into the terminal's own scrollback, and the live frame under
 them (reply tail, queued lines, caption, box, status) is the only thing
 repainted -- cursor up by its height, rewrite, erase down, all in one write
 inside synchronized-output markers. The frame is never taller than
-`rows - 1`. Blank rows at the top of the frame hold the box on the last rows
-from the first frame while output fills the window from the top.
+`rows - 1`. The box is on the last rows from the first frame. In a young
+session (the conversation does not yet fill the window) the conversation sits
+directly on the box and the blank rows are above it: they are deleted at the
+top (DL) as output arrives and inserted (IL) when the frame shrinks, so none
+reach the scrollback and a shorter window keeps the newest conversation on
+screen instead of a blank page. That mode ends once the window fills or is
+resized. On a resize the cursor position is asked for first, then the old
+frame is erased and the new one painted in one write; frame rows a shrink
+pushed into the scrollback are tracked and erased if a grow brings them back.
 
 Ink 8 was the default, and was measured first (an `@xterm/headless` probe).
 8.0.0 no longer writes `clearTerminal` (its full-screen path erases from the
@@ -132,9 +139,10 @@ xterm.js also moves a cursor left inside the frame down for every row that
 re-wraps below it (pinned by a test). So this is a small custom renderer:
 the terminal's cursor is hidden and parked at column 0 under the frame,
 where nothing below can move it, the caret is drawn as an inverse cell, and
-a resize erases the old frame by its re-wrapped height and then asks the
-terminal where the cursor is (`\x1b[6n`) to place the next frame. No answer
-in 250 ms: the frame is assumed to have been on the foot of the window.
+a resize asks the terminal where the cursor is (`\x1b[6n`) and then erases
+the old frame by its re-wrapped height and paints the next one in one write.
+No answer in 250 ms: the frame is assumed to have been on the foot of the
+window (the old frame stays visible during the wait).
 
 Never the alternate screen, never a scroll region (DECSTBM), never CSI 3 J:
 `test/sources.test.ts` greps the sources for all three and the emulator
@@ -156,11 +164,16 @@ line break (never read as Enter).
 
 ## Known limits
 
-- Not yet driven in a real terminal (Windows Terminal/conpty): reflow and the
-  cursor position report are verified only against xterm.js.
-- The menu hand-off (`suspend()`, a Python child on the inherited terminal,
-  `resume()`) is verified only with a fake prelude. Whether Node's paused stdin
-  gives the console back cleanly on a real Windows console is not yet checked.
+- Driven in a real ConPTY (screenshots in `output/sim/shots-ts/`, git-ignored),
+  but ConPTY under pyte does not reflow, so resize behaviour is verified against
+  xterm.js, not against Windows Terminal itself. IL/DL (young-session mode) and
+  cursor save/restore are likewise only checked in xterm.js.
+- Windows Terminal never returns rows a shrink pushed into the scrollback, so
+  reply rows stranded by a large mid-turn shrink stay there (pinned by a test).
+  A shrink of a young session also leaves blank rows above the header.
+- The `/back` menu hand-off (`suspend()`, a Python child on the inherited
+  terminal, `resume()`) works with the real splash and a fake menu; it was not
+  run to a real menu "start" because no API key is saved on the test machine.
 - A terminal that does not re-wrap on resize (X11 xterm) would have a few
   committed rows above the frame erased on a narrower resize.
 - The caret is drawn, so an IME's composition window opens at the parked

@@ -26,8 +26,16 @@ export class FakeTerminal {
   readonly stdout: EventEmitter & { columns: number; rows: number; isTTY: boolean; write(data: string): boolean };
   readonly stdin: EventEmitter & { isTTY: boolean; setRawMode(mode: boolean): void; resume(): void; pause(): void };
 
-  constructor(columns: number, rows: number, { answers = true } = {}) {
-    this.term = new Terminal({ cols: columns, rows, scrollback: 10000, allowProposedApi: true });
+  /**
+   * `conpty` makes the emulator resize the way Windows Terminal does behind
+   * ConPTY: a taller window adds blank rows at the bottom instead of pulling
+   * rows back out of the scrollback, so what a shrink pushed up stays there.
+   */
+  constructor(columns: number, rows: number, { answers = true, conpty = false } = {}) {
+    this.term = new Terminal({
+      cols: columns, rows, scrollback: 10000, allowProposedApi: true,
+      ...(conpty ? { windowsPty: { backend: 'conpty' as const, buildNumber: 22631 } } : {}),
+    });
     const out = new EventEmitter() as FakeTerminal['stdout'];
     out.columns = columns;
     out.rows = rows;

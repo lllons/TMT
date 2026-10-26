@@ -236,6 +236,193 @@ describe('resize', () => {
   });
 });
 
+// A young session as the screenshots had it: a header and two short turns,
+// far less than a window of it.
+const TALK = [
+  '', 'TMT 0.1.99  2026-10-26', 'workspace  C:\\work\\demo', 'tip  /notes  shows what TMT knows about this project',
+  '', '', '> quick one: summarise the repo', '', 'Quick answer for: quick one', '',
+  '', '> quick two: list the open TODOs', '', 'Quick answer for: quick two',
+];
+const CAPTION = '09:30:00  OpenRouter  Nemotron 3 Ultra 550B';
+const streamed = (from: number, to: number): string =>
+  Array.from({ length: to - from + 1 }, (_, index) => `streamed line ${from + index}: the quick brown fox jumps over the lazy dog and keeps going`).join('\n');
+
+/** Every written row of `rows`, once each and in order, somewhere in the terminal. */
+function expectRecord(term: FakeTerminal, rows: string[]): void {
+  const all = term.all();
+  let at = -1;
+  for (const row of rows.filter((text) => text !== '')) {
+    expect(all.filter((line) => line === row), row).toHaveLength(1);
+    expect(all.indexOf(row), row).toBeGreaterThan(at);
+    at = all.indexOf(row);
+  }
+}
+
+describe.each([['xterm.js', false], ['conpty', true]] as const)('a young session resized (%s)', (_name, conpty) => {
+  it('keeps the newest conversation on screen above the box after a shrink (defect 3)', async () => {
+    // Every terminal keeps the bottom of a window made shorter and pushes its
+    // top into the scrollback. Blank rows between the conversation and the
+    // box put the conversation on top, so the shrink took all of it and left
+    // a blank window over the box.
+    const term = new FakeTerminal(120, 36, { conpty });
+    const screen = open(term);
+    screen.setStatus(STATUS);
+    screen.setCaption(CAPTION);
+    screen.commit(TALK.join('\n'));
+    await term.settle();
+    term.resize(70, 20);
+    await term.settle();
+    const view = term.viewport();
+    expect(view).toContain('Quick answer for: quick two');
+    expect(view).toContain('> quick two: list the open TODOs');
+    expect(box(term).status).toBe(18);
+    expect(view[19]).toBe('');
+    expectNoStaleRows(term);
+    expectRecord(term, TALK);
+    expect(forbiddenIn(term.raw)).toEqual([]);
+  });
+
+  it('keeps it there through a shrink and a grow back', async () => {
+    const term = new FakeTerminal(120, 36, { conpty });
+    const screen = open(term);
+    screen.setStatus(STATUS);
+    screen.setCaption(CAPTION);
+    screen.commit(TALK.join('\n'));
+    await term.settle();
+    for (const [columns, rows] of [[70, 20], [140, 40], [120, 36]] as const) {
+      term.resize(columns, rows);
+      await term.settle();
+      expect(term.viewport()).toContain('Quick answer for: quick two');
+      expect(box(term).status).toBe(rows - 2);
+      expectNoStaleRows(term);
+      expectRecord(term, TALK);
+    }
+    // Output afterwards follows the conversation, wherever the resizes left it.
+    screen.commit('next');
+    await term.settle();
+    const all = term.all();
+    expect(all[all.indexOf('Quick answer for: quick two') + 1]).toBe('next');
+  });
+
+  it('keeps the conversation on the box while the window fills, with no blank rows in the record', async () => {
+    const term = new FakeTerminal(80, 24, { conpty });
+    const screen = open(term);
+    screen.setStatus(STATUS);
+    screen.setCaption(CAPTION);
+    for (let index = 0; index < 40; index += 1) {
+      screen.commit(`line ${index}`);
+      await term.settle(1);
+      // The reply arriving and going again moves the conversation, not the box.
+      screen.setReply(index % 3 === 0 ? 'a reply\nof two rows' : '');
+      await term.settle(1);
+      const view = term.viewport();
+      const { top, status } = box(term);
+      expect(status).toBe(22);
+      if (index < 12) {
+        // Until it fills the window, the conversation sits on the box, the
+        // blank rows above it; a shrink then takes blank rows first.
+        const last = view.indexOf(`line ${index}`);
+        expect(view.slice(last + 1, top - 1).every((row) => row.startsWith('a reply') || row.startsWith('of two'))).toBe(true);
+        expect(view.slice(0, view.indexOf('line 0')).every((row) => row === '')).toBe(true);
+      }
+    }
+    expect(term.scrollback()).not.toContain('');
+    expectRecord(term, Array.from({ length: 40 }, (_, index) => `line ${index}`));
+  }, 30_000);
+});
+
+describe('a live reply resized (defect 2)', () => {
+  async function streaming(conpty: boolean) {
+    const term = new FakeTerminal(120, 36, { conpty });
+    const screen = open(term);
+    screen.setStatus(STATUS);
+    screen.setCaption(CAPTION);
+    screen.setBusy(true);
+    screen.commit(TALK.slice(0, 5).join('\n') + '\n> stream a long reply\n  · Streaming a long reply.');
+    screen.setReply(streamed(1, 14));
+    await term.settle();
+    return { term, screen };
+  }
+
+  it('leaves no reply rows in the record after a shrink and a grow while it streams', async () => {
+    const { term, screen } = await streaming(false);
+    term.resize(70, 20);
+    await term.settle();
+    // Taller than the window once re-wrapped: its top went into the scrollback.
+    screen.setReply(streamed(1, 18));
+    await term.settle();
+    term.resize(140, 40);
+    await term.settle();
+    expect(term.viewport().filter((row) => row.startsWith('streamed line'))).toHaveLength(10);
+    expect(term.scrollback().some((row) => row.startsWith('streamed line'))).toBe(false);
+    screen.setReply('');
+    screen.commit('\nStreaming finished.');
+    await term.settle();
+    const all = term.all();
+    expect(all.some((row) => row.startsWith('streamed line'))).toBe(false);
+    // The answer follows the record directly: no stranded or blank rows between.
+    expect(all.indexOf('Streaming finished.')).toBe(all.indexOf('  · Streaming a long reply.') + 2);
+    expectNoStaleRows(term);
+    expect(forbiddenIn(term.raw)).toEqual([]);
+  });
+
+  it('keeps the window clean where the terminal never gives the pushed rows back', async () => {
+    // Windows Terminal: what a shrink pushed above the window stays in the
+    // scrollback, out of reach of any cursor move. The window itself is clean.
+    const { term, screen } = await streaming(true);
+    term.resize(70, 20);
+    await term.settle();
+    term.resize(140, 40);
+    await term.settle();
+    const view = term.viewport();
+    expect(view.filter((row) => row.startsWith('streamed line'))).toHaveLength(10);
+    expect(new Set(view.filter((row) => row.startsWith('streamed line'))).size).toBe(10);
+    expect(box(term).status).toBe(38);
+    screen.setReply('');
+    screen.commit('\nStreaming finished.');
+    await term.settle();
+    expect(term.viewport().some((row) => row.startsWith('streamed line'))).toBe(false);
+    expect(box(term).status).toBe(38);
+    expect(rowsWhere(term.all(), isRule)).toHaveLength(2);
+    expect(forbiddenIn(term.raw)).toEqual([]);
+  });
+
+  it.each([['xterm.js', false], ['conpty', true]] as const)('survives a shrink below the height of the frame (%s)', async (_name, conpty) => {
+    const term = new FakeTerminal(80, 24, { conpty });
+    const screen = open(term);
+    screen.setStatus(STATUS);
+    screen.setCaption(CAPTION);
+    screen.setBusy(true);
+    screen.commit('header\n> a task');
+    screen.setReply(Array.from({ length: 12 }, (_, index) => `reply ${index}`).join('\n'));
+    await term.settle();
+    const replies = (rows: string[]) => rows.filter((row) => row.startsWith('reply '));
+    expect(replies(term.viewport())).toHaveLength(10);
+    term.resize(80, 10);
+    await term.settle();
+    let view = term.viewport();
+    expect(box(term).status).toBe(8);
+    expect(view[9]).toBe('');
+    expect(replies(view)).toEqual(['reply 8', 'reply 9', 'reply 10', 'reply 11']);
+    expect(rowsWhere(term.all(), isRule)).toHaveLength(2);
+    expect(rowsWhere(term.all(), isField)).toHaveLength(1);
+    term.resize(80, 24);
+    await term.settle();
+    view = term.viewport();
+    expect(box(term).status).toBe(22);
+    expect(replies(view)).toEqual(Array.from({ length: 10 }, (_, index) => `reply ${index + 2}`));
+    // Given back by a terminal that pulls rows out of the scrollback, and then
+    // erased with the frame; kept by one that does not, out of reach.
+    if (!conpty) expect(replies(term.all())).toHaveLength(10);
+    expectNoStaleRows(term);
+    screen.setReply('');
+    screen.commit('the answer');
+    await term.settle();
+    if (!conpty) expect(term.all().slice(term.all().indexOf('> a task') + 1)[0]).toBe('the answer');
+    expect(forbiddenIn(term.raw)).toEqual([]);
+  });
+});
+
 describe('typing during a turn', () => {
   it('queues a line, shows it above the box, and sends it when the turn ends', async () => {
     const term = new FakeTerminal(80, 24);
