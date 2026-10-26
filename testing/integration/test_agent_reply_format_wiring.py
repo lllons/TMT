@@ -470,8 +470,9 @@ def _called_in(tree, function):
 
 def test_every_way_in_re_reads_the_reply_format():
     """A setting written by the menu and never re-read lasts one session and
-    quietly reverts. TMT can start a session from three places -- a normal
-    launch, a CI run, and a return to the menu from inside a session -- and the
+    quietly reverts. TMT can start a session from four places -- a normal
+    launch, a CI run, a return to the menu from inside a session, and the
+    startup screens the TypeScript front end runs (`run_prelude`) -- and the
     format has to be re-read at each of them.
 
     The CI run is included deliberately, unlike `refresh_auto_update`: that one
@@ -479,8 +480,8 @@ def test_every_way_in_re_reads_the_reply_format():
     this one changes what the model is asked to write.
     """
     source = Path(TMT.__file__).read_text(encoding="utf-8")
-    assert source.count("agent_config.refresh_protocol()") == 3, \
+    assert source.count("agent_config.refresh_protocol()") == 4, \
         source.count("agent_config.refresh_protocol()")
     tree = ast.parse(source)
-    for function in ("main", "run_ci", "_return_to_menu"):
+    for function in ("main", "run_ci", "_return_to_menu", "run_prelude"):
         assert _called_in(tree, function), function + " never re-reads it"
