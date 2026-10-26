@@ -130,6 +130,8 @@ class Channel:
         self.ready = False
         self.on_interrupt = None
         self.on_close = None
+        # Called after a `resize` has been taken, on the reading thread.
+        self.on_resize = None
 
     @property
     def closed(self):
@@ -239,6 +241,13 @@ class Channel:
             _resize(message)
             if kind == "hello":
                 self.inbox.put(("hello", message))
+            elif self.on_resize is not None:
+                try:
+                    self.on_resize()
+                except Exception as error:
+                    # This is the reading thread: it must outlive anything the
+                    # layout code does.
+                    _log("resize hook failed: %s: %s" % (type(error).__name__, error))
         elif kind == "submit":
             if not isinstance(message.get("text"), str):
                 self.problem("submit needs \"text\", a string")
@@ -449,6 +458,140 @@ def settings():
             "configured": configured, "version": _version()}
 
 
+# --- rendered rows -----------------------------------------------------------
+#
+# Besides the facts, an event can carry `rows`: the terminal rows the Python UI
+# would have printed for it, colour and blank-row rhythm included. They are not
+# a second renderer. Each one is made by calling the Python UI's own function
+# on a stand-in terminal, so a front end that commits them as they are shows
+# what the Python UI shows and cannot drift from it. If one cannot be made the
+# event goes out without it and the front end lays the facts out itself.
+
+# The escapes a row may keep: colour and weight, nothing that moves the cursor.
+_SGR = re.compile(r"\x1b\[[0-9;]*m")
+_ESCAPES = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+_STRAY = re.compile(r"[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f]|\x1b(?!\[[0-9;]*m)")
+
+
+class _Capture(io.StringIO):
+    """The terminal the Python UI's renderers draw on when nobody is watching.
+
+    It answers as a UTF-8 terminal does -- a tty, UTF-8 -- so every renderer
+    makes the choices it makes for the real one: colour (unless NO_COLOR is
+    set, exactly as on a screen) and the box-drawing glyphs, not the ASCII
+    fallbacks. The width and height come from COLUMNS and LINES, which
+    `hello` and `resize` set from the front end's terminal.
+    """
+
+    @property
+    def encoding(self):
+        return "utf-8"
+
+    def isatty(self):
+        return True
+
+
+def _clean(text):
+    """`text` with colour kept and everything else that is not a character gone.
+
+    A row can carry text the model or a command wrote, and a cursor movement
+    inside it must not reach the front end's screen.
+    """
+    text = str(text).replace("\r\n", "\n")
+    text = _ESCAPES.sub(lambda m: m.group(0) if _SGR.fullmatch(m.group(0)) else "",
+                        text)
+    return _STRAY.sub("", text)
+
+
+def _rows_of(text):
+    """The terminal rows `text` occupies: split at its line breaks, the last dropped.
+
+    What a renderer writes ends in a newline, so the empty piece after it is
+    not a row; an empty piece anywhere else is a blank row and stays.
+    """
+    rows = _clean(text).split("\n")
+    if rows and rows[-1] == "":
+        rows.pop()
+    return rows
+
+
+def _drawn(draw, *args, **kwargs):
+    """The rows `draw` prints on a terminal, or None when it cannot (logged).
+
+    `draw` is one of the Python UI's functions, called as it is called with a
+    `stream` of its own. Whatever it raises costs the event its rows and
+    nothing else.
+    """
+    try:
+        stream = _Capture()
+        draw(*args, stream=stream, **kwargs)
+        return _rows_of(stream.getvalue())
+    except Exception as error:
+        _log("could not draw rows with %s: %s: %s"
+             % (getattr(draw, "__name__", draw), type(error).__name__, error))
+        return None
+
+
+def _text_rows(template, *values):
+    """The rows of text the Python UI prints as it is, or None when they cannot be made."""
+    try:
+        return _rows_of(template % values)
+    except Exception as error:
+        _log("could not make rows: %s: %s" % (type(error).__name__, error))
+        return None
+
+
+def _with_rows(rows):
+    """The `rows` field for an event, or nothing when there are none to send."""
+    return {} if rows is None else {"rows": rows}
+
+
+def _console_rows(objects, kwargs):
+    """What `console.print(*objects, **kwargs)` puts on a terminal, colour included."""
+    try:
+        try:
+            from rich.console import Console
+        except ImportError:
+            # TMT's plain console, the fallback when rich is missing, prints
+            # the words and drops the markup.
+            return _rows_of(" ".join(_unmarkup(value) for value in objects) + "\n")
+        stream = _Capture()
+        Console(file=stream, force_terminal=True, color_system="truecolor",
+                width=shutil.get_terminal_size((80, 24)).columns,
+                legacy_windows=False).print(*objects, **kwargs)
+        return _rows_of(stream.getvalue())
+    except Exception as error:
+        _log("could not draw a notice: %s: %s" % (type(error).__name__, error))
+        return None
+
+
+# Stands in for a row of the prompt box while the column is cut out of a
+# composed frame; see `_column`.
+_MARK = "\x01"
+
+
+def _column(state, columns, lines):
+    """(rows, width) of the right-hand column `state` draws in this terminal.
+
+    `PanelState.frame` returns the column only as a `join` that sets it beside
+    the prompt box's rows. A marker row of the full width goes in as the box:
+    `compose` cuts it to the left column's width, which says where the column
+    starts, and everything from there on is the column.
+    """
+    import agent_panel
+    frame = state.frame(columns, lines)
+    if frame is None:
+        return [], 0
+    composed = list(frame[1]([_MARK * columns]))
+    last = composed[-1] if composed else ""
+    cut = len(last) - len(last.lstrip(_MARK))
+    start = cut + (agent_panel.GUTTER if cut else 0)
+    rows = [_clean(row[start:]) for row in composed]
+    width = max([agent_ui.visible_width(row) for row in rows] or [0])
+    return (rows, width) if width else ([], 0)
+
+
 def _panels(session, manager):
     """(kind, payload) for each panel the terminal UI's right-hand column draws."""
     out = []
@@ -632,7 +775,9 @@ class _Transcript(agent_ui.Transcript):
     """
 
     def __init__(self, port, history=None):
-        super().__init__(history=history)
+        # A terminal of its own to lay the rows out for, not `sys.stdout`,
+        # which is the log for the length of a run.
+        super().__init__(stream=_Capture(), history=history)
         self._port = port
 
     def emit(self, event):
@@ -645,8 +790,20 @@ class _Transcript(agent_ui.Transcript):
         elif level < 3:
             self._port.channel.send("event", kind=event.kind, message=event.message,
                                     stage=event.stage, level=level,
-                                    detail=event.detail)
+                                    detail=event.detail, **_with_rows(self._rows(event)))
         return event
+
+    def _rows(self, event):
+        """What `Transcript.emit` prints for `event`, blank-row rhythm included."""
+        try:
+            lines = self.lines_for(event)
+            if not lines:
+                return None
+            return _rows_of(self._separator(event) + "\n".join(lines) + "\n")
+        except Exception as error:
+            _log("could not draw rows for a %s event: %s: %s"
+                 % (event.kind, type(error).__name__, error))
+            return None
 
 
 class _Prompt:
@@ -701,7 +858,8 @@ class _Console:
                  else "warning" if _YELLOW.match(head) else "info")
         said = _unmarkup(text).strip()
         if said:
-            self._port.channel.send("notice", level=level, text=said)
+            self._port.channel.send("notice", level=level, text=said,
+                                    **_with_rows(_console_rows(objects, kwargs)))
 
     def input(self, prompt=""):
         # Nothing in a headless run reads a console; the prompt box and the
@@ -747,6 +905,7 @@ class Headless:
         self._sent_lock = threading.Lock()
         channel.on_interrupt = self._interrupted
         channel.on_close = self._interrupted
+        channel.on_resize = self._resized
 
     # --- installing over the loop's names --------------------------------
 
@@ -790,12 +949,16 @@ class Headless:
             gesture, detail = str(tip or ""), ""
         self.channel.send("session",
                           workspace=str(facts.get("workspace") or agent_config.ROOT_DIR),
-                          tip={"gesture": gesture, "detail": detail})
+                          tip={"gesture": gesture, "detail": detail},
+                          **_with_rows(_drawn(agent_menu.render_status, prompt=False,
+                                              **facts)))
         return 0
 
     def render_task(self, task, stream=None, size=None, moment=None):
         self._task = str(task or "")
-        self.channel.send("task", text=self._task, caption=_caption(moment))
+        self.channel.send("task", text=self._task, caption=_caption(moment),
+                          **_with_rows(_drawn(agent_menu.render_task, task, size=size,
+                                              moment=moment)))
         return True
 
     def render_command(self, result, stream=None, size=None):
@@ -806,17 +969,25 @@ class Headless:
                              "value": _plain(row[1] if len(row) > 1 else "")})
             else:
                 rows.append({"text": _plain(row)})
+        drawn = _drawn(agent_menu.render_command, result, size=size)
+        # `rows` has always been the command's structured rows, and a front
+        # end that cannot use rendered ones still reads them from there. When
+        # the Python UI's own rows are available they take the name -- the
+        # one every event uses for them -- and the structured rows move to
+        # `items`, so nothing is lost either way.
+        fields = {"rows": rows} if drawn is None else {"rows": drawn, "items": rows}
         self.channel.send("command", title=_plain(getattr(result, "title", "")),
-                          ok=bool(getattr(result, "ok", True)), rows=rows,
+                          ok=bool(getattr(result, "ok", True)),
                           note=_plain(getattr(result, "note", "")),
                           prompt_for=str(getattr(result, "prompt_for", "") or ""),
-                          to_menu=bool(getattr(result, "to_menu", False)))
+                          to_menu=bool(getattr(result, "to_menu", False)), **fields)
         self.sync()
         # No rows were drawn, so the pad gives none up.
         return 0
 
     def render_response(self, response, stream=None):
-        self.channel.send("final", text=str(response))
+        self.channel.send("final", text=str(response),
+                          **_with_rows(_drawn(agent_ui.render_response, str(response))))
 
     # --- the prompt ------------------------------------------------------
 
@@ -869,7 +1040,9 @@ class Headless:
             "approval", "approval_reply",
             accept=lambda message: isinstance(message.get("answer"), str),
             question=str(question), pattern=pattern, hint=hint, choices=choices,
-            action=str(tool.get("action") or ""))
+            action=str(tool.get("action") or ""),
+            # What `_command_approval` prints before it reads the answer.
+            **_with_rows(_text_rows("%s\n%s", question, hint)))
         if reply is None:
             # Nobody is there to approve anything, which is no.
             return False
@@ -886,7 +1059,7 @@ class Headless:
             question=text, pattern="", hint=text,
             choices=[{"key": "y", "label": "Use it as the workspace"},
                      {"key": "n", "label": "Stop"}],
-            action="workspace")
+            action="workspace", **_with_rows(_text_rows("%s", text)))
         return "n" if reply is None else reply["answer"]
 
     def choose(self, text, keys):
@@ -904,7 +1077,9 @@ class Headless:
             accept=lambda message: message.get("key") in (None, "") + accepted,
             text=_plain(text), keys=list(accepted),
             question=asked.question if asked is not None else None,
-            options=list(asked.options) if asked is not None else None)
+            options=list(asked.options) if asked is not None else None,
+            # The block `_question_asker` prints above the one-key read.
+            **_with_rows(_text_rows("%s", text)))
         if reply is None:
             return None
         return reply.get("key")
@@ -1042,8 +1217,54 @@ class Headless:
                 if self._sent.get(kind) != payload:
                     self._sent[kind] = payload
                     changed.append((kind, payload))
+            # Last: the column those snapshots (and what was authorised for
+            # the turn) are drawn into. Sent the first time too, empty or not.
+            column = self._column()
+            if self._sent.get("panel") != column:
+                self._sent["panel"] = column
+                changed.append(("panel", column))
         for kind, payload in changed:
             self.channel.send(kind, **payload)
+
+    def _column(self):
+        """The right-hand column as the Python prompt box draws it right now.
+
+        `{"rows": [...], "width": N}`, or no rows and no width when the Python
+        UI would draw no column: nothing to show, or a window too narrow.
+        Asked of the same `PanelState` the prompt box builds, against the
+        terminal as the front end last reported it.
+        """
+        empty = {"rows": [], "width": 0}
+        if self.session is None and self.manager is None:
+            return empty
+        try:
+            import agent_panel
+            columns, lines = shutil.get_terminal_size((80, 24))
+            state = agent_panel.PanelState(
+                self.manager, stream=_Capture(),
+                plan=lambda: getattr(self.session, "plan", None),
+                review=lambda: getattr(self.session, "review", None),
+                verify=lambda: getattr(self.session, "verify", None),
+                capabilities=lambda: getattr(self.session, "capabilities", None))
+            rows, width = _column(state, columns, lines)
+            return {"rows": rows, "width": width}
+        except Exception as error:
+            # The Python box takes a column that cannot be built as no column.
+            _log("could not draw the column: %s: %s" % (type(error).__name__, error))
+            return empty
+
+    def _resized(self):
+        """The front end's terminal changed size: send the column laid out again.
+
+        Not before the first `sync` has gone out: the first `prompt` carries
+        the size as it is by then.
+        """
+        with self._sent_lock:
+            if "panel" not in self._sent:
+                return
+            column = self._column()
+            self._sent["panel"] = column
+        self.channel.send("panel", **column)
 
 
 # --- the entry point -------------------------------------------------------

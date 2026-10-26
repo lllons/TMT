@@ -5,15 +5,22 @@ pins each piece on its own, so a failure there can be read off a failure here.
 The contract is `docs/tui-protocol.md`.
 """
 
+import datetime
 import inspect
 import io
 import json
 import os
+import re
+import sys
 import threading
 import time
 
 import agent_backend
+import agent_commands
 import agent_config
+import agent_menu
+import agent_panel
+import agent_plan
 import agent_ui
 import TMT
 
@@ -337,3 +344,255 @@ def test_settings_carry_what_the_front_end_needs():
     assert values["mouse"] == "on" and isinstance(values["configured"], bool)
     assert values["protocol"] in agent_config.PROTOCOLS
     json.dumps(values)
+
+
+# --- rendered rows -----------------------------------------------------------
+#
+# `rows` on an event is what the Python UI would have printed for it. These
+# pin the pieces; `test_agent_backend_events` checks them on whole sessions.
+
+class Tty(io.StringIO):
+    """A terminal for the Python renderers to draw on, made here and not by the
+    backend, so the golden checks below do not use the thing they check."""
+
+    encoding = "utf-8"
+
+    def isatty(self):
+        return True
+
+
+COLOUR = re.compile(r"\x1b\[[0-9;]*m")
+MOMENT = datetime.datetime(2026, 10, 25, 9, 30, 0)
+
+
+def only_colour(rows):
+    """Whether `rows` is a list of strings with no escape in them but colour."""
+    return (isinstance(rows, list) and all(isinstance(row, str) for row in rows)
+            and all("\x1b" not in COLOUR.sub("", row) for row in rows))
+
+
+def plain(rows):
+    return [agent_ui.strip_ansi(row) for row in rows]
+
+
+def printed(draw, *args, **kwargs):
+    """What one of the Python UI's renderers prints on a terminal, as plain rows."""
+    screen = Tty()
+    draw(*args, stream=screen, **kwargs)
+    return agent_ui.strip_ansi(screen.getvalue()).split("\n")[:-1]
+
+
+class Terminal(Env):
+    """A 90 x 30 terminal and a fixed clock, put back afterwards."""
+
+    def __enter__(self):
+        super().__enter__()
+        os.environ["COLUMNS"], os.environ["LINES"] = "90", "30"
+        self.clock = agent_menu._clock
+        agent_menu._clock = lambda moment=None: MOMENT if moment is None else moment
+        return self
+
+    def __exit__(self, *exc):
+        agent_menu._clock = self.clock
+        return super().__exit__(*exc)
+
+
+class Session:
+    """The three things the right-hand column reads off a session."""
+
+    def __init__(self, steps=()):
+        self.plan = agent_plan.Plan(steps)
+        self.review = self.verify = self.capabilities = None
+
+
+def headless():
+    ch, out = channel()
+    return agent_backend.Headless(ch, interrupt=lambda: None), out
+
+
+def panels(out):
+    return [event for event in sent(out) if event["type"] == "panel"]
+
+
+def test_rows_keep_colour_and_weight_and_lose_everything_else():
+    dirty = "a\x1b[2K\x1b[31mred\x1b[0m\x1b[5A\x1b]0;title\x07b\rc\x08\x1b"
+    assert agent_backend._rows_of(dirty + "\n") == ["a\x1b[31mred\x1b[0mbc"]
+    # A blank row is a row; the newline that ends the last one is not.
+    assert agent_backend._rows_of("\nx\n\ny\n") == ["", "x", "", "y"]
+    assert agent_backend._rows_of("") == []
+    assert agent_backend._rows_of("one\r\ntwo") == ["one", "two"]
+
+
+def test_task_session_and_final_rows_are_what_the_python_renderers_print():
+    tip = ("/notes", "shows what TMT knows")
+    answer = "Done **now** with `code`.\n\n- one\n- two"
+    with Terminal():
+        port, out = headless()
+        port.render_status(workspace="/work/app", tip=tip)
+        port.render_task("fix   the  parser", moment=MOMENT)
+        port.render_response(answer)
+        expected = {
+            "session": printed(agent_menu.render_status, prompt=False,
+                               workspace="/work/app", tip=tip),
+            "task": printed(agent_menu.render_task, "fix   the  parser", moment=MOMENT),
+            "final": printed(agent_ui.render_response, answer)}
+    events = {event["type"]: event for event in sent(out)}
+    for kind, rows in expected.items():
+        assert only_colour(events[kind]["rows"]), kind
+        assert plain(events[kind]["rows"]) == rows, kind
+    # The facts the front end falls back on are untouched.
+    assert events["session"]["tip"] == {"gesture": "/notes", "detail": "shows what TMT knows"}
+    assert events["task"]["text"] == "fix   the  parser" and events["task"]["caption"]
+    assert events["final"]["text"] == answer
+    # Caption row, the task, and nothing after it: the Python UI writes no blank row there.
+    assert len(events["task"]["rows"]) == 2 and events["task"]["rows"][1] == " > fix the parser"
+    if not os.environ.get("NO_COLOR"):
+        # The wordmark's truecolor gradient, as the Python UI paints it.
+        assert any("\x1b[38;2;" in row for row in events["session"]["rows"])
+
+
+def test_event_rows_repeat_the_blank_row_rhythm_of_the_terminal_record():
+    kinds = [("progress", "Reading the parser.", {}),
+             ("file_edit", "Edited a.py", {"added": 1, "removed": 2, "paths": ("a.py",)}),
+             ("file_create", "Created b.py", {"added": 3, "removed": 0}),
+             ("progress", "Now the tests.", {}),
+             ("success", "All green.", {})]
+    with Terminal():
+        port, out = headless()
+        transcript = agent_backend._Transcript(port)
+        screen = Tty()
+        record = agent_ui.Transcript(stream=screen)
+        for kind, message, detail in kinds:
+            transcript.emit_kind(kind, message, **detail)
+            record.emit_kind(kind, message, **detail)
+    events = [event for event in sent(out) if event["type"] == "event"]
+    assert len(events) == 5 and all(only_colour(event["rows"]) for event in events)
+    assert plain([row for event in events for row in event["rows"]]) \
+        == agent_ui.strip_ansi(screen.getvalue()).split("\n")[:-1]
+    # A blank row goes in front of a prominent block and again after it.
+    assert [event["rows"][0] == "" for event in events] == [False, True, False, True, False]
+    assert plain(events[1]["rows"])[-1].endswith("+1 -2")
+    assert events[1]["message"] == "Edited a.py"
+
+
+def test_a_command_carries_the_python_rows_and_keeps_its_structured_rows_as_items():
+    def boom(*args, **kwargs):
+        raise RuntimeError("renderer broke")
+
+    result = agent_commands.dispatch("/help")
+    with Terminal():
+        port, out = headless()
+        port.render_command(result)
+        expected = printed(agent_menu.render_command, result)
+        saved, agent_menu.render_command = agent_menu.render_command, boom
+        log, stderr = io.StringIO(), sys.stderr
+        sys.stderr = log
+        try:
+            port.render_command(result)
+        finally:
+            agent_menu.render_command = saved
+            sys.stderr = stderr
+    drawn, fallback = [event for event in sent(out) if event["type"] == "command"]
+    assert only_colour(drawn["rows"]) and plain(drawn["rows"]) == expected
+    assert drawn["rows"][0] == "" and drawn["title"] == "Commands"
+    assert drawn["items"] and all(isinstance(item, dict) for item in drawn["items"])
+    # Without the Python rows, `rows` is what it has always been.
+    assert "items" not in fallback and fallback["rows"] == drawn["items"], fallback
+    assert "renderer broke" in log.getvalue()
+
+
+def test_a_renderer_that_raises_costs_the_event_its_rows_and_nothing_else():
+    def boom(*args, **kwargs):
+        raise RuntimeError("renderer broke")
+
+    saved = (agent_menu.render_status, agent_menu.render_task,
+             agent_ui.render_response, sys.stderr)
+    log = io.StringIO()
+    agent_menu.render_status = agent_menu.render_task = agent_ui.render_response = boom
+    sys.stderr = log
+    try:
+        port, out = headless()
+        port.render_status(workspace="/w", tip=("/notes", "x"))
+        port.render_task("do it", moment=MOMENT)
+        port.render_response("done")
+        transcript = agent_backend._Transcript(port)
+        transcript.lines_for = boom
+        transcript.emit_kind("progress", "still here")
+    finally:
+        (agent_menu.render_status, agent_menu.render_task,
+         agent_ui.render_response, sys.stderr) = saved
+    events = {event["type"]: event for event in sent(out)}
+    for kind in ("session", "task", "final", "event"):
+        assert kind in events and "rows" not in events[kind], kind
+    assert events["session"]["tip"] == {"gesture": "/notes", "detail": "x"}
+    assert events["task"]["text"] == "do it" and events["final"]["text"] == "done"
+    assert events["event"]["message"] == "still here"
+    assert transcript.history.kinds() == ("progress",)
+    assert log.getvalue().count("renderer broke") == 4, log.getvalue()
+
+
+def test_a_notice_carries_the_rows_the_console_prints_with_its_colour():
+    with Terminal():
+        port, out = headless()
+        console = agent_backend._Console(port)
+        console.print("[red]Stream failed:[/red] boom")
+        console.print("\n[yellow]Task cancelled. Returning to prompt.[/yellow]")
+        console.print("[yellow]" + "word " * 60 + "[/yellow]")
+    failed, cancelled, long = sent(out)
+    assert failed["text"] == "Stream failed: boom" and failed["level"] == "error"
+    assert plain(failed["rows"]) == ["Stream failed: boom"]
+    # The blank row the leading newline prints is a row.
+    assert plain(cancelled["rows"]) == ["", "Task cancelled. Returning to prompt."]
+    # Wrapped at the front end's width, as the console wraps for its terminal.
+    assert len(long["rows"]) > 1
+    assert all(agent_ui.visible_width(row) <= 90 for row in long["rows"])
+    assert all(only_colour(event["rows"]) for event in (failed, cancelled, long))
+    try:
+        import rich  # noqa: F401
+    except ImportError:
+        return
+    if not os.environ.get("NO_COLOR"):
+        assert failed["rows"][0].startswith("\x1b[31mStream failed:"), failed["rows"]
+
+
+def test_the_column_is_the_one_the_prompt_box_draws():
+    with Terminal():
+        os.environ["COLUMNS"], os.environ["LINES"] = "100", "30"
+        port, _ = headless()
+        nothing = {"rows": [], "width": 0}
+        assert port._column() == nothing                      # no session at all
+        port.session = Session()
+        assert port._column() == nothing                      # a session with no plan
+        port.session = Session(["Write the notes", "Check them"])
+        column = port._column()
+        width = agent_panel.panel_width(99)
+        assert column["width"] == width == 28
+        # Exactly the rows the Python UI's column holds, cut out of its frame.
+        assert column["rows"] == agent_panel.plan_rows(
+            port.session.plan, width, height=28, stream=Tty())
+        assert only_colour(column["rows"]) and plain(column["rows"])[0] == "PLAN 0/2"
+        assert max(agent_ui.visible_width(row) for row in column["rows"]) == column["width"]
+        os.environ["COLUMNS"] = "40"        # too narrow for two columns: the box draws none
+        assert port._column() == nothing
+
+
+def test_a_resize_sends_the_column_again_but_only_after_the_first_snapshot():
+    with Terminal():
+        os.environ["COLUMNS"], os.environ["LINES"] = "100", "30"
+        port, out = headless()
+        ch = port.channel
+        ch.ready = True
+        port.session = Session(["Write the notes", "Check them"])
+        ch._take('{"type":"resize","columns":100,"rows":30}')
+        assert panels(out) == []                  # the first prompt will carry it
+        port.sync()
+        assert [panel["width"] for panel in panels(out)] == [28]
+        port.sync()                               # nothing changed: nothing sent
+        ch._take('{"type":"hello","columns":100,"rows":30}')
+        assert len(panels(out)) == 1
+        ch._take('{"type":"resize","columns":60,"rows":20}')
+        ch._take('{"type":"resize","columns":60,"rows":20}')    # same size: still fresh
+        ch._take('{"type":"resize","columns":20,"rows":20}')    # too narrow for a column
+        sizes = [(panel["width"], len(panel["rows"])) for panel in panels(out)]
+        assert sizes == [(28, 4), (18, 4), (18, 4), (0, 0)], sizes
+        assert panels(out)[-1] == {"v": 1, "type": "panel", "rows": [], "width": 0}

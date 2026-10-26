@@ -16,6 +16,7 @@ import datetime
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -24,9 +25,11 @@ import time
 from pathlib import Path
 
 import agent_backend
+import agent_commands
 import agent_config
 import agent_menu
 import agent_tips
+import agent_ui
 import TMT
 from test_agent_workspace import Workspace, remove_tree
 
@@ -849,3 +852,167 @@ def test_the_python_ui_draws_exactly_what_it_drew_before_the_backend():
     second = _python_ui_session()
     assert first == second, (first, second)
     assert first == GOLDEN, "\n" + first
+
+
+# --- rendered rows -------------------------------------------------------------
+#
+# An event can carry `rows`: the terminal rows the Python UI prints for it. The
+# front end commits them as they are, so they have to be what the Python UI
+# prints, and nothing a terminal would read as a command.
+
+COLOUR = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class Tty(io.StringIO):
+    """A terminal for the Python renderers to draw on, made here and not by the
+    backend, so the checks below do not use the thing they check."""
+
+    encoding = "utf-8"
+
+    def isatty(self):
+        return True
+
+
+def rows_of(event):
+    """The plain text of an event's `rows`, after checking they are only colour."""
+    rows = event.get("rows")
+    assert isinstance(rows, list) and all(isinstance(row, str) for row in rows), event
+    for row in rows:
+        assert "\x1b" not in COLOUR.sub("", row), repr(row)
+        assert "\n" not in row and "\r" not in row, repr(row)
+    return [agent_ui.strip_ansi(row) for row in rows]
+
+
+def printed(draw, *args, **kwargs):
+    """What one of the Python UI's renderers prints on a terminal, as plain rows."""
+    screen = Tty()
+    draw(*args, stream=screen, **kwargs)
+    return agent_ui.strip_ansi(screen.getvalue()).split("\n")[:-1]
+
+
+def test_events_carry_the_rows_the_python_ui_would_have_printed():
+    code, client, _, _ = drive(
+        script(tasks=["write the notes", "/help"], approvals=["y"], keys=["2"]),
+        [WRITE, DELETE, ASK, ANSWER])
+    assert code == 0
+    for kind in ("session", "task", "event", "command", "final", "approval", "question"):
+        assert client.of(kind), kind
+        for event in client.of(kind):
+            assert rows_of(event), event
+    # The size and the clock the run had, so the Python renderers draw for the same.
+    with Pinned():
+        session = client.of("session")[0]
+        tip = (session["tip"]["gesture"], session["tip"]["detail"])
+        assert rows_of(session) == printed(agent_menu.render_status, prompt=False,
+                                           workspace=session["workspace"], tip=tip)
+        for task in client.of("task"):
+            assert rows_of(task) == printed(agent_menu.render_task, task["text"],
+                                            moment=FIXED), task
+        final = client.of("final")[0]
+        assert rows_of(final) == printed(agent_ui.render_response, final["text"])
+        # The turn's record, row for row, blank rows between the blocks included.
+        screen = Tty()
+        record = agent_ui.Transcript(stream=screen)
+        for event in client.of("event"):
+            record.emit_kind(event["kind"], event["message"], event["stage"],
+                             **event["detail"])
+        assert [row for event in client.of("event") for row in rows_of(event)] \
+            == agent_ui.strip_ansi(screen.getvalue()).split("\n")[:-1]
+        command = client.of("command")[0]
+        assert rows_of(command) == printed(agent_menu.render_command,
+                                           agent_commands.dispatch("/help"))
+    assert command["rows"][0] == "" and command["items"], command
+    approval = client.of("approval")[0]
+    assert rows_of(approval) == (approval["question"] + "\n" + approval["hint"]).split("\n")
+    question = client.of("question")[0]
+    assert rows_of(question) == question["text"].split("\n")
+    # What the front end falls back on is still all there.
+    assert final["text"] == ANSWER["message"] and question["options"] == ["Red", "Blue"]
+    if not os.environ.get("NO_COLOR"):
+        # Colour as the Python UI paints it: a truecolor wordmark, a gradient mark.
+        assert any("\x1b[38;2;" in row for row in session["rows"])
+        assert any("\x1b[38;2;" in row for event in client.of("event")
+                   for row in event["rows"])
+
+
+def test_a_notice_carries_the_rows_the_console_printed():
+    code, client, _, _ = drive(script(tasks=["go"]), [{"action": "no_such_action"}, ANSWER])
+    notices = [event for event in client.of("notice") if event["level"] == "error"]
+    assert notices and notices[0]["text"].startswith("Invalid action:"), client.of("notice")
+    rows = rows_of(notices[0])
+    # Wrapped for the front end's 100 columns, and the same words.
+    assert len(rows) > 1 and all(agent_ui.display_width(row) <= 100 for row in rows)
+    assert " ".join(" ".join(rows).split()) == " ".join(notices[0]["text"].split())
+    if not os.environ.get("NO_COLOR"):
+        assert notices[0]["rows"][0].startswith("\x1b["), notices[0]["rows"][0]
+
+
+def test_the_column_is_sent_empty_with_the_first_prompt_and_again_when_it_changes():
+    plan = {"action": "plan", "operation": "create",
+            "steps": ["Write the notes", "Check them"]}
+    clear = {"action": "plan", "operation": "clear"}
+    code, client, _, _ = drive(script(tasks=["write the notes, /plan it first"]),
+                               [plan, clear, ANSWER])
+    types = client.types()
+    panels = client.of("panel")
+    assert panels and types.index("panel") < types.index("prompt"), types
+    assert panels[0]["rows"] == [] and panels[0]["width"] == 0, panels[0]
+    shown = [rows_of(panel) for panel in panels]
+    planned = [panel for panel, rows in zip(panels, shown)
+               if any(row.startswith("PLAN") for row in rows)]
+    assert planned, shown
+    rows = rows_of(planned[0])
+    assert any("Write the notes" in row for row in rows)
+    assert any("Check them" in row for row in rows)
+    # The column's own width: the widest row it draws, at most the panel's ceiling.
+    for panel in planned:
+        assert panel["width"] == max(agent_ui.visible_width(row) for row in panel["rows"])
+        assert 18 <= panel["width"] <= 34, panel["width"]
+    # Sent when it changed and not otherwise, and gone from it once the plan is.
+    assert all(a != b for a, b in zip(panels, panels[1:])), shown
+    assert not any(row.startswith("PLAN") for row in shown[-1]), shown[-1]
+
+
+def test_a_resize_makes_the_backend_send_the_column_again():
+    plan = {"action": "plan", "operation": "create",
+            "steps": ["Write the notes", "Check them"]}
+    done = [{"action": "plan", "operation": "update", "step": step, "status": "completed"}
+            for step in ("S1", "S2")]
+
+    def resize(client, event):
+        # At the second prompt: the plan is on the column; the window narrows.
+        if event["type"] == "prompt" and len(client.of("prompt")) == 2:
+            return [{"v": 1, "type": "resize", "columns": 60, "rows": 20},
+                    {"v": 1, "type": "quit"}]
+        return None
+
+    code, client, _, _ = drive(script(tasks=["go /plan"], also=resize),
+                               [plan] + done + [ANSWER])
+    assert code == 0
+    before, after = client.events[-3], client.events[-2]
+    assert client.events[-1]["type"] == "exit", client.types()[-5:]
+    assert before["type"] == "prompt" and after["type"] == "panel", client.types()[-5:]
+    last = [panel for panel in client.of("panel")[:-1]][-1]
+    assert any(row.startswith("PLAN 2/2") for row in rows_of(last)), rows_of(last)
+    assert last["width"] == 28 and after["width"] == 18, (last["width"], after["width"])
+    assert any(row.startswith("PLAN 2/2") for row in rows_of(after))
+
+
+def test_a_renderer_that_fails_costs_its_event_the_rows_and_nothing_else():
+    def boom(*args, **kwargs):
+        raise RuntimeError("renderer broke")
+
+    saved, stderr = agent_menu.render_task, sys.stderr
+    agent_menu.render_task = boom
+    sys.stderr = log = io.StringIO()
+    try:
+        code, client, _, _ = drive(script(tasks=["write the notes"]), [WRITE, ANSWER])
+    finally:
+        agent_menu.render_task = saved
+        sys.stderr = stderr
+    assert code == 0 and client.of("exit")[0]["reason"] == "quit"
+    task = client.of("task")[0]
+    assert "rows" not in task and task["text"] == "write the notes" and task["caption"]
+    assert rows_of(client.of("session")[0]) and rows_of(client.of("final")[0])
+    assert client.of("final")[0]["text"] == ANSWER["message"]
+    assert "renderer broke" in log.getvalue()
