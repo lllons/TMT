@@ -17,6 +17,8 @@
 >**Needs Python 3.8+.** Install it with `npm install -g tmtcode` (Node 14+ and git),
 >or from a clone with pip.
 
+[![Architecture diagram](https://gitdiagram.com/diagram-badge.svg)](https://gitdiagram.com/lllons/tmt?utm_source=readme&utm_medium=badge)
+
 ## Quick start
 
 **With npm — two commands, no clone and no pip step:**
