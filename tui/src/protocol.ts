@@ -80,7 +80,8 @@ export type BackendEvent =
   | { type: 'delta'; text?: string }
   | { type: 'reply_reset' }
   | { type: 'event'; kind?: string; message?: string; stage?: string; level?: number; detail?: Record<string, unknown>; rows?: string[] }
-  | { type: 'tool_start' | 'tool_end'; id?: number }
+  | { type: 'tool_start'; id?: number; action?: string; label?: string; target?: string }
+  | { type: 'tool_end'; id?: number; action?: string; status?: 'done' | 'raised' | 'interrupted'; error?: string }
   | { type: 'approval'; id: number; question?: string; hint?: string; choices?: Choice[]; pattern?: string; action?: string; rows?: string[] }
   | { type: 'question'; id: number; text?: string; keys?: string[]; question?: string | null; options?: string[] | null; rows?: string[] }
   | { type: 'plan'; steps?: PlanStep[] }

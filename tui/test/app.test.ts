@@ -3,150 +3,19 @@
 // Python) for its backend. What is asserted is what the terminal shows and
 // what the backend was sent.
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { runApp, type PreludeRequest, type PreludeRunner } from '../src/app.js';
+import { describe, expect, it, vi } from 'vitest';
+import type { PreludeRequest, PreludeRunner } from '../src/app.js';
 import { displayWidth } from '../src/input/width.js';
-import { FakeTerminal, forbiddenIn, isField } from './harness.js';
+import { makeTheme } from '../src/theme.js';
+import { forbiddenIn, isField, showsPainted } from './harness.js';
+import { CAPTION, FAKE, prompt, QUIT, READY, SESSION, start, START, TASK, type Run, type Step } from './run.js';
 
 // Every test starts a real process, and two wait out the 2 s a backend that
 // ignores its quit is given before it is killed.
 vi.setConfig({ testTimeout: 30_000 });
-
-const FAKE = join(import.meta.dirname, 'fixtures', 'fake-backend.mjs');
-
-const CAPTION = { clock: '09:30:00', provider: 'Prov', model: 'Model' };
-const READY = {
-  type: 'ready', workspace: 'C:\\work', columns: 100, rows: 30, protocol: 'tags', mouse: 'off', effort: 'high',
-  provider: 'p', provider_label: 'Prov', model: 'm', model_label: 'Model', configured: true, version: '0.1.1',
-};
-const SESSION = { type: 'session', workspace: 'C:\\work', tip: { gesture: '/notes', detail: 'shows what TMT knows' } };
-const prompt = (placeholder: string, meter: object = {}) => ({ type: 'prompt', placeholder, caption: CAPTION, meter });
-const TASK = (text: string) => ({ type: 'task', text, caption: CAPTION });
-const START = { on: { type: 'hello' }, send: [READY, SESSION, prompt('Describe your first task')] };
-const QUIT = { on: { type: 'quit' }, send: [{ type: 'exit', code: 0, reason: 'quit', message: '' }], exit: 0 };
-
-type Step = Record<string, unknown>;
-type Message = Record<string, unknown> & { type?: string };
-
-interface Options {
-  columns?: number;
-  rows?: number;
-  runPrelude?: PreludeRunner;
-  quitWaitMs?: number;
-  python?: string;
-  color?: boolean;
-}
-
-class Run {
-  readonly dir = mkdtempSync(join(tmpdir(), 'tmt-tui-app-'));
-  readonly term: FakeTerminal;
-  readonly stderr: string[] = [];
-  readonly done: Promise<number>;
-  code: number | undefined;
-  private readonly receivedFile = join(this.dir, 'received.jsonl');
-  readonly logFile = join(this.dir, 'logs', 'tui-backend.log');
-
-  constructor(script: Step[], options: Options = {}) {
-    const scriptFile = join(this.dir, 'script.json');
-    writeFileSync(scriptFile, JSON.stringify(script));
-    this.term = new FakeTerminal(options.columns ?? 100, options.rows ?? 30);
-    this.done = runApp({
-      stdin: this.term.stdin,
-      stdout: this.term.stdout,
-      stderr: { write: (text) => this.stderr.push(text) },
-      python: options.python ?? process.execPath,
-      entry: FAKE,
-      args: [scriptFile, this.receivedFile],
-      logPath: this.logFile,
-      runPrelude: options.runPrelude ?? (async () => 0),
-      color: options.color ?? false,
-      quitWaitMs: options.quitWaitMs,
-    }).then((code) => { this.code = code; return code; });
-  }
-
-  /** Everything the backend was sent, in order (its first record is its arguments). */
-  received(): Message[] {
-    if (!existsSync(this.receivedFile)) return [];
-    return readFileSync(this.receivedFile, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as Message);
-  }
-
-  sent(type: string): Message[] {
-    return this.received().filter((message) => message.type === type);
-  }
-
-  /** Every row the terminal holds. */
-  rows(): string[] {
-    return this.term.all();
-  }
-
-  shows(text: string): boolean {
-    return this.rows().some((row) => row.includes(text));
-  }
-
-  count(text: string): number {
-    return this.rows().filter((row) => row.includes(text)).length;
-  }
-
-  async until(test: () => boolean, what: string, ms = 8000): Promise<void> {
-    const deadline = Date.now() + ms;
-    for (;;) {
-      await this.term.settle(2);
-      if (test()) return;
-      if (Date.now() > deadline) {
-        throw new Error(`timed out waiting for ${what}\n--- screen\n${this.rows().join('\n')}\n--- received\n${JSON.stringify(this.received())}`);
-      }
-      await new Promise((resolve) => setTimeout(resolve, 15));
-    }
-  }
-
-  async showing(text: string): Promise<void> {
-    await this.until(() => this.shows(text), `"${text}" on the screen`);
-  }
-
-  async receiving(type: string, count = 1): Promise<void> {
-    await this.until(() => this.sent(type).length >= count, `${count} ${type} message(s)`);
-  }
-
-  /** Type a line and press Enter (separate reads, as a keyboard sends them). */
-  async enter(text: string): Promise<void> {
-    if (text) this.term.type(text);
-    this.term.type('\r');
-    await this.term.settle(2);
-  }
-
-  /** The exit code, once the app has finished and the terminal has drawn everything it wrote. */
-  async finished(): Promise<number> {
-    const code = await Promise.race([
-      this.done,
-      new Promise<number>((_, reject) => setTimeout(() => reject(new Error('runApp did not finish\n' + this.rows().join('\n'))), 8000)),
-    ]);
-    await this.term.settle();
-    return code;
-  }
-}
-
-let runs: Run[] = [];
-afterEach(async () => {
-  for (const run of runs) {
-    // A test that failed halfway leaves the app up: two Ctrl-C stop it.
-    if (run.code === undefined) {
-      run.term.type('\x03');
-      run.term.type('\x03');
-      await Promise.race([run.done, new Promise((resolve) => setTimeout(resolve, 4000))]);
-    }
-    rmSync(run.dir, { recursive: true, force: true });
-  }
-  runs = [];
-});
-
-function start(script: Step[], options?: Options): Run {
-  const run = new Run(script, options);
-  runs.push(run);
-  return run;
-}
 
 describe('a whole session', () => {
   it('shows the header, streams a reply, commits the record and the answer once, and quits', async () => {
@@ -179,42 +48,42 @@ describe('a whole session', () => {
     const hello = run.sent('hello')[0]!;
     expect(hello).toMatchObject({ v: 1, type: 'hello', columns: 100, rows: 30 });
     expect(run.received()[0]).toEqual({ argv: ['--backend-stdio', expect.stringMatching(/script\.json$/), expect.stringMatching(/received\.jsonl$/)] });
-    // The header, the caption row above the box.
+    // The header is three dim rows, and the footer under the box has the hint and the caption.
     expect(run.shows('TMT 0.1.1')).toBe(true);
     expect(run.shows('workspace  C:\\work')).toBe(true);
     expect(run.shows('tip  /notes  shows what TMT knows')).toBe(true);
-    expect(run.shows('09:30:00 · Prov · Model')).toBe(true);
+    expect(run.rows().some((row) => row.startsWith(' Enter to send') && row.endsWith('09:30:00 · Prov · Model'))).toBe(true);
 
     await run.enter('write the notes');
     await run.showing('Done — wrote notes.txt ✓');
     expect(run.sent('submit')).toMatchObject([{ v: 1, text: 'write the notes' }]);
     // Mid-turn: the reply is live in the frame only, not in the record yet.
     expect(run.term.scrollback().some((row) => row.includes('Done — wrote'))).toBe(false);
-    expect(run.shows('> write the notes')).toBe(true);
-    expect(run.shows('Write File')).toBe(true);
-    expect(run.shows('40%')).toBe(true);
-    // The counts get a row of their own during a turn, and the caption is gone.
-    expect(run.shows('+2 lines, -0 lines, ~12k context, 168 out')).toBe(true);
+    expect(run.shows('❯ write the notes')).toBe(true);
+    // The status row says what is happening, with the turn's clock and tokens: the model has written the reply.
+    expect(run.term.viewport().some((row) => /^[·✢*✶✻✽] Writing the reply… \(\d+s · ↓ 84 tokens · esc to interrupt\)$/.test(row))).toBe(true);
+    // The counts are in the footer during a turn, and the caption is gone.
+    expect(run.term.viewport().some((row) => row.startsWith(' esc/ctrl-c to interrupt · enter queues the next task') && row.includes('+2 lines, -0 lines, ~12k context, 168 out'))).toBe(true);
     expect(run.shows('Prov')).toBe(false);
-    expect(run.shows('  40% Write File | Estimated finish: ')).toBe(true);
-    expect(run.shows('Working. Type to queue the next task')).toBe(true);
-    // Level 0 and 1 rows, with a blank row wherever the record crosses level 2.
+    // The record: a note of progress, the file as a block (no tool call started, so it is named by its kind) with
+    // its result and what was measured, and a success row.
     const rows = run.rows();
     const at = (text: string) => rows.findIndex((row) => row.includes(text));
-    expect(rows[at('Writing the notes.') + 1]).toBe('');
-    expect(rows[at('Created file: notes.txt') + 1]!.trim()).toBe('+2 -0');
-    expect(rows[at('Created file: notes.txt') + 2]).toBe('');
-    expect(at('All good')).toBe(at('Created file: notes.txt') + 3);
+    expect(rows[at('Writing the notes.')]).toBe('· Writing the notes.');
+    expect(rows.slice(at('● Write'), at('● Write') + 3)).toEqual(['● Write', '  ⎿  Created file: notes.txt', '     Wrote 2 lines']);
+    expect(rows[at('● Write') - 1]).toBe('');
+    expect(rows[at('All good')]).toBe('✓ All good');
 
     run.term.resize(110, 30);
     await run.receiving('resize');
     expect(run.sent('resize')[0]).toMatchObject({ columns: 110, rows: 30 });
     await run.until(() => run.shows('Review the notes') && run.count('Done — wrote notes.txt ✓') === 1, 'the answer, once');
     const answer = run.rows().findIndex((row) => row.includes('Done — wrote notes.txt ✓'));
+    expect(run.rows()[answer]).toBe('● Done — wrote notes.txt ✓');
     expect(run.rows()[answer - 1]).toBe('');
     expect(run.rows()[answer + 1]).toBe('');
     expect(run.term.viewport().some((row) => row.startsWith(' > Review the notes'))).toBe(true);
-    expect(run.shows('Working. Type to queue')).toBe(false);
+    expect(run.shows('esc/ctrl-c to interrupt')).toBe(false);
 
     await run.enter('/plan');
     await run.showing('a note');
@@ -296,50 +165,60 @@ describe('a whole session', () => {
     expect(run.term.raw).toContain('\x1b[?1006l\x1b[?1000l');
   });
 
-  it('shows a panel only when it changes', async () => {
+  it('commits a review and a verification once when they end, and a background agent when it stops; the plan is the frame\'s while a turn runs', async () => {
     const steps = (status: string) => [{ id: 'S1', position: 1, title: 'Write the notes', status }];
+    const agent = (status: string, activity: string) => ({ type: 'agents', agents: [{ id: '1', number: 1, kind: 'worker', task: 'port the parser', status, activity }] });
     const run = start([
       { on: { type: 'hello' }, send: [
         READY, SESSION,
         { type: 'plan', steps: [] }, { type: 'review', state: 'idle', headline: 'No review yet' },
         { type: 'verify', state: 'idle', headline: '', checks: [] }, { type: 'agents', agents: [] },
         { type: 'plan', steps: steps('in_progress') }, { type: 'plan', steps: steps('in_progress') },
+        { type: 'review', state: 'running', headline: 'Reviewing the diff' }, { type: 'review', state: 'passed', headline: 'Reviewed - no issues' },
         { type: 'review', state: 'passed', headline: 'Reviewed - no issues' },
         { type: 'verify', state: 'failed', headline: 'Verification failed', checks: [{ name: 'npm test', status: 'failed' }] },
-        { type: 'agents', agents: [{ id: '1', number: 1, kind: 'worker', task: 'port the parser', status: 'running', activity: 'Reading a.py' }] },
-        { type: 'agents', agents: [{ id: '1', number: 1, kind: 'worker', task: 'port the parser', status: 'running', activity: 'Reading b.py' }] },
-        { type: 'plan', steps: steps('completed') },
+        agent('running', 'Reading a.py'), agent('running', 'Reading b.py'),
         prompt('go'),
       ] },
+      { on: { type: 'resize' }, send: [agent('completed', ''), agent('completed', '')] },
       QUIT,
     ]);
-    await run.showing('go');
-    expect(run.count('Plan')).toBe(2);
-    expect(run.shows('  [>] Write the notes')).toBe(true);
-    expect(run.shows('  [x] Write the notes')).toBe(true);
-    expect(run.count('Review  Reviewed - no issues')).toBe(1);
-    expect(run.shows('Verify  Verification failed')).toBe(true);
-    expect(run.shows('  [failed] npm test')).toBe(true);
-    expect(run.count('1 worker  running  port the parser')).toBe(1);
-    expect(run.shows('Reading')).toBe(false);
+    await run.showing('Reading b.py');
+    // Idle, the plan is not drawn; the agent that works is a row of the frame, not of the record.
+    expect(run.shows('Write the notes')).toBe(false);
+    expect(run.term.viewport().filter((row) => row.includes('⎇ 1 worker  running  Reading b.py'))).toHaveLength(1);
+    expect(run.shows('Reading a.py')).toBe(false);
+    // A review and a verification are a row each when they end, however often they are said again.
+    expect(run.rows().filter((row) => row === '✓ Reviewed - no issues')).toHaveLength(1);
+    expect(run.rows().filter((row) => row === '✗ Verification failed')).toHaveLength(1);
+    expect(run.shows('Reviewing the diff')).toBe(false);
+    expect(run.shows('No review yet')).toBe(false);
+    run.term.resize(101, 30);
+    await run.until(() => run.shows('completed'), 'the agent to stop');
+    expect(run.rows().filter((row) => row === '⎇ 1 worker  completed  port the parser')).toHaveLength(1);
+    expect(run.term.viewport().some((row) => row.includes('running'))).toBe(false);
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
 });
 
-describe('the live look: the progress row, the counts and the right-hand column', () => {
+describe('the live look: the status row, the plan and the footer', () => {
   const COLUMN = {
     type: 'panel', width: 33,
     rows: ['CAPABILITIES 1', '● /plan', '', 'PLAN 0/3', '─'.repeat(33), 'S1 ● Read README.md', 'S2 ○ Add a Contents line', 'S3 ○ Check the result'],
   };
-  const NO_COLUMN = { type: 'panel', rows: [], width: 0 };
-  const steps = [{ id: 'S1', position: 1, title: 'Read README.md', status: 'in_progress' }];
+  const steps = [
+    { id: 'S1', position: 1, title: 'Read README.md', status: 'completed' },
+    { id: 'S2', position: 2, title: 'Add a Contents line', status: 'in_progress' },
+    { id: 'S3', position: 3, title: 'Check the result', status: 'pending' },
+  ];
   const ENDED = [
     { type: 'status', state: 'idle', label: '', progress: null },
     { type: 'turn_end', task: 'go', answer: '', outcome: 'you stopped it with Ctrl-C', suggestion: '' },
   ];
+  const statusRow = (run: Run): string | undefined => run.term.viewport().find((row) => /^[·✢*✶✻✽] \S/.test(row));
 
-  it('draws the bar and the readout from status and meter on the backend\'s clock, the counts in a row of their own, and the caption again after', async () => {
+  it('says what is happening on the backend\'s clock, with the counts in the footer, and the caption again after', async () => {
     const run = start([
       START,
       { on: { type: 'submit', text: 'go' }, send: [TASK('go'), { type: 'turn_start', task: 'go' }, { type: 'status', state: 'thinking', label: '', progress: null }] },
@@ -354,97 +233,97 @@ describe('the live look: the progress row, the counts and the right-hand column'
     ]);
     await run.showing('Describe your first task');
     await run.enter('go');
-    await run.showing('THINKING');
-    expect(run.shows('✻')).toBe(false);
+    await run.showing('Thinking…');
+    // No tool, no reply, nothing said yet: the model is thinking, and nothing else is claimed.
+    expect(statusRow(run)).toMatch(/^[·✢*✶✻✽] Thinking… \(\d+s · esc to interrupt\)$/);
     run.term.resize(101, 30);
-    await run.showing('35% Plan');
+    await run.showing('↓ 80 tokens');
     const view = run.term.viewport();
-    const bar = view.find((row) => row.includes('35% Plan'))!;
-    // The estimate is worked out from the 30 s the backend said, not from the 0 s here.
-    expect(bar).toMatch(/^████░░░░░░░░ {2}35% Plan \| Estimated finish: ~5\d seconds {2,}[✻✽] thinking… \(3[01]s · ↓ 80 tokens\)$/);
-    expect(view.indexOf(bar)).toBe(view.length - 2);
-    expect(view.some((row) => row === ' +0 lines, -0 lines, ~16k context, ~326 out')).toBe(true);
+    const row = statusRow(run)!;
+    // The clock is the 30 s the backend said, not the 0 s here.
+    expect(row).toMatch(/^[·✢*✶✻✽] Thinking… \(3[01]s · ↓ 80 tokens · esc to interrupt\)$/);
+    // The status row is above the box; the footer under it holds the hints and the counts.
+    const field = view.findIndex(isField);
+    expect(view.indexOf(row)).toBeLessThan(field);
+    expect(view[field + 2]).toBe(' esc/ctrl-c to interrupt · enter queues the next task  +0 lines, -0 lines, ~16k context, ~326 out');
+    expect(view[view.length - 1]).toBe('');
     expect(run.shows('09:30:00')).toBe(false);
 
     run.term.type('\x03');
-    await run.until(() => run.shows('next') && !run.shows('35% Plan'), 'the next prompt');
-    expect(run.rows().some((row) => row.startsWith(' +3 lines, -1 line, ~16k context, 326 out') && row.endsWith('09:30:00 · Prov · Model'))).toBe(true);
-    expect(run.shows('thinking…')).toBe(false);
+    await run.until(() => run.shows('next') && !run.shows('Thinking…'), 'the next prompt');
+    expect(run.rows().some((row) => row.startsWith(' Enter to send  +3 lines, -1 line, ~16k context, 326 out') && row.endsWith('09:30:00 · Prov · Model'))).toBe(true);
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
 
-  it('draws the column beside the live area, commits no plan block once there is one, and drops it when it is empty', async () => {
+  it('draws the plan as a checklist under the status row while the turn runs, never the Python column, and drops it when the turn ends', async () => {
     const run = start([
-      { on: { type: 'hello' }, send: [READY, SESSION, NO_COLUMN, prompt('Describe your first task')] },
+      { on: { type: 'hello' }, send: [READY, SESSION, prompt('Describe your first task')] },
       { on: { type: 'submit', text: 'go' }, send: [
         TASK('go'), { type: 'turn_start', task: 'go' }, { type: 'delta', text: 'README.md is one heading.' },
         { type: 'status', state: 'working', label: 'Plan', progress: 35 },
         { type: 'plan', steps }, { type: 'review', state: 'passed', headline: 'Reviewed - no issues' },
-        { type: 'agents', agents: [{ id: '1', number: 1, kind: 'worker', task: 'port the parser', status: 'running', activity: 'x' }] },
+        { type: 'agents', agents: [{ id: '1', number: 1, kind: 'worker', task: 'port the parser', status: 'running', activity: 'Reading x.py' }] },
         COLUMN,
       ] },
-      { on: { type: 'interrupt' }, send: [{ type: 'plan', steps: [] }, NO_COLUMN, ...ENDED, prompt('next')] },
+      { on: { type: 'interrupt' }, send: [{ type: 'plan', steps: [] }, { type: 'panel', rows: [], width: 0 }, ...ENDED, prompt('next')] },
       QUIT,
     ], { columns: 120, rows: 36 });
     await run.showing('Describe your first task');
-    expect(run.shows('CAPABILITIES')).toBe(false);
     await run.enter('go');
-    await run.showing('S3 ○ Check the result');
+    await run.showing('☐ Check the result');
     const view = run.term.viewport();
-    const top = view.findIndex((row) => row.includes('CAPABILITIES 1'));
-    // The column is flush with the top and the live area with the foot: it is
-    // two rows taller, so those are blank on the left. The reply box is 84
-    // columns, and the column starts two columns on.
-    expect(view[top]).toBe(' '.repeat(86) + 'CAPABILITIES 1');
-    expect(view[top + 1]).toBe(' '.repeat(86) + '● /plan');
-    expect(view[top + 2]).toBe('┌' + '─'.repeat(82) + '┐');
-    expect(view[top + 3]).toContain('『  README.md is one heading.');
-    expect(view[top + 3]!.endsWith('』  PLAN 0/3')).toBe(true);
-    expect(view.findIndex((row) => row.includes('S1 ● Read README.md'))).toBe(top + 5);
-    expect(view[top + 5]!.startsWith(' ─')).toBe(true);
-    // The box is as wide as the left column, the bar and its readout are under both columns.
-    const rules = view.filter((row) => /^ ─/.test(row));
-    expect(rules).toHaveLength(2);
-    for (const row of rules) expect(row.startsWith(' ' + '─'.repeat(83) + '  ')).toBe(true);
-    expect(view.at(-2)).toMatch(/^████░░░░░░░░ {2}35% Plan .*[✻✽] thinking… \(\d+s\)$/);
+    const status = view.findIndex((row) => /^[·✢*✶✻✽] Writing the reply…/.test(row));
+    // The checklist follows the status row: done, struck through in colour; in progress; waiting.
+    expect(view.slice(status + 1, status + 4)).toEqual(['  ⎿  ☒ Read README.md', '     ◼ Add a Contents line', '     ☐ Check the result']);
+    expect(view[status + 4]).toBe('  ⎇ 1 worker  running  Reading x.py');
+    // The column Python drew is never drawn, and the reply is a bullet and its text, not a box.
+    expect(run.shows('CAPABILITIES')).toBe(false);
+    expect(run.shows('PLAN 0/3')).toBe(false);
+    expect(view.some((row) => row === '● README.md is one heading.')).toBe(true);
+    expect(view.some((row) => /[┌└『]/.test(row))).toBe(false);
+    // One box, a rule above and below the field, and nothing wider than the window.
+    expect(view.filter((row) => /^ ─+$/.test(row))).toHaveLength(2);
     expect(view.every((row) => displayWidth(row) <= 119)).toBe(true);
-    // The plan and review are in the column, so they are not committed as blocks; the agents are.
-    expect(run.shows('[>] Read README.md')).toBe(false);
-    expect(run.shows('Review  Reviewed')).toBe(false);
-    expect(run.shows('1 worker  running  port the parser')).toBe(true);
+    // A review that passed is a row of the record; the plan is not.
+    expect(run.rows().filter((row) => row === '✓ Reviewed - no issues')).toHaveLength(1);
+    expect(run.rows().filter((row) => row.includes('Read README.md') && !row.includes('☒'))).toEqual([]);
 
     run.term.type('\x03');
-    await run.until(() => run.shows('next') && !run.shows('PLAN 0/3'), 'the column gone');
-    expect(run.term.viewport().some((row) => row.includes('CAPABILITIES'))).toBe(false);
-    expect(run.rows().filter((row) => isField(row))).toHaveLength(1);
+    await run.until(() => run.shows('next') && !run.shows('Add a Contents line'), 'the plan gone');
+    expect(run.rows().filter(isField)).toHaveLength(1);
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
     expect(forbiddenIn(run.term.raw)).toEqual([]);
   });
 
-  it('hides a column that no longer fits after a resize, until the backend sends one laid out for the new width', async () => {
+  it('stops a turn on Esc when the line is empty, as the footer says, and clears the line otherwise', async () => {
     const run = start([
-      { on: { type: 'hello' }, send: [READY, SESSION, COLUMN, prompt('go')] },
-      { on: { type: 'resize' }, delay: 700, send: [{ type: 'panel', width: 18, rows: ['PLAN 0/3', '─'.repeat(18), 'S1 ● Read it'] }] },
+      START,
+      { on: { type: 'submit', text: 'go' }, send: [TASK('go'), { type: 'turn_start', task: 'go' }, { type: 'status', state: 'thinking', label: '', progress: null }] },
+      { on: { type: 'interrupt' }, send: [...ENDED, prompt('next')] },
       QUIT,
-    ], { columns: 100, rows: 30 });
-    await run.showing('PLAN 0/3');
-    const wide = run.term.viewport().find((row) => row.includes('CAPABILITIES 1'))!;
-    expect(wide.indexOf('CAPABILITIES 1')).toBe(100 - 1 - 33);
-    // 58 - 1 - 2 - 33 = 22: less than the 24 columns a box needs.
-    run.term.resize(58, 30);
-    await run.receiving('resize');
+    ]);
+    await run.showing('Describe your first task');
+    await run.enter('go');
+    await run.showing('Thinking…');
+    run.term.type('half a line');
     await run.term.settle();
-    expect(run.shows('PLAN 0/3')).toBe(false);
-    expect(run.term.viewport().find(isField)).toBe(' > go');
-    await run.until(() => run.shows('PLAN 0/3') && !run.shows('CAPABILITIES'), 'the column for the new width');
-    expect(run.term.viewport().find((row) => row.includes('PLAN 0/3'))).toContain('  PLAN 0/3');
-    expect(run.term.viewport().every((row) => displayWidth(row) <= 57)).toBe(true);
-    // One box on the screen, not the old one's rows left behind under the re-wrapped ones.
-    expect(run.rows().filter((row) => /^ ─+( {2}.*)?$/.test(row))).toHaveLength(2);
-    expect(run.rows().filter(isField)).toHaveLength(1);
+    run.term.type('\x1b');
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    await run.term.settle();
+    // The line goes; the turn goes on.
+    expect(run.term.viewport().find(isField)!.trim()).toBe('>');
+    expect(run.sent('interrupt')).toEqual([]);
+    run.term.type('\x1b');
+    await run.receiving('interrupt');
+    await run.showing('next');
+    // Between turns Esc has nothing to stop: the session stays up.
+    run.term.type('\x1b');
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(run.sent('quit')).toEqual([]);
     run.term.type('\x03');
+    await run.receiving('quit');
     expect(await run.finished()).toBe(0);
   });
 });
@@ -472,12 +351,14 @@ describe('approvals and questions', () => {
     await run.showing('Describe your first task');
     await run.enter('delete it');
     await run.showing('rm notes1.txt');
-    // The question, the choices and the backend's sentence are in the record; the keys are in the box.
+    // The dialog is in the record: a title, the question, the choices. The backend's sentence says the same as
+    // the choices and is not printed; the keys are in the box.
+    expect(run.shows('Run this command?')).toBe(true);
     expect(run.shows('  y  Run it once')).toBe(true);
     expect(run.shows('  a  Allow `rm` from now on')).toBe(true);
     expect(run.shows('  n  Refuse')).toBe(true);
-    expect(run.rows().filter((row) => row === 'Type y, a or n and Enter')).toHaveLength(1);
-    expect(run.term.viewport().some((row) => row === ' > y / a / n  then Enter')).toBe(true);
+    expect(run.shows('Type y, a or n and Enter')).toBe(false);
+    expect(run.term.viewport().some((row) => row === ' > Press y, a or n then Enter')).toBe(true);
     // Each line is the answer to the open question: none is queued or submitted.
     await run.enter(' A ');
     await run.showing('rm notes2.txt');
@@ -490,6 +371,9 @@ describe('approvals and questions', () => {
     await run.enter('Y');
     await run.showing('done');
     expect(run.sent('approval_reply').map((message) => [message.id, message.answer])).toEqual([[1, 'a'], [2, 'n'], [3, 'maybe'], [4, 'n'], [5, 'y']]);
+    // What was chosen is echoed under the dialog.
+    expect(run.rows().filter((row) => row.startsWith('  ⎿  '))).toEqual(
+      ['  ⎿  Always allowed', '  ⎿  Refused', '  ⎿  Refused', '  ⎿  Refused', '  ⎿  Allowed once']);
     // None of the answers started a turn of its own.
     expect(run.sent('submit')).toHaveLength(1);
     run.term.type('\x03');
@@ -511,19 +395,19 @@ describe('approvals and questions', () => {
     ]);
     await run.showing('Describe your first task');
     await run.enter('first');
-    await run.showing('Working. Type to queue the next task');
+    await run.showing('enter queues the next task');
     await run.enter('second');
-    await run.until(() => run.shows('1 queued task - they run when this one finishes'), 'the queued line');
+    await run.until(() => run.shows('1 queued'), 'the queued line');
     run.term.resize(101, 30);
     await run.showing('rm notes1.txt');
     // With the question open the queue is left alone, and the answer is not queued.
-    expect(run.shows('1 queued task')).toBe(false);
+    expect(run.shows('1 queued')).toBe(false);
     expect(run.sent('submit').map((message) => message.text)).toEqual(['first']);
     await run.enter('y');
     await run.receiving('submit', 2);
     expect(run.sent('approval_reply')).toMatchObject([{ id: 1, answer: 'y' }]);
     expect(run.sent('submit').map((message) => message.text)).toEqual(['first', 'second']);
-    await run.until(() => run.shows('> second') && !run.shows('queued task'), 'the second task');
+    await run.until(() => run.shows('❯ second') && !run.shows('queued'), 'the second task');
     run.term.resize(102, 30);
     await run.showing('the end');
     run.term.type('\x03');
@@ -546,9 +430,10 @@ describe('approvals and questions', () => {
     await run.showing('Describe your first task');
     await run.enter('ask me');
     await run.showing('Which colour 1?');
-    // The block is printed as the backend sent it.
-    expect(run.shows('  1. Red')).toBe(true);
-    expect(run.shows('Press 1 or 2 to choose, or Esc to skip the question.')).toBe(true);
+    // The question is the dialog's title and its options are keys, as the backend's structured fields say.
+    expect(run.shows('  1  Red')).toBe(true);
+    expect(run.shows('  2  Blue')).toBe(true);
+    expect(run.shows('Press 1 or 2 to choose')).toBe(false);
     expect(run.term.viewport().find(isField)).toBe(' > 1-2, Esc to skip');
     // A key that was not offered, Enter and a paste do nothing: no answer, no notice, nothing in the box.
     run.term.type('9');
@@ -566,8 +451,8 @@ describe('approvals and questions', () => {
     run.term.type('1');
     await run.showing('thanks');
     expect(run.sent('answer').map((message) => [message.id, message.key])).toEqual([[1, '2'], [2, ''], [3, '1']]);
-    // Nothing the user pressed is echoed under the question.
-    expect(run.rows().filter((row) => /^[12]$/.test(row.trim()))).toEqual([]);
+    // What was chosen is echoed under the question, as the option said it; not the key that was pressed.
+    expect(run.rows().filter((row) => row.startsWith('  ⎿  '))).toEqual(['  ⎿  Blue', '  ⎿  Skipped', '  ⎿  Red']);
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
@@ -587,7 +472,7 @@ describe('interrupts and quitting', () => {
     ]);
     await run.showing('Describe your first task');
     await run.enter('long task');
-    await run.showing('THINKING');
+    await run.showing('Thinking…');
     run.term.type('\x04');
     await run.term.settle();
     // Ctrl-D during a turn is not a way out.
@@ -778,7 +663,7 @@ describe('the Python screens', () => {
     expect(seen).toEqual([{ rawMode: false, box: false, calls: 2, heldBack: true }]);
     expect(run.term.rawMode).toBe(true);
     await run.until(() => run.term.viewport().some((row) => row.startsWith(' > after the menu')), 'the prompt after the menu');
-    expect(run.shows('> /back')).toBe(true);
+    expect(run.shows('❯ /back')).toBe(true);
     run.term.type('\x03');
     await run.receiving('quit');
     expect(await run.finished()).toBe(0);
@@ -823,7 +708,7 @@ describe('committed rows wrap at a word boundary, at the content width', () => {
     const rows = run.rows();
     const start = rows.findIndex((row) => row.startsWith(first));
     expect(start, `a row starting ${first}\n${rows.join('\n')}`).toBeGreaterThanOrEqual(0);
-    const end = rows.findIndex((row, index) => index >= start && row.endsWith(last));
+    const end = rows.findIndex((row, index) => index >= start && row.trimEnd().endsWith(last));
     expect(end, `a row ending ${last}\n${rows.join('\n')}`).toBeGreaterThanOrEqual(start);
     return rows.slice(start, end + 1);
   };
@@ -846,24 +731,25 @@ describe('committed rows wrap at a word boundary, at the content width', () => {
     await run.enter(TASK_TEXT);
     await run.showing('done');
 
-    const task = block(run, '> Please', ' in.');
+    const task = block(run, '❯ Please', ' in.');
     expect(task.length).toBeGreaterThan(1);
     expect(widestRow(task)).toBeLessThanOrEqual(width);
     // Cut at a space: every word is whole, and a continuation lines up under the text.
-    expect(wordsOf(task)).toEqual(['>', ...TASK_TEXT.split(' ')]);
+    expect(wordsOf(task)).toEqual(['❯', ...TASK_TEXT.split(' ')]);
     for (const row of task.slice(1)) expect(row).toMatch(/^ {2}\S/);
     // Filled to the edge, as far as a whole word allows.
     expect(displayWidth(task[0]!)).toBeGreaterThan(width - 16);
 
-    const event = block(run, '  ✓ ', ' in');
+    const event = block(run, '✓ ', ' in');
     expect(wordsOf(event)).toEqual(['✓', ...message.split(' ')]);
-    for (const row of event.slice(1)) expect(row).toMatch(/^ {4}\S/);
+    for (const row of event.slice(1)) expect(row).toMatch(/^ {2}\S/);
     if (width < 90) expect(event.length).toBeGreaterThan(1);
 
-    // A word longer than the row is cut where the row ends, not dropped.
-    const path = block(run, '  • Edited file:', 'file.ts');
+    // A word longer than the row is cut where the row ends, not dropped. It is the result of a block,
+    // under a `⎿`, and four rows of it are shown whole.
+    const path = block(run, '  ⎿  Edited file:', 'file.ts');
     expect(widestRow(path)).toBeLessThanOrEqual(width);
-    expect(path.map((row) => row.trim()).join('').replace(/\s/g, '')).toBe('•Editedfile:' + long);
+    expect(path.map((row) => row.trim()).join('').replace(/\s/g, '')).toBe('⎿Editedfile:' + long);
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
@@ -880,12 +766,17 @@ describe('committed rows wrap at a word boundary, at the content width', () => {
     await run.showing('Describe your first task');
     await run.enter(TASK_TEXT);
     await run.showing('done');
-    const task = block(run, '> Please', ' in.');
+    const task = block(run, '❯ Please', ' in.');
     expect(widestRow(task)).toBeLessThanOrEqual(100);
-    expect(wordsOf(task)).toEqual(['>', ...TASK_TEXT.split(' ')]);
-    // Bold on every row of it: the colour is carried across each break.
-    expect(run.term.raw).toContain('\x1b[1m> Please refactor');
-    expect(run.term.raw.match(/\x1b\[1m {0,2}\S/g)!.length).toBeGreaterThanOrEqual(task.length);
+    expect(wordsOf(task)).toEqual(['❯', ...TASK_TEXT.split(' ')]);
+    // The user row's grey is behind every row of it, out to the edge of the block: the colour is carried across each break.
+    const grey = (y: number): boolean => {
+      const buffer = run.term.term.buffer.active;
+      const cell = buffer.getLine(y)!.getCell(99)!;
+      return cell.getBgColorMode() !== 0 && cell.getBgColor() === (55 << 16 | 55 << 8 | 55);
+    };
+    const first = run.rows().findIndex((row) => row.startsWith('❯ Please'));
+    for (let y = first; y < first + task.length; y += 1) expect(grey(y), `row ${y - first}`).toBe(true);
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
@@ -901,18 +792,18 @@ describe('committed rows wrap at a word boundary, at the content width', () => {
     await run.showing('Describe your first task');
     run.term.resize(70, 30);
     await run.showing('change29');
-    const narrow = block(run, 'change0 ', 'change29');
+    const narrow = block(run, '! change0 ', 'change29');
     expect(narrow.length).toBeGreaterThan(2);
     expect(widestRow(narrow)).toBeLessThanOrEqual(69);
-    expect(wordsOf(narrow)).toEqual(notice.split(' '));
+    expect(wordsOf(narrow)).toEqual(['!', ...notice.split(' ')]);
 
     run.term.resize(140, 30);
     await run.showing('second29');
-    const wide = block(run, 'second0 ', 'second29');
+    const wide = block(run, '! second0 ', 'second29');
     // Wider than before, but never past 100 columns, however wide the window.
     expect(widestRow(wide)).toBeLessThanOrEqual(100);
     expect(wide.length).toBeLessThan(narrow.length);
-    expect(wordsOf(wide)).toEqual(notice.replace(/change/g, 'second').split(' '));
+    expect(wordsOf(wide)).toEqual(['!', ...notice.replace(/change/g, 'second').split(' ')]);
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
@@ -930,7 +821,7 @@ describe('an approval or a question in the box', () => {
     keys, question: `Which one ${id}?`, options: keys.map((key) => `Option ${key}`),
   });
 
-  it('says in the box which keys answer, and commits the whole sentence, wrapped, under the choices', async () => {
+  it('says in the box which keys answer, and the dialog above it says what each one does', async () => {
     const run = start([
       START,
       { on: { type: 'submit', text: 'rm it' }, send: [TASK('rm it'), { type: 'turn_start', task: 'rm it' }, approval(1)] },
@@ -945,18 +836,21 @@ describe('an approval or a question in the box', () => {
     ], { columns: 80, rows: 30 });
     await run.showing('Describe your first task');
     await run.enter('rm it');
-    await run.showing('y / a / n  then Enter');
-    // The box row is short and whole: no ellipsis, and the refusal is not lost, because
-    // the sentence that says it is in the record, under the choices, in full.
+    await run.showing('Press y, a or n then Enter');
+    // The box row is short and whole: no ellipsis. The dialog is a rule, a title, the question
+    // indented and the choices; the backend's long sentence says what the choices say, and is not printed.
     const box = run.term.viewport().find(isField)!;
-    expect(box).toBe(' > y / a / n  then Enter');
+    expect(box).toBe(' > Press y, a or n then Enter');
     expect(box).not.toContain('…');
     const rows = run.rows();
-    const refuse = rows.findIndex((row) => row === '  n  Refuse');
-    const sentence = rows.slice(refuse + 1, refuse + 3);
-    expect(sentence[0]).toMatch(/^Type y and Enter/);
-    expect(wordsOf(sentence).join(' ')).toBe(SENTENCE);
-    expect(widestRow(sentence)).toBeLessThanOrEqual(79);
+    const title = rows.findIndex((row) => row === ' Run this command?');
+    expect(rows[title - 1]).toMatch(/^─{79}$/);
+    expect(rows[title + 1]).toBe('  TMT wants to run a command that needs your approval.');
+    expect(rows[title + 3]).toBe('      rm notes.txt');
+    expect(rows.slice(title + 6, title + 9)).toEqual(['  y  Run it once', '  a  Allow `rm` in this project from now on', '  n  Refuse']);
+    expect(run.shows(SENTENCE.slice(0, 30))).toBe(false);
+    // The footer says what Esc does here.
+    expect(run.term.viewport().at(-2)).toBe(' esc refuses · ctrl-c interrupts');
 
     await run.enter('n');
     await run.showing('Which one 2?');
@@ -969,9 +863,7 @@ describe('an approval or a question in the box', () => {
     expect(run.term.viewport().find(isField)).toBe(' > y / n, Esc to skip');
     run.term.type('n');
     await run.until(() => run.count('rm notes.txt') === 2, 'the last approval');
-    // The backend sent no sentence for it, so no row is committed under its choices.
-    expect(run.term.viewport().find(isField)).toBe(' > y / a / n  then Enter');
-    expect(run.rows().filter((row) => row.startsWith('Type y and Enter'))).toHaveLength(1);
+    expect(run.term.viewport().find(isField)).toBe(' > Press y, a or n then Enter');
     await run.enter('y');
     await run.showing('ok');
     expect(run.sent('approval_reply').map((message) => message.answer)).toEqual(['n', 'y']);
@@ -996,12 +888,12 @@ describe('an approval or a question in the box', () => {
     ]);
     await run.showing('Describe your first task');
     await run.enter('go');
-    await run.showing('y / a / n  then Enter');
+    await run.showing('Press y, a or n then Enter');
     // Nothing of the reply is on the screen, above or below the question.
     expect(run.shows('I read the project layout')).toBe(false);
     expect(run.shows('then wrote the notes file')).toBe(false);
     const rows = run.rows();
-    expect(rows.findIndex((row) => row === '  n  Refuse')).toBeGreaterThan(rows.findIndex((row) => row.startsWith('TMT wants')));
+    expect(rows.findIndex((row) => row === '  n  Refuse')).toBeGreaterThan(rows.findIndex((row) => row.includes('TMT wants')));
     await run.enter('y');
     await run.showing('I read the project layout first, then wrote the notes file.');
     expect(run.sent('approval_reply')).toMatchObject([{ id: 1, answer: 'y' }]);
@@ -1011,6 +903,35 @@ describe('an approval or a question in the box', () => {
     run.term.resize(101, 30);
     await run.until(() => run.shows('the end') && run.shows('next'), 'the answer');
     expect(run.shows('I read the project layout')).toBe(false);
+    run.term.type('\x03');
+    expect(await run.finished()).toBe(0);
+  });
+
+  it('names a question the dialog\'s title, and an approval with no choices prints the backend\'s sentence under its text', async () => {
+    const run = start([
+      START,
+      { on: { type: 'submit', text: 'go' }, send: [
+        TASK('go'), { type: 'turn_start', task: 'go' },
+        { type: 'approval', id: 1, question: 'Use this folder?', hint: 'Type yes or no and Enter:', action: 'workspace', choices: [] },
+      ] },
+      { on: { type: 'approval_reply', id: 1, answer: 'yes' }, send: [
+        { type: 'approval', id: 2, question: 'Delete notes.txt?', hint: '', action: 'delete_file', choices: [{ key: 'y', label: 'Delete it' }, { key: 'n', label: 'Keep it' }] },
+      ] },
+      { on: { type: 'approval_reply', id: 2, answer: 'y' }, send: [{ type: 'turn_end', task: 'go', answer: '', outcome: '', suggestion: '' }, prompt('next')] },
+      QUIT,
+    ]);
+    await run.showing('Describe your first task');
+    await run.enter('go');
+    await run.showing('Permission needed');
+    expect(run.rows().filter((row) => row === '  Type yes or no and Enter:')).toHaveLength(1);
+    expect(run.term.viewport().find(isField)).toBe(' > Type yes or no and Enter:');
+    await run.enter('yes');
+    await run.showing('Delete this file?');
+    expect(run.shows('  y  Delete it')).toBe(true);
+    await run.enter('y');
+    await run.showing('next');
+    // Two choices: it was allowed, not allowed once.
+    expect(run.rows().filter((row) => row.startsWith('  ⎿  '))).toEqual(['  ⎿  Refused', '  ⎿  Allowed']);
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
@@ -1054,7 +975,7 @@ describe('the answer is read as markdown', () => {
   const ANSWER = [
     '# Summary', '', 'I wrote **notes.txt** and *briefly* changed `README.md`, see [the docs](https://example.com/docs).', '',
     '- notes.txt is **new** (12 lines) and it goes on for long enough to need a second row once it is wrapped to the width of the window',
-    '1. the test suite still passes', '', '```', 'const raw = **not bold**;', '```', 'Done.',
+    '1. the test suite still passes', '', '> a quote', '', '```ts', 'const raw = **not bold**;', '```', 'Done.',
   ].join('\n');
   const script = (): Step[] => [
     START,
@@ -1071,204 +992,161 @@ describe('the answer is read as markdown', () => {
     await run.showing('Done.');
     const rows = run.rows();
     expect(run.shows('**notes.txt**')).toBe(false);
-    expect(rows).toContain('Summary');
-    expect(rows).toContain('I wrote notes.txt and briefly changed README.md, see the docs (https://example.com/docs).');
-    const item = rows.findIndex((row) => row.startsWith('- notes.txt is new (12 lines)'));
+    // The answer is a bullet and its body, indented two columns; the heading is its first row.
+    expect(rows).toContain('● Summary');
+    expect(rows).toContain('  I wrote notes.txt and briefly changed README.md, see the docs (https://example.com/docs).');
+    const item = rows.findIndex((row) => row.startsWith('  - notes.txt is new (12 lines)'));
     expect(item).toBeGreaterThanOrEqual(0);
     // The item keeps its marker, and wraps under its text.
-    expect(rows[item + 1]).toMatch(/^ {2}\S/);
-    expect(rows).toContain('1. the test suite still passes');
-    // The fenced block is as written, fences and all.
-    expect(rows).toContain('```');
-    expect(rows).toContain('const raw = **not bold**;');
-    expect(run.term.raw).not.toMatch(/\x1b\[(?:1|2|3|22|23|36|39)m/);
+    expect(rows[item + 1]).toMatch(/^ {4}\S/);
+    expect(rows).toContain('  1. the test suite still passes');
+    expect(rows).toContain('  ▎ a quote');
+    // The fenced block is its language, then the code as written, indented, with no fence.
+    expect(rows).toContain('    ts');
+    expect(rows).toContain('    const raw = **not bold**;');
+    expect(rows.some((row) => row.includes('```'))).toBe(false);
+    expect(run.term.raw).not.toMatch(/\x1b\[(?:1|2|3|4|9|22|23|24|29|36|39)m/);
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
 
-  it('paints bold, italic, code, headings and the dimmed block when colour is on', async () => {
-    const run = start(script(), { columns: 100, rows: 40, color: true });
+  it('paints bold, italic, code, headings, links, the quote bar and the language when colour is on', async () => {
+    const run = start(script(), { columns: 100, rows: 40, color: true, truecolor: true });
     await run.showing('Describe your first task');
     await run.enter('go');
     await run.showing('Done.');
-    const raw = run.term.raw;
-    expect(raw).toContain('I wrote \x1b[1mnotes.txt\x1b[22m and \x1b[3mbriefly\x1b[23m changed \x1b[36mREADME.md\x1b[39m');
-    expect(raw).toContain('\x1b[1mSummary\x1b[22m');
-    expect(raw).toContain('\x1b[2mconst raw = **not bold**;\x1b[0m');
-    expect(run.rows()).toContain('const raw = **not bold**;');
+    const theme = makeTheme({ color: true, truecolor: true });
+    expect(await showsPainted(run.term, '● ' + theme.bold(theme.underline('Summary')))).toBe(true);
+    expect(await showsPainted(run.term,
+      `  I wrote ${theme.bold('notes.txt')} and ${theme.italic('briefly')} changed ${theme.code('README.md')}, see ${theme.link(theme.underline('the docs'))} ${theme.dim('(https://example.com/docs)')}.`)).toBe(true);
+    expect(await showsPainted(run.term, '  ' + theme.dim('▎') + ' ' + theme.italic('a quote'))).toBe(true);
+    expect(await showsPainted(run.term, '    ' + theme.dim('ts'))).toBe(true);
+    expect(run.rows()).toContain('    const raw = **not bold**;');
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
 });
 
 // ---------------------------------------------------------------------------
-// The backend's own rows (`rows`): laid out by the Python renderer, committed
-// as they are; today's formatting when they are absent or not a list of strings.
+// The backend's own rows (`rows`): the structured fields draw an event now, and
+// the Python rows are what is used when an event has none of them. A command's
+// are committed as they are, as before.
 
 describe('rows the backend rendered itself', () => {
   const LOGO = '\x1b[38;2;238;87;28m▇▇▇\x1b[0m \x1b[38;2;112;203;36m▇▇▇\x1b[0m';
-  const WIDE = 'wide '.repeat(26).trim();
-  const SESSION_ROWS = ['', LOGO, '\x1b[2mMon 26 Oct 2026\x1b[0m', 'C:\\work', '\x1b[2mTip · /notes shows what TMT knows\x1b[0m', ''];
-  const TASK_ROWS = ['', ' '.repeat(40) + '\x1b[2m09:30:00 · Prov · Model\x1b[0m', '> go', ''];
-  const EVENT_ROWS = ['  \x1b[32m▸\x1b[0m Wrote file: notes.txt', '    7 lines'];
-  const EVENT_ROWS_2 = ['', '  \x1b[2m· ' + WIDE + '\x1b[0m'];
-  const NOTICE_ROWS = ['\x1b[33mPython notice row\x1b[0m'];
-  const FINAL_ROWS = ['', '┌' + '─'.repeat(30) + '┐', '│ \x1b[1mDone\x1b[0m' + ' '.repeat(25) + '│', '└' + '─'.repeat(30) + '┘', ''];
   const HELP_ROWS = ['', '\x1b[38;2;50;200;120mHelp\x1b[0m', '  /plan  show the plan', ''];
   const sgr = /\x1b\[[0-9;]*m/g;
   const plainRow = (row: string): string => row.replace(sgr, '').trimEnd();
 
-  it('commits every row of every event verbatim: blank rows, colour and rows wider than the wrap included', async () => {
+  it('draws the session, task, event, notice, final, approval and question from their fields, and commits a command\'s rows verbatim', async () => {
+    const WIDE = 'wide '.repeat(26).trim();
     const run = start([
-      { on: { type: 'hello' }, send: [READY, { ...SESSION, rows: SESSION_ROWS }, prompt('Describe your first task')] },
+      { on: { type: 'hello' }, send: [READY, { ...SESSION, rows: ['', LOGO, 'PYTHON HEADER', ''] }, prompt('Describe your first task')] },
       { on: { type: 'submit', text: 'go' }, send: [
-        { ...TASK('go'), rows: TASK_ROWS }, { type: 'turn_start', task: 'go' },
-        { type: 'event', kind: 'file_create', message: 'FALLBACK event', stage: '', level: 2, detail: { added: 7 }, rows: EVENT_ROWS },
-        { type: 'event', kind: 'progress', message: 'FALLBACK second', stage: '', level: 0, detail: {}, rows: EVENT_ROWS_2 },
-        { type: 'notice', level: 'warning', text: 'FALLBACK notice', rows: NOTICE_ROWS },
-        { type: 'final', text: 'FALLBACK answer', rows: FINAL_ROWS },
+        { ...TASK('go'), rows: ['', 'PYTHON CAPTION', '> go', ''] }, { type: 'turn_start', task: 'go' },
+        { type: 'event', kind: 'file_create', message: 'Wrote file: notes.txt', stage: '', level: 2, detail: { added: 7 }, rows: ['PYTHON EVENT'] },
+        { type: 'event', kind: 'progress', message: 'a note', stage: '', level: 0, detail: {}, rows: ['', '  \x1b[2m· ' + WIDE + '\x1b[0m'] },
+        { type: 'notice', level: 'warning', text: 'a notice', rows: ['\x1b[33mPYTHON NOTICE\x1b[0m'] },
+        { type: 'approval', id: 1, question: 'May I?', hint: 'y or n', action: 'bash', choices: [{ key: 'y', label: 'Yes' }, { key: 'n', label: 'No' }], rows: ['PYTHON APPROVAL'] },
+      ] },
+      { on: { type: 'approval_reply', id: 1, answer: 'y' }, send: [
+        { type: 'question', id: 2, text: 'FALLBACK block', keys: ['1', '2'], question: 'Which colour?', options: ['Red', 'Blue'], rows: ['PYTHON QUESTION'] },
+      ] },
+      { on: { type: 'answer', id: 2, key: '2' }, send: [
+        { type: 'final', text: 'the answer', rows: ['┌──┐', '│ PYTHON FINAL', '└──┘'] },
         { type: 'turn_end', task: 'go', answer: '', outcome: '', suggestion: '' }, prompt('next'),
       ] },
       { on: { type: 'submit', text: '/help' }, send: [
-        { ...TASK('/help'), rows: ['', '> /help', ''] },
+        TASK('/help'),
         { type: 'command', title: 'FALLBACK Help', ok: true, rows: HELP_ROWS, note: '', prompt_for: '', to_menu: false }, prompt('next'),
       ] },
       QUIT,
-    ], { columns: 160, rows: 40 });
+    ], { columns: 160, rows: 50 });
     await run.showing('Describe your first task');
-    expect(run.shows(LOGO.replace(sgr, ''))).toBe(true);
     await run.enter('go');
-    await run.until(() => run.shows('Done') && run.shows('next'), 'the answer');
+    await run.showing('May I?');
+    await run.enter('y');
+    await run.showing('Which colour?');
+    run.term.type('2');
+    await run.showing('the answer');
     await run.enter('/help');
     await run.showing('/plan  show the plan');
+    await run.until(() => run.shows('Help'), 'the command');
 
-    // One unbroken run, in the order sent: no row added, dropped or moved. The
-    // only blank rows are the ones the backend sent.
-    const sent = [...SESSION_ROWS, ...TASK_ROWS, ...EVENT_ROWS, ...EVENT_ROWS_2, ...NOTICE_ROWS, ...FINAL_ROWS, '', '> /help', '', ...HELP_ROWS].map(plainRow);
+    // Drawn from the fields.
+    expect(run.shows('TMT 0.1.1')).toBe(true);
+    expect(run.shows('❯ go')).toBe(true);
+    expect(run.shows('● Write')).toBe(true);
+    expect(run.shows('Wrote 7 lines')).toBe(true);
+    expect(run.shows('! a notice')).toBe(true);
+    expect(run.shows('May I?')).toBe(true);
+    expect(run.shows('  2  Blue')).toBe(true);
+    expect(run.shows('● the answer')).toBe(true);
+    // The row of a note of progress is the note, not the Python row around it.
+    expect(run.shows('· a note')).toBe(true);
+    expect(run.rows().some((row) => row.includes('wide wide'))).toBe(false);
+    // None of the Python rows.
+    for (const marker of ['PYTHON', 'FALLBACK block', '▇▇▇']) expect(run.shows(marker), marker).toBe(false);
+    // A command's rows are the backend's, as they are: the blank rows, the colour, the title in its colour.
     const rows = run.rows();
-    const at = rows.indexOf(sent[1]!);
-    expect(at).toBeGreaterThan(0);
-    expect(rows.slice(at - 1, at - 1 + sent.length)).toEqual(sent);
-    // The wide row is whole, on one row, though the format path wraps at 100.
-    expect(rows.filter((row) => row.includes('wide wide'))).toEqual([plainRow(EVENT_ROWS_2[1]!)]);
-    expect(Math.max(...rows.map((row) => displayWidth(row)))).toBeGreaterThan(100);
-    // The colour is the backend's, truecolor included.
-    for (const row of [LOGO, TASK_ROWS[1]!, EVENT_ROWS[0]!, NOTICE_ROWS[0]!, FINAL_ROWS[2]!, HELP_ROWS[1]!]) expect(run.term.raw).toContain(row);
-    // Nothing of today's own formatting.
-    expect(run.shows('FALLBACK')).toBe(false);
-    expect(run.shows('TMT 0.1.1')).toBe(false);
+    const at = rows.indexOf('Help');
+    expect(rows.slice(at - 1, at + 3)).toEqual(HELP_ROWS.map(plainRow));
+    expect(await showsPainted(run.term, HELP_ROWS[1]!)).toBe(true);
+    expect(run.shows('FALLBACK Help')).toBe(false);
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
     expect(forbiddenIn(run.term.raw)).toEqual([]);
   });
 
-  it('commits a tall header in a young session without losing a row or the box', async () => {
+  it('commits a long command\'s rows in a young session without losing a row or the box', async () => {
     const header = ['', ...Array.from({ length: 6 }, (_, index) => `  logo row ${index}`), '  Mon 26 Oct 2026', 'C:\\work', 'Tip', ''];
     const run = start([
-      { on: { type: 'hello' }, send: [READY, { ...SESSION, rows: header }, prompt('go')] },
+      { on: { type: 'hello' }, send: [READY, SESSION, prompt('go')] },
       { on: { type: 'submit', text: 'more' }, send: [
-        { type: 'event', kind: 'progress', message: 'x', stage: '', level: 1, detail: {}, rows: ['one', 'two', 'three'] }, prompt('go'),
+        TASK('more'), { type: 'command', title: 'Help', ok: true, rows: header, note: '', prompt_for: '', to_menu: false }, prompt('go'),
       ] },
       QUIT,
     ], { columns: 80, rows: 16 });
     await run.showing('go');
-    expect(run.rows().filter((row) => row.startsWith('  logo row'))).toHaveLength(6);
-    expect(run.term.viewport().some(isField)).toBe(true);
-    // The header sits directly above the box, not at the top of a blank page.
-    const view = run.term.viewport();
-    expect(view.findIndex(isField) - view.findIndex((row) => row === 'Tip')).toBeLessThan(6);
     await run.enter('more');
-    await run.showing('three');
+    await run.showing('Tip');
     expect(run.rows().filter((row) => row.startsWith('  logo row'))).toHaveLength(6);
     expect(run.term.viewport().some(isField)).toBe(true);
+    // The box is still on the last rows, with the footer under it.
+    const view = run.term.viewport();
+    expect(view.findIndex(isField)).toBe(view.length - 4);
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
 
-  const SENTENCE = (id: number): string => `Type y and Enter to run it once (${id}), or anything else to refuse:`;
-  const approval = (id: number, rows?: unknown) => ({
-    type: 'approval', id, question: `QUESTION ${id}\n\n    rm n${id}.txt`, hint: SENTENCE(id), pattern: 'rm', action: 'bash',
-    choices: [{ key: 'y', label: 'Run it once' }, { key: 'a', label: 'Allow `rm` from now on' }, { key: 'n', label: 'Refuse' }],
-    ...(rows === undefined ? {} : { rows }),
-  });
-  const approvalRows = (id: number): string[] => ['', `Allow command ${id}?`, '', `    rm n${id}.txt`, '', SENTENCE(id)];
-
-  it('prints the approval as the Python UI does, with no choice list, and echoes what was typed under it', async () => {
+  it('prints the backend\'s rows for an approval or a question that has none of the fields to draw it from', async () => {
     const run = start([
       START,
-      { on: { type: 'submit', text: 'rm' }, send: [TASK('rm'), { type: 'turn_start', task: 'rm' }, approval(1, approvalRows(1))] },
-      { on: { type: 'approval_reply', id: 1, answer: 'y' }, send: [{ type: 'notice', level: 'info', text: 'AFTER 1' }, approval(2, approvalRows(2))] },
-      { on: { type: 'approval_reply', id: 2, answer: 'n' }, send: [{ type: 'notice', level: 'info', text: 'AFTER 2' }, approval(3, approvalRows(3))] },
-      { on: { type: 'approval_reply', id: 3, answer: 'maybe' }, send: [{ type: 'notice', level: 'info', text: 'AFTER 3' }, approval(4, approvalRows(4))] },
-      { on: { type: 'approval_reply', id: 4, answer: 'n' }, send: [
-        { type: 'notice', level: 'info', text: 'AFTER 4' }, { type: 'turn_end', task: 'rm', answer: '', outcome: '', suggestion: '' }, prompt('next'),
+      { on: { type: 'submit', text: 'rm' }, send: [
+        TASK('rm'), { type: 'turn_start', task: 'rm' },
+        { type: 'approval', id: 1, action: 'bash', rows: ['', 'Allow command 1?', '', '    rm n1.txt'] },
       ] },
+      { on: { type: 'approval_reply', id: 1, answer: 'y' }, send: [
+        { type: 'question', id: 2, keys: ['1', '2'], rows: ['', 'Which colour?', '', '  1. Red', '  2. Blue'] },
+      ] },
+      { on: { type: 'answer', id: 2, key: '2' }, send: [{ type: 'turn_end', task: 'rm', answer: '', outcome: '', suggestion: '' }, prompt('next')] },
       QUIT,
     ]);
     await run.showing('Describe your first task');
     await run.enter('rm');
-    await run.showing(SENTENCE(1));
-    // The prompt and its hint line only: no `y  Run it once`, and the sentence is not printed twice.
-    expect(run.shows('Run it once')).toBe(false);
-    expect(run.count(SENTENCE(1))).toBe(1);
-    expect(run.rows().filter((row) => row.startsWith('QUESTION'))).toEqual([]);
-    expect(run.term.viewport().find(isField)).toBe(' > y / a / n  then Enter');
-    const below = (text: string, count: number): string[] => {
-      const rows = run.rows();
-      const at = rows.indexOf(text);
-      return rows.slice(at + 1, at + 1 + count);
-    };
-
+    await run.showing('Allow command 1?');
+    expect(run.shows('    rm n1.txt')).toBe(true);
+    expect(run.shows('Run this command?')).toBe(false);
     await run.enter('y');
-    await run.showing('AFTER 1');
-    expect(below(SENTENCE(1), 2)).toEqual(['y', 'AFTER 1']);
-    // An empty line is the refusal, and there is nothing to echo.
-    await run.showing(SENTENCE(2));
-    await run.enter('');
-    await run.showing('AFTER 2');
-    expect(below(SENTENCE(2), 1)).toEqual(['AFTER 2']);
-    await run.showing(SENTENCE(3));
-    await run.enter('maybe');
-    await run.showing('AFTER 3');
-    expect(below(SENTENCE(3), 2)).toEqual(['maybe', 'AFTER 3']);
-    await run.showing(SENTENCE(4));
-    run.term.type('\x1b');
-    await run.showing('AFTER 4');
-    expect(below(SENTENCE(4), 1)).toEqual(['AFTER 4']);
-    expect(run.sent('approval_reply').map((message) => message.answer)).toEqual(['y', 'n', 'maybe', 'n']);
-    expect(run.shows('Run it once')).toBe(false);
-    run.term.type('\x03');
-    expect(await run.finished()).toBe(0);
-  });
-
-  it('answers a question with one key and no Enter, and echoes nothing', async () => {
-    const rows = ['', 'Which colour?', '', '  1. Red', '  2. Blue', '', 'Press 1 or 2 to choose, or Esc to skip the question.'];
-    const run = start([
-      START,
-      { on: { type: 'submit', text: 'ask' }, send: [
-        TASK('ask'), { type: 'turn_start', task: 'ask' },
-        { type: 'question', id: 1, text: 'FALLBACK block', keys: ['1', '2'], question: 'Which colour?', options: ['Red', 'Blue'], rows },
-      ] },
-      { on: { type: 'answer', id: 1, key: '2' }, send: [{ type: 'notice', level: 'info', text: 'AFTER' }, { type: 'turn_end', task: 'ask', answer: '', outcome: '', suggestion: '' }, prompt('next')] },
-      QUIT,
-    ]);
-    await run.showing('Describe your first task');
-    await run.enter('ask');
-    await run.showing('Press 1 or 2 to choose');
-    expect(run.shows('FALLBACK')).toBe(false);
-    run.term.type('7');
-    await run.term.settle(4);
-    expect(run.sent('answer')).toEqual([]);
+    await run.showing('  1. Red');
     run.term.type('2');
-    await run.showing('AFTER');
-    expect(run.sent('answer')).toMatchObject([{ id: 1, key: '2' }]);
-    const all = run.rows();
-    expect(all.slice(all.indexOf(rows[1]!) - 1, all.indexOf('AFTER') + 1)).toEqual([...rows.map(plainRow), 'AFTER']);
+    await run.showing('next');
+    expect(run.sent('answer')).toMatchObject([{ id: 2, key: '2' }]);
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
 
-  it('formats an event itself when its rows are absent, empty or not a list of strings', async () => {
+  it('draws what it can from an event whose rows are absent, empty or not a list of strings', async () => {
     const bad = (type: string, extra: object, rows: unknown) => ({ type, ...extra, rows });
     const run = start([
       { on: { type: 'hello' }, send: [READY, bad('session', { workspace: 'C:\\work' }, 5), prompt('go')] },
@@ -1290,17 +1168,17 @@ describe('rows the backend rendered itself', () => {
     expect(run.shows('TMT 0.1.1')).toBe(true);
     await run.enter('go');
     await run.showing('my question');
-    expect(run.shows('> my task')).toBe(true);
-    expect(run.shows('  ✓ my event')).toBe(true);
+    expect(run.shows('❯ my task')).toBe(true);
+    expect(run.shows('✓ my event')).toBe(true);
     expect(run.shows('my notice')).toBe(true);
     expect(run.shows('My Command')).toBe(true);
     expect(run.shows('  Steps  3')).toBe(true);
     expect(run.shows('  a note row')).toBe(true);
-    expect(run.shows('my answer')).toBe(true);
+    expect(run.shows('● my answer')).toBe(true);
     expect(run.shows('**')).toBe(false);
-    // The choice list and the dim hint row are today's.
+    // The choice list; the backend's sentence is only for an approval with no choices.
     expect(run.shows('  y  Yes')).toBe(true);
-    expect(run.shows('my hint')).toBe(true);
+    expect(run.shows('my hint')).toBe(false);
     await run.enter('y');
     await run.showing('my block');
     expect(run.rows().filter((row) => row === 'y')).toEqual([]);

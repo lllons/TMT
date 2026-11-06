@@ -10,7 +10,7 @@ import { KeyParser, type KeyEvent } from '../input/keys.js';
 import { plain, sanitizeCommitLine } from '../input/width.js';
 import type { Caption, Meter } from '../protocol.js';
 import { detectTruecolor } from '../theme.js';
-import { composeFrame, PROMPT_PREFIX, type Panel } from './frame.js';
+import { composeFrame, type Panel } from './frame.js';
 import type { Progress } from './rows.js';
 import { LiveTerminal, type Output } from './terminal.js';
 
@@ -49,6 +49,14 @@ export interface AskOptions {
    * in the box). Without keys (or an empty list) the question takes a line.
    */
   keys?: string[];
+  /**
+   * Ask the way the Python UI does: while the question is open the box, the
+   * caption or counts, the progress row, the reply and the right-hand column
+   * are not drawn. A line question is the typed text at column 0 with the
+   * caret, right under the output; a one-key question is nothing at all, the
+   * cursor's row under the output. All of it comes back when it closes.
+   */
+  bare?: boolean;
 }
 
 export interface SessionScreen {
@@ -139,6 +147,7 @@ export function createSessionScreen(options: SessionScreenOptions): SessionScree
   let asking: {
     hint: string;
     keys: string[];
+    bare: boolean;
     draft: { value: string; cursor: number; pastes: string[]; placeholderVisible: boolean };
     resolve: (line: string | null) => void;
   } | null = null;
@@ -146,6 +155,7 @@ export function createSessionScreen(options: SessionScreenOptions): SessionScree
   const state = () => ({
     editor, reply, status, caption, meter, progress, panel, busy, color, truecolor,
     ask: asking ? asking.hint : null,
+    bare: asking?.bare ? (asking.keys.length > 0 ? 'key' as const : 'line' as const) : null,
     pending: queue.map((entry) => entry.shown),
     now: clock(),
   });
@@ -267,7 +277,7 @@ export function createSessionScreen(options: SessionScreenOptions): SessionScree
     const row = y - terminal.top - terminal.pad - frame.field.first;
     if (row < 0 || row >= frame.field.count) return;
     editor.moveTo(caretAt(editor.value, editor.cursor, frame.field.inner, frame.field.maxRows,
-                          row, x - PROMPT_PREFIX));
+                          row, x - frame.field.prefix));
   }
 
   function onData(chunk: Buffer | string): void {
@@ -419,7 +429,7 @@ export function createSessionScreen(options: SessionScreenOptions): SessionScree
         : { value: editor.value, cursor: editor.cursor, pastes: editor.pastes, placeholderVisible: editor.placeholderVisible };
       editor.reset();
       return new Promise((resolve) => {
-        asking = { hint: plain(askOptions.hint ?? ''), keys: askOptions.keys ?? [], draft, resolve };
+        asking = { hint: plain(askOptions.hint ?? ''), keys: askOptions.keys ?? [], bare: askOptions.bare === true, draft, resolve };
         previous?.resolve(null);
         schedule();
       });

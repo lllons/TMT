@@ -5,8 +5,9 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { layoutField, visibleField } from '../src/input/field.js';
 import { MAX_CONTENT_WIDTH, PROMPT_PREFIX } from '../src/live/frame.js';
-import { createSessionScreen, type SessionScreen } from '../src/live/session.js';
+import type { SessionScreen } from '../src/live/session.js';
 import { FakeTerminal, isField, isRule, rowsWhere } from './harness.js';
+import { createSessionScreen } from './screens.js';
 
 let screens: SessionScreen[] = [];
 afterEach(() => {

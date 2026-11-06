@@ -1,6 +1,7 @@
 // The live frame and the input field, for the front end to wire to the
 // backend. See tui/README.md.
 
+export { createInkSessionScreen, type InkSessionScreen } from './ink/screen.js';
 export { createSessionScreen } from './live/session.js';
 export type { SessionScreen, SessionScreenOptions, AskOptions, InterruptKey, Input } from './live/session.js';
 export type { Output } from './live/terminal.js';

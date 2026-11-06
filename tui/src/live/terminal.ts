@@ -10,21 +10,17 @@
 // kept, and 3J erases them outright.
 
 //
-// Where the blank rows go. Every terminal keeps the bottom of a window made
-// shorter and pushes its top rows into the scrollback (xterm.js because the
+// Where the blank rows go, as in the Python UI: output fills the window from
+// the top, the frame is held on the last rows by blank rows above it (the
+// pad), and the next output is written over them. A window made shorter keeps
+// its bottom and pushes its top rows into the scrollback (xterm.js because the
 // cursor is on the last row; Windows Terminal because it keeps the last
 // written row and the cursor in view; conhost because it keeps the cursor in
-// view). So while the conversation is shorter than the window it sits on the
-// box and the blank rows are kept ABOVE it: a shrink then takes blank rows
-// first, never the conversation. They are taken by deleting them (DL) as output
-// arrives and given back by inserting them (IL) when the frame gets shorter,
-// both at the top of the window, so none of them is ever scrolled into the
-// record. Once the conversation has filled the window, or the window has been
-// resized, the rows the frame gives up are kept as blank rows above the frame
-// instead and the next output is written over them.
+// view), so while the pad is there a shrink takes the conversation above it
+// first and the pad stays: the same as the Python UI does.
 
 import type { EventEmitter } from 'node:events';
-import { displayWidth, graphemes, sanitizeCommitLine, screenRows, stripAnsi, wrapPlain } from '../input/width.js';
+import { sanitizeCommitLine, screenRows, wrapPlain } from '../input/width.js';
 import type { Frame } from './frame.js';
 
 export interface Output extends EventEmitter {
@@ -40,11 +36,7 @@ const SHOW_CURSOR = '\x1b[?25h';
 const ERASE_DOWN = '\x1b[J';
 const ERASE_LINE = '\x1b[2K';
 const REPORT_CURSOR = '\x1b[6n';
-const SAVE_CURSOR = '\x1b7';
-const RESTORE_CURSOR = '\x1b8';
-const HOME = '\x1b[H';
 const up = (rows: number): string => (rows > 0 ? `\x1b[${rows}A` : '');
-const down = (rows: number): string => (rows > 0 ? `\x1b[${rows}B` : '');
 
 /** How long a resize waits for the terminal to say where the cursor is. */
 export const CPR_TIMEOUT_MS = 250;
@@ -71,12 +63,10 @@ export class LiveTerminal {
   private lost: string[] = [];
   // What the last resize found pushed out, kept as `lost` by the next paint.
   private losing: string[] | null = null;
-  // Blank rows at the top of the window, over a conversation that has not
-  // yet filled it; null once it has, or the window was resized.
-  private blank: number | null = null;
   // The rows under the frame's top no longer match `drawn` (a resize).
   private dirty = false;
   private shown: string[] | null = null;
+  private held = true;
   private content = 0;
   private timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -102,7 +92,6 @@ export class LiveTerminal {
     this.above = 0;
     this.lost = [];
     this.losing = null;
-    this.blank = 0;
     this.dirty = false;
     this.shown = null;
   }
@@ -118,45 +107,30 @@ export class LiveTerminal {
    * rewritten under the reader.
    */
   paint(frame: Frame, commits: string[]): void {
-    if (commits.length === 0 && this.shown !== null && same(frame.rows, this.shown)) return;
+    const hold = frame.hold !== false;
+    if (commits.length === 0 && this.shown !== null && hold === this.held && same(frame.rows, this.shown)) return;
     // A paint that cannot wait for the terminal's answer (the screen is being
     // handed over) takes the answer it would have had on a silent terminal.
     if (this.awaiting > 0) this.settle();
-    const lines = commits.flatMap(splitLines).map(sanitizeCommitLine);
-    // Counted as the terminal will wrap them. It need not be exact: once the
-    // window is full the clamp below makes it exact again.
-    const written = lines.reduce((sum, line) => sum + screenRows(line, this.columns), 0);
-    this.content = frame.rows.length;
     let out = BEGIN_SYNC + up(this.above) + '\r';
-    // Rows are only ever deleted at the top while their count is certain: a
-    // row the terminal drew taller than counted scrolled one of the blank
-    // rows away, and the next delete would take a row of the conversation.
-    if (this.blank !== null && ![...lines, ...frame.plain].every((row) => certain(row, this.columns))) this.blank = null;
-    if (this.blank !== null) {
-      // Up by the rows the frame and the output need, out of the blank rows,
-      // or down by the rows they no longer need, so the frame ends on the
-      // row above the foot with the conversation on it.
-      const over = this.top + written + this.content - (this.rows - 1);
-      const shift = over < 0 ? over : Math.min(over, this.blank);
-      if (shift < 0) out += SAVE_CURSOR + HOME + `\x1b[${-shift}L` + RESTORE_CURSOR + down(-shift) + '\r';
-      if (shift > 0) out += SAVE_CURSOR + HOME + `\x1b[${shift}M` + RESTORE_CURSOR + up(shift) + '\r';
-      this.blank -= shift;
-      this.top -= shift;
-    }
+    const lines = commits.flatMap(splitLines).map(sanitizeCommitLine);
     // Erased first: a committed line wider than the window wraps onto the
     // rows below, and those still hold the old frame -- as do rows a resize
     // re-wrapped.
     if (lines.length > 0 || this.dirty) out += ERASE_DOWN;
-    for (const line of lines) out += line + (line.includes('\x1b[') ? '\x1b[0m' : '') + '\r\n';
-    this.top += written;
-    // A frame that would cross the foot of the window scrolls it, and then
-    // ends on the row above the foot like every other frame. What scrolled
-    // out was conversation, so it no longer fits the window.
-    if (this.top + this.content > this.rows - 1) {
-      this.top = Math.max(0, this.rows - 1 - this.content);
-      this.blank = null;
+    for (const line of lines) {
+      out += line + (line.includes('\x1b[') ? '\x1b[0m' : '') + '\r\n';
+      // Counted as the terminal will wrap it. It need not be exact: once the
+      // window is full the clamp below makes it exact again.
+      this.top += screenRows(line, this.columns);
     }
-    this.pad = Math.max(0, this.rows - 1 - this.top - this.content);
+    this.content = frame.rows.length;
+    // A frame that would cross the foot of the window scrolls it, and then
+    // ends on the row above the foot like every other frame.
+    if (this.top + this.content > this.rows - 1) this.top = Math.max(0, this.rows - 1 - this.content);
+    // A frame that is not held (a bare question) follows the output instead,
+    // with nothing under it but the cursor's row.
+    this.pad = hold ? Math.max(0, this.rows - 1 - this.top - this.content) : 0;
     for (let row = 0; row < this.pad; row += 1) out += ERASE_LINE + '\r\n';
     for (const row of frame.rows) out += ERASE_LINE + row + '\r\n';
     out += ERASE_DOWN + END_SYNC;
@@ -168,6 +142,7 @@ export class LiveTerminal {
     this.losing = null;
     this.dirty = false;
     this.shown = frame.rows;
+    this.held = hold;
   }
 
   /**
@@ -252,32 +227,9 @@ export class LiveTerminal {
       this.losing.push(heights[index]! <= cut ? line : wrapPlain(line, this.columns).slice(0, cut).join(''));
       cut -= heights[index]!;
     }
-    // The terminal may have moved rows over the top of the window, so the
-    // blank rows there can no longer be counted on.
-    this.blank = null;
     this.dirty = true;
     this.shown = null;
   }
-}
-
-/**
- * Whether the terminal is sure to give `row` exactly the rows `screenRows`
- * counts. Printable ASCII always is. Otherwise only when the row fits even if
- * every code point of a grapheme made of several (an emoji sequence, a flag,
- * a skin tone) were drawn two columns wide: that is where terminals and
- * `string-width` disagree, and they never disagree by more.
- */
-function certain(row: string, columns: number): boolean {
-  const text = stripAnsi(row);
-  if (/^[\x20-\x7e]*$/.test(text)) return true;
-  let widest = 0;
-  let single = true;
-  for (const grapheme of graphemes(text)) {
-    const points = [...grapheme].length;
-    if (points > 1) single = false;
-    widest += points === 1 ? displayWidth(grapheme) : 2 * points;
-  }
-  return single || widest <= columns;
 }
 
 function same(a: string[], b: string[]): boolean {

@@ -4,8 +4,9 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { INPUT_MAX_ROWS, layoutField } from '../src/input/field.js';
 import { LIVE_BODY_LINES, MAX_CONTENT_WIDTH, PROMPT_PREFIX } from '../src/live/frame.js';
-import { createSessionScreen, type SessionScreen } from '../src/live/session.js';
-import { FakeTerminal, forbiddenIn, isField, isRule, rowsWhere } from './harness.js';
+import type { SessionScreen } from '../src/live/session.js';
+import { FakeTerminal, forbiddenIn, isField, isRule, rowsWhere, showsPainted } from './harness.js';
+import { createSessionScreen, INK } from './screens.js';
 
 const SIZES: [number, number][] = [[80, 24], [40, 12], [160, 50]];
 const STATUS = 'status: thinking';
@@ -84,7 +85,7 @@ describe.each(SIZES)('live frame at %ix%i', (columns, rows) => {
     screen.commit('tool said \x1b[3J\x1b[2J\x1b[1;5r\x1b[?1049h\x1bc\x9b3J and \x1b[31mred\x1b[0m\tok');
     await term.settle();
     expect(forbiddenIn(term.raw)).toEqual([]);
-    expect(term.raw).toContain('\x1b[31mred\x1b[0m');
+    expect(await showsPainted(term, 'tool said 3J and \x1b[31mred\x1b[0m    ok')).toBe(true);
     // The eight-bit CSI goes and leaves its parameters as text; the tab is
     // expanded to the next stop of eight, so the row count is the terminal's.
     expect(term.all()).toContain('tool said 3J and red    ok');
@@ -99,10 +100,11 @@ describe.each(SIZES)('live frame at %ix%i', (columns, rows) => {
     const view = term.viewport();
     expect(view[rows - 1]).toBe('');
     expect(box(term).status).toBe(rows - 2);
-    // The window less the cursor's row, the box, the status row and the reply
-    // box's own two rules; and never more than the ten rows the Python relay shows.
+    // The window less the cursor's row, the box and the status row, and on the
+    // Python look the reply box's own two rules; and never more than the ten
+    // rows the Python relay shows.
     const shown = view.filter((row) => row.includes('reply row'));
-    expect(shown).toHaveLength(Math.min(LIVE_BODY_LINES, rows - 1 - 3 - 1 - 2));
+    expect(shown).toHaveLength(Math.min(LIVE_BODY_LINES, rows - 1 - 3 - 1 - (INK ? 0 : 2)));
     expect(shown.at(-1)).toContain('reply row 79');
     expect(term.scrollback().some((row) => row.includes('reply row'))).toBe(false);
     expect(forbiddenIn(term.raw)).toEqual([]);
@@ -403,8 +405,8 @@ describe('a live reply resized (defect 2)', () => {
     let view = term.viewport();
     expect(box(term).status).toBe(8);
     expect(view[9]).toBe('');
-    // Nine rows less the cursor's, the box, its status row and the reply box's rules.
-    expect(replies(view)).toEqual(['reply 9', 'reply 10', 'reply 11']);
+    // Nine rows less the cursor's, the box, its status row and, on the Python look, the reply box's rules.
+    expect(replies(view)).toEqual(INK ? ['reply 7', 'reply 8', 'reply 9', 'reply 10', 'reply 11'] : ['reply 9', 'reply 10', 'reply 11']);
     expect(rowsWhere(term.all(), isRule)).toHaveLength(2);
     expect(rowsWhere(term.all(), isField)).toHaveLength(1);
     term.resize(80, 24);
@@ -425,7 +427,7 @@ describe('a live reply resized (defect 2)', () => {
 });
 
 describe('typing during a turn', () => {
-  it('queues a line, says so in the box instead of listing it, and sends it when the turn ends', async () => {
+  it.skipIf(INK)('queues a line, says so in the box instead of listing it, and sends it when the turn ends', async () => {
     const term = new FakeTerminal(80, 24);
     const screen = open(term);
     const sent: string[] = [];
@@ -538,7 +540,7 @@ describe('asking a question', () => {
     expect(screen.queued()).toEqual([]);
   });
 
-  it('draws the hint only in the empty box, and the typing hint comes back after', async () => {
+  it.skipIf(INK)('draws the hint only in the empty box, and the typing hint comes back after', async () => {
     const term = new FakeTerminal(80, 24);
     const screen = open(term);
     screen.setBusy(true);

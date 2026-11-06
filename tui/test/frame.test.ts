@@ -1,10 +1,12 @@
 // The live frame is a pure function of its state and the window: the rows of
-// the Python UI's look, laid out and measured without a terminal.
+// the Python UI's look, laid out and measured without a terminal. The Ink
+// screen draws the Claude Code look instead; its frame is in ink-frame.test.ts.
 
 import { describe, expect, it } from 'vitest';
 import { LineEditor } from '../src/input/editor.js';
 import { displayWidth, stripAnsi } from '../src/input/width.js';
-import { composeFrame, type FrameState } from '../src/live/frame.js';
+import type { FrameState } from '../src/live/frame.js';
+import { composeFrame, INK } from './screens.js';
 
 const CAPTION = { clock: '14:39:37', provider: 'OpenRouter', model: 'Nemotron 3 Ultra 550B' };
 const COUNTED = { tokens_in: 14500, tokens_out: 48, tokens_out_exact: false, lines_added: 0, lines_removed: 0 };
@@ -24,7 +26,7 @@ const plain = (over: Partial<FrameState>, columns = 120, rows = 36): string[] =>
 const inside = (row: string): string => row.slice(1).replace(/ 』$/, '').trim();
 const waiting =(text: string): LineEditor => Object.assign(new LineEditor(text), { placeholderVisible: true });
 
-describe('the live reply in the frame', () => {
+describe.skipIf(INK)('the live reply in the frame', () => {
   const frame = (reply: string, columns: number) => plain({ reply, busy: true }, columns, 24);
 
   it('wraps at word boundaries, never in the middle of a word', () => {
@@ -60,7 +62,7 @@ describe('the live reply in the frame', () => {
   });
 });
 
-describe('the caption row', () => {
+describe.skipIf(INK)('the caption row', () => {
   it('is the clock, provider and model, right-aligned to the box, with Python\'s separator', () => {
     const row = plain({ caption: CAPTION })[0]!;
     expect(row).toBe(' '.repeat(100 - 45) + '14:39:37 · OpenRouter · Nemotron 3 Ultra 550B');
@@ -91,7 +93,7 @@ describe('the caption row', () => {
   });
 });
 
-describe('the meter row', () => {
+describe.skipIf(INK)('the meter row', () => {
   const during = (meter: object, columns = 120): string[] => plain({ meter, busy: true }, columns, 24);
 
   it('is its own row above the box during a turn: wide, short and nothing', () => {
@@ -122,7 +124,7 @@ describe('the meter row', () => {
   });
 });
 
-describe('the progress row', () => {
+describe.skipIf(INK)('the progress row', () => {
   const under = (over: Partial<FrameState>, columns = 120): string => plain({ busy: true, ...over }, columns, 36).at(-1)!;
 
   it('is the bar, the percentage, the label and the estimate, with the readout at the right edge', () => {
@@ -172,7 +174,7 @@ describe('the progress row', () => {
   });
 });
 
-describe('the queued lines', () => {
+describe.skipIf(INK)('the queued lines', () => {
   const editor = (): LineEditor => new LineEditor();
 
   it('are counted in the empty box, not listed above it', () => {
@@ -195,7 +197,7 @@ describe('the queued lines', () => {
   });
 });
 
-describe('the right-hand column', () => {
+describe.skipIf(INK)('the right-hand column', () => {
   const live = (columns: number, rows: number, over: Partial<FrameState> = {}) => composeFrame(state({
     busy: true, reply: 'a short reply\nof two rows',
     meter: COUNTED, progress: WORKING, ...over,

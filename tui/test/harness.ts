@@ -32,8 +32,11 @@ export class FakeTerminal {
    * rows back out of the scrollback, so what a shrink pushed up stays there.
    */
   constructor(columns: number, rows: number, { answers = true, conpty = false } = {}) {
+    // A line feed returns to column 0, as it does through a real terminal's
+    // tty layer (ONLCR on POSIX, newline auto-return in the Windows console):
+    // Ink ends its rows with a bare line feed.
     this.term = new Terminal({
-      cols: columns, rows, scrollback: 10000, allowProposedApi: true,
+      cols: columns, rows, scrollback: 10000, allowProposedApi: true, convertEol: true,
       ...(conpty ? { windowsPty: { backend: 'conpty' as const, buildNumber: 22631 } } : {}),
     });
     const out = new EventEmitter() as FakeTerminal['stdout'];
@@ -101,6 +104,35 @@ export class FakeTerminal {
   cursorRow(): number {
     return this.term.buffer.active.cursorY;
   }
+}
+
+/**
+ * Whether the terminal holds `row` (text with SGR colour) on one of its rows,
+ * cell for cell: the same characters in the same colours and attributes,
+ * however the bytes that drew it were spelled. (Ink closes a colour with its
+ * own off code where the text had a reset: the same cells, other bytes.)
+ */
+export async function showsPainted(term: FakeTerminal, row: string): Promise<boolean> {
+  const probe = new Terminal({ cols: term.term.cols, rows: 1, allowProposedApi: true });
+  await new Promise<void>((resolve) => probe.write(row, resolve));
+  const want = cells(probe.buffer.active.getLine(0)!, probe.cols);
+  const buffer = term.term.buffer.active;
+  for (let y = 0; y < buffer.length; y += 1) {
+    if (cells(buffer.getLine(y)!, term.term.cols) === want) return true;
+  }
+  return false;
+}
+
+type Line = NonNullable<ReturnType<InstanceType<typeof Terminal>['buffer']['active']['getLine']>>;
+
+function cells(line: Line, columns: number): string {
+  const out: string[] = [];
+  for (let x = 0; x < columns; x += 1) {
+    const cell = line.getCell(x)!;
+    out.push([cell.getChars(), cell.getFgColorMode(), cell.getFgColor(), cell.getBgColorMode(), cell.getBgColor(),
+      cell.isBold(), cell.isDim(), cell.isItalic(), cell.isUnderline(), cell.isInverse()].join(','));
+  }
+  return out.join('|');
 }
 
 /** Every row of `rows` matching `test`, by index. */

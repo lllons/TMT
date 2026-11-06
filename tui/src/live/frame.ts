@@ -50,6 +50,12 @@ export interface FrameState {
   busy: boolean;
   /** The hint of the open question, or null when none is open. */
   ask: string | null;
+  /**
+   * The open question is bare, as the Python UI asks: the frame is only what
+   * is typed, at column 0 with the caret (`line`), or nothing at all, the
+   * cursor's own row under the question being the whole of it (`key`).
+   */
+  bare?: 'line' | 'key' | null;
   color: boolean;
   truecolor: boolean;
   /** The clock, in ms: the elapsed time and the colour cycle are read from it. */
@@ -61,8 +67,14 @@ export interface Frame {
   rows: string[];
   /** The same rows with no styling, for the arithmetic. */
   plain: string[];
-  /** Where the field's rows are, for mapping a click back to the caret. */
-  field: { first: number; count: number; inner: number; maxRows: number };
+  /** Where the field's rows are, and the columns before its text, for mapping a click back to the caret. */
+  field: { first: number; count: number; inner: number; maxRows: number; prefix: number };
+  /**
+   * Held on the last rows of the window by blank rows above it (the default),
+   * or, for a bare question, drawn straight under the output like the Python
+   * UI's answer line, with only the cursor's row under it.
+   */
+  hold?: boolean;
 }
 
 const INVERSE = '\x1b[7m';
@@ -91,11 +103,12 @@ export function composeFrame(state: FrameState, columns: number, rows: number): 
   const width = Math.min(MAX_CONTENT_WIDTH, Math.max(1, leftWidth));
   const inner = Math.max(1, width - PROMPT_PREFIX);
   const maxRows = Math.max(1, Math.min(INPUT_MAX_ROWS, room - 2));
-  const empty: Frame = { rows: [], plain: [], field: { first: 0, count: 0, inner, maxRows } };
+  const empty: Frame = { rows: [], plain: [], field: { first: 0, count: 0, inner, maxRows, prefix: PROMPT_PREFIX } };
   if (room < 1) return empty;
+  if (state.bare) return bareFrame(state, Math.min(MAX_CONTENT_WIDTH, spare), room);
 
   const dim = (text: string): string => dimmed(look, text);
-  const field = fieldRows(state, inner, maxRows, dim);
+  const field = fieldRows(state.editor, fieldHint(state, inner), inner, maxRows, dim, ' > ');
   const rule = ' ' + '─'.repeat(Math.max(0, width - 1));
 
   // What is kept is the field and both rules; everything else gives up its
@@ -142,7 +155,26 @@ export function composeFrame(state: FrameState, columns: number, rows: number): 
   return {
     rows: all.map((row) => row.styled),
     plain: all.map((row) => row.plain),
-    field: { first: first + pad, count: field.length, inner, maxRows },
+    field: { first: first + pad, count: field.length, inner, maxRows, prefix: PROMPT_PREFIX },
+  };
+}
+
+/**
+ * A bare question's frame (agent_live_renderer.LiveRegion.ask_below): no box,
+ * no caption or counts, no progress row, no reply and no right-hand column,
+ * all of which come back when it closes. A line question is what is typed, at
+ * column 0 with the caret and nothing else on the row; a one-key question has
+ * no rows at all.
+ */
+function bareFrame(state: FrameState, width: number, room: number): Frame {
+  const maxRows = Math.max(1, Math.min(INPUT_MAX_ROWS, room));
+  const inner = Math.max(1, width);
+  const rows = state.bare === 'line' ? fieldRows(state.editor, '', inner, maxRows, (text) => text, '') : [];
+  return {
+    rows: rows.map((row) => row.styled),
+    plain: rows.map((row) => row.plain),
+    field: { first: 0, count: rows.length, inner, maxRows, prefix: 0 },
+    hold: false,
   };
 }
 
@@ -192,15 +224,9 @@ function beside(column: Row[], right: string[], cell: number): Row[] {
  * it in inverse video, or an inverse space after the last character -- the
  * column `layoutField` keeps free for it.
  */
-function fieldRows(state: FrameState, inner: number, maxRows: number,
-                   dim: (text: string) => string): Row[] {
-  const { editor } = state;
-  const lead = ' > ';
-  const indent = ' '.repeat(PROMPT_PREFIX);
-  const waiting = state.pending.length;
-  const hint = state.ask !== null && editor.value === '' ? state.ask
-    : state.busy && editor.value === '' ? (waiting > 0 ? queuedHint(waiting, inner - 1) : TYPING_HINT)
-    : editor.placeholderVisible ? editor.placeholder : '';
+function fieldRows(editor: LineEditor, hint: string, inner: number, maxRows: number,
+                   dim: (text: string) => string, lead: string): Row[] {
+  const indent = ' '.repeat(lead.length);
   if (editor.value === '') {
     // The placeholder never wraps. It is shadow text standing in for an empty
     // field, and a hint that grew the box would rearrange the screen before
@@ -227,6 +253,15 @@ function fieldRows(state: FrameState, inner: number, maxRows: number,
       styled: prefix + before + INVERSE + cell + UNINVERSE + rest,
     };
   });
+}
+
+/** The shadow text of an empty box: the question's, the turn's, or the placeholder. */
+function fieldHint(state: FrameState, inner: number): string {
+  const { editor } = state;
+  const waiting = state.pending.length;
+  return state.ask !== null && editor.value === '' ? state.ask
+    : state.busy && editor.value === '' ? (waiting > 0 ? queuedHint(waiting, inner - 1) : TYPING_HINT)
+    : editor.placeholderVisible ? editor.placeholder : '';
 }
 
 /** `text` split around the grapheme that starts at `column`. */

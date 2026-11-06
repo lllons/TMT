@@ -1,10 +1,12 @@
 // The Python UI's look in the live frame, driven through a headless terminal:
 // the progress row moving with the clock, the colours it asks the terminal
 // for, the right-hand column across resizes, and the bytes all of it writes.
+// (The Ink screen draws the Claude Code look; test/ink-look.test.ts has its own.)
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { displayWidth } from '../src/input/width.js';
-import { createSessionScreen, type SessionScreen } from '../src/live/session.js';
+import type { SessionScreen } from '../src/live/session.js';
+import { createSessionScreen, INK } from './screens.js';
 import { FakeTerminal, forbiddenIn, isField, isRule, rowsWhere } from './harness.js';
 
 let screens: SessionScreen[] = [];
@@ -29,7 +31,7 @@ const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 /** The rule rows of the box, with or without a column beside them: two in the whole buffer, or the frame is stale. */
 const boxRules = (term: FakeTerminal) => rowsWhere(term.all(), (row) => /^ ─+( {2,}\S.*)?$/.test(row) && !row.includes('PLAN'));
 
-describe('the progress row against the clock', () => {
+describe.skipIf(INK)('the progress row against the clock', () => {
   it('counts the seconds and works the estimate out from them, and is the last row but the cursor\'s', async () => {
     let now = 10_000;
     const term = new FakeTerminal(120, 36);
@@ -93,7 +95,7 @@ describe('the progress row against the clock', () => {
   });
 });
 
-describe('colour', () => {
+describe.skipIf(INK)('colour', () => {
   async function drawn(options: { color: boolean; truecolor: boolean }): Promise<string> {
     const term = new FakeTerminal(120, 36);
     const screen = open(term, { ...options, clock: () => 10_000 });
@@ -106,17 +108,18 @@ describe('colour', () => {
 
   it('is truecolor where the terminal has it: the meter, the bar, the dim empty cells, the readout', async () => {
     const raw = await drawn({ color: true, truecolor: true });
-    expect(raw).toContain('\x1b[38;2;34;197;94m+3\x1b[0m');
-    expect(raw).toContain('\x1b[38;2;220;38;38m-1\x1b[0m');
+    // A colour ends with a reset, or with the default-colour code Ink closes it with.
+    expect(raw).toMatch(/\x1b\[38;2;34;197;94m\+3\x1b\[(?:0|39)m/);
+    expect(raw).toMatch(/\x1b\[38;2;220;38;38m-1\x1b\[(?:0|39)m/);
     expect(raw).toContain('\x1b[38;2;88;88;88m░');
-    expect(raw).toContain('\x1b[38;2;88;88;88m (6s · ↓ 48 tokens)\x1b[0m');
+    expect(raw).toMatch(/\x1b\[38;2;88;88;88m \(6s · ↓ 48 tokens\)\x1b\[(?:0|39)m/);
     expect(raw).not.toMatch(/\x1b\[38;5;/);
   });
 
   it('is the nearest of 256 where it has not', async () => {
     const raw = await drawn({ color: true, truecolor: false });
     expect(raw).toContain('\x1b[38;5;240m░');
-    expect(raw).toMatch(/\x1b\[38;5;\d+m\+3\x1b\[0m/);
+    expect(raw).toMatch(/\x1b\[38;5;\d+m\+3\x1b\[(?:0|39)m/);
     expect(raw).not.toMatch(/\x1b\[38;2;/);
   });
 
@@ -131,7 +134,7 @@ describe('colour', () => {
   });
 });
 
-describe('the right-hand column in a terminal', () => {
+describe.skipIf(INK)('the right-hand column in a terminal', () => {
   it('draws, moves with the window, hides when the box would be too narrow, and is back when it fits', async () => {
     const term = new FakeTerminal(120, 36);
     const screen = open(term, { clock: () => 10_000 });
@@ -189,7 +192,7 @@ describe('the right-hand column in a terminal', () => {
     expect(writes).toHaveLength(1);
     expect(forbiddenIn(writes[0]!)).toEqual([]);
     expect(writes[0]).not.toMatch(/\x1b\[2J/);
-    expect(writes[0]).toContain('\x1b[31mred\x1b[0m');
+    expect(writes[0]).toMatch(/\x1b\[31mred\x1b\[(?:0|39)m/);
     expect(term.viewport().some((row) => row.includes('PLANSNEAK'))).toBe(true);
   });
 });
