@@ -6,7 +6,7 @@
 //
 // Two readers share the inline rules. `markdownLines` is the first one: one
 // row per line, the codes fixed, used by the hand-written renderer's reply box
-// and the fallback path. `renderMarkdown` is the one the Claude Code look uses:
+// and the fallback path. `renderMarkdown` is the one the signal rail look uses:
 // it lays the blocks out for a width (hanging indents, a quote bar, a code
 // block, a table) and paints them with a theme.
 
@@ -67,11 +67,11 @@ const legacyMarks = (color: boolean): Marks => {
 };
 
 const themeMarks = (theme: Theme): Marks => ({
-  code: theme.code,
+  code: theme.ref,
   bold: theme.bold,
   italic: theme.italic,
   strike: theme.strike,
-  link: (label, url) => (label === url ? theme.link(theme.underline(url)) : `${theme.link(theme.underline(label))} ${theme.dim(`(${url})`)}`),
+  link: (label, url) => (label === url ? theme.ref(theme.underline(url)) : `${theme.ref(theme.underline(label))} ${theme.dim(`(${url})`)}`),
 });
 
 /** Inline markup in one line of text. */
@@ -137,7 +137,7 @@ export function markdownLines(text: string, color: boolean): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// The Claude Code look: blocks laid out for a width.
+// The signal rail look: blocks laid out for a width.
 
 const BULLET_ITEM = /^(\s*)([-*+]|\d{1,3}[.)])[ \t]+(.*)$/;
 const QUOTE = /^ {0,3}>[ \t]?(.*)$/;
@@ -157,10 +157,10 @@ const visible = (text: string): number => displayWidth(stripAnsi(text));
  *   continuation lines hang under the text, nested items by their indent;
  * - a fenced block is its language in dim, then the code indented two columns
  *   and read for nothing, no border;
- * - a quote has a dim `▎` bar on every row and its text in italic;
+ * - a quote has a dim `┇` bar on every row and its text in italic;
  * - a rule is a dim line, a table a box when it fits `width` and its lines as
  *   written when it does not;
- * - `**bold**`, `*italic*`, `~~strike~~`, `` `code` `` in its own colour, and
+ * - `**bold**`, `*italic*`, `~~strike~~`, `` `code` `` in the reference hue, and
  *   `[text](url)` as underlined text and the url in dim after it.
  *
  * With colour off the same rows come out with no escape in them.
@@ -221,7 +221,7 @@ export function renderMarkdown(text: string, theme: Theme, width: number): strin
     }
 
     if (QUOTE.test(line)) {
-      const bar = theme.dim('▎') + ' ';
+      const bar = theme.dim('┇') + ' ';
       for (; at < lines.length && QUOTE.test(lines[at]!); at += 1) {
         const inner = QUOTE.exec(lines[at]!)![1]!;
         if (inner.trim() === '') out.push(bar.trimEnd());

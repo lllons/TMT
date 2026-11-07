@@ -4,10 +4,14 @@
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { layoutField, visibleField } from '../src/input/field.js';
-import { MAX_CONTENT_WIDTH, PROMPT_PREFIX } from '../src/live/frame.js';
+import { PROMPT_PREFIX as INK_PROMPT_PREFIX } from '../src/ink/layout.js';
+import { MAX_CONTENT_WIDTH, PROMPT_PREFIX as LIVE_PROMPT_PREFIX } from '../src/live/frame.js';
 import type { SessionScreen } from '../src/live/session.js';
-import { FakeTerminal, isField, isRule, rowsWhere } from './harness.js';
-import { createSessionScreen } from './screens.js';
+import { FakeTerminal, isField, rowsWhere } from './harness.js';
+import { createSessionScreen, INK } from './screens.js';
+
+/** The columns before the field: the Python UI's ` > `, or the Ink composer's bar and a space. */
+const PROMPT_PREFIX = INK ? INK_PROMPT_PREFIX : LIVE_PROMPT_PREFIX;
 
 let screens: SessionScreen[] = [];
 afterEach(() => {
@@ -23,7 +27,7 @@ async function setup(text: string, mouseCaret = true, columns = 80, rows = 24) {
   screen.onSubmit((line) => sent.push(line));
   term.type(text);
   await term.settle();
-  const fieldTop = rowsWhere(term.viewport(), isRule)[0]! + 1;
+  const fieldTop = rowsWhere(term.viewport(), isField)[0]!;
   const inner = Math.min(MAX_CONTENT_WIDTH, columns - 1) - PROMPT_PREFIX;
   /** Click visible field row `row`, column `column` after the prefix, then type X and Enter. */
   const clickAndMark = async (row: number, column: number): Promise<string> => {

@@ -20,8 +20,8 @@ vi.setConfig({ testTimeout: 60_000 });
 
 const SIZES = [[80, 24], [40, 12], [200, 50], [120, 40]] as const;
 const CAPTURES = process.env['TMT_CAPTURE_DIR'];
-/** The status row: a star and the words, which end in an ellipsis, then the readout when it fits. */
-const STATUS = /^[·✢*✶✻✽] .*…( \(.*\))?$/;
+/** The status row: a rail cell and the words, which end in an ellipsis, then the readout when it fits. */
+const STATUS = /^┃ .*…( \(.*\))?$/;
 
 /** The whole buffer, trailing blank rows dropped, as the plain text a person would see by scrolling. */
 const capture = (run: Run): string => {
@@ -36,14 +36,13 @@ function save(run: Run, columns: number, rows: number, name: string): void {
   writeFileSync(join(CAPTURES, `turn-${columns}x${rows}-${name}.txt`), capture(run));
 }
 
-/** The box is on the last rows: rule, field, rule, footer, then the cursor's own row. */
+/** The box is on the last rows: the field, the footer, then the cursor's own row; no rule above or below it. */
 function expectBoxOnFoot(run: Run, rows: number): void {
   const view = run.term.viewport();
   expect(view[rows - 1], 'the cursor row').toBe('');
   expect(view[rows - 2]!.startsWith(' '), `the footer: ${view[rows - 2]}`).toBe(true);
-  expect(isRule(view[rows - 3]!), 'the rule under the field').toBe(true);
-  expect(isField(view[rows - 4]!), `the field: ${view[rows - 4]}`).toBe(true);
-  expect(isRule(view[rows - 5]!), 'the rule above the field').toBe(true);
+  expect(isField(view[rows - 3]!), `the field: ${view[rows - 3]}`).toBe(true);
+  expect(view.some(isRule), 'no rule in the window').toBe(false);
 }
 
 /** Where the live frame starts: the first row of the window that belongs to it (the last status or blank row above the box). */
@@ -63,8 +62,8 @@ describe.each(SIZES)('a turn at %ix%i', (columns, rows) => {
     await run.showing('Run this command?');
     await run.term.settle();
     expectBoxOnFoot(run, rows);
-    expect(run.term.viewport().find(isField)!.trim()).toBe('> Press y, a or n then Enter');
-    expect(run.term.viewport().some((row) => /^[·✢*✶✻✽] Waiting for your approval…/.test(row))).toBe(rows > 8);
+    expect(run.term.viewport().find(isField)!.trim()).toBe('▌ Press y, a or n then Enter');
+    expect(run.term.viewport().some((row) => /^┃ Waiting for your approval…/.test(row))).toBe(rows > 8);
     save(run, columns, rows, 'approval');
     run.term.type('y');
     run.term.type('\r');
@@ -76,8 +75,8 @@ describe.each(SIZES)('a turn at %ix%i', (columns, rows) => {
     expectBoxOnFoot(run, rows);
     const mid = frameRows(run, rows);
     expect(mid.filter((row) => STATUS.test(row))).toHaveLength(1);
-    expect(mid.some((row) => row.includes('Bash(npm test -- --coverage)'))).toBe(true);
-    expect(mid.some((row) => /[☒◼☐]/.test(row))).toBe(true);
+    expect(mid.some((row) => row.includes('│ Bash npm test -- --coverage'))).toBe(true);
+    expect(mid.some((row) => /[◉◐○]/.test(row))).toBe(true);
     // The reply is live only: nothing of it is in the record yet.
     expect(run.term.scrollback().some((row) => row.includes('parser.add_argument'))).toBe(false);
     expect(run.term.viewport().some((row) => row.includes('parser.add_argument'))).toBe(true);
@@ -93,30 +92,31 @@ describe.each(SIZES)('a turn at %ix%i', (columns, rows) => {
 
     const all = run.rows();
     const once = (text: string): void => expect(all.filter((row) => row === text), text).toHaveLength(1);
-    once('TMT 0.1.1');
+    once('│ TMT 0.1.1');
     once('· Looking at the project first.');
-    once('● Read File(cli.py)');
-    once('● Patch File(cli.py)');
-    once('● Bash(npm test)');
-    once('● Bash(npm run lint)');
-    once('● Bash(npm test -- --coverage)');
+    once('│ Read File cli.py');
+    once('│ Patch File cli.py');
+    once('│ Bash npm test');
+    once('│ Bash npm run lint');
+    once('│ Bash npm test -- --coverage');
     once('✓ The tests pass.');
-    once('  ⎿  Allowed once');
-    once(' Run this command?');
-    expect(all.filter((row) => row.startsWith('● I added --verbose'))).toHaveLength(1);
-    expect(all.filter((row) => row.startsWith('❯ '))).toHaveLength(1);
+    once('┃ Allowed once');
+    once('┃ Run this command?');
+    expect(all.filter((row) => row.startsWith('┃ I added --verbose'))).toHaveLength(1);
+    // The task is on the double rail, every row of it, once.
+    expect(all.filter((row) => row.startsWith('║ ')).map((row) => row.slice(2)).join(' ')).toBe(ASK);
     // The facts of each call are under it.
-    const at = all.indexOf('● Patch File(cli.py)');
-    expect(all.slice(at + 1, at + 3)).toEqual(['  ⎿  Edited cli.py', '     Added 4 lines, removed 1 line']);
-    const lint = all.indexOf('● Bash(npm run lint)');
+    const at = all.indexOf('│ Patch File cli.py');
+    expect(all.slice(at + 1, at + 3)).toEqual(['│ Edited cli.py', '│ Added 4 lines, removed 1 line']);
+    const lint = all.indexOf('│ Bash npm run lint');
     expect(all.slice(lint + 1, lint + 4).join('\n')).toContain('exit 1');
     // Nothing of the live frame was left in the record: no status row, no plan, no live reply, no second box.
     expect(all.filter((row) => STATUS.test(row))).toEqual([]);
-    expect(all.filter((row) => /^ {2}⎿ {2}[☒◼☐]|^ {5}[☒◼☐]/.test(row))).toEqual([]);
+    expect(all.filter((row) => /^│ [◉◐○] /.test(row))).toEqual([]);
     expect(all.filter(isField)).toHaveLength(1);
-    expect(all.filter(isRule)).toHaveLength(2);
+    expect(all.filter(isRule)).toHaveLength(0);
     // The idle frame: the hint and the counts, and the placeholder the turn left.
-    expect(run.term.viewport().find(isField)!.trim()).toBe('> Fix the long line');
+    expect(run.term.viewport().find(isField)!.trim()).toBe('▌ Fix the long line');
     expect(run.term.viewport()[rows - 2]!.startsWith(' Enter to send')).toBe(true);
 
     expect(forbiddenIn(run.term.raw)).toEqual([]);
@@ -152,7 +152,7 @@ describe('a turn resized while it runs', () => {
     await run.term.settle();
     expectBoxOnFoot(run, 24);
     const all = run.rows();
-    for (const text of ['● Read File(cli.py)', '● Patch File(cli.py)', '● Bash(npm test)', '● Bash(npm run lint)']) {
+    for (const text of ['│ Read File cli.py', '│ Patch File cli.py', '│ Bash npm test', '│ Bash npm run lint']) {
       expect(all.filter((row) => row.trimEnd() === text), text).toHaveLength(1);
     }
     expect(forbiddenIn(run.term.raw)).toEqual([]);

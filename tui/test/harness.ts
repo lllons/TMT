@@ -140,5 +140,7 @@ export function rowsWhere(rows: string[], test: (row: string) => boolean): numbe
   return rows.flatMap((row, index) => (test(row) ? [index] : []));
 }
 
+/** A rule of the Python UI's box; the Ink screen's composer has none. */
 export const isRule = (row: string): boolean => /^ ─+$/.test(row);
-export const isField = (row: string): boolean => row.startsWith(' > ');
+/** The field's first row: after the Python UI's `>`, or the Ink composer's bar (alone when the field is empty). */
+export const isField = (row: string): boolean => row.startsWith(' > ') || row === '▌' || row.startsWith('▌ ');

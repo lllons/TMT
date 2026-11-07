@@ -3,7 +3,8 @@
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { INPUT_MAX_ROWS, layoutField } from '../src/input/field.js';
-import { LIVE_BODY_LINES, MAX_CONTENT_WIDTH, PROMPT_PREFIX } from '../src/live/frame.js';
+import { PROMPT_PREFIX as INK_PROMPT_PREFIX } from '../src/ink/layout.js';
+import { LIVE_BODY_LINES, MAX_CONTENT_WIDTH, PROMPT_PREFIX as LIVE_PROMPT_PREFIX } from '../src/live/frame.js';
 import type { SessionScreen } from '../src/live/session.js';
 import { FakeTerminal, forbiddenIn, isField, isRule, rowsWhere, showsPainted } from './harness.js';
 import { createSessionScreen, INK } from './screens.js';
@@ -23,19 +24,35 @@ function open(term: FakeTerminal, options: { mouseCaret?: boolean } = {}): Sessi
   return screen;
 }
 
-/** Where the box is in the window: the rule above the field, the field, the rule under it. */
+/** The rules the box has: the Python UI's two, none for the Ink composer. */
+const RULES = INK ? 0 : 2;
+/** The columns before the field: the Python UI's ` > `, or the Ink composer's bar and a space. */
+const PROMPT_PREFIX = INK ? INK_PROMPT_PREFIX : LIVE_PROMPT_PREFIX;
+
+/**
+ * Where the box is in the window: the row above it (the rule on the Python
+ * look, the row over the field on the Ink one), the field, the row under it
+ * (the rule, or the footer), and the status row.
+ */
 function box(term: FakeTerminal): { top: number; field: number; bottom: number; status: number } {
   const view = term.viewport();
   const rules = rowsWhere(view, isRule);
   const fields = rowsWhere(view, isField);
-  return { top: rules[0]!, field: fields[0]!, bottom: rules[1]!, status: view.indexOf(` ${STATUS}`) };
+  const status = view.indexOf(` ${STATUS}`);
+  if (INK) return { top: fields[0]! - 1, field: fields[0]!, bottom: fields.at(-1)! + 1, status };
+  return { top: rules[0]!, field: fields[0]!, bottom: rules[1]!, status };
 }
 
 /** No frame left anywhere but the live one: one box, one status row, in the whole buffer. */
 function expectNoStaleRows(term: FakeTerminal): void {
   const all = term.all();
-  expect(rowsWhere(all, isRule)).toHaveLength(2);
-  expect(rowsWhere(all, isField)).toHaveLength(1);
+  expect(rowsWhere(all, isRule)).toHaveLength(RULES);
+  // One field: a single row on the Python look, where only the first row of a wrapped line has the marker;
+  // one unbroken run of rows on the Ink one, where every row keeps the bar.
+  const field = rowsWhere(all, isField);
+  expect(field.length).toBeGreaterThan(0);
+  expect(field.at(-1)! - field[0]! + 1).toBe(field.length);
+  if (!INK) expect(field).toHaveLength(1);
   expect(rowsWhere(all, (row) => row.includes(STATUS))).toHaveLength(1);
 }
 
@@ -45,8 +62,9 @@ describe.each(SIZES)('live frame at %ix%i', (columns, rows) => {
     const screen = open(term);
     screen.setStatus(STATUS);
     await term.settle();
-    // Field, bottom rule, status, then the row the cursor waits on.
-    expect(box(term)).toEqual({ top: rows - 5, field: rows - 4, bottom: rows - 3, status: rows - 2 });
+    // Field, bottom rule (the Python look's), status, then the row the cursor waits on.
+    expect(box(term)).toEqual(INK ? { top: rows - 4, field: rows - 3, bottom: rows - 2, status: rows - 2 }
+      : { top: rows - 5, field: rows - 4, bottom: rows - 3, status: rows - 2 });
     expect(term.viewport()[rows - 1]).toBe('');
   });
 
@@ -104,7 +122,7 @@ describe.each(SIZES)('live frame at %ix%i', (columns, rows) => {
     // Python look the reply box's own two rules; and never more than the ten
     // rows the Python relay shows.
     const shown = view.filter((row) => row.includes('reply row'));
-    expect(shown).toHaveLength(Math.min(LIVE_BODY_LINES, rows - 1 - 3 - 1 - (INK ? 0 : 2)));
+    expect(shown).toHaveLength(Math.min(LIVE_BODY_LINES, rows - 1 - (INK ? 1 : 3) - 1 - (INK ? 0 : 2)));
     expect(shown.at(-1)).toContain('reply row 79');
     expect(term.scrollback().some((row) => row.includes('reply row'))).toBe(false);
     expect(forbiddenIn(term.raw)).toEqual([]);
@@ -122,10 +140,11 @@ describe.each(SIZES)('live frame at %ix%i', (columns, rows) => {
     expect(status).toBe(rows - 2);
     const inner = Math.min(MAX_CONTENT_WIDTH, columns - 1) - PROMPT_PREFIX;
     expect(bottom - top - 1).toBe(Math.min(INPUT_MAX_ROWS, layoutField(text, inner).length));
-    // Only the first row carries the marker; the rest line up under the text.
+    // On the Python look only the first row carries the marker and the rest line up under the text;
+    // on the Ink one every row keeps the bar.
     const rows_ = view.slice(top + 1, bottom);
-    expect(rows_[0]!.startsWith(' > word')).toBe(true);
-    for (const row of rows_.slice(1)) expect(row.startsWith('   word')).toBe(true);
+    expect(rows_[0]!.startsWith(INK ? '▌ word' : ' > word')).toBe(true);
+    for (const row of rows_.slice(1)) expect(row.startsWith(INK ? '▌ word' : '   word')).toBe(true);
     for (const row of view) expect(row.length).toBeLessThan(columns);
   });
 });
@@ -169,7 +188,8 @@ describe('resize', () => {
         expectNoStaleRows(term);
         expect(box(term).status).toBe(toRows - 2);
         expect(view[toRows - 1]).toBe('');
-        for (const row of view) expect(row.length).toBeLessThan(toColumns);
+        // Every row of the frame is cut to the window with a column to spare; a row of the record is the terminal's to wrap.
+        for (const row of view.filter((text) => !/^(line \d+ |x+$)/.test(text))) expect(row.length).toBeLessThan(toColumns);
         // Output after the resize lands above the box, at the new width.
         screen.commit('after the resize');
         await term.settle();
@@ -385,7 +405,7 @@ describe('a live reply resized (defect 2)', () => {
     await term.settle();
     expect(term.viewport().some((row) => row.includes('streamed line'))).toBe(false);
     expect(box(term).status).toBe(38);
-    expect(rowsWhere(term.all(), isRule)).toHaveLength(2);
+    expect(rowsWhere(term.all(), isRule)).toHaveLength(RULES);
     expect(forbiddenIn(term.raw)).toEqual([]);
   });
 
@@ -406,8 +426,8 @@ describe('a live reply resized (defect 2)', () => {
     expect(box(term).status).toBe(8);
     expect(view[9]).toBe('');
     // Nine rows less the cursor's, the box, its status row and, on the Python look, the reply box's rules.
-    expect(replies(view)).toEqual(INK ? ['reply 7', 'reply 8', 'reply 9', 'reply 10', 'reply 11'] : ['reply 9', 'reply 10', 'reply 11']);
-    expect(rowsWhere(term.all(), isRule)).toHaveLength(2);
+    expect(replies(view)).toEqual(INK ? ['reply 5', 'reply 6', 'reply 7', 'reply 8', 'reply 9', 'reply 10', 'reply 11'] : ['reply 9', 'reply 10', 'reply 11']);
+    expect(rowsWhere(term.all(), isRule)).toHaveLength(RULES);
     expect(rowsWhere(term.all(), isField)).toHaveLength(1);
     term.resize(80, 24);
     await term.settle();
@@ -484,7 +504,7 @@ describe('typing during a turn', () => {
     term.type('look at ');
     term.type('\x1b[200~Traceback:\r  File "x.py"\r    boom\r\x1b[201~');
     await term.settle();
-    expect(term.viewport().some((row) => row.includes('> look at [Pasted text #1 +3 lines]'))).toBe(true);
+    expect(term.viewport().some((row) => row.includes(`${INK ? '▌' : '>'} look at [Pasted text #1 +3 lines]`))).toBe(true);
     term.type('\r');
     expect(sent).toEqual(['look at Traceback:\n  File "x.py"\n    boom']);
   });
@@ -511,7 +531,7 @@ describe('typing during a turn', () => {
     term.type('\x03');
     await term.settle();
     expect(keys).toEqual(['ctrl-c']);
-    expect(term.viewport().some((row) => row.startsWith(' > draft'))).toBe(true);
+    expect(term.viewport().some((row) => row.startsWith(INK ? '▌ draft' : ' > draft'))).toBe(true);
     screen.setBusy(false);
     term.type('\x03');
     expect(keys).toEqual(['ctrl-c']);
@@ -529,7 +549,7 @@ describe('asking a question', () => {
     screen.setBusy(true);
     const first = screen.ask({ hint: 'Type y to run it' });
     await term.settle();
-    expect(term.viewport().some((row) => row.startsWith(' > ') && row.includes('Type y to run it'))).toBe(true);
+    expect(term.viewport().some((row) => isField(row) && row.includes('Type y to run it'))).toBe(true);
     term.type('y');
     term.type('\r');
     expect(await first).toBe('y');
@@ -601,7 +621,7 @@ describe('asking a question', () => {
     expect(await answer).toBe('n');
     expect(sent).toEqual(['later']);
     await term.settle();
-    expect(term.viewport().some((row) => row.startsWith(' > half a draft'))).toBe(true);
+    expect(term.viewport().some((row) => row.startsWith(INK ? '▌ half a draft' : ' > half a draft'))).toBe(true);
     term.type('\r');
     expect(sent).toEqual(['later', 'half a draft']);
   });
@@ -628,7 +648,7 @@ describe('asking for one key', () => {
     screen.setBusy(true);
     const answer = screen.ask({ hint: '1-2, Esc to skip', keys: ['1', '2'] });
     await term.settle();
-    expect(term.viewport().some((row) => row.startsWith(' > ') && row.includes('1-2, Esc to skip'))).toBe(true);
+    expect(term.viewport().some((row) => isField(row) && row.includes('1-2, Esc to skip'))).toBe(true);
     term.type('2');
     expect(await answer).toBe('2');
     await term.settle();
@@ -652,7 +672,7 @@ describe('asking for one key', () => {
     term.type('\x7f');
     await term.settle();
     expect(settled).toBe(false);
-    expect(term.viewport().find(isField)).toBe(' > Pick');
+    expect(term.viewport().find(isField)).toBe(INK ? '▌ Pick' : ' > Pick');
     term.type('\x1b');
     await new Promise((resolve) => setTimeout(resolve, 60));
     expect(await answer).toBeNull();
@@ -703,7 +723,7 @@ describe('asking for one key', () => {
     expect(await answer).toBe('1');
     expect(sent).toEqual(['later']);
     await term.settle();
-    expect(term.viewport().some((row) => row.startsWith(' > a draft'))).toBe(true);
+    expect(term.viewport().some((row) => row.startsWith(INK ? '▌ a draft' : ' > a draft'))).toBe(true);
     term.type('\r');
     expect(sent).toEqual(['later', 'a draft']);
     const line = screen.ask({ hint: 'Type', keys: [] });

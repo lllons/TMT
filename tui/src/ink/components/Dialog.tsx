@@ -1,8 +1,9 @@
-// A question the turn waits on, in the record above the box: a rule in the
-// permission colour, a bold title, the backend's text indented two columns,
-// and the keys that answer it with the key in the accent colour.
+// A question the turn waits on, in the record above the box: a heavy orange
+// rule, then a heavy orange rail down the bold title, the backend's text
+// indented two columns and the keys that answer it, the key in orange.
 
 import { wrapLine } from '../../wrap.js';
+import { RAIL, railed } from '../live.js';
 import { Rows, type BlockProps } from './Rows.js';
 
 export interface DialogProps extends BlockProps {
@@ -15,14 +16,13 @@ export interface DialogProps extends BlockProps {
 }
 
 export function dialogRows({ theme, width, title, body = [], options = [] }: DialogProps): string[] {
-  const inside = Math.max(1, width - 2);
-  const rows = ['', theme.code('─'.repeat(width)), ' ' + theme.bold(theme.code(title))];
-  for (const line of body) rows.push(...(line.trim() === '' ? [''] : wrapLine(line, inside).map((row) => '  ' + row)));
+  const rail = theme.needsYou(RAIL.heavy);
+  const rows = ['', theme.needsYou('━'.repeat(width)), railed(rail, theme.bold(title))];
+  for (const line of body) rows.push(...(line.trim() === '' ? [railed(rail, '')] : wrapLine(line, Math.max(1, width - 4)).map((row) => railed(rail, '  ' + row))));
   if (options.length > 0) {
-    rows.push('');
+    rows.push(railed(rail, ''));
     for (const { key, label } of options) {
-      const lead = `  ${theme.bold(theme.code(key))}  `;
-      wrapLine(label, Math.max(1, width - 5)).forEach((row, index) => rows.push((index === 0 ? lead : ' '.repeat(5)) + row));
+      wrapLine(label, Math.max(1, width - 5)).forEach((row, index) => rows.push(railed(rail, (index === 0 ? theme.bold(theme.needsYou(key)) + '  ' : '   ') + row)));
     }
   }
   return rows;

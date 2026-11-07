@@ -17,7 +17,7 @@ import { Notice, type NoticeKind } from './ink/components/Notice.js';
 import { Task } from './ink/components/Task.js';
 import { failed, ToolCall } from './ink/components/ToolCall.js';
 import { MAX_CONTENT_WIDTH } from './ink/layout.js';
-import { NO_LIVE, RESULT, type Call, type Live, type Note } from './ink/live.js';
+import { NO_LIVE, RAIL, railed, type Call, type Live, type Note } from './ink/live.js';
 import { createInkSessionScreen, type InkSessionScreen, type Input, type InterruptKey, type Output } from './ink/screen.js';
 import type { AgentCard, BackendEvent, Caption, Choice, Meter, PlanStep } from './protocol.js';
 import { detectTruecolor, makeTheme, type Theme } from './theme.js';
@@ -464,7 +464,7 @@ class App {
   }
 
   // -------------------------------------------------------------------------
-  // Tool calls: `● Name(args)` in the frame while it runs, one block in the
+  // Tool calls: `│ Name target` in the frame while it runs, one block in the
   // record when its result is known.
 
   private toolEnded(end: Of<'tool_end'>): void {
@@ -548,7 +548,7 @@ class App {
       this.agentStates.set(id, now);
       if (was === undefined || !AGENT_BUSY.has(was) || AGENT_BUSY.has(now)) continue;
       const paint = now === 'completed' ? this.theme.success : this.theme.error;
-      this.commit(`${this.theme.accent('⎇')} ${agent.number ?? agent.id ?? '?'} ${agent.kind ?? 'agent'}  ${paint(now)}  ${oneLine(agent.task ?? '')}`.trimEnd());
+      this.commit(`${paint('⎇')} ${agent.number ?? agent.id ?? '?'} ${agent.kind ?? 'agent'}  ${paint(now)}  ${oneLine(agent.task ?? '')}`.trimEnd());
     }
     this.agents = agents;
     this.syncLive();
@@ -568,6 +568,11 @@ class App {
   // -------------------------------------------------------------------------
   // Approvals and questions.
 
+  /** What the record says once a dialog is answered: the dialog's own rail, then the answer dim. */
+  private answered(text: string): void {
+    this.commit(railed(this.theme.needsYou(RAIL.heavy), this.theme.dim(text)));
+  }
+
   private approval(event: Of<'approval'>): void {
     const choices = event.choices ?? [];
     // The backend's whole sentence says the same as the choices; it is kept
@@ -586,7 +591,7 @@ class App {
     void this.whileAsking(WAITING_FOR_APPROVAL, () => this.ask(approvalHint(choices, sentence), undefined, 'esc refuses · ctrl-c interrupts')).then((answer) => {
       if (!answer) return;
       const reply = approvalAnswer(answer.line, choices);
-      this.commit(this.theme.dim(RESULT + approvalEcho(reply, choices)));
+      this.answered(approvalEcho(reply, choices));
       this.backend.approvalReply(event.id, reply);
     });
   }
@@ -612,11 +617,11 @@ class App {
         // Esc and an empty line dismiss it. Anything else is asked again here:
         // the backend would answer a key it did not offer with an error.
         if (answer.line === null || typed === '') {
-          this.commit(this.theme.dim(RESULT + 'Skipped'));
+          this.answered('Skipped');
           return this.backend.answer(event.id, '');
         }
         if (key !== undefined) {
-          this.commit(this.theme.dim(RESULT + (options[keys.indexOf(key)] ?? key)));
+          this.answered(options[keys.indexOf(key)] ?? key);
           return this.backend.answer(event.id, key);
         }
         this.commit(this.style.yellow(`"${typed}" is not one of ${keys.join(', ')}. Type one of them, or press Esc to skip.`));

@@ -59,9 +59,9 @@ describe('a whole session', () => {
     expect(run.sent('submit')).toMatchObject([{ v: 1, text: 'write the notes' }]);
     // Mid-turn: the reply is live in the frame only, not in the record yet.
     expect(run.term.scrollback().some((row) => row.includes('Done — wrote'))).toBe(false);
-    expect(run.shows('❯ write the notes')).toBe(true);
+    expect(run.shows('║ write the notes')).toBe(true);
     // The status row says what is happening, with the turn's clock and tokens: the model has written the reply.
-    expect(run.term.viewport().some((row) => /^[·✢*✶✻✽] Writing the reply… \(\d+s · ↓ 84 tokens · esc to interrupt\)$/.test(row))).toBe(true);
+    expect(run.term.viewport().some((row) => /^┃ Writing the reply… \(\d+s · ↓ 84 tokens · esc to interrupt\)$/.test(row))).toBe(true);
     // The counts are in the footer during a turn, and the caption is gone.
     expect(run.term.viewport().some((row) => row.startsWith(' esc/ctrl-c to interrupt · enter queues the next task') && row.includes('+2 lines, -0 lines, ~12k context, 168 out'))).toBe(true);
     expect(run.shows('Prov')).toBe(false);
@@ -70,8 +70,8 @@ describe('a whole session', () => {
     const rows = run.rows();
     const at = (text: string) => rows.findIndex((row) => row.includes(text));
     expect(rows[at('Writing the notes.')]).toBe('· Writing the notes.');
-    expect(rows.slice(at('● Write'), at('● Write') + 3)).toEqual(['● Write', '  ⎿  Created file: notes.txt', '     Wrote 2 lines']);
-    expect(rows[at('● Write') - 1]).toBe('');
+    expect(rows.slice(at('│ Write'), at('│ Write') + 3)).toEqual(['│ Write', '│ Created file: notes.txt', '│ Wrote 2 lines']);
+    expect(rows[at('│ Write') - 1]).toBe('');
     expect(rows[at('All good')]).toBe('✓ All good');
 
     run.term.resize(110, 30);
@@ -79,10 +79,10 @@ describe('a whole session', () => {
     expect(run.sent('resize')[0]).toMatchObject({ columns: 110, rows: 30 });
     await run.until(() => run.shows('Review the notes') && run.count('Done — wrote notes.txt ✓') === 1, 'the answer, once');
     const answer = run.rows().findIndex((row) => row.includes('Done — wrote notes.txt ✓'));
-    expect(run.rows()[answer]).toBe('● Done — wrote notes.txt ✓');
+    expect(run.rows()[answer]).toBe('┃ Done — wrote notes.txt ✓');
     expect(run.rows()[answer - 1]).toBe('');
     expect(run.rows()[answer + 1]).toBe('');
-    expect(run.term.viewport().some((row) => row.startsWith(' > Review the notes'))).toBe(true);
+    expect(run.term.viewport().some((row) => row.startsWith('▌ Review the notes'))).toBe(true);
     expect(run.shows('esc/ctrl-c to interrupt')).toBe(false);
 
     await run.enter('/plan');
@@ -216,7 +216,7 @@ describe('the live look: the status row, the plan and the footer', () => {
     { type: 'status', state: 'idle', label: '', progress: null },
     { type: 'turn_end', task: 'go', answer: '', outcome: 'you stopped it with Ctrl-C', suggestion: '' },
   ];
-  const statusRow = (run: Run): string | undefined => run.term.viewport().find((row) => /^[·✢*✶✻✽] \S/.test(row));
+  const statusRow = (run: Run): string | undefined => run.term.viewport().find((row) => /^┃ \S.*…( \(.*\))?$/.test(row));
 
   it('says what is happening on the backend\'s clock, with the counts in the footer, and the caption again after', async () => {
     const run = start([
@@ -235,17 +235,17 @@ describe('the live look: the status row, the plan and the footer', () => {
     await run.enter('go');
     await run.showing('Thinking…');
     // No tool, no reply, nothing said yet: the model is thinking, and nothing else is claimed.
-    expect(statusRow(run)).toMatch(/^[·✢*✶✻✽] Thinking… \(\d+s · esc to interrupt\)$/);
+    expect(statusRow(run)).toMatch(/^┃ Thinking… \(\d+s · esc to interrupt\)$/);
     run.term.resize(101, 30);
     await run.showing('↓ 80 tokens');
     const view = run.term.viewport();
     const row = statusRow(run)!;
     // The clock is the 30 s the backend said, not the 0 s here.
-    expect(row).toMatch(/^[·✢*✶✻✽] Thinking… \(3[01]s · ↓ 80 tokens · esc to interrupt\)$/);
+    expect(row).toMatch(/^┃ Thinking… \(3[01]s · ↓ 80 tokens · esc to interrupt\)$/);
     // The status row is above the box; the footer under it holds the hints and the counts.
     const field = view.findIndex(isField);
     expect(view.indexOf(row)).toBeLessThan(field);
-    expect(view[field + 2]).toBe(' esc/ctrl-c to interrupt · enter queues the next task  +0 lines, -0 lines, ~16k context, ~326 out');
+    expect(view[field + 1]).toBe(' esc/ctrl-c to interrupt · enter queues the next task  +0 lines, -0 lines, ~16k context, ~326 out');
     expect(view[view.length - 1]).toBe('');
     expect(run.shows('09:30:00')).toBe(false);
 
@@ -271,23 +271,24 @@ describe('the live look: the status row, the plan and the footer', () => {
     ], { columns: 120, rows: 36 });
     await run.showing('Describe your first task');
     await run.enter('go');
-    await run.showing('☐ Check the result');
+    await run.showing('○ Check the result');
     const view = run.term.viewport();
-    const status = view.findIndex((row) => /^[·✢*✶✻✽] Writing the reply…/.test(row));
+    const status = view.findIndex((row) => /^┃ Writing the reply…/.test(row));
     // The checklist follows the status row: done, struck through in colour; in progress; waiting.
-    expect(view.slice(status + 1, status + 4)).toEqual(['  ⎿  ☒ Read README.md', '     ◼ Add a Contents line', '     ☐ Check the result']);
-    expect(view[status + 4]).toBe('  ⎇ 1 worker  running  Reading x.py');
+    expect(view.slice(status + 1, status + 4)).toEqual(['│ ◉ Read README.md', '│ ◐ Add a Contents line', '│ ○ Check the result']);
+    expect(view[status + 4]).toBe('⎇ 1 worker  running  Reading x.py');
     // The column Python drew is never drawn, and the reply is a bullet and its text, not a box.
     expect(run.shows('CAPABILITIES')).toBe(false);
     expect(run.shows('PLAN 0/3')).toBe(false);
-    expect(view.some((row) => row === '● README.md is one heading.')).toBe(true);
+    expect(view.some((row) => row === '┃ README.md is one heading.')).toBe(true);
     expect(view.some((row) => /[┌└『]/.test(row))).toBe(false);
-    // One box, a rule above and below the field, and nothing wider than the window.
-    expect(view.filter((row) => /^ ─+$/.test(row))).toHaveLength(2);
+    // One composer, no rule above or below the field, and nothing wider than the window.
+    expect(view.filter(isField)).toHaveLength(1);
+    expect(view.some((row) => /^ ?[─━]{10}/.test(row))).toBe(false);
     expect(view.every((row) => displayWidth(row) <= 119)).toBe(true);
     // A review that passed is a row of the record; the plan is not.
     expect(run.rows().filter((row) => row === '✓ Reviewed - no issues')).toHaveLength(1);
-    expect(run.rows().filter((row) => row.includes('Read README.md') && !row.includes('☒'))).toEqual([]);
+    expect(run.rows().filter((row) => row.includes('Read README.md') && !row.includes('◉'))).toEqual([]);
 
     run.term.type('\x03');
     await run.until(() => run.shows('next') && !run.shows('Add a Contents line'), 'the plan gone');
@@ -313,7 +314,7 @@ describe('the live look: the status row, the plan and the footer', () => {
     await new Promise((resolve) => setTimeout(resolve, 80));
     await run.term.settle();
     // The line goes; the turn goes on.
-    expect(run.term.viewport().find(isField)!.trim()).toBe('>');
+    expect(run.term.viewport().find(isField)!.trim()).toBe('▌');
     expect(run.sent('interrupt')).toEqual([]);
     run.term.type('\x1b');
     await run.receiving('interrupt');
@@ -354,11 +355,11 @@ describe('approvals and questions', () => {
     // The dialog is in the record: a title, the question, the choices. The backend's sentence says the same as
     // the choices and is not printed; the keys are in the box.
     expect(run.shows('Run this command?')).toBe(true);
-    expect(run.shows('  y  Run it once')).toBe(true);
-    expect(run.shows('  a  Allow `rm` from now on')).toBe(true);
-    expect(run.shows('  n  Refuse')).toBe(true);
+    expect(run.shows('┃ y  Run it once')).toBe(true);
+    expect(run.shows('┃ a  Allow `rm` from now on')).toBe(true);
+    expect(run.shows('┃ n  Refuse')).toBe(true);
     expect(run.shows('Type y, a or n and Enter')).toBe(false);
-    expect(run.term.viewport().some((row) => row === ' > Press y, a or n then Enter')).toBe(true);
+    expect(run.term.viewport().some((row) => row === '▌ Press y, a or n then Enter')).toBe(true);
     // Each line is the answer to the open question: none is queued or submitted.
     await run.enter(' A ');
     await run.showing('rm notes2.txt');
@@ -372,8 +373,8 @@ describe('approvals and questions', () => {
     await run.showing('done');
     expect(run.sent('approval_reply').map((message) => [message.id, message.answer])).toEqual([[1, 'a'], [2, 'n'], [3, 'maybe'], [4, 'n'], [5, 'y']]);
     // What was chosen is echoed under the dialog.
-    expect(run.rows().filter((row) => row.startsWith('  ⎿  '))).toEqual(
-      ['  ⎿  Always allowed', '  ⎿  Refused', '  ⎿  Refused', '  ⎿  Refused', '  ⎿  Allowed once']);
+    expect(run.rows().filter((row) => /^┃ (Always allowed|Allowed once|Allowed|Refused)$/.test(row))).toEqual(
+      ['┃ Always allowed', '┃ Refused', '┃ Refused', '┃ Refused', '┃ Allowed once']);
     // None of the answers started a turn of its own.
     expect(run.sent('submit')).toHaveLength(1);
     run.term.type('\x03');
@@ -407,7 +408,7 @@ describe('approvals and questions', () => {
     await run.receiving('submit', 2);
     expect(run.sent('approval_reply')).toMatchObject([{ id: 1, answer: 'y' }]);
     expect(run.sent('submit').map((message) => message.text)).toEqual(['first', 'second']);
-    await run.until(() => run.shows('❯ second') && !run.shows('queued'), 'the second task');
+    await run.until(() => run.shows('║ second') && !run.shows('queued'), 'the second task');
     run.term.resize(102, 30);
     await run.showing('the end');
     run.term.type('\x03');
@@ -431,10 +432,10 @@ describe('approvals and questions', () => {
     await run.enter('ask me');
     await run.showing('Which colour 1?');
     // The question is the dialog's title and its options are keys, as the backend's structured fields say.
-    expect(run.shows('  1  Red')).toBe(true);
-    expect(run.shows('  2  Blue')).toBe(true);
+    expect(run.shows('┃ 1  Red')).toBe(true);
+    expect(run.shows('┃ 2  Blue')).toBe(true);
     expect(run.shows('Press 1 or 2 to choose')).toBe(false);
-    expect(run.term.viewport().find(isField)).toBe(' > 1-2, Esc to skip');
+    expect(run.term.viewport().find(isField)).toBe('▌ 1-2, Esc to skip');
     // A key that was not offered, Enter and a paste do nothing: no answer, no notice, nothing in the box.
     run.term.type('9');
     run.term.type('\r');
@@ -442,7 +443,7 @@ describe('approvals and questions', () => {
     await run.term.settle(5);
     expect(run.sent('answer')).toEqual([]);
     expect(run.shows('is not one of')).toBe(false);
-    expect(run.term.viewport().find(isField)).toBe(' > 1-2, Esc to skip');
+    expect(run.term.viewport().find(isField)).toBe('▌ 1-2, Esc to skip');
     // One key, no Enter.
     run.term.type('2');
     await run.showing('Which colour 2?');
@@ -452,7 +453,7 @@ describe('approvals and questions', () => {
     await run.showing('thanks');
     expect(run.sent('answer').map((message) => [message.id, message.key])).toEqual([[1, '2'], [2, ''], [3, '1']]);
     // What was chosen is echoed under the question, as the option said it; not the key that was pressed.
-    expect(run.rows().filter((row) => row.startsWith('  ⎿  '))).toEqual(['  ⎿  Blue', '  ⎿  Skipped', '  ⎿  Red']);
+    expect(run.rows().filter((row) => /^┃ (Blue|Skipped|Red)$/.test(row))).toEqual(['┃ Blue', '┃ Skipped', '┃ Red']);
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
@@ -662,8 +663,8 @@ describe('the Python screens', () => {
     await run.receiving('reload');
     expect(seen).toEqual([{ rawMode: false, box: false, calls: 2, heldBack: true }]);
     expect(run.term.rawMode).toBe(true);
-    await run.until(() => run.term.viewport().some((row) => row.startsWith(' > after the menu')), 'the prompt after the menu');
-    expect(run.shows('❯ /back')).toBe(true);
+    await run.until(() => run.term.viewport().some((row) => row.startsWith('▌ after the menu')), 'the prompt after the menu');
+    expect(run.shows('║ /back')).toBe(true);
     run.term.type('\x03');
     await run.receiving('quit');
     expect(await run.finished()).toBe(0);
@@ -731,12 +732,12 @@ describe('committed rows wrap at a word boundary, at the content width', () => {
     await run.enter(TASK_TEXT);
     await run.showing('done');
 
-    const task = block(run, '❯ Please', ' in.');
+    const task = block(run, '║ Please', ' in.');
     expect(task.length).toBeGreaterThan(1);
     expect(widestRow(task)).toBeLessThanOrEqual(width);
-    // Cut at a space: every word is whole, and a continuation lines up under the text.
-    expect(wordsOf(task)).toEqual(['❯', ...TASK_TEXT.split(' ')]);
-    for (const row of task.slice(1)) expect(row).toMatch(/^ {2}\S/);
+    // Cut at a space: every word is whole, and every row keeps the double rail.
+    expect(wordsOf(task.map((row) => row.slice(1)))).toEqual(TASK_TEXT.split(' '));
+    for (const row of task.slice(1)) expect(row).toMatch(/^║ \S/);
     // Filled to the edge, as far as a whole word allows.
     expect(displayWidth(task[0]!)).toBeGreaterThan(width - 16);
 
@@ -746,10 +747,10 @@ describe('committed rows wrap at a word boundary, at the content width', () => {
     if (width < 90) expect(event.length).toBeGreaterThan(1);
 
     // A word longer than the row is cut where the row ends, not dropped. It is the result of a block,
-    // under a `⎿`, and four rows of it are shown whole.
-    const path = block(run, '  ⎿  Edited file:', 'file.ts');
+    // on its rail, and four rows of it are shown whole.
+    const path = block(run, '│ Edited file:', 'file.ts');
     expect(widestRow(path)).toBeLessThanOrEqual(width);
-    expect(path.map((row) => row.trim()).join('').replace(/\s/g, '')).toBe('⎿Editedfile:' + long);
+    expect(path.map((row) => row.replace(/^│/, '').trim()).join('').replace(/\s/g, '')).toBe('Editedfile:' + long);
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
@@ -766,17 +767,15 @@ describe('committed rows wrap at a word boundary, at the content width', () => {
     await run.showing('Describe your first task');
     await run.enter(TASK_TEXT);
     await run.showing('done');
-    const task = block(run, '❯ Please', ' in.');
+    const task = block(run, '║ Please', ' in.');
     expect(widestRow(task)).toBeLessThanOrEqual(100);
-    expect(wordsOf(task)).toEqual(['❯', ...TASK_TEXT.split(' ')]);
-    // The user row's grey is behind every row of it, out to the edge of the block: the colour is carried across each break.
-    const grey = (y: number): boolean => {
-      const buffer = run.term.term.buffer.active;
-      const cell = buffer.getLine(y)!.getCell(99)!;
-      return cell.getBgColorMode() !== 0 && cell.getBgColor() === (55 << 16 | 55 << 8 | 55);
-    };
-    const first = run.rows().findIndex((row) => row.startsWith('❯ Please'));
-    for (let y = first; y < first + task.length; y += 1) expect(grey(y), `row ${y - first}`).toBe(true);
+    expect(wordsOf(task.map((row) => row.slice(1)))).toEqual(TASK_TEXT.split(' '));
+    // The user's row has no background, out to the edge of the block: the terminal's own on every cell.
+    const first = run.rows().findIndex((row) => row.startsWith('║ Please'));
+    const buffer = run.term.term.buffer.active;
+    for (let y = first; y < first + task.length; y += 1) {
+      for (let x = 0; x < 100; x += 1) expect(buffer.getLine(y)!.getCell(x)!.getBgColorMode(), `row ${y - first}, column ${x}`).toBe(0);
+    }
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
@@ -837,33 +836,33 @@ describe('an approval or a question in the box', () => {
     await run.showing('Describe your first task');
     await run.enter('rm it');
     await run.showing('Press y, a or n then Enter');
-    // The box row is short and whole: no ellipsis. The dialog is a rule, a title, the question
+    // The box row is short and whole: no ellipsis. The dialog is a heavy rule, a railed title, the question
     // indented and the choices; the backend's long sentence says what the choices say, and is not printed.
     const box = run.term.viewport().find(isField)!;
-    expect(box).toBe(' > Press y, a or n then Enter');
+    expect(box).toBe('▌ Press y, a or n then Enter');
     expect(box).not.toContain('…');
     const rows = run.rows();
-    const title = rows.findIndex((row) => row === ' Run this command?');
-    expect(rows[title - 1]).toMatch(/^─{79}$/);
-    expect(rows[title + 1]).toBe('  TMT wants to run a command that needs your approval.');
-    expect(rows[title + 3]).toBe('      rm notes.txt');
-    expect(rows.slice(title + 6, title + 9)).toEqual(['  y  Run it once', '  a  Allow `rm` in this project from now on', '  n  Refuse']);
+    const title = rows.findIndex((row) => row === '┃ Run this command?');
+    expect(rows[title - 1]).toMatch(/^━{79}$/);
+    expect(rows[title + 1]).toBe('┃   TMT wants to run a command that needs your approval.');
+    expect(rows[title + 3]).toBe('┃       rm notes.txt');
+    expect(rows.slice(title + 6, title + 9)).toEqual(['┃ y  Run it once', '┃ a  Allow `rm` in this project from now on', '┃ n  Refuse']);
     expect(run.shows(SENTENCE.slice(0, 30))).toBe(false);
     // The footer says what Esc does here.
     expect(run.term.viewport().at(-2)).toBe(' esc refuses · ctrl-c interrupts');
 
     await run.enter('n');
     await run.showing('Which one 2?');
-    expect(run.term.viewport().find(isField)).toBe(' > 1-3, Esc to skip');
+    expect(run.term.viewport().find(isField)).toBe('▌ 1-3, Esc to skip');
     run.term.type('2');
     await run.showing('Which one 3?');
-    expect(run.term.viewport().find(isField)).toBe(' > 1, Esc to skip');
+    expect(run.term.viewport().find(isField)).toBe('▌ 1, Esc to skip');
     run.term.type('\x1b');
     await run.showing('Which one 4?');
-    expect(run.term.viewport().find(isField)).toBe(' > y / n, Esc to skip');
+    expect(run.term.viewport().find(isField)).toBe('▌ y / n, Esc to skip');
     run.term.type('n');
     await run.until(() => run.count('rm notes.txt') === 2, 'the last approval');
-    expect(run.term.viewport().find(isField)).toBe(' > Press y, a or n then Enter');
+    expect(run.term.viewport().find(isField)).toBe('▌ Press y, a or n then Enter');
     await run.enter('y');
     await run.showing('ok');
     expect(run.sent('approval_reply').map((message) => message.answer)).toEqual(['n', 'y']);
@@ -893,13 +892,13 @@ describe('an approval or a question in the box', () => {
     expect(run.shows('I read the project layout')).toBe(false);
     expect(run.shows('then wrote the notes file')).toBe(false);
     const rows = run.rows();
-    expect(rows.findIndex((row) => row === '  n  Refuse')).toBeGreaterThan(rows.findIndex((row) => row.includes('TMT wants')));
+    expect(rows.findIndex((row) => row === '┃ n  Refuse')).toBeGreaterThan(rows.findIndex((row) => row.includes('TMT wants')));
     await run.enter('y');
     await run.showing('I read the project layout first, then wrote the notes file.');
     expect(run.sent('approval_reply')).toMatchObject([{ id: 1, answer: 'y' }]);
     // The question is above the reply now: the order they came in.
     const after = run.rows();
-    expect(after.findIndex((row) => row.includes('I read the project'))).toBeGreaterThan(after.findIndex((row) => row === '  n  Refuse'));
+    expect(after.findIndex((row) => row.includes('I read the project'))).toBeGreaterThan(after.findIndex((row) => row === '┃ n  Refuse'));
     run.term.resize(101, 30);
     await run.until(() => run.shows('the end') && run.shows('next'), 'the answer');
     expect(run.shows('I read the project layout')).toBe(false);
@@ -923,15 +922,15 @@ describe('an approval or a question in the box', () => {
     await run.showing('Describe your first task');
     await run.enter('go');
     await run.showing('Permission needed');
-    expect(run.rows().filter((row) => row === '  Type yes or no and Enter:')).toHaveLength(1);
-    expect(run.term.viewport().find(isField)).toBe(' > Type yes or no and Enter:');
+    expect(run.rows().filter((row) => row === '┃   Type yes or no and Enter:')).toHaveLength(1);
+    expect(run.term.viewport().find(isField)).toBe('▌ Type yes or no and Enter:');
     await run.enter('yes');
     await run.showing('Delete this file?');
-    expect(run.shows('  y  Delete it')).toBe(true);
+    expect(run.shows('┃ y  Delete it')).toBe(true);
     await run.enter('y');
     await run.showing('next');
     // Two choices: it was allowed, not allowed once.
-    expect(run.rows().filter((row) => row.startsWith('  ⎿  '))).toEqual(['  ⎿  Refused', '  ⎿  Allowed']);
+    expect(run.rows().filter((row) => /^┃ (Refused|Allowed)$/.test(row))).toEqual(['┃ Refused', '┃ Allowed']);
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
@@ -992,18 +991,18 @@ describe('the answer is read as markdown', () => {
     await run.showing('Done.');
     const rows = run.rows();
     expect(run.shows('**notes.txt**')).toBe(false);
-    // The answer is a bullet and its body, indented two columns; the heading is its first row.
-    expect(rows).toContain('● Summary');
-    expect(rows).toContain('  I wrote notes.txt and briefly changed README.md, see the docs (https://example.com/docs).');
-    const item = rows.findIndex((row) => row.startsWith('  - notes.txt is new (12 lines)'));
+    // The answer is its body on a heavy rail; the heading is its first row.
+    expect(rows).toContain('┃ Summary');
+    expect(rows).toContain('┃ I wrote notes.txt and briefly changed README.md, see the docs (https://example.com/docs).');
+    const item = rows.findIndex((row) => row.startsWith('┃ - notes.txt is new (12 lines)'));
     expect(item).toBeGreaterThanOrEqual(0);
     // The item keeps its marker, and wraps under its text.
-    expect(rows[item + 1]).toMatch(/^ {4}\S/);
-    expect(rows).toContain('  1. the test suite still passes');
-    expect(rows).toContain('  ▎ a quote');
+    expect(rows[item + 1]).toMatch(/^┃ {3}\S/);
+    expect(rows).toContain('┃ 1. the test suite still passes');
+    expect(rows).toContain('┃ ┇ a quote');
     // The fenced block is its language, then the code as written, indented, with no fence.
-    expect(rows).toContain('    ts');
-    expect(rows).toContain('    const raw = **not bold**;');
+    expect(rows).toContain('┃   ts');
+    expect(rows).toContain('┃   const raw = **not bold**;');
     expect(rows.some((row) => row.includes('```'))).toBe(false);
     expect(run.term.raw).not.toMatch(/\x1b\[(?:1|2|3|4|9|22|23|24|29|36|39)m/);
     run.term.type('\x03');
@@ -1016,12 +1015,13 @@ describe('the answer is read as markdown', () => {
     await run.enter('go');
     await run.showing('Done.');
     const theme = makeTheme({ color: true, truecolor: true });
-    expect(await showsPainted(run.term, '● ' + theme.bold(theme.underline('Summary')))).toBe(true);
+    const rail = theme.success('┃');
+    expect(await showsPainted(run.term, `${rail} ` + theme.bold(theme.underline('Summary')))).toBe(true);
     expect(await showsPainted(run.term,
-      `  I wrote ${theme.bold('notes.txt')} and ${theme.italic('briefly')} changed ${theme.code('README.md')}, see ${theme.link(theme.underline('the docs'))} ${theme.dim('(https://example.com/docs)')}.`)).toBe(true);
-    expect(await showsPainted(run.term, '  ' + theme.dim('▎') + ' ' + theme.italic('a quote'))).toBe(true);
-    expect(await showsPainted(run.term, '    ' + theme.dim('ts'))).toBe(true);
-    expect(run.rows()).toContain('    const raw = **not bold**;');
+      `${rail} I wrote ${theme.bold('notes.txt')} and ${theme.italic('briefly')} changed ${theme.ref('README.md')}, see ${theme.ref(theme.underline('the docs'))} ${theme.dim('(https://example.com/docs)')}.`)).toBe(true);
+    expect(await showsPainted(run.term, `${rail} ` + theme.dim('┇') + ' ' + theme.italic('a quote'))).toBe(true);
+    expect(await showsPainted(run.term, `${rail}   ` + theme.dim('ts'))).toBe(true);
+    expect(run.rows()).toContain('┃   const raw = **not bold**;');
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
@@ -1075,13 +1075,13 @@ describe('rows the backend rendered itself', () => {
 
     // Drawn from the fields.
     expect(run.shows('TMT 0.1.1')).toBe(true);
-    expect(run.shows('❯ go')).toBe(true);
-    expect(run.shows('● Write')).toBe(true);
+    expect(run.shows('║ go')).toBe(true);
+    expect(run.shows('│ Write')).toBe(true);
     expect(run.shows('Wrote 7 lines')).toBe(true);
     expect(run.shows('! a notice')).toBe(true);
     expect(run.shows('May I?')).toBe(true);
-    expect(run.shows('  2  Blue')).toBe(true);
-    expect(run.shows('● the answer')).toBe(true);
+    expect(run.shows('┃ 2  Blue')).toBe(true);
+    expect(run.shows('┃ the answer')).toBe(true);
     // The row of a note of progress is the note, not the Python row around it.
     expect(run.shows('· a note')).toBe(true);
     expect(run.rows().some((row) => row.includes('wide wide'))).toBe(false);
@@ -1114,7 +1114,7 @@ describe('rows the backend rendered itself', () => {
     expect(run.term.viewport().some(isField)).toBe(true);
     // The box is still on the last rows, with the footer under it.
     const view = run.term.viewport();
-    expect(view.findIndex(isField)).toBe(view.length - 4);
+    expect(view.findIndex(isField)).toBe(view.length - 3);
     run.term.type('\x03');
     expect(await run.finished()).toBe(0);
   });
@@ -1168,16 +1168,16 @@ describe('rows the backend rendered itself', () => {
     expect(run.shows('TMT 0.1.1')).toBe(true);
     await run.enter('go');
     await run.showing('my question');
-    expect(run.shows('❯ my task')).toBe(true);
+    expect(run.shows('║ my task')).toBe(true);
     expect(run.shows('✓ my event')).toBe(true);
     expect(run.shows('my notice')).toBe(true);
     expect(run.shows('My Command')).toBe(true);
     expect(run.shows('  Steps  3')).toBe(true);
     expect(run.shows('  a note row')).toBe(true);
-    expect(run.shows('● my answer')).toBe(true);
+    expect(run.shows('┃ my answer')).toBe(true);
     expect(run.shows('**')).toBe(false);
     // The choice list; the backend's sentence is only for an approval with no choices.
-    expect(run.shows('  y  Yes')).toBe(true);
+    expect(run.shows('┃ y  Yes')).toBe(true);
     expect(run.shows('my hint')).toBe(false);
     await run.enter('y');
     await run.showing('my block');

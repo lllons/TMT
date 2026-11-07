@@ -1,24 +1,22 @@
-// The Claude Code look's colours: the roles of the study copy of the installed
-// CLI's dark theme, painted in truecolor or the nearest of 256, or not at all.
+// The signal rail look's colours: the gradient read as a state ramp, painted in
+// truecolor or the nearest of 256, or not at all.
 
 import { describe, expect, it } from 'vitest';
-import {
-  ACCENT, ACCENT_SHIMMER, BORDER, CODE, DIFF_ADDED, DIFF_REMOVED, ERROR, INACTIVE, makeTheme, nearest256, STAR_FRAMES, starAt, SUCCESS, USER_BACKGROUND, WARNING,
-} from '../src/theme.js';
+import { DIFF_ADDED, DIFF_REMOVED, GREEN, INFO, LIME, makeTheme, nearest256, ORANGE, RED, YELLOW } from '../src/theme.js';
 
 describe('the roles', () => {
-  it('are the values of the installed CLI\'s dark theme', () => {
-    expect(SUCCESS).toEqual([78, 186, 101]);
-    expect(ERROR).toEqual([255, 107, 128]);
-    expect(WARNING).toEqual([255, 193, 7]);
-    expect(ACCENT).toEqual([215, 119, 87]);
-    expect(ACCENT_SHIMMER).toEqual([235, 159, 127]);
-    expect(INACTIVE).toEqual([153, 153, 153]);
-    expect(BORDER).toEqual([136, 136, 136]);
-    expect(CODE).toEqual([177, 185, 249]);
-    expect(USER_BACKGROUND).toEqual([55, 55, 55]);
-    expect(DIFF_ADDED).toEqual([34, 92, 43]);
-    expect(DIFF_REMOVED).toEqual([122, 41, 54]);
+  it('are the gradient\'s own stops, one cool hue and darker tints of green and red for a diff', () => {
+    expect(RED).toEqual([220, 38, 38]);
+    expect(ORANGE).toEqual([249, 115, 22]);
+    expect(YELLOW).toEqual([234, 179, 8]);
+    expect(LIME).toEqual([132, 204, 22]);
+    expect(GREEN).toEqual([34, 197, 94]);
+    expect(INFO).toEqual([0, 204, 204]);
+    // Darker than the colour they tint, the same hue (the channel that leads stays the one that leads).
+    expect(Math.max(...DIFF_ADDED)).toBeLessThan(Math.max(...GREEN));
+    expect(DIFF_ADDED.indexOf(Math.max(...DIFF_ADDED))).toBe(GREEN.indexOf(Math.max(...GREEN)));
+    expect(Math.max(...DIFF_REMOVED)).toBeLessThan(Math.max(...RED));
+    expect(DIFF_REMOVED.indexOf(Math.max(...DIFF_REMOVED))).toBe(RED.indexOf(Math.max(...RED)));
   });
 });
 
@@ -27,18 +25,19 @@ describe('a theme with colour', () => {
   const palette = makeTheme({ color: true, truecolor: false });
 
   it('paints a role in truecolor, closed with the default colour only, so what is around it keeps its own', () => {
-    expect(truecolor.success('ok')).toBe('\x1b[38;2;78;186;101mok\x1b[39m');
-    expect(truecolor.error('no')).toBe('\x1b[38;2;255;107;128mno\x1b[39m');
-    expect(truecolor.accent('hi')).toBe('\x1b[38;2;215;119;87mhi\x1b[39m');
-    expect(truecolor.code('x')).toBe('\x1b[38;2;177;185;249mx\x1b[39m');
+    expect(truecolor.success('ok')).toBe('\x1b[38;2;34;197;94mok\x1b[39m');
+    expect(truecolor.error('no')).toBe('\x1b[38;2;220;38;38mno\x1b[39m');
+    expect(truecolor.warning('hm')).toBe('\x1b[38;2;234;179;8mhm\x1b[39m');
+    expect(truecolor.working('go')).toBe('\x1b[38;2;132;204;22mgo\x1b[39m');
+    expect(truecolor.needsYou('you')).toBe('\x1b[38;2;249;115;22myou\x1b[39m');
+    expect(truecolor.ref('x')).toBe('\x1b[38;2;0;204;204mx\x1b[39m');
     expect(truecolor.fg([1, 2, 3], 'y')).toBe('\x1b[38;2;1;2;3my\x1b[39m');
   });
 
   it('paints the same role in the nearest of the 256 where the terminal has no truecolor', () => {
-    expect(palette.accent('hi')).toBe(`\x1b[38;5;${nearest256(ACCENT)}mhi\x1b[39m`);
-    expect(palette.success('ok')).toBe(`\x1b[38;5;${nearest256(SUCCESS)}mok\x1b[39m`);
+    expect(palette.needsYou('hi')).toBe(`\x1b[38;5;${nearest256(ORANGE)}mhi\x1b[39m`);
+    expect(palette.success('ok')).toBe(`\x1b[38;5;${nearest256(GREEN)}mok\x1b[39m`);
     expect(palette.success('ok')).not.toContain('38;2');
-    expect(palette.userRow('x')).toBe(`\x1b[48;5;${nearest256(USER_BACKGROUND)}mx\x1b[49m`);
   });
 
   it('has the attributes as the terminal\'s own, each closed by its own code', () => {
@@ -47,11 +46,10 @@ describe('a theme with colour', () => {
     expect(truecolor.italic('i')).toBe('\x1b[3mi\x1b[23m');
     expect(truecolor.underline('u')).toBe('\x1b[4mu\x1b[24m');
     expect(truecolor.strike('s')).toBe('\x1b[9ms\x1b[29m');
-    expect(truecolor.userRow('x')).toBe('\x1b[48;2;55;55;55mx\x1b[49m');
   });
 
   it('leaves an empty string alone, so no empty span is written', () => {
-    for (const paint of [truecolor.dim, truecolor.bold, truecolor.success, truecolor.userRow]) expect(paint('')).toBe('');
+    for (const paint of [truecolor.dim, truecolor.bold, truecolor.success, truecolor.working]) expect(paint('')).toBe('');
   });
 });
 
@@ -59,23 +57,9 @@ describe('a theme with no colour (NO_COLOR)', () => {
   const none = makeTheme({ color: false, truecolor: true });
 
   it('hands every text back as it is: the glyphs stay, nothing is written but them', () => {
-    for (const paint of [none.dim, none.bold, none.italic, none.underline, none.strike, none.success, none.error, none.warning, none.accent, none.shimmer, none.muted,
-      none.border, none.code, none.info, none.link, none.userRow]) expect(paint('● text')).toBe('● text');
+    for (const paint of [none.dim, none.bold, none.italic, none.underline, none.strike, none.success, none.error, none.warning, none.working, none.needsYou, none.ref]) {
+      expect(paint('┃ text')).toBe('┃ text');
+    }
     expect(none.fg([1, 2, 3], 'z')).toBe('z');
-  });
-});
-
-describe('the star', () => {
-  it('has the six glyphs of the installed CLI, in order', () => {
-    expect(STAR_FRAMES).toEqual(['·', '✢', '*', '✶', '✻', '✽']);
-  });
-
-  it('breathes through them in a cosine over two seconds: the first at the start, the last in the middle', () => {
-    expect(starAt(0)).toBe('·');
-    expect(starAt(1000)).toBe('✽');
-    expect(starAt(2000)).toBe('·');
-    expect(starAt(123_000)).toBe(starAt(1000));
-    const seen = new Set(Array.from({ length: 41 }, (_, step) => starAt(step * 50)));
-    expect(seen.size).toBe(6);
   });
 });

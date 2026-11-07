@@ -1,14 +1,13 @@
-// A tool call as the record keeps it: a blank row, `● Name(args)` with the
-// bullet green when it worked and red when it did not, and under it the
-// result after a dim `⎿`: the backend's sentence, then what was measured
-// (lines added and removed, lines read, the exit status). Long results show
-// three lines and a dim `… +N lines`.
+// A tool call as the record keeps it: a blank row, `│ Name target` on a thin
+// rail that is green when it worked and red when it did not, and under it, on
+// the same rail, the result: the backend's sentence, then what was measured
+// (lines added and removed, lines read, the exit status), all dim. Long
+// results show three lines and a dim `… +N lines`.
 
 import { oneLine } from '../../format.js';
-import { displayWidth, fit } from '../../input/width.js';
 import { wrapLine } from '../../wrap.js';
 import type { Theme } from '../../theme.js';
-import { RESULT } from '../live.js';
+import { callHeader, RAIL, railed } from '../live.js';
 import { Rows, type BlockProps } from './Rows.js';
 
 export interface ToolCallProps extends BlockProps {
@@ -31,27 +30,25 @@ const SHOWN = 3;
 
 const number = (value: unknown): number | null => (typeof value === 'number' && Number.isFinite(value) ? value : null);
 
-/** `Added 3 lines, removed 1 line`: the counts bold. */
-function counted(theme: Theme, count: number, noun: string): string {
-  return `${theme.bold(String(count))} ${noun}${count === 1 ? '' : 's'}`;
-}
+/** `3 lines`, `1 line`. */
+const counted = (count: number, noun: string): string => `${count} ${noun}${count === 1 ? '' : 's'}`;
 
-/** What was measured, as rows: the edit or read sentence, then a row of the plain facts. */
+/** What was measured, as dim rows: the edit or read sentence, then a row of the plain facts. */
 export function factRows(theme: Theme, kind: string | undefined, detail: Record<string, unknown> | undefined): string[] {
   if (!detail) return [];
   const [added, removed, lines] = [number(detail['added']), number(detail['removed']), number(detail['lines'])];
   const rows: string[] = [];
   if (added !== null || removed !== null) {
     const [more, less] = [added ?? 0, removed ?? 0];
-    if (kind === 'file_create' && less === 0 && more > 0) rows.push(`Wrote ${counted(theme, more, 'line')}`);
-    else if (kind === 'file_delete' && more === 0 && less > 0) rows.push(`Removed ${counted(theme, less, 'line')}`);
-    else if (more > 0 && less > 0) rows.push(`Added ${counted(theme, more, 'line')}, removed ${counted(theme, less, 'line')}`);
-    else if (more > 0) rows.push(`Added ${counted(theme, more, 'line')}`);
-    else if (less > 0) rows.push(`Removed ${counted(theme, less, 'line')}`);
+    if (kind === 'file_create' && less === 0 && more > 0) rows.push(theme.dim(`Wrote ${counted(more, 'line')}`));
+    else if (kind === 'file_delete' && more === 0 && less > 0) rows.push(theme.dim(`Removed ${counted(less, 'line')}`));
+    else if (more > 0 && less > 0) rows.push(theme.dim(`Added ${counted(more, 'line')}, removed ${counted(less, 'line')}`));
+    else if (more > 0) rows.push(theme.dim(`Added ${counted(more, 'line')}`));
+    else if (less > 0) rows.push(theme.dim(`Removed ${counted(less, 'line')}`));
   }
   const plain: string[] = [];
   if (lines !== null) {
-    if (kind === 'file_read') rows.push(`Read ${counted(theme, lines, 'line')}`);
+    if (kind === 'file_read') rows.push(theme.dim(`Read ${counted(lines, 'line')}`));
     else plain.push(`${lines} ${lines === 1 ? 'line' : 'lines'}`);
   }
   for (const [key, noun] of [['files', 'file'], ['bytes', 'byte'], ['calls', 'call']] as const) {
@@ -73,13 +70,9 @@ export const failed = (detail: Record<string, unknown> | undefined): boolean => 
 
 export function toolCallRows(props: ToolCallProps): string[] {
   const { theme, width } = props;
-  const paint = props.tone === 'error' ? theme.error : theme.success;
-  const name = fit(oneLine(props.label) || 'Tool', Math.max(1, width - 2));
-  const target = oneLine(props.target);
-  const head = `${paint('●')} ${theme.bold(name)}`;
-  const header = target ? `${head}(${fit(target, Math.max(1, width - 2 - displayWidth(name) - 2))})` : head;
+  const rail = (props.tone === 'error' ? theme.error : theme.success)(RAIL.thin);
 
-  const inner = Math.max(1, width - RESULT.length);
+  const inner = Math.max(1, width - 2);
   const lines: string[] = [];
   const text = props.error !== undefined ? props.error : props.message;
   if (text) {
@@ -90,9 +83,7 @@ export function toolCallRows(props: ToolCallProps): string[] {
     if (shown.length < wrapped.length) lines.push(theme.dim(`… +${wrapped.length - shown.length} lines`));
   }
   if (props.error === undefined) lines.push(...factRows(theme, props.kind, props.detail));
-  const lead = props.error !== undefined ? theme.error(RESULT) : theme.dim(RESULT);
-  const body = lines.map((line, index) => (index === 0 ? lead : ' '.repeat(RESULT.length)) + line);
-  return ['', header, ...body];
+  return ['', callHeader(rail, props.label, props.target, width, theme), ...lines.map((line) => railed(rail, line))];
 }
 
 export function ToolCall(props: ToolCallProps) {

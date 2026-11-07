@@ -1,11 +1,11 @@
-// The Ink screen's Claude Code look in a terminal: the status row moving with
+// The Ink screen's signal rail look in a terminal: the status row moving with
 // the clock, the plan and the tool call around it, the colours it asks the
 // terminal for, and the footer, with the bytes all of it writes.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { displayWidth } from '../src/input/width.js';
 import { createInkSessionScreen, type InkSessionScreen } from '../src/ink/screen.js';
-import { ACCENT, BORDER, fgCode } from '../src/theme.js';
+import { fgCode, gradientAt, gradientPhase, LIME } from '../src/theme.js';
 import { FakeTerminal, forbiddenIn, isField } from './harness.js';
 
 let screens: InkSessionScreen[] = [];
@@ -40,21 +40,20 @@ describe('the status row against the clock', () => {
     screen.setLive({ ...LIVE, calls: [] });
     await term.settle();
     const view = term.viewport();
-    const at = view.findIndex((row) => row.startsWith('✻ Running npm test…'));
-    expect(view[at]).toBe('✻ Running npm test… (6s · ↓ 48 tokens · esc to interrupt)');
-    expect(view.slice(at + 1, at + 4)).toEqual(['  ⎿  ☒ Read cli.py', '     ◼ Add the flag', '     ☐ Run the tests']);
-    expect(view[at + 4]).toMatch(/^ ─+$/);
-    expect(view[at + 6]).toMatch(/^ ─+$/);
-    expect(view[at + 7]).toBe(' esc/ctrl-c to interrupt · enter queues the next task');
+    const at = view.findIndex((row) => row.startsWith('┃ Running npm test…'));
+    expect(view[at]).toBe('┃ Running npm test… (6s · ↓ 48 tokens · esc to interrupt)');
+    expect(view.slice(at + 1, at + 4)).toEqual(['│ ◉ Read cli.py', '│ ◐ Add the flag', '│ ○ Run the tests']);
+    expect(view[at + 4]!.trim()).toBe('▌');
+    expect(view[at + 5]).toBe(' esc/ctrl-c to interrupt · enter queues the next task');
     expect(view[view.length - 1]).toBe('');
     now = 14_750;
     await pause(250);
     await term.settle();
-    expect(term.viewport().some((row) => row.startsWith('✻ Running npm test… (10s · '))).toBe(true);
+    expect(term.viewport().some((row) => row.startsWith('┃ Running npm test… (10s · '))).toBe(true);
     expect(forbiddenIn(term.raw)).toEqual([]);
   });
 
-  it('leaves no timer running once the row and the calls are gone, the screen is handed over, or it is stopped', async () => {
+  it('leaves no timer running once the turn and the row are gone, the screen is handed over, or it is stopped', async () => {
     const started = vi.spyOn(globalThis, 'setInterval');
     const cleared = vi.spyOn(globalThis, 'clearInterval');
     const running = () => started.mock.calls.length - cleared.mock.calls.length;
@@ -69,9 +68,12 @@ describe('the status row against the clock', () => {
       screen.setLive(LIVE);
       expect(running()).toBe(1);
       screen.setProgress(null);
-      // A running tool call blinks its bullet, so it keeps the clock.
+      // A running tool call is steady: it needs no clock of its own.
+      expect(running()).toBe(0);
+      // A turn that runs keeps the colour cycle of the composer's bar moving.
+      screen.setBusy(true);
       expect(running()).toBe(1);
-      screen.setLive({ ...LIVE, calls: [] });
+      screen.setBusy(false);
       expect(running()).toBe(0);
       screen.setProgress({ ...WORKING });
       screen.suspend();
@@ -86,7 +88,7 @@ describe('the status row against the clock', () => {
     }
   });
 
-  it('writes nothing while nothing changes, and a frame when the second, the star or the shimmer does', async () => {
+  it('writes nothing while nothing changes, and a frame when the second does', async () => {
     let now = 10_000;
     const term = new FakeTerminal(80, 24);
     const screen = open(term, { clock: () => now });
@@ -95,13 +97,33 @@ describe('the status row against the clock', () => {
     const first = writes(term);
     await pause(350);
     await term.settle();
-    // No colour: the star turns with the clock (it is not a colour), so the frame is rewritten when it changes, no oftener.
+    // No colour: only the elapsed time moves, so the frame is rewritten when the second changes, no oftener.
     const idle = writes(term);
     expect(idle).toBe(first);
     now = 10_500;
     await pause(250);
     await term.settle();
+    expect(writes(term)).toBe(idle);
+    now = 11_000;
+    await pause(250);
+    await term.settle();
     expect(writes(term)).toBeGreaterThan(idle);
+  });
+
+  it('writes a frame when the colour of the rail cell moves, in colour, and not within the same colour', async () => {
+    let now = 10_000;
+    const term = new FakeTerminal(80, 24);
+    const screen = open(term, { color: true, truecolor: true, clock: () => now });
+    screen.setProgress({ ...WORKING, since: 9000 });
+    await term.settle();
+    const first = writes(term);
+    await pause(250);
+    await term.settle();
+    expect(writes(term)).toBe(first);
+    now = 10_600;
+    await pause(250);
+    await term.settle();
+    expect(writes(term)).toBeGreaterThan(first);
   });
 
   it('keeps the box and the footer where they were while the row changes', async () => {
@@ -118,13 +140,13 @@ describe('the status row against the clock', () => {
       await pause(30);
       await term.settle();
       expect(term.viewport().findIndex(isField)).toBe(where);
-      expect(term.all().filter((row) => /^[·✢*✶✻✽] \S/.test(row))).toHaveLength(1);
+      expect(term.all().filter((row) => /^┃ \S.*…( \(.*\))?$/.test(row))).toHaveLength(1);
     }
   });
 });
 
 describe('the plan and the running call', () => {
-  it('draws the call dim above the status row with a bullet that blinks, and the plan under it', async () => {
+  it('draws the call on a steady rail above the status row, and the plan under it', async () => {
     let now = 10_000;
     const term = new FakeTerminal(100, 30);
     const screen = open(term, { clock: () => now });
@@ -132,13 +154,14 @@ describe('the plan and the running call', () => {
     screen.setProgress({ ...WORKING, since: 9000 });
     screen.setLive(LIVE);
     await term.settle();
-    const call = () => term.viewport().findIndex((row) => row.endsWith('Bash(npm test)'));
-    expect(term.viewport()[call()]).toBe('● Bash(npm test)');
-    expect(term.viewport()[call() + 1]).toMatch(/^[·✢*✶✻✽] Running npm test…/);
+    const call = () => term.viewport().findIndex((row) => row === '│ Bash npm test');
+    expect(term.viewport()[call()]).toBe('│ Bash npm test');
+    expect(term.viewport()[call() + 1]).toMatch(/^┃ Running npm test…/);
+    // The old bullet blinked every 600 ms; the rail does not.
     now = 10_600;
     await pause(250);
     await term.settle();
-    expect(term.viewport()[call()]).toBe('  Bash(npm test)');
+    expect(term.viewport()[call()]).toBe('│ Bash npm test');
   });
 
   it('strips every escape from what the model and the backend named, so a plan or a command cannot move the cursor', async () => {
@@ -155,8 +178,8 @@ describe('the plan and the running call', () => {
     await term.settle();
     expect(forbiddenIn(term.raw)).toEqual([]);
     expect(term.raw).not.toMatch(/\x1b\[2J|\x1b\]0;/);
-    expect(term.viewport().some((row) => row.endsWith('Bash(echo hi)'))).toBe(true);
-    expect(term.viewport().some((row) => row.endsWith('☐ step one'))).toBe(true);
+    expect(term.viewport().some((row) => row === '│ Bash echo hi')).toBe(true);
+    expect(term.viewport().some((row) => row.endsWith('○ step one'))).toBe(true);
     expect(term.viewport().some((row) => row.endsWith('⎇ 1 worker  running  xy') || row.includes('running  x'))).toBe(true);
   });
 });
@@ -173,14 +196,17 @@ describe('colour', () => {
     return term.raw;
   }
 
-  it('is truecolor where the terminal has it: the accent of the status row, the dim brackets, the rules, the checklist', async () => {
+  it('is truecolor where the terminal has it: the colour cycle of the rail cell and the bar, the lime call, the dim brackets, the checklist', async () => {
     const raw = await drawn({ color: true, truecolor: true });
-    expect(raw).toMatch(/\x1b\[38;2;215;119;87m✻ /);
-    expect(raw).toMatch(/\x1b\[38;2;235;159;127m/);
+    const cycle = fgCode(gradientAt(gradientPhase(10_750)), true);
+    expect(raw).toContain(`${cycle}┃\x1b[39m Running npm test…`);
+    expect(raw).toContain(`${cycle}▌\x1b[39m `);
+    expect(raw).toContain(`${fgCode(LIME, true)}│\x1b[39m \x1b[1mBash\x1b[22m npm test`);
     expect(raw).toContain('\x1b[2m (6s · ↓ 48 tokens · esc to interrupt)\x1b[22m');
-    expect(raw).toMatch(/\x1b\[38;2;136;136;136m ─+\x1b\[39m/);
-    expect(raw).toMatch(/\x1b\[38;2;215;119;87m◼\x1b\[39m/);
+    expect(raw).toContain(`${fgCode(LIME, true)}◐\x1b[39m`);
     expect(raw).toContain('\x1b[9mRead cli.py\x1b[29m');
+    // No rule above or below the box.
+    expect(raw).not.toMatch(/[─━]{3}/);
     // The counts: +N green, -N red.
     expect(raw).toMatch(/\x1b\[38;2;34;197;94m\+3\x1b\[(?:0|39)m/);
     expect(raw).not.toMatch(/\x1b\[38;5;/);
@@ -188,9 +214,9 @@ describe('colour', () => {
 
   it('is the nearest of 256 where it has not', async () => {
     const raw = await drawn({ color: true, truecolor: false });
-    expect(raw).toContain(fgCode(ACCENT, false) + '✻ ');
-    expect(raw).toContain(fgCode(BORDER, false) + ' ─');
-    expect(fgCode(BORDER, false)).toMatch(/^\x1b\[38;5;\d+m$/);
+    expect(raw).toContain(fgCode(gradientAt(gradientPhase(10_750)), false) + '┃');
+    expect(raw).toContain(fgCode(LIME, false) + '│');
+    expect(fgCode(LIME, false)).toMatch(/^\x1b\[38;5;\d+m$/);
     expect(raw).not.toMatch(/\x1b\[38;2;/);
   });
 
@@ -203,7 +229,7 @@ describe('colour', () => {
     await term.settle();
     // Only the caret is drawn in inverse; nothing is coloured, dimmed, bold or struck through.
     expect(term.raw).not.toMatch(/\x1b\[(?:38|39|48|49|1m|2m|3m|4m|9m|22m|29m)/);
-    expect(term.viewport().some((row) => row.includes('☒ Read cli.py'))).toBe(true);
+    expect(term.viewport().some((row) => row.includes('◉ Read cli.py'))).toBe(true);
   });
 });
 
@@ -232,7 +258,7 @@ describe('the footer', () => {
     await term.settle();
     const view = () => term.viewport();
     expect(view()[view().length - 2]).toBe(' esc/ctrl-c to interrupt · enter queues the next task');
-    expect(view().find(isField)!.trim()).toBe('>');
+    expect(view().find(isField)!.trim()).toBe('▌');
     term.type('run the tests');
     term.type('\r');
     await term.settle();
@@ -240,7 +266,7 @@ describe('the footer', () => {
     expect(view()[view().length - 2]).toBe(' esc/ctrl-c to interrupt · enter queues the next task · 1 queued');
     // The queued line is not listed anywhere, and the box is empty again.
     expect(view().some((row) => row.includes('run the tests'))).toBe(false);
-    expect(view().find(isField)!.trim()).toBe('>');
+    expect(view().find(isField)!.trim()).toBe('▌');
     screen.setBusy(false);
     expect(sent).toEqual(['run the tests']);
   });
@@ -252,7 +278,7 @@ describe('the footer', () => {
     const answer = screen.ask({ hint: 'Press y or n then Enter', footer: 'esc refuses · ctrl-c interrupts' });
     await term.settle();
     expect(term.viewport()[term.viewport().length - 2]).toBe(' esc refuses · ctrl-c interrupts');
-    expect(term.viewport().find(isField)).toBe(' > Press y or n then Enter');
+    expect(term.viewport().find(isField)).toBe('▌ Press y or n then Enter');
     term.type('y');
     term.type('\r');
     expect(await answer).toBe('y');
@@ -283,7 +309,7 @@ describe('Esc', () => {
     await pause(60);
     expect(keys).toEqual([]);
     await term.settle();
-    expect(term.viewport().find(isField)!.trim()).toBe('>');
+    expect(term.viewport().find(isField)!.trim()).toBe('▌');
     term.type('\x1b');
     await pause(60);
     expect(keys).toEqual(['escape']);

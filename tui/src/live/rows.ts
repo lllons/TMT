@@ -7,10 +7,12 @@
 import { displayWidth, fit, graphemes, stripAnsi } from '../input/width.js';
 import { markdownLines } from '../markdown.js';
 import type { Caption, Meter } from '../protocol.js';
-import {
-  ACTIVITY_GLYPHS, ACTIVITY_TICK_MS, cycleBar, cycleText, DIM, GREEN, gradientPhase, paint, RED, type Rgb,
-} from '../theme.js';
+import { cycleBar, cycleText, DIM, GREEN, gradientPhase, paint, RED, type Rgb } from '../theme.js';
 import { wrapLine } from '../wrap.js';
+
+/** The glyph that turns beside the Python UI's activity readout, and how long each is held. */
+const ACTIVITY_GLYPHS = ['✻', '✽', '✻'] as const;
+const ACTIVITY_TICK_MS = 400;
 
 const RESET = '\x1b[0m';
 const SGR_SPLIT = /(\x1b\[[0-9;]*m)/;

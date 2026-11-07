@@ -3,10 +3,16 @@
 // thing -- every row of the scrollback and the window, every cell's colour
 // and attributes, and the cursor. That holds for everything that is not the
 // look: the scrollback, the resizes, the keys, the field and the questions.
-// The Ink screen has since taken the Claude Code look (the reply, the status
+// The Ink screen has since taken the signal rail look (the reply, the status
 // row, the footer, the plan), so the calls that draw those are not made here
-// -- a footer is only a `setStatus` row on both. (Goes with src/live when that
-// is removed.)
+// -- a footer is only a `setStatus` row on both. Its composer is the field
+// behind a bar, where the Python UI's box is a rule, the field and a rule. So
+// what the box drew is read in the Ink look before the two are compared (the
+// rules are not rows, the `>` is the bar), and blank rows are not compared:
+// the two rules of a window made narrower are re-wrapped by the terminal into
+// rows of their own, which scroll the record up by as many blank ones. Where
+// the box sits on the foot is the shared scenarios' (test/live.test.ts runs on
+// both screens). (Goes with src/live when that is removed.)
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { createInkSessionScreen } from '../src/ink/screen.js';
@@ -16,10 +22,12 @@ import { FakeTerminal } from './harness.js';
 type Step = ((screen: SessionScreen, term: FakeTerminal) => void | Promise<unknown>) & { cursorMayDiffer?: boolean };
 
 /**
- * A step after which the hidden cursor may be one row lower on the Ink screen:
+ * A step after which the hidden cursor may be on another row on the Ink screen:
  * while a bare one-key question is open the frame has no rows, and Ink ends
  * even an empty frame with a line break, so the cursor waits on a blank row
- * under the output rather than on the row right under it. Nothing else differs.
+ * under the output rather than on the row right under it; and once the frame
+ * is taken down (`suspend`) the cursor is left on the row it started on, which
+ * is two rows lower for a composer that has no rules. Nothing else differs.
  */
 const cursorMayDiffer = (step: Step): Step => Object.assign(step, { cursorMayDiffer: true });
 
@@ -30,16 +38,23 @@ afterEach(() => {
 });
 
 /**
- * Everything the terminal holds: each row's text, whether it is wrapped, the
- * runs of cells drawn in anything but the default look, and the cursor. A
- * cell never written and a space written in no colour look the same, and are
- * the same here: Ink leaves off a row's trailing spaces.
+ * Everything the terminal holds but its blank rows: each row's text, whether
+ * it is wrapped, the runs of cells drawn in anything but the default look, and
+ * the cursor (its row counted from the foot of the window). A cell never
+ * written and a space written in no colour look the same, and are the same
+ * here: Ink leaves off a row's trailing spaces. With `python`, the Python UI's
+ * box is read as the Ink composer: its rules are not rows, and the `>` before
+ * the field is the bar.
  */
-function dump(term: FakeTerminal): string[] {
+function dump(term: FakeTerminal, python: boolean): string[] {
   const buffer = term.term.buffer.active;
   const rows: string[] = [];
   for (let y = 0; y < buffer.length; y += 1) {
     const line = buffer.getLine(y)!;
+    let text = line.translateToString(true).trimEnd();
+    if (python && /^ ─+$/.test(text)) continue;
+    const blank = text === '' && !line.isWrapped;
+    const field = python && /^ >( |$)/.test(text);
     const runs: string[] = [];
     let run = '';
     for (let x = 0; x < term.term.cols; x += 1) {
@@ -47,12 +62,14 @@ function dump(term: FakeTerminal): string[] {
       const look = [cell.getFgColorMode(), cell.getFgColor(), cell.getBgColorMode(), cell.getBgColor(),
         cell.isBold(), cell.isDim(), cell.isItalic(), cell.isUnderline(), cell.isInverse()].join(',');
       if (look === '0,-1,0,-1,0,0,0,0,0') continue;
-      if (look !== run) runs.push(`${x}:${look}`);
+      if (look !== run) runs.push(`${field ? x - 1 : x}:${look}`);
       run = look;
     }
-    rows.push(`${line.isWrapped ? 'w' : ' '}${line.translateToString(true).trimEnd()}${runs.length ? `  [${runs.join(' ')}]` : ''}`);
+    if (field) text = '▌' + text.slice(2);
+    if (blank && runs.length === 0) continue;
+    rows.push(`${line.isWrapped ? 'w' : ' '}${text}${runs.length ? `  [${runs.join(' ')}]` : ''}`);
   }
-  rows.push(`cursor ${buffer.cursorX},${buffer.cursorY} base ${buffer.baseY}`);
+  rows.push(`cursor ${buffer.cursorX},${term.term.rows - 1 - buffer.cursorY}`);
   return rows;
 }
 
@@ -69,7 +86,10 @@ async function same(columns: number, rows: number, steps: Step[], options: { col
       await step(screen, term);
       await term.settle();
     }
-    const [live, ink] = sides.map(({ term }) => (step.cursorMayDiffer ? dump(term).slice(0, -1) : dump(term)));
+    const [live, ink] = sides.map(({ term }, side) => {
+      const all = dump(term, side === 0);
+      return step.cursorMayDiffer ? all.slice(0, -1) : all;
+    });
     expect(ink, `after step ${index}`).toEqual(live);
   }
 }
@@ -109,7 +129,7 @@ describe('the Ink screen holds what the hand-written one holds', () => {
       (_screen, term) => term.type('y'),
       (_screen, term) => term.type('\r'),
       (_screen, term) => term.resize(90, 30),
-      (screen) => screen.suspend(),
+      cursorMayDiffer((screen) => screen.suspend()),
       (screen) => screen.resume(),
       lines(8, 3),
       (screen) => screen.stop(),

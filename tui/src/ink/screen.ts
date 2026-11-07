@@ -87,7 +87,7 @@ export interface SessionScreen {
   /** The session's counts: the left end of the caption between turns, a row of their own during a turn. */
   setMeter(meter: Meter | null): void;
   /**
-   * The status row above the box (`✻ Running npm test… (6s · ↓ 48 tokens)`), or
+   * The status row above the box (`┃ Running npm test… (6s · ↓ 48 tokens)`), or
    * null for none: `label` says what is happening, `since` and `tokens` are
    * its readout. Redrawn with the clock.
    */
@@ -192,12 +192,12 @@ export function createInkSessionScreen(options: SessionScreenOptions): InkSessio
     now: clock(),
   });
 
-  // The status row's elapsed time, its star and shimmer, and the blinking
-  // bullet of a running tool call move with the clock, so the frame is composed
-  // again on a timer while one is up; an unchanged frame is not written (see
-  // InkTerminal.paint).
+  // The status row's elapsed time and the colour of its rail cell and of the
+  // composer's bar move with the clock, so the frame is composed again on a
+  // timer while a turn runs or a progress row is up; an unchanged frame is not
+  // written (see InkTerminal.paint).
   function tick(): void {
-    const moving = live && (progress !== null || extras.calls.length > 0);
+    const moving = live && (busy || progress !== null);
     if (moving && !ticker) {
       ticker = setInterval(schedule, TICK_MS);
       ticker.unref();
@@ -467,6 +467,7 @@ export function createInkSessionScreen(options: SessionScreenOptions): InkSessio
     },
     setBusy(value) {
       busy = value;
+      tick();
       if (!busy) drain();
       schedule();
     },

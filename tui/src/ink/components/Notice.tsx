@@ -23,7 +23,7 @@ export function noticeRows({ theme, width, kind, text }: NoticeProps): string[] 
       case 'warning': return theme.warning(`${lead} ${row}`);
       case 'progress': return theme.dim(`${lead} ${row}`);
       case 'success': return `${index === 0 ? theme.success(mark) : ' '} ${row}`;
-      default: return `${index === 0 ? theme.info(mark) : ' '} ${row}`;
+      default: return `${index === 0 ? theme.ref(mark) : ' '} ${row}`;
     }
   });
 }

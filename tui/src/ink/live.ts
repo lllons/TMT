@@ -1,7 +1,7 @@
-// The rows of the live frame that say what the model is doing, in the Claude
-// Code look: the status row with its turning star, the tool call that is
-// running, the plan as a checklist, the background agents, the review and
-// verify one-liners, the reply as it streams, and the footer under the box.
+// The rows of the live frame that say what the model is doing, in the signal
+// rail look: the status row with its colour-cycling rail cell, the tool call
+// that is running, the plan as a checklist, the background agents, the review
+// and verify one-liners, the reply as it streams, and the footer under the box.
 // Pure: the clock and the window are handed in, strings come back styled by
 // the theme (and plain, with the same layout, when it has no colour).
 
@@ -10,7 +10,7 @@ import { elapsedText, oneLine, tokenCount } from '../format.js';
 import { meterLine, visibleWidth, type Look, type Progress } from '../live/rows.js';
 import { renderMarkdown } from '../markdown.js';
 import type { AgentCard, Caption, Meter, PlanStep } from '../protocol.js';
-import { starAt, type Theme } from '../theme.js';
+import { gradientAt, gradientPhase, type Theme } from '../theme.js';
 
 /** The status row's state: the live progress, minus the bar the Python UI drew. */
 export interface Activity extends Progress {
@@ -47,15 +47,27 @@ export const CALL_ROWS = 2;
 export const NOTE_ROWS = 2;
 /** Visible rows of the reply in progress. */
 export const REPLY_ROWS = 10;
-/** The result prefix of a tool call, and what its continuation lines and the live checklists indent by. */
-export const RESULT = '  ⎿  ';
+/** The rail glyphs: heavy for the answer, what the model says and asks, thin for tool rows and the plan, double for the user's own task. */
+export const RAIL = { heavy: '┃', thin: '│', double: '║' } as const;
 
 const pad = (count: number): string => ' '.repeat(Math.max(0, count));
 
+/** A row of a block: the painted rail cell and a space, then the text. A blank row keeps the rail and drops the space. */
+export const railed = (cell: string, text: string): string => (text === '' ? cell : `${cell} ${text}`);
+
+/** `│ Name target`: the rail cell, the name in bold, the target as it is, cut to the row. */
+export function callHeader(cell: string, label: string, target: string, width: number, theme: Theme): string {
+  const name = fit(oneLine(label) || 'Tool', Math.max(1, width - 2));
+  const room = width - 2 - displayWidth(name) - 1;
+  const rest = oneLine(target);
+  return railed(cell, theme.bold(name) + (rest && room > 0 ? ' ' + fit(rest, room) : ''));
+}
+
 /**
- * `✻ Running npm test… (6s · ↓ 48 tokens · esc to interrupt)`: the star turns,
- * the words shimmer across in the accent colour, the brackets are dim. The
- * suffix gives up its parts as the window narrows; the words are cut last.
+ * `┃ Running npm test… (6s · ↓ 48 tokens · esc to interrupt)`: a heavy rail
+ * cell on the shared colour cycle (orange and still while the user is being
+ * asked), the words in the terminal's own colour, the brackets dim. The suffix
+ * gives up its parts as the window narrows; the words are cut last.
  */
 export function statusRow(activity: Activity, now: number, width: number, theme: Theme): string {
   const words = `${oneLine(activity.label) || 'Thinking'}…`;
@@ -66,33 +78,21 @@ export function statusRow(activity: Activity, now: number, width: number, theme:
   const room = Math.max(1, width - 2);
   const suffixes = tiers.map((parts) => (parts.length > 0 ? ` (${parts.join(' · ')})` : ''));
   const suffix = suffixes.find((text) => displayWidth(words) + displayWidth(text) <= room) ?? '';
-  const chars = [...fit(words, room - displayWidth(suffix))];
-  // A window of three characters brighter than the rest, one cell on every 100 ms.
-  const at = (Math.floor(now / 100) % (chars.length + 12)) - 6;
-  const before = chars.slice(0, Math.max(0, at - 1)).join('');
-  const window = chars.slice(Math.max(0, at - 1), Math.max(0, at + 2)).join('');
-  const after = chars.slice(Math.max(0, at + 2)).join('');
-  const lead = `${starAt(now)} `;
-  // One span when the window is off either end of the words.
-  if (!window) return theme.accent(lead + chars.join('')) + theme.dim(suffix);
-  return theme.accent(lead + before) + theme.shimmer(window) + theme.accent(after) + theme.dim(suffix);
+  const cell = activity.waiting ? theme.needsYou(RAIL.heavy) : theme.fg(gradientAt(gradientPhase(now)), RAIL.heavy);
+  return railed(cell, fit(words, room - displayWidth(suffix))) + theme.dim(suffix);
 }
 
-/** The tool calls that are running, as the record will show them once they end, dim, the bullet blinking. */
-export function callRows(calls: Call[], now: number, width: number, theme: Theme): string[] {
-  const bullet = Math.floor(now / 600) % 2 === 0 ? '●' : ' ';
-  return calls.slice(-CALL_ROWS).map((call) => {
-    const target = oneLine(call.target);
-    const head = `${bullet} ${call.label}`;
-    return theme.dim(target ? `${head}(${fit(target, Math.max(1, width - displayWidth(head) - 2))})` : fit(head, width));
-  });
+/** The tool calls that are running, as the record will show them once they end, the rail lime and steady. */
+export function callRows(calls: Call[], width: number, theme: Theme): string[] {
+  const cell = theme.working(RAIL.thin);
+  return calls.slice(-CALL_ROWS).map((call) => callHeader(cell, call.label, call.target, width, theme));
 }
 
-const STEP_MARK: Record<string, string> = { pending: '☐', in_progress: '◼', completed: '☒', blocked: '!' };
+const STEP_MARK: Record<string, string> = { pending: '○', in_progress: '◐', completed: '◉', blocked: '!' };
 
 /**
- * The plan as a checklist under the status row: `☐` waiting, `◼` in progress
- * in the accent colour, `☒` done, dim and struck through, `!` blocked. More
+ * The plan as a checklist under the status row, on a dim thin rail: `○` waiting,
+ * `◐` in progress in lime, `◉` done, dim and struck through, `!` blocked. More
  * steps than `limit` rows: a window that starts on the step before the
  * first one not done, and a dim `… +N more` for the rest.
  */
@@ -103,18 +103,18 @@ export function planRows(steps: PlanStep[], limit: number, width: number, theme:
   const active = steps.findIndex((step) => step.status !== 'completed');
   // With room for one step it is the one in progress; with more, the one before it as well.
   const from = Math.max(0, Math.min((active < 0 ? steps.length : active) - (keep > 1 ? 1 : 0), steps.length - keep));
-  const rows = steps.slice(from, from + keep).map((step, index) => {
-    const title = fit(oneLine(step.title ?? step.id ?? ''), Math.max(1, width - RESULT.length - 2));
-    const lead = index === 0 && from === 0 ? RESULT : pad(RESULT.length);
-    const mark = STEP_MARK[step.status ?? ''] ?? '☐';
+  const rail = theme.dim(RAIL.thin);
+  const rows = steps.slice(from, from + keep).map((step) => {
+    const title = fit(oneLine(step.title ?? step.id ?? ''), Math.max(1, width - 4));
+    const mark = STEP_MARK[step.status ?? ''] ?? '○';
     switch (step.status) {
-      case 'in_progress': return theme.dim(lead) + theme.accent(mark) + ' ' + theme.bold(title);
-      case 'completed': return theme.dim(lead + mark + ' ' + theme.strike(title));
-      case 'blocked': return theme.dim(lead) + theme.warning(mark) + ' ' + theme.dim(title);
-      default: return theme.dim(lead) + mark + ' ' + title;
+      case 'in_progress': return railed(rail, theme.working(mark) + ' ' + theme.bold(title));
+      case 'completed': return railed(rail, theme.dim(mark + ' ' + theme.strike(title)));
+      case 'blocked': return railed(rail, theme.warning(mark) + ' ' + theme.dim(title));
+      default: return railed(rail, mark + ' ' + title);
     }
   });
-  if (keep < steps.length && cap > 1) rows.push(theme.dim(`${pad(RESULT.length)}… +${steps.length - keep} more`));
+  if (keep < steps.length && cap > 1) rows.push(railed(rail, theme.dim(`… +${steps.length - keep} more`)));
   return rows;
 }
 
@@ -126,8 +126,8 @@ export function agentRows(agents: AgentCard[], limit: number, width: number, the
   const rows = shown.map((agent) => {
     const name = `${agent.number ?? agent.id ?? '?'} ${agent.kind ?? 'agent'}`;
     const what = oneLine(agent.activity || agent.task || '');
-    const fixed = 2 + 2 + displayWidth(name) + 2 + displayWidth(agent.status ?? '') + 2;
-    return '  ' + theme.accent('⎇') + ' ' + name + '  ' + theme.dim(agent.status ?? '') + (what ? '  ' + theme.dim(fit(what, Math.max(1, width - fixed))) : '');
+    const fixed = 2 + displayWidth(name) + 2 + displayWidth(agent.status ?? '') + 2;
+    return theme.working('⎇') + ' ' + name + '  ' + theme.dim(agent.status ?? '') + (what ? '  ' + theme.dim(fit(what, Math.max(1, width - fixed))) : '');
   });
   if (shown.length < agents.length) rows.push(theme.dim(`  … +${agents.length - shown.length} more`));
   return rows;
@@ -139,19 +139,18 @@ const NOTE_MARK = { running: '·', passed: '✓', warning: '!', failed: '✗' } 
 export function noteRows(notes: Note[], limit: number, width: number, theme: Theme): string[] {
   return notes.slice(0, Math.max(0, Math.min(NOTE_ROWS, limit))).map((note) => {
     const mark = NOTE_MARK[note.state];
-    const paint = note.state === 'passed' ? theme.success : note.state === 'failed' ? theme.error : note.state === 'warning' ? theme.warning : theme.accent;
-    return '  ' + paint(mark) + ' ' + fit(oneLine(note.text), Math.max(1, width - 4));
+    const paint = note.state === 'passed' ? theme.success : note.state === 'failed' ? theme.error : note.state === 'warning' ? theme.warning : theme.working;
+    return paint(mark) + ' ' + fit(oneLine(note.text), Math.max(1, width - 2));
   });
 }
 
 /**
- * The reply as it arrives: its markdown, `● ` in front of the first row and
- * two columns of indent on the rest, the last `visible` rows of it. The bullet
- * goes when the first row has scrolled out of the window.
+ * The reply as it arrives: its markdown on a heavy lime rail, the last
+ * `visible` rows of it. The rail turns green when the answer is committed.
  */
 export function replyRows(reply: string, visible: number, width: number, theme: Theme): string[] {
-  const rows = renderMarkdown(reply, theme, Math.max(1, width - 2));
-  return rows.slice(-Math.max(1, visible)).map((row, index) => (row === '' ? '' : (index === 0 && rows.length <= visible ? '● ' : '  ') + row));
+  const cell = theme.working(RAIL.heavy);
+  return renderMarkdown(reply, theme, Math.max(1, width - 2)).slice(-Math.max(1, visible)).map((row) => railed(cell, row));
 }
 
 export interface FooterState {

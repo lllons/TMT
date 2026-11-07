@@ -40,13 +40,13 @@ describe('text with no markdown', () => {
 describe('inline markup', () => {
   it('paints bold, italic, strike and code in the theme, and nothing else', () => {
     expect(on('wrote **notes.txt** and *briefly* ~~twice~~ with `code`', 100)).toEqual([
-      `wrote ${COLOR.bold('notes.txt')} and ${COLOR.italic('briefly')} ${COLOR.strike('twice')} with ${COLOR.code('code')}`,
+      `wrote ${COLOR.bold('notes.txt')} and ${COLOR.italic('briefly')} ${COLOR.strike('twice')} with ${COLOR.ref('code')}`,
     ]);
     expect(off('wrote **notes.txt** and *briefly* ~~twice~~ with `code`', 100)).toEqual(['wrote notes.txt and briefly twice with code']);
   });
 
   it('reads a link as underlined text and its url dim after it, or the url alone when they are the same', () => {
-    expect(on('see [the docs](https://x.y/z) now', 100)).toEqual([`see ${COLOR.link(COLOR.underline('the docs'))} ${COLOR.dim('(https://x.y/z)')} now`]);
+    expect(on('see [the docs](https://x.y/z) now', 100)).toEqual([`see ${COLOR.ref(COLOR.underline('the docs'))} ${COLOR.dim('(https://x.y/z)')} now`]);
     expect(off('see [the docs](https://x.y/z) now', 100)).toEqual(['see the docs (https://x.y/z) now']);
     expect(off('see [https://x.y](https://x.y)', 100)).toEqual(['see https://x.y']);
   });
@@ -72,8 +72,8 @@ describe('headings, rules and quotes', () => {
 
   it('puts a dim bar before every row of a quote, its text in italic, wrapped inside the bar', () => {
     const rows = on('> the lint failure was there before this change\n>\n> and it stays', 20);
-    expect(rows.map(stripAnsi)).toEqual(['▎ the lint failure', '▎ was there before', '▎ this change', '▎', '▎ and it stays']);
-    for (const row of rows) expect(row.startsWith(COLOR.dim('▎')), row).toBe(true);
+    expect(rows.map(stripAnsi)).toEqual(['┇ the lint failure', '┇ was there before', '┇ this change', '┇', '┇ and it stays']);
+    for (const row of rows) expect(row.startsWith(COLOR.dim('┇')), row).toBe(true);
     expect(rows[0]).toContain('\x1b[3m');
   });
 });
@@ -104,7 +104,7 @@ describe('lists', () => {
   });
 
   it('reads the inline markup of an item', () => {
-    expect(on('- is **new** and `code`', 40)).toEqual([`- is ${COLOR.bold('new')} and ${COLOR.code('code')}`]);
+    expect(on('- is **new** and `code`', 40)).toEqual([`- is ${COLOR.bold('new')} and ${COLOR.ref('code')}`]);
   });
 });
 

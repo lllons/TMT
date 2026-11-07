@@ -86,7 +86,7 @@ export function questionHint(keys: string[]): string {
 }
 
 // ---------------------------------------------------------------------------
-// The Claude Code look: what a tool call, the status row and a dialog say.
+// The signal rail look: what a tool call, the status row and a dialog say.
 
 /** The events that are the result of a tool call; every other kind is a row of its own. */
 const RESULT_KINDS = new Set(['file_read', 'file_edit', 'file_create', 'file_delete', 'command', 'test', 'tool', 'background_agent']);

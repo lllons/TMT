@@ -4,10 +4,14 @@ The optional TypeScript front end for the TMT CLI. The Python UI stays the
 default; see `docs/typescript-ui-design.md`. It owns the terminal: the live
 frame pinned to the bottom, the input field in it, and the client for the
 Python backend (`TMT.py --backend-stdio`, protocol in `docs/tui-protocol.md`).
-It draws with Ink and looks like Claude Code: tool calls as `● Name(args)` with
-their result under a `⎿`, a status row that says what the model is doing, the
-plan as a checklist, a prompt box that is two rules and a footer, and
-dialogs for approvals. The sections below say how.
+It draws with Ink and has a look of its own, the signal rail: a two-column
+gutter down the left of every block, its glyph saying who speaks and its colour
+the state (red failed, orange needs you, yellow warns, lime works, green done).
+Tool calls are `│ Name target` with their result under the same rail, the answer
+is on a heavy `┃` rail and the user's own task on a double `║` one; a status
+row says what the model is doing, the plan is a checklist, the composer is one
+coloured bar `▌` and the field (no rules, no box), and approvals are dialogs
+under a heavy `━` rule. The sections below say how.
 
 ## Build and test
 
@@ -25,7 +29,7 @@ and in the `ink` project against the Ink screen the app uses
 (`test/screens.ts` picks one). They are about the terminal's behaviour (the
 scrollback, the resizes, the keys, the field, the questions), which the two
 share; what each draws in the live frame differs (the Python UI's look, the
-Claude Code look), so the scenarios about the Python look are skipped on the
+signal rail), so the scenarios about the Python look are skipped on the
 Ink screen (`INK` in `test/screens.ts`) and the Ink screen's look has its own
 tests: `ink-frame` (the frame as a pure function), `ink-look` (in a terminal),
 `components` (the committed blocks at 40, 80 and 120 columns, in colour and
@@ -34,7 +38,8 @@ streams a scripted turn (`test/turn.ts`) through the app at 80x24, 40x12,
 120x40 and 200x50. With `TMT_CAPTURE_DIR` set, `turn.test.ts` also writes the
 screen at the approval, mid-turn and at the end as plain text.
 `test/ink-vs-live.test.ts` drives both screens side by side through everything
-that is not the look and compares what the terminal holds after every step.
+that is not the look and compares what the terminal holds after every step (the
+Python box read as the composer, blank rows left out).
 
 ## Entry point and flow
 
@@ -50,9 +55,9 @@ result, so a test can call `runApp` with a headless terminal and a fake backend.
 | `src/app.ts` | `runApp`: the flow below, and every backend event's handler |
 | `src/backend.ts` | `Backend`: spawns `<python> <entry> --backend-stdio <args>`, JSON lines both ways, typed send helpers, stderr appended to `<install dir>/logs/tui-backend.log` (git-ignored) |
 | `src/format.ts` | Pure: what a tool call, the status row and a dialog say (`toolActivity`, `approvalTitle`, `approvalEcho`, `elapsedText`, `tokenCount`), the box hints, a command's rows |
-| `src/markdown.ts` | The answer's markdown. `renderMarkdown(text, theme, width)` lays the blocks out for the Claude Code look; `markdownLines` is the first reader the hand-written renderer's reply box uses |
+| `src/markdown.ts` | The answer's markdown. `renderMarkdown(text, theme, width)` lays the blocks out for the signal rail look; `markdownLines` is the first reader the hand-written renderer's reply box uses |
 | `src/protocol.ts` | The wire contract as types |
-| `src/theme.ts` | The colours: the Python UI's (the gradient, the dim grey) and the Claude Code roles (`makeTheme`: success, error, accent, code, the user row's grey, the diff colours, dim as the terminal's own faint). Truecolor where `COLORTERM` says `truecolor`/`24bit` or `WT_SESSION` is set, the nearest of the 256 otherwise, none under `NO_COLOR` |
+| `src/theme.ts` | The colours: the Python UI's gradient and dim grey, and the state roles `makeTheme` paints them as (`success` green, `error` red, `warning` yellow, `working` lime, `needsYou` orange, `ref` the one cool hue for code, links and paths, the diff tints, dim as the terminal's own faint). Truecolor where `COLORTERM` says `truecolor`/`24bit` or `WT_SESSION` is set, the nearest of the 256 otherwise, none under `NO_COLOR` |
 | `src/ink/screen.ts` | `createInkSessionScreen`, the session screen the app uses: state, keys (read from stdin here, not by Ink), the queue, `ask`, terminal modes |
 | `src/ink/terminal.tsx` | `InkTerminal`: the Ink instance and the stdout it is given, the pad, the resize, suspend and stop |
 | `src/ink/view.tsx` | The Ink tree: `<Static>` for committed rows, the live frame's rows under it |
@@ -79,19 +84,19 @@ result, so a test can call `runApp` with a headless terminal and a fake backend.
 
    | Event | In the record | In the frame |
    |---|---|---|
-   | `session` | three dim rows: `TMT <version>`, `workspace`, `tip` | |
-   | `task` | a blank row, then a grey `❯` and the text on the user row's grey | |
-   | `tool_start` | | a dim `● Name(target)` above the status row, the bullet blinking every 600 ms; the status row says `Running npm test…`, `Reading parser.py…`, `Editing app.ts…` |
-   | `tool_end`, then its `event` | one block: `● **Name**(target)` (green bullet, red if it raised, was interrupted or a command exited non-zero), `⎿` and the event's sentence dim, then the facts: `Added **N** lines, removed **M** lines`, `Wrote **N** lines`, `Read **N** lines`, `exit S` (red when not 0), files, bytes, calls. Three lines of a long result, then `… +N lines` | |
-   | `tool_end` `raised` / `interrupted` | the same block with the `error` in red under a red `⎿` (`Interrupted` when it has none) | |
-   | `event` of another kind | one row: `·` dim progress, `◆` cyan milestone, `!` yellow warning, `✓` green success, `✗` red error. It also ends the wait for a call's result: the call is committed bare, first | |
-   | `delta`, `reply_reset` | | the reply as `●` and markdown, its last ten rows |
-   | `final` | a blank row, `●` and the markdown, a blank row | the reply is gone |
-   | `status`, `meter` | | the status row `✻ <what> (6s · ↓ 48 tokens · esc to interrupt)` and the counts in the footer |
-   | `plan` | | while a turn runs, `☐` waiting, `◼` in progress (accent), `☒` done (dim, struck through), `!` blocked, six rows at most and `… +N more`, under the status row |
+   | `session` | three dim rows on a thin `│` rail: `TMT <version>`, `workspace`, `tip` | |
+   | `task` | a blank row, then the text on a double `║` rail, in the terminal's own colours (no background, no marker) | |
+   | `tool_start` | | a `│ Name target` row above the status row, the rail lime and steady (nothing blinks); the status row says `Running npm test…`, `Reading parser.py…`, `Editing app.ts…` |
+   | `tool_end`, then its `event` | one block on a thin `│` rail, green (red if it raised, was interrupted or a command exited non-zero): `│ **Name** target`, then the event's sentence, then the facts: `Added N lines, removed M lines`, `Wrote N lines`, `Read N lines`, `exit S` (red when not 0), files, bytes, calls, all dim. Three lines of a long result, then `… +N lines` | |
+   | `tool_end` `raised` / `interrupted` | the same block on a red rail with the `error` in red (`Interrupted` when it has none) | |
+   | `event` of another kind | one row: `·` dim progress, `◆` milestone in the reference hue, `!` yellow warning, `✓` green success, `✗` red error. It also ends the wait for a call's result: the call is committed bare, first | |
+   | `delta`, `reply_reset` | | the reply as markdown on a heavy lime `┃` rail, its last ten rows |
+   | `final` | a blank row, the markdown on a heavy green `┃` rail, a blank row | the reply is gone |
+   | `status`, `meter` | | the status row `┃ <what> (6s · ↓ 48 tokens · esc to interrupt)` and the counts in the footer |
+   | `plan` | | while a turn runs, on a dim `│` rail: `○` waiting, `◐` in progress (lime), `◉` done (dim, struck through), `!` blocked, six rows at most and `… +N more`, under the status row |
    | `review`, `verify` | a row when one ends (`✓` passed, `!` warnings, `✗` failed), once | a `·` row while it runs |
-   | `agents` | a row when an agent stops | `⎇ 1 worker  running  Reading parser.py` while one works |
-   | `approval`, `question` | a dialog (below), then what was chosen under a dim `⎿` | the box asks |
+   | `agents` | a row when an agent stops | `⎇ 1 worker  running  Reading parser.py` while one works, the glyph lime |
+   | `approval`, `question` | a dialog (a heavy orange `━` rule, then the title, the text and the keys on an orange `┃` rail), then what was chosen on the same rail, dim | the box asks, its bar orange |
    | `notice` | `✗` red for an error, `!` yellow for a warning, plain for information | |
    | `command` | the backend's rows, verbatim | |
    | `panel` | | nothing: the plan is drawn from `plan`, one column |
@@ -126,7 +131,7 @@ result, so a test can call `runApp` with a headless terminal and a fake backend.
 `session`, `task`, `event`, `command`, `final`, `notice`, `approval` and
 `question` may carry `rows: string[]`: what the Python UI would print for the
 event, laid out by its own renderer for the width the front end reported. The
-Claude Code look is drawn from the structured fields instead (the `text`, the
+signal rail look is drawn from the structured fields instead (the `text`, the
 `message` and `detail`, the `choices`), so those rows are ignored for every
 event that has them. They are committed verbatim (no wrapping, no markdown, no
 blank row added) when the event has none of the fields to draw it from: a
@@ -163,10 +168,10 @@ const key = await screen.ask({ hint: 'Type y and Enter' }); // an approval
 |---|---|
 | `commit(text)` | Writes `text` into the terminal's scrollback above the frame, once, never redrawn. One row per line; a final newline adds none; `''` is one blank line. Colour (SGR) is kept; every other escape and control character is stripped, so output cannot erase or narrow the scrollback. |
 | `commitNode(node)` | The Ink screen only: an Ink component, rendered once at the window's width and committed like `commit` (measured, kept, never redrawn; a blank last row is kept). |
-| `setReply(text)` | The reply in progress, drawn live above the status row as `●` and its markdown (the same rows `final` commits, its last 10 rows at most, fewer when the window is short). Keep only the tail here: the live frame should stay small, because a frame taller than a window that is then made shorter leaves rows in the scrollback. |
+| `setReply(text)` | The reply in progress, drawn live above the status row as its markdown on a heavy lime `┃` rail (the same rows `final` commits, on a green one; its last 10 rows at most, fewer when the window is short). Keep only the tail here: the live frame should stay small, because a frame taller than a window that is then made shorter leaves rows in the scrollback. |
 | `setStatus(text)` | One plain row under the box, which takes the footer's place. `''` removes it. |
-| `setProgress(progress)` | The status row above the box while a turn runs: `{ state, label, percent, since, tokens, waiting? }`, `null` removes it. It is `✻ <label>… (6s · ↓ 48 tokens · esc to interrupt)`: the star turns through `· ✢ * ✶ ✻ ✽` on a two-second cosine, the words are the accent colour with a brighter window of three characters moving across, the brackets dim. `label` is what is happening (the app says it); `percent` is ignored. `since` is ms on the screen's clock. `waiting` leaves the interrupt hint out (the user is being asked something). The suffix gives up the hint, then the tokens, then the clock as the window narrows. While a row or a running call is set the frame is recomposed every 100 ms (an unchanged frame is not written); the timer is cleared with them, on `suspend()` and on `stop()`. |
-| `setLive(live)` | `{ calls, plan, agents, notes }`, the rest of what is drawn around the status row: the running tool calls (`● Name(target)`, dim, the bullet blinking), the plan as a checklist under a `⎿`, the working agents and the reviews that run, one row each. Text from the model and the backend has every escape stripped. |
+| `setProgress(progress)` | The status row above the box while a turn runs: `{ state, label, percent, since, tokens, waiting? }`, `null` removes it. It is `┃ <label>… (6s · ↓ 48 tokens · esc to interrupt)`: the heavy rail cell takes the colour of the shared gradient cycle (red to green and back over 2.4 s; orange and still while `waiting`), the words are the terminal's own colour, the brackets dim. `label` is what is happening (the app says it); `percent` is ignored. `since` is ms on the screen's clock. `waiting` leaves the interrupt hint out (the user is being asked something). The suffix gives up the hint, then the tokens, then the clock as the window narrows. While a turn runs or a row is set the frame is recomposed every 100 ms (an unchanged frame is not written; the composer's bar moves with the same cycle); the timer is cleared with them, on `suspend()` and on `stop()`. |
+| `setLive(live)` | `{ calls, plan, agents, notes }`, the rest of what is drawn around the status row: the running tool calls (`│ Name target`, the rail lime and steady), the plan as a checklist on a dim rail, the working agents and the reviews that run, one row each. Text from the model and the backend has every escape stripped. |
 | `setMeter(meter)` | The counts (the `meter` event's fields), in the footer after the hint: `+0 lines, -0 lines, ~14k context, ~48 out` (shorter forms when narrow; nothing until something is counted). `+N` is green, `-N` red. |
 | `setCaption(caption)` | Between turns, the right end of the footer: `{ clock, provider, model }` as `09:30:00 · OpenRouter · Model` in dim, the narrowest of three forms that fits; or a string taken as it is. `''` removes it. Not drawn while a turn runs. |
 | `setPanel(panel)` | The right-hand column the Python UI draws: `{ rows, width }`, rows styled (SGR kept, anything else stripped), beside the live area, flush with the top. The app does not call it (the plan is drawn from `plan`); it is kept for the contract the hand-written renderer shares. `null` removes it. |
@@ -201,8 +206,8 @@ terminal's own scrollback through Ink's `<Static>` (a block of the record is an
 Ink component rendered to rows once, at the width the window has then, by
 `commitNode`), and the live frame under them is the only thing Ink repaints.
 Top to bottom it is the reply, a blank row, the running tool call, the status
-row, the plan, the notes and the agents, the box (a rule, the field, a rule)
-and the footer. When the window is short the box and the footer are kept, then
+row, the plan, the notes and the agents, the box (the field behind its bar, no
+rules) and the footer. When the window is short the box and the footer are kept, then
 the status row, then the call; the reply keeps three rows before the plan
 and the notes get any, and at most ten. It is the only thing Ink repaints -- it erases the rows it
 drew and writes the frame again, gathered into one write inside
@@ -246,8 +251,10 @@ tall) is never taken, because the frame is shorter.
 Widths are display widths (`string-width`, by grapheme). One column is kept
 for the caret (`inner - 1`). Rows wrap at a word boundary, the break space
 staying on the row it ends, so no continuation row starts with a space
-(ui-review F12). Five rows, then the window follows the caret. Only the
-first row carries `>`. The placeholder never wraps. A paste of more than one
+(ui-review F12). Five rows, then the window follows the caret. Every
+row keeps the composer's bar `▌` (lime between turns, the colour cycle while a
+turn runs, orange while a question is open), so a wrapped line is one bar. The
+placeholder never wraps. A paste of more than one
 line folds to `[Pasted text #N +M lines]` and is expanded on submit; a token
 with no stored paste is left as typed. Pastes are detected by bracketed
 paste and, as a fallback, by a single read that starts with text and holds a
@@ -267,7 +274,7 @@ line break (never read as Enter).
   removes OSC sequences so output cannot set a title or worse, and the row
   wrapper does not know a zero-width escape other than colour.
 - A result event that is a `warning` (a failed action) is not the call's
-  result by the protocol's kinds, so the call is committed bare, its bullet
+  result by the protocol's kinds, so the call is committed bare, its rail
   green, and the `!` row follows it.
 - Ink re-spells colour codes: a colour the text closed with a reset
   (`\x1b[0m`) is closed with its own off code (`\x1b[39m`, `\x1b[22m`), the

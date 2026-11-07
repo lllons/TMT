@@ -1,10 +1,11 @@
-// The live frame as rows of text, for the Ink screen to draw, in the Claude
-// Code look: the reply in progress, the status row that says what the model is
-// doing, the plan as a checklist, the prompt box (a rule above and below, no
-// sides) and one dim row of hints under it. Pure: the terminal is measured by
-// the caller and handed in, and so is the clock, so a frame is a function of
-// the state and the window and nothing else. That is what makes two frames of
-// an untouched box equal, and an equal frame is never repainted.
+// The live frame as rows of text, for the Ink screen to draw, in the signal
+// rail look: the reply in progress, the status row that says what the model is
+// doing, the plan as a checklist, the composer (the field's rows behind one
+// coloured bar, no rules) and one dim row of hints under it. Pure: the
+// terminal is measured by the caller and handed in, and so is the clock, so a
+// frame is a function of the state and the window and nothing else. That is
+// what makes two frames of an untouched box equal, and an equal frame is never
+// repainted.
 //
 // The rows of each region come from live.ts; `composeFrame` decides how many
 // rows each one gets, and `fieldRows` and `beside` are the input field and the
@@ -15,13 +16,13 @@ import { INPUT_MAX_ROWS, visibleField } from '../input/field.js';
 import { displayWidth, fieldText, fit, graphemes, stripAnsi } from '../input/width.js';
 import { cutStyled, padStyled, visibleWidth, type Look } from '../live/rows.js';
 import type { Caption, Meter } from '../protocol.js';
-import { makeTheme } from '../theme.js';
+import { gradientAt, gradientPhase, LIME, makeTheme, ORANGE } from '../theme.js';
 import { agentRows, callRows, footerRow, NO_LIVE, noteRows, planRows, replyRows, REPLY_ROWS, statusRow, type Activity, type Live } from './live.js';
 
 /** The widest block TMT draws, however wide the window is (MAX_CONTENT_WIDTH). */
 export const MAX_CONTENT_WIDTH = 100;
-/** Columns before the field: a margin, the marker, a gap. */
-export const PROMPT_PREFIX = 3;
+/** Columns before the field: the bar and a gap. */
+export const PROMPT_PREFIX = 2;
 /** Visible rows of the reply in progress (LIVE_BODY_LINES). */
 export const LIVE_BODY_LINES = REPLY_ROWS;
 /** Blank columns between the live area and the right-hand column (agent_panel.GUTTER). */
@@ -29,7 +30,7 @@ export const GUTTER = 2;
 /** The narrowest left column a right-hand column may leave (agent_menu._MIN_CONTENT). */
 export const MIN_LEFT = 24;
 /** The rows to spare from which a blank row goes above the status row. */
-const SPACER_FROM = 8;
+const SPACER_FROM = 10;
 
 /** The right-hand column as the backend rendered it: styled rows, and the width it was laid out for. */
 export interface Panel {
@@ -69,7 +70,7 @@ export interface FrameState {
   bare?: 'line' | 'key' | null;
   color: boolean;
   truecolor: boolean;
-  /** The clock, in ms: the elapsed time and the star and shimmer of the status row are read from it. */
+  /** The clock, in ms: the elapsed time of the status row and the colour of its rail cell and of the composer's bar are read from it. */
   now: number;
 }
 
@@ -101,11 +102,12 @@ const RESET = '\x1b[0m';
  * row; see src/ink/terminal.tsx.)
  *
  * Top to bottom: the reply, a blank row, the running tool calls, the status
- * row, the plan, the notes and agents, the box (rule, field, rule) and the
- * footer; as the left column, flush with the foot of the region, beside the
- * right-hand column when there is one, flush with its top. When the window is
- * short the box and the footer are kept, then the status row, then the tool
- * call; the reply keeps three rows before the plan and the notes get any.
+ * row, the plan, the notes and agents, the box (the field's rows behind the
+ * bar) and the footer; as the left column, flush with the foot of the region,
+ * beside the right-hand column when there is one, flush with its top. When
+ * the window is short the box and the footer are kept, then the status row,
+ * then the tool call; the reply keeps three rows before the plan and the
+ * notes get any.
  */
 export function composeFrame(state: FrameState, columns: number, rows: number): Frame {
   const room = rows - 1;
@@ -119,24 +121,19 @@ export function composeFrame(state: FrameState, columns: number, rows: number): 
   const leftWidth = panel ? spare - GUTTER - panel.width : spare;
   const width = Math.min(MAX_CONTENT_WIDTH, Math.max(1, leftWidth));
   const inner = Math.max(1, width - PROMPT_PREFIX);
-  const maxRows = Math.max(1, Math.min(INPUT_MAX_ROWS, room - 2));
+  const maxRows = Math.max(1, Math.min(INPUT_MAX_ROWS, room - 1));
   const empty: Frame = { rows: [], plain: [], field: { first: 0, count: 0, inner, maxRows, prefix: PROMPT_PREFIX } };
   if (room < 1) return empty;
   if (state.bare) return bareFrame(state, Math.min(MAX_CONTENT_WIDTH, spare), room);
 
   const live = state.live ?? NO_LIVE;
-  const field = fieldRows(state.editor, fieldHint(state), inner, maxRows, theme.dim, ' > ');
-  // The marker is grey; the rest of the row is as it was drawn.
-  field[0]!.styled = ' ' + theme.muted('>') + field[0]!.styled.slice(2);
-  const rule = ' ' + '─'.repeat(Math.max(0, width - 1));
+  // The bar is lime between turns, on the colour cycle while one runs, orange while a question is open.
+  const bar = state.ask !== null ? theme.needsYou : state.busy ? (text: string) => theme.fg(gradientAt(gradientPhase(state.now)), text) : theme.working;
+  const field = fieldRows(state.editor, fieldHint(state), inner, maxRows, theme.dim, bar('▌') + ' ');
 
-  // What is kept is the field and both rules; everything else gives up its
-  // rows to them when the window is short.
-  let topRule = true;
-  let bottomRule = true;
-  if (field.length + 2 > room) topRule = false;
-  if (field.length + 1 > room) bottomRule = false;
-  let left = room - field.length - (topRule ? 1 : 0) - (bottomRule ? 1 : 0);
+  // What is kept is the field; everything else gives up its rows to it when
+  // the window is short.
+  let left = room - field.length;
 
   const footer: Row[] = left > 0 ? [styledRow(footerRow({
     status: state.status, asking: state.ask !== null, askFooter: state.askFooter ?? '', busy: state.busy,
@@ -150,7 +147,7 @@ export function composeFrame(state: FrameState, columns: number, rows: number): 
 
   // The tool call that is running, then the reply (three rows are the least
   // worth drawing), then the plan, the notes and the agents with what is left.
-  const calls = left > 0 ? callRows(live.calls, state.now, width, theme).slice(-left).map(styledRow) : [];
+  const calls = left > 0 ? callRows(live.calls, width, theme).slice(-left).map(styledRow) : [];
   left -= calls.length;
   const reserve = state.reply ? Math.min(3, left) : 0;
   const plan = planRows(live.plan, left - reserve, width, theme).map(styledRow);
@@ -161,12 +158,8 @@ export function composeFrame(state: FrameState, columns: number, rows: number): 
   left -= agents.length;
   const reply: Row[] = state.reply && left > 0 ? replyRows(state.reply, Math.min(REPLY_ROWS, left), width, theme).map(styledRow) : [];
 
-  const ruleRow = styledRow(theme.border(rule));
-  const column: Row[] = [
-    ...reply, ...spacer, ...calls, ...status, ...plan, ...notes, ...agents,
-    ...(topRule ? [ruleRow] : []), ...field, ...(bottomRule ? [ruleRow] : []), ...footer,
-  ];
-  const first = column.length - footer.length - (bottomRule ? 1 : 0) - field.length;
+  const column: Row[] = [...reply, ...spacer, ...calls, ...status, ...plan, ...notes, ...agents, ...field, ...footer];
+  const first = column.length - footer.length - field.length;
 
   const all = panel ? beside(column, panel.rows.slice(0, Math.max(0, room)), spare - GUTTER - panel.widest) : column;
   const pad = all.length - column.length;
@@ -243,16 +236,15 @@ function beside(column: Row[], right: string[], cell: number): Row[] {
 }
 
 /**
- * The field's rows, prefixed. Only the first visible row carries the `>`;
- * the rest indent to line up under the text rather than repeating a marker
- * nobody typed. The caret is drawn, not placed: the terminal's own cursor is
+ * The field's rows, each behind `lead` (the coloured bar and a space), so a
+ * wrapped line keeps the bar. The caret is drawn, not placed: the terminal's own cursor is
  * parked under the frame (see InkTerminal), so the caret is the cell under
  * it in inverse video, or an inverse space after the last character -- the
  * column `layoutField` keeps free for it.
  */
 function fieldRows(editor: LineEditor, hint: string, inner: number, maxRows: number,
                    dim: (text: string) => string, lead: string): Row[] {
-  const indent = ' '.repeat(lead.length);
+  const bare = stripAnsi(lead);
   if (editor.value === '') {
     // The placeholder never wraps. It is shadow text standing in for an empty
     // field, and a hint that grew the box would rearrange the screen before
@@ -261,22 +253,21 @@ function fieldRows(editor: LineEditor, hint: string, inner: number, maxRows: num
     const [head = ' ', ...rest] = text ? graphemes(text) : [' '];
     const tail = rest.join('');
     return [{
-      plain: lead + head + tail,
+      plain: bare + head + tail,
       styled: lead + INVERSE + head + UNINVERSE + dim(tail),
     }];
   }
   const view = visibleField(editor.value, editor.cursor, inner, maxRows);
   return view.rows.map((row, index) => {
-    const prefix = index === 0 ? lead : indent;
     const text = fieldText(row.text);
-    if (index !== view.caretRow) return { plain: prefix + text, styled: prefix + text };
+    if (index !== view.caretRow) return { plain: bare + text, styled: lead + text };
     const { before, under, after } = splitAt(text, view.caretColumn);
     // A zero-width character under the caret would make the caret invisible.
     const cell = under && displayWidth(under) > 0 ? under : ' ';
     const rest = cell === under ? after : under + after;
     return {
-      plain: prefix + before + cell + rest,
-      styled: prefix + before + INVERSE + cell + UNINVERSE + rest,
+      plain: bare + before + cell + rest,
+      styled: lead + before + INVERSE + cell + UNINVERSE + rest,
     };
   });
 }

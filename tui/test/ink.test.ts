@@ -30,21 +30,21 @@ function open(term: FakeTerminal, options: { mouseCaret?: boolean } = {}): InkSe
 // rows on it included. Never taken, because the frame is never that tall.
 const HOME = /\x1b\[(?:1;1)?H|\x1b\[2J/;
 
-/** No frame left anywhere but the live one: one box, one status row, in the whole buffer. */
+/** No frame left anywhere but the live one: one composer (and no rule), one status row, in the whole buffer. */
 function expectNoStaleRows(term: FakeTerminal): void {
   const all = term.all();
-  expect(rowsWhere(all, isRule)).toHaveLength(2);
+  expect(rowsWhere(all, isRule)).toHaveLength(0);
   expect(rowsWhere(all, isField)).toHaveLength(1);
   expect(rowsWhere(all, (row) => row.includes(STATUS))).toHaveLength(1);
 }
 
-/** The box on the last rows: field, bottom rule, status, then the cursor's row. */
+/** The box on the last rows: field, status, then the cursor's row. */
 function expectBoxOnFoot(term: FakeTerminal): void {
   const view = term.viewport();
   const rows = term.term.rows;
   expect(view[rows - 1]).toBe('');
   expect(view[rows - 2]).toBe(` ${STATUS}`);
-  expect(isRule(view[rows - 3]!)).toBe(true);
+  expect(isField(view[rows - 3]!)).toBe(true);
 }
 
 describe('the Ink screen, byte for byte', () => {
@@ -163,12 +163,12 @@ describe('the Ink screen and the terminal', () => {
     expect(buffer.cursorX).toBe(0);
     expect(term.raw.lastIndexOf('\x1b[?25l')).toBeGreaterThan(term.raw.lastIndexOf('\x1b[?25h'));
     const field = term.viewport().findIndex(isField);
-    expect(term.viewport()[field]).toBe(' > hello world');
+    expect(term.viewport()[field]).toBe('▌ hello world');
     const line = buffer.getLine(buffer.viewportY + field)!;
     // The caret is on the r of "world", three to the left of the end.
-    expect(line.getCell(3 + 8)!.getChars()).toBe('r');
-    expect(line.getCell(3 + 8)!.isInverse()).toBeTruthy();
-    expect(line.getCell(3 + 7)!.isInverse()).toBeFalsy();
+    expect(line.getCell(2 + 8)!.getChars()).toBe('r');
+    expect(line.getCell(2 + 8)!.isInverse()).toBeTruthy();
+    expect(line.getCell(2 + 7)!.isInverse()).toBeFalsy();
     screen.stop();
     expect(term.raw.endsWith('\x1b[?25h')).toBe(true);
   });
@@ -186,10 +186,10 @@ describe('the Ink screen and the terminal', () => {
     await term.settle();
     expect(screen.queued()).toEqual(['next task']);
     // The box stays empty while a turn runs; how many wait is in the footer (test/ink-look.test.ts).
-    expect(term.viewport().find(isField)!.trim()).toBe('>');
+    expect(term.viewport().find(isField)!.trim()).toBe('▌');
     const key = screen.ask({ hint: '1-2, Esc to skip', keys: ['1', '2'] });
     await term.settle();
-    expect(term.viewport().find(isField)).toBe(' > 1-2, Esc to skip');
+    expect(term.viewport().find(isField)).toBe('▌ 1-2, Esc to skip');
     term.type('2');
     expect(await key).toBe('2');
     const line = screen.ask({ hint: 'y / n  then Enter' });

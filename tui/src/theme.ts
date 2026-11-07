@@ -1,6 +1,8 @@
-// The colours of the Python UI (agent_ui.py), so a row drawn here is the colour
-// of the same row there. Truecolor where the terminal says it has it, the
-// nearest of the 256 otherwise; none at all when the caller turns colour off.
+// The colours: TMT's own gradient (agent_ui.py's, so a row drawn here is the
+// colour of the same row in the Python UI) read as a state ramp, the terminal's
+// own faint for context, and one cool hue for references. Truecolor where the
+// terminal says it has it, the nearest of the 256 otherwise; none at all when
+// the caller turns colour off.
 
 export type Rgb = readonly [number, number, number];
 
@@ -18,9 +20,6 @@ const STOPS: readonly (readonly [number, Rgb])[] = [[10, RED], [40, ORANGE], [60
 
 /** Seconds for one there-and-back pass of the shared colour cycle (GRADIENT_CYCLE). */
 export const GRADIENT_CYCLE_MS = 2400;
-/** The glyph that turns beside the activity readout, and how long each is held. */
-export const ACTIVITY_GLYPHS = ['✻', '✽', '✻'] as const;
-export const ACTIVITY_TICK_MS = 400;
 
 const RESET = '\x1b[0m';
 
@@ -100,41 +99,17 @@ export function cycleBar(percent: number, width: number, phase: number, truecolo
 }
 
 // ---------------------------------------------------------------------------
-// The Claude Code look: one role per kind of thing a row can be, and a theme
-// that paints them. The values are the dark theme of the study copy of the
-// installed CLI (success green, error red, the orange accent, the code and
-// permission blue, the user row's grey). Dim is the terminal's own faint
-// attribute, not a grey of its own, so it follows whatever the text would be.
+// The signal rail look: one role per kind of thing a row can be, and a theme
+// that paints them. The gradient is the state ramp: red failed, orange needs
+// the user, yellow warns or writes, lime works, green is done. Text is the
+// terminal's own foreground and dim is its own faint attribute, not a grey of
+// its own, so both follow whatever the terminal's text would be.
 
-export const SUCCESS: Rgb = [78, 186, 101];
-export const ERROR: Rgb = [255, 107, 128];
-export const WARNING: Rgb = [255, 193, 7];
-export const ACCENT: Rgb = [215, 119, 87];
-export const ACCENT_SHIMMER: Rgb = [235, 159, 127];
-/** The grey of the user's own line marker and of anything inactive. */
-export const INACTIVE: Rgb = [153, 153, 153];
-/** The prompt box's rules. */
-export const BORDER: Rgb = [136, 136, 136];
-/** Inline code, the accent key of a dialog, and the dialog's rule. */
-export const CODE: Rgb = [177, 185, 249];
+/** The one cool hue: inline code, links, file paths. */
 export const INFO: Rgb = [0, 204, 204];
-export const LINK: Rgb = [122, 180, 232];
-/** The background of the user's task row. */
-export const USER_BACKGROUND: Rgb = [55, 55, 55];
-export const DIFF_ADDED: Rgb = [34, 92, 43];
-export const DIFF_REMOVED: Rgb = [122, 41, 54];
-
-/** The star that turns beside the status row, swept back and forth as one breath of 2 s. */
-export const STAR_FRAMES = ['·', '✢', '*', '✶', '✻', '✽'] as const;
-export const STAR_PERIOD_MS = 2000;
-
-/** The star at `now` (ms): a cosine sweep through the frames, as the installed CLI breathes it. */
-export function starAt(now: number): string {
-  const breath = (1 - Math.cos((2 * Math.PI * (now % STAR_PERIOD_MS)) / STAR_PERIOD_MS)) / 2;
-  return STAR_FRAMES[Math.round(breath * (STAR_FRAMES.length - 1))]!;
-}
-
-const bgCode = (rgb: Rgb, truecolor: boolean): string => (truecolor ? `\x1b[48;2;${rgb[0]};${rgb[1]};${rgb[2]}m` : `\x1b[48;5;${nearest256(rgb)}m`);
+/** Darker tints of GREEN and RED, for the added and removed lines of a diff. */
+export const DIFF_ADDED: Rgb = [12, 69, 33];
+export const DIFF_REMOVED: Rgb = [88, 15, 15];
 
 type Paint = (text: string) => string;
 
@@ -152,19 +127,19 @@ export interface Theme {
   italic: Paint;
   underline: Paint;
   strike: Paint;
+  /** Done, passed. */
   success: Paint;
+  /** Failed, refused, non-zero. */
   error: Paint;
+  /** Written with care: a warning, a blocked step. */
   warning: Paint;
-  accent: Paint;
-  shimmer: Paint;
-  muted: Paint;
-  border: Paint;
-  code: Paint;
-  info: Paint;
-  link: Paint;
+  /** Working: a call that runs, the reply that streams. */
+  working: Paint;
+  /** Waiting for the user: an approval, a question. */
+  needsYou: Paint;
+  /** A reference: inline code, a link, a path. */
+  ref: Paint;
   fg(rgb: Rgb, text: string): string;
-  /** `text` on the user row's grey. */
-  userRow: Paint;
 }
 
 export function makeTheme(look: { color: boolean; truecolor: boolean }): Theme {
@@ -179,8 +154,6 @@ export function makeTheme(look: { color: boolean; truecolor: boolean }): Theme {
     italic: wrap('\x1b[3m', '\x1b[23m'),
     underline: wrap('\x1b[4m', '\x1b[24m'),
     strike: wrap('\x1b[9m', '\x1b[29m'),
-    success: role(SUCCESS), error: role(ERROR), warning: role(WARNING), accent: role(ACCENT), shimmer: role(ACCENT_SHIMMER),
-    muted: role(INACTIVE), border: role(BORDER), code: role(CODE), info: role(INFO), link: role(LINK),
-    userRow: wrap(bgCode(USER_BACKGROUND, truecolor), '\x1b[49m'),
+    success: role(GREEN), error: role(RED), warning: role(YELLOW), working: role(LIME), needsYou: role(ORANGE), ref: role(INFO),
   };
 }
